@@ -1,0 +1,13 @@
+{
+  "keyfile": "/root/sequentia/pignus-data/oracle.key",
+  "logfile": "/root/sequentia/pignus-data/attestations.log",
+  "listen": "127.0.0.1:8740",
+  "interval": 60,
+  "price_scale": 100000,
+  "markets": ["GOLD/USDX", "SILVR/USDX", "OILX/USDX", "SEQ/USDX",
+              "EURX/USDX", "BTC/USDX"],
+  "symbols": {"BTC": "tBTC"},
+  "precisions": {"GOLD": 8, "SILVR": 8, "OILX": 8, "SEQ": 8, "EURX": 8,
+                 "BTC": 8, "USDX": 8},
+  "source": {"type": "http", "url": "http://127.0.0.1:8088/price", "field": "price"}
+}

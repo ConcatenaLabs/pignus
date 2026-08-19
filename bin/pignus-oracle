@@ -21,6 +21,7 @@ Config (JSON):
       "price_scale": 100000,
       "markets":     ["GOLD/USDX", "SILVR/USDX", "OILX/USDX", "SEQ/USDX"],
       "precisions":  {"GOLD": 8, "USDX": 8},
+      "symbols":     {"BTC": "tBTC"},
       "source":      {"type": "http", "url": "http://127.0.0.1:8088/price"}
     }
 
@@ -102,6 +103,8 @@ class Oracle:
         self.markets = list(cfg.get("markets", []))
         self.precisions = {k.upper(): int(v)
                            for k, v in cfg.get("precisions", {}).items()}
+        # market asset name -> the ticker the feed knows it by
+        self.aliases = dict(cfg.get("symbols", {}))
         self.price_scale = int(cfg.get("price_scale", 100_000))
         self.latest = {}
         self.errors = {}
@@ -115,7 +118,7 @@ class Oracle:
         for market in self.markets:
             try:
                 price = self.source.price_for(market, self.precisions,
-                                              self.price_scale)
+                                              self.price_scale, self.aliases)
                 att = O.sign(self.sec, market, price, self.price_scale)
             except Exception as e:                # noqa: BLE001 - reported, not raised
                 with self._lock:
