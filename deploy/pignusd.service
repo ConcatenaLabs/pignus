@@ -1,0 +1,22 @@
+[Unit]
+Description=Pignus loan book and watcher (Sequentia testnet)
+Documentation=https://github.com/GracedEternalKingCabbageMan/pignus
+After=network-online.target pignus-oracle.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/sequentia/pignus
+Environment=SEQUENTIA_SRC=/root/sequentia/SequentiaByClaude
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignusd --config /root/sequentia/pignusd.json
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

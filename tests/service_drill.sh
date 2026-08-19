@@ -64,8 +64,12 @@ sys.exit(0 if h["markets"] and h["priced"] == h["markets"] else 1)' 2>/dev/null;
     fi
     sleep 0.5
 done
-test "$ready" = "1" || { echo "services did not become ready" >&2;
-                         tail -20 "$WORK/oracle.log" "$WORK/pignusd.log" >&2; exit 1; }
+if [ "$ready" != "1" ]; then
+    echo "services did not become ready" >&2
+    echo "--- oracle.log ---" >&2; tail -n 20 "$WORK/oracle.log" >&2
+    echo "--- pignusd.log ---" >&2; tail -n 20 "$WORK/pignusd.log" >&2
+    exit 1
+fi
 
 O="http://127.0.0.1:$OPORT"; D="http://127.0.0.1:$DPORT"
 OX=$(curl -fsS "$O/v1/pubkey" | python3 -c 'import json,sys;print(json.load(sys.stdin)["oracle_x"])')

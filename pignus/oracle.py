@@ -265,12 +265,23 @@ class PriceSource:
     def reference_price(self, symbol: str) -> float:
         raise NotImplementedError
 
-    def price_for(self, market: str, precisions=None, price_scale=100_000) -> int:
+    def price_for(self, market: str, precisions=None, price_scale=100_000,
+                  aliases=None) -> int:
+        """The covenant's integer price for `market`.
+
+        `aliases` maps a market's asset name to the ticker the feed knows it by.
+        The Sequentia demo feed quotes Bitcoin as `tBTC`, for instance, while a
+        market is naturally written `BTC/USDX` -- and the market NAME is what the
+        feed id commits to, so renaming the market to suit the feed would change
+        every vault address that references it. Aliasing the lookup instead
+        leaves the on-chain identity alone.
+        """
         collateral_sym, debt_sym = [p.strip().upper() for p in market.split("/")]
         precisions = precisions or {}
+        aliases = {k.upper(): v for k, v in (aliases or {}).items()}
         return quote_price(
-            self.reference_price(collateral_sym),
-            self.reference_price(debt_sym),
+            self.reference_price(aliases.get(collateral_sym, collateral_sym)),
+            self.reference_price(aliases.get(debt_sym, debt_sym)),
             precisions.get(collateral_sym, 8),
             precisions.get(debt_sym, 8),
             price_scale)
@@ -305,7 +316,9 @@ class HttpPriceSource(PriceSource):
 
     def reference_price(self, symbol: str) -> float:
         import urllib.request
-        url = f"{self.url}/{symbol.upper()}"
+        # NOT upper-cased: feed tickers are case-sensitive (the Sequentia demo
+        # feed serves `tBTC`, and `TBTC` is a 404).
+        url = f"{self.url}/{symbol}"
         with urllib.request.urlopen(url, timeout=self.timeout) as r:
             data = json.loads(r.read().decode())
         if isinstance(data, (int, float)):
