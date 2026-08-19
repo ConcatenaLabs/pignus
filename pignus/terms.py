@@ -51,7 +51,10 @@ class LoanTerms:
     collateral_amount: int
     principal: int          # what the borrower receives at origination
     debt: int               # what must be repaid: principal plus term interest
-    # the parties, as 32-byte x-only keys (hex). Payouts are v1 taproot.
+    # The parties, as payout programs. There is no signing key anywhere in a
+    # loan any more: every exit reads what it enforces out of the transaction
+    # and pays a PINNED destination, so a browser wallet -- which can sign its
+    # own inputs but not a covenant leaf -- can drive all of them.
     borrower_x: str
     lender_x: str
     # the oracle: EITHER one key in `oracle_x`, OR a set in `oracles` with a
@@ -74,6 +77,14 @@ class LoanTerms:
     # from_json() converts the JSON list back.
     oracles: tuple = ()
     oracle_threshold: int = 0
+    # Where the payouts go. A payout is not always taproot: the browser wallet
+    # extension is a wpkhSlip77 wallet and can only receive at segwit v0, so a
+    # loan originated from a browser sets version 0 and gives 20-byte programs.
+    # Left unset, the programs are the x-only keys at v1.
+    lender_ver: int = 1
+    borrower_ver: int = 1
+    lender_prog: str = ""
+    borrower_prog: str = ""
 
     def __post_init__(self):
         if self.oracles and self.oracle_x:
@@ -90,6 +101,12 @@ class LoanTerms:
             if not 1 <= t <= len(self.oracles):
                 raise ValueError(
                     f"oracle_threshold {t} outside 1..{len(self.oracles)}")
+
+    @property
+    def payout_programs(self):
+        """(lender, borrower) witness programs, as hex."""
+        return (self.lender_prog or self.lender_x,
+                self.borrower_prog or self.borrower_x)
 
     @property
     def oracle_keys(self):
@@ -109,8 +126,9 @@ class LoanTerms:
         return feed_id(self.market)
 
     def _covenant_kwargs(self):
-        borrower = bytes.fromhex(self.borrower_x)
-        lender = bytes.fromhex(self.lender_x)
+        lender_prog, borrower_prog = self.payout_programs
+        borrower = bytes.fromhex(borrower_prog)
+        lender = bytes.fromhex(lender_prog)
         return dict(
             asset_c=_internal(self.collateral_asset),
             asset_d=_internal(self.debt_asset),
@@ -118,7 +136,8 @@ class LoanTerms:
             # A v1 taproot payout program IS the x-only key, so the payout
             # program and the signing key are one value, not two that can
             # disagree.
-            lender_prog=lender, borrower_prog=borrower, lender_x=lender,
+            lender_prog=lender, borrower_prog=borrower,
+            lender_ver=self.lender_ver, borrower_ver=self.borrower_ver,
             feed_id=self.feed,
             oracle_x=bytes.fromhex(self.oracle_x) if self.oracle_x else None,
             oracles=[bytes.fromhex(k) for k in self.oracles] or None,
@@ -240,6 +259,13 @@ class LoanTerms:
             w.append(f"a 1-of-{len(self.oracles)} oracle set is not a threshold: "
                      "ANY one of those keys can trigger a liquidation alone, so "
                      "this is weaker than a single oracle, not stronger")
+        for who, ver, prog in (("lender", self.lender_ver, self.payout_programs[0]),
+                               ("borrower", self.borrower_ver, self.payout_programs[1])):
+            want = 20 if ver == 0 else 32
+            if len(bytes.fromhex(prog)) != want:
+                w.append(f"the {who} payout program is not {want} bytes, which "
+                         f"is what witness version {ver} requires -- this loan "
+                         "would compile to an address nobody can be paid at")
         if self.not_before == 0:
             w.append("not_before is 0: any attestation the oracle has EVER "
                      "signed for this feed can trigger a liquidation")

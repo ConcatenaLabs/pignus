@@ -197,6 +197,28 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
+    # The site is plain ES modules with no build step, so the browser fetches
+    # them by name. Only files that actually exist in web/ are served, and only
+    # by their bare name -- no path traversal, no directory listing, nothing
+    # outside that one directory.
+    STATIC = {".js": "application/javascript; charset=utf-8",
+              ".json": "application/json",
+              ".css": "text/css; charset=utf-8",
+              ".svg": "image/svg+xml"}
+
+    def _static(self, path):
+        name = os.path.basename(path)
+        if name != path.lstrip("/"):
+            return None
+        ext = os.path.splitext(name)[1]
+        if ext not in self.STATIC or not name:
+            return None
+        full = os.path.realpath(os.path.join(WEB, name))
+        if os.path.dirname(full) != os.path.realpath(WEB) or not os.path.isfile(full):
+            return None
+        with open(full, "rb") as f:
+            return self._send(200, f.read(), self.STATIC[ext])
+
     def do_OPTIONS(self):
         self._send(204, b"", "text/plain")
 
@@ -215,15 +237,34 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/":
                 with open(os.path.join(WEB, "index.html"), "rb") as f:
                     return self._send(200, f.read(), "text/html; charset=utf-8")
+            asset = self._static(path)
+            if asset is not None:
+                return asset
             if path == "/healthz":
+                height = None
+                try:
+                    height = s.node.getblockcount() if s.node else None
+                except Exception:                    # noqa: BLE001
+                    pass
                 return self._send(200, {
                     "ok": s.node_error is None, "error": s.node_error,
+                    "height": height,
                     "last_poll": s.last_poll, "markets": len(s.markets),
                     "priced": len(s.prices), "offers": len(s.book.offers),
                     "loans": len(s.book.loans),
                     "node": bool(s.node)})
             if path == "/v1/markets":
                 return self._send(200, {"markets": s.market_rows()})
+            if path == "/v1/vectors":
+                # The browser pins its own covenant implementation against
+                # these before deriving any address a user will act on.
+                # Parsed rather than streamed: _send serialises whatever it
+                # is given for a JSON response, and this doubles as a check
+                # that the file on disk is still valid JSON before a browser
+                # tries to pin itself against it.
+                with open(os.path.join(
+                        os.path.dirname(WEB), "pignus", "vectors.json")) as f:
+                    return self._send(200, json.load(f))
             if path == "/v1/oracle":
                 return self._send(200, {
                     "oracle_x": s.oracle_x, "url": s.oracle_url,
@@ -242,6 +283,30 @@ class Handler(BaseHTTPRequestHandler):
                 if not rec:
                     return self._send(404, {"error": "no such loan"})
                 return self._send(200, s.loan_view(rec))
+            if path.startswith("/v1/outpoint/"):
+                # What is actually at an outpoint right now. The browser uses
+                # this to confirm an offer still exists and holds what the book
+                # says before composing anything against it.
+                parts = path[len("/v1/outpoint/"):].split("/")
+                if len(parts) != 2 or not s.node:
+                    return self._send(404, {"error": "no node, or bad outpoint"})
+                txid, vout = parts[0], int(parts[1])
+                got = s.node.gettxout(txid, vout, False)
+                if got is None:
+                    return self._send(404, {"error": "unspent output not found; "
+                                                     "it may already be spent"})
+                return self._send(200, {
+                    "txid": txid, "vout": vout,
+                    "scriptPubKey": got["scriptPubKey"]["hex"],
+                    "asset": got.get("asset"),
+                    "value": str(int(round(float(got["value"]) * 1e8))),
+                    "confirmations": got.get("confirmations", 0)})
+            if path.startswith("/v1/attestation/"):
+                market = path[len("/v1/attestation/"):].replace("_", "/").upper()
+                att = s.attestations.get(market)
+                if att is None:
+                    return self._send(404, {"error": f"no attestation for {market}"})
+                return self._send(200, att.to_dict())
             if path == "/v1/stats":
                 return self._send(200, s.book.stats(s.prices))
             return self._send(404, {"error": "no such endpoint", "path": path})
