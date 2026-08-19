@@ -16,6 +16,7 @@
 import * as pig from "./pignus.js";
 import * as offer from "./offer.js";
 import * as flows from "./flows.js";
+import * as repo from "./repurchase.js";
 import { Wallet, payoutProgram, scriptPubKeyFor, WalletError } from "./wallet.js";
 
 const $ = (s) => document.querySelector(s);
@@ -58,8 +59,77 @@ function busy(on, what = "") {
 async function pinCovenant() {
   const vectors = await api("v1/vectors");
   state.pinned = pig.selfTest(vectors);
+  // The repurchase composition is pinned SEPARATELY. It is a different product
+  // built from the same leaves, and a deployment whose vectors predate it
+  // should still be able to run the lending page -- it just must not be able to
+  // check a repurchase, because an unpinned check is worse than none.
+  try {
+    state.repoPinned = repo.selfTest(vectors);
+  } catch (e) {
+    state.repoPinned = 0;
+    state.repoWhy = e.message;
+  }
   $("#pinned").textContent =
-    `covenant pinned to ${state.pinned} golden vectors`;
+    `covenant pinned to ${state.pinned} golden vectors` +
+    (state.repoPinned ? `, repurchase to ${state.repoPinned}` : "");
+}
+
+/**
+ * The borrower's check for a Tier D repurchase.
+ *
+ * Composing a settlement needs the regulated asset's own machinery and a
+ * browser does not have it, so this page deliberately offers only the half it
+ * can do honestly: rebuild the bond vault address from the terms and compare it
+ * with the coin. That half is the one that protects the borrower.
+ */
+async function checkRepurchase(ev) {
+  ev.preventDefault();
+  const out = $("#repoout");
+  const say = (cls, html) => { out.innerHTML = `<div class="${cls}">${html}</div>`; };
+  if (!state.repoPinned) {
+    say("bad", "This page cannot check a repurchase: its implementation is not " +
+        "pinned to the golden vectors" +
+        (state.repoWhy ? ` (${esc(state.repoWhy)})` : "") +
+        ". Refusing to check rather than checking with something unproven.");
+    return;
+  }
+  let terms;
+  try {
+    terms = JSON.parse($("#repoterms").value);
+  } catch (e) {
+    say("bad", "Those terms are not valid JSON: " + esc(e.message));
+    return;
+  }
+  let spk, words;
+  try {
+    spk = pig._internals.bytesToHex(repo.repurchaseScriptPubKey(terms));
+    words = repo.describe(terms);
+  } catch (e) {
+    say("bad", "These terms do not describe a repurchase this page will " +
+        "compose: " + esc(e.message));
+    return;
+  }
+  const txid = $("#repotxid").value.trim();
+  if (!txid) {
+    say("ok", `<p><strong>These terms compile to</strong><br>` +
+        `<code>${spk}</code></p><p>${esc(words)}</p>` +
+        `<p class="hint">Give the funding txid to check the coin itself.</p>`);
+    return;
+  }
+  busy(true, "reading the chain");
+  try {
+    const vout = parseInt($("#repovout").value || "0", 10);
+    const o = await api(`v1/outpoint/${txid}/${vout}`);
+    repo.verifyRepurchaseFunding(terms, o.scriptPubKey, o.value);
+    say("ok", `<p><strong>This is the repurchase you were shown.</strong> The ` +
+        `coin at <code>${esc(txid)}:${vout}</code> pays the address ` +
+        `these terms compile to, and holds exactly the bond they name.</p>` +
+        `<p>${esc(words)}</p>`);
+  } catch (e) {
+    say("bad", "<strong>REFUSED.</strong> " + esc(e.message));
+  } finally {
+    busy(false);
+  }
 }
 
 async function refresh() {
@@ -385,6 +455,7 @@ async function boot() {
   await refresh();
   renderWallet();
   $("#lendform").onsubmit = lend;
+  $("#repoform").onsubmit = checkRepurchase;
   $("#refresh").onclick = () => refresh();
   document.querySelectorAll("[data-tab]").forEach(b => {
     b.onclick = () => {

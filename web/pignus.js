@@ -683,4 +683,11 @@ export function isLiquidatable(terms, price) {
 }
 
 export const _internals = { sha256, taggedHash, hexToBytes, bytesToHex, le8, big,
-                            tweakAddPubkey, leafHash, branchHash };
+                            tweakAddPubkey, leafHash, branchHash,
+                            // repurchase.js composes these two leaves into a
+                            // tree of its own (Tier D). They are exported
+                            // rather than reimplemented so there stays exactly
+                            // ONE definition of each leaf in the browser, which
+                            // is the whole reason the golden vectors mean
+                            // anything.
+                            repayLeaf, recoverLeaf, NUMS };
