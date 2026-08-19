@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
+"""pignusd: the loan book, the chain watcher, and the page that shows them.
+
+The daemon holds no keys and no funds. It cannot originate a loan, cannot settle
+one, and cannot alter the terms of one -- the terms live inside the vault
+address, and a borrower checks that address themselves before signing. So this
+is an index and a viewer, and it is written to be obviously that.
+
+    pignusd --config pignusd.json
+
+Config:
+
+    {
+      "listen":   "127.0.0.1:8741",
+      "book":     "/var/lib/pignus/book.json",
+      "oracle":   "http://127.0.0.1:8740",
+      "markets":  ["GOLD/USDX", "SILVR/USDX", "OILX/USDX"],
+      "poll":     30,
+      "rpc":      {"url": "http://127.0.0.1:18200", "user": "...",
+                   "password": "...", "wallet": ""}
+    }
+
+`rpc` is optional: without a node the book still serves offers and whatever it
+last knew, and says so in /healthz rather than pretending the states are fresh.
+
+Endpoints:
+    GET  /                     the page
+    GET  /v1/markets           markets, with live oracle prices
+    GET  /v1/offers            the book        (?market=, ?kind=)
+    POST /v1/offers            publish an offer
+    DELETE /v1/offers/{id}     withdraw one
+    GET  /v1/loans             known loans     (?state=, ?market=)
+    POST /v1/loans             register a loan for watching
+    GET  /v1/loan/{id}         one loan, with health at the current price
+    GET  /v1/stats             counts, live debt, positions near their strike
+    GET  /v1/oracle            the oracle key and feeds this book quotes against
+    GET  /healthz
+"""
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+
+from pignus import oracle as O                     # noqa: E402
+from pignus.book import Book                       # noqa: E402
+from pignus.node import Node, RpcError             # noqa: E402
+from pignus.terms import LoanTerms, feed_id        # noqa: E402
+from pignus.watcher import VaultWatcher, State     # noqa: E402
+
+WEB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "web")
+MAX_BODY = 256 * 1024
+
+
+class Service:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.book = Book(cfg["book"])
+        self.oracle_url = cfg.get("oracle", "").rstrip("/")
+        self.markets = list(cfg.get("markets", []))
+        self.prices = {}
+        self.attestations = {}
+        self.oracle_x = None
+        self.node = None
+        self.node_error = None
+        self.last_poll = 0
+        rpc = cfg.get("rpc")
+        if rpc and rpc.get("url"):
+            self.node = Node(url=rpc["url"], user=rpc.get("user"),
+                             password=rpc.get("password"),
+                             wallet=rpc.get("wallet") or None,
+                             cookie_path=rpc.get("cookie"))
+        self.watcher = VaultWatcher(self.node) if self.node else None
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------- the oracle
+
+    def refresh_prices(self):
+        if not self.oracle_url:
+            return
+        try:
+            with urllib.request.urlopen(f"{self.oracle_url}/v1/pubkey",
+                                        timeout=8) as r:
+                self.oracle_x = json.loads(r.read().decode())["oracle_x"]
+        except Exception as e:                      # noqa: BLE001
+            self.node_error = f"oracle: {type(e).__name__}: {e}"
+            return
+        for m in self.markets:
+            try:
+                url = f"{self.oracle_url}/v1/attestation/{m.replace('/', '_')}"
+                with urllib.request.urlopen(url, timeout=8) as r:
+                    att = O.Attestation.from_dict(json.loads(r.read().decode()))
+            except Exception:                       # noqa: BLE001
+                continue
+            # Verify before storing. A price this service displays is a price
+            # someone may act on, and the oracle is trusted for the number, not
+            # for the transport that carried it.
+            if not O.verify(self.oracle_x, att):
+                continue
+            with self._lock:
+                self.prices[m] = att.price
+                self.attestations[m] = att
+
+    # ------------------------------------------------------------ the watcher
+
+    def refresh_chain(self):
+        if not self.watcher:
+            return
+        try:
+            for rec in self.book.list_loans():
+                if rec["loan_id"] in self.watcher.vaults:
+                    continue
+                self.watcher.track(rec["loan_id"],
+                                   LoanTerms.from_json(rec["terms"]),
+                                   rec["txid"], rec["vout"])
+            for v in self.watcher.poll():
+                self.book.update_loan(v.loan_id, state=v.state.value,
+                                      confirmations=v.confirmations,
+                                      spent_by=v.spent_by, note=v.note)
+            self.node_error = None
+        except Exception as e:                      # noqa: BLE001
+            self.node_error = f"node: {type(e).__name__}: {e}"
+
+    def loop(self, interval):
+        while True:
+            started = time.time()
+            self.refresh_prices()
+            self.refresh_chain()
+            self.last_poll = int(time.time())
+            time.sleep(max(2.0, interval - (time.time() - started)))
+
+    # -------------------------------------------------------------- rendering
+
+    def market_rows(self):
+        rows = []
+        for m in self.markets:
+            att = self.attestations.get(m)
+            rows.append({
+                "market": m, "feed_id": feed_id(m).hex(),
+                "price": att.price if att else None,
+                "price_scale": att.price_scale if att else None,
+                "unit_price": (O.unquote_price(att.price,
+                                               price_scale=att.price_scale)
+                               if att else None),
+                "timestamp": att.timestamp if att else None,
+                "age_seconds": (int(time.time()) - att.timestamp) if att else None,
+            })
+        return rows
+
+    def loan_view(self, rec):
+        t = LoanTerms.from_json(rec["terms"])
+        price = self.prices.get(t.market)
+        out = dict(rec)
+        out["collateral_asset"] = t.collateral_asset
+        out["debt_asset"] = t.debt_asset
+        out["debt"] = t.debt
+        out["collateral_amount"] = t.collateral_amount
+        out["strike"] = t.strike
+        out["maturity"] = t.maturity
+        out["oracle"] = f"{t.threshold}-of-{len(t.oracle_keys)}"
+        out["vault_address"] = t.script_pubkey().hex()
+        if price is not None:
+            out["price"] = price
+            out["health"] = round(t.health(price), 4)
+            out["ltv"] = round(t.ltv(price), 4)
+            out["liquidatable"] = t.is_liquidatable(price)
+            out["surplus_if_liquidated"] = t.surplus_at(price)
+        return out
+
+
+class Handler(BaseHTTPRequestHandler):
+    svc = None
+    server_version = "pignusd"
+
+    def _send(self, code, payload, ctype="application/json"):
+        body = (json.dumps(payload, indent=2).encode()
+                if ctype == "application/json" else payload)
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def do_OPTIONS(self):
+        self._send(204, b"", "text/plain")
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_BODY:
+            raise ValueError("request body too large")
+        return json.loads(self.rfile.read(n).decode() or "{}")
+
+    def do_GET(self):
+        s = self.svc
+        u = urlparse(self.path)
+        path = u.path.rstrip("/") or "/"
+        q = parse_qs(u.query)
+        try:
+            if path == "/":
+                with open(os.path.join(WEB, "index.html"), "rb") as f:
+                    return self._send(200, f.read(), "text/html; charset=utf-8")
+            if path == "/healthz":
+                return self._send(200, {
+                    "ok": s.node_error is None, "error": s.node_error,
+                    "last_poll": s.last_poll, "markets": len(s.markets),
+                    "priced": len(s.prices), "offers": len(s.book.offers),
+                    "loans": len(s.book.loans),
+                    "node": bool(s.node)})
+            if path == "/v1/markets":
+                return self._send(200, {"markets": s.market_rows()})
+            if path == "/v1/oracle":
+                return self._send(200, {
+                    "oracle_x": s.oracle_x, "url": s.oracle_url,
+                    "note": "verify every attestation against the key the VAULT "
+                            "bakes in, not against this one"})
+            if path == "/v1/offers":
+                return self._send(200, {"offers": s.book.list_offers(
+                    market=q.get("market", [None])[0],
+                    kind=q.get("kind", [None])[0])})
+            if path == "/v1/loans":
+                rows = s.book.list_loans(state=q.get("state", [None])[0],
+                                         market=q.get("market", [None])[0])
+                return self._send(200, {"loans": [s.loan_view(r) for r in rows]})
+            if path.startswith("/v1/loan/"):
+                rec = s.book.loans.get(path[len("/v1/loan/"):])
+                if not rec:
+                    return self._send(404, {"error": "no such loan"})
+                return self._send(200, s.loan_view(rec))
+            if path == "/v1/stats":
+                return self._send(200, s.book.stats(s.prices))
+            return self._send(404, {"error": "no such endpoint", "path": path})
+        except FileNotFoundError:
+            return self._send(500, {"error": "web/index.html is missing"})
+        except Exception as e:                      # noqa: BLE001
+            return self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def do_POST(self):
+        s = self.svc
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        try:
+            body = self._body()
+            if path == "/v1/offers":
+                return self._send(200, s.book.put_offer(body))
+            if path == "/v1/loans":
+                rec = s.book.put_loan(body["terms"], body["txid"], body["vout"],
+                                      state=body.get("state", "UNCONFIRMED"))
+                s.refresh_chain()
+                return self._send(200, s.book.loans.get(rec["loan_id"], rec))
+            return self._send(404, {"error": "no such endpoint", "path": path})
+        except (KeyError, ValueError, TypeError) as e:
+            return self._send(400, {"error": f"{type(e).__name__}: {e}"})
+        except Exception as e:                      # noqa: BLE001
+            return self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path.rstrip("/")
+        if path.startswith("/v1/offers/"):
+            gone = self.svc.book.drop_offer(path[len("/v1/offers/"):])
+            return self._send(200 if gone else 404, {"removed": gone})
+        return self._send(404, {"error": "no such endpoint"})
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--once", action="store_true",
+                    help="refresh once and print the state, without serving")
+    args = ap.parse_args()
+    with open(args.config) as f:
+        cfg = json.load(f)
+    svc = Service(cfg)
+
+    if args.once:
+        svc.refresh_prices()
+        svc.refresh_chain()
+        print(json.dumps({"markets": svc.market_rows(),
+                          "stats": svc.book.stats(svc.prices),
+                          "error": svc.node_error}, indent=2))
+        return
+
+    svc.refresh_prices()
+    svc.refresh_chain()
+    threading.Thread(target=svc.loop, args=(int(cfg.get("poll", 30)),),
+                     daemon=True).start()
+    host, _, port = cfg.get("listen", "127.0.0.1:8741").rpartition(":")
+    Handler.svc = svc
+    srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
+    print(f"pignusd: {len(svc.markets)} market(s), book {cfg['book']}, "
+          f"serving on {host}:{port}", file=sys.stderr)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

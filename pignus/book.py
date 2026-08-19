@@ -1,0 +1,160 @@
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
+"""The loan book: discovery, and nothing else.
+
+A book that could alter a loan would be a party to it. This one cannot, and the
+reason is not restraint -- it is that the terms are inside the vault address. A
+borrower rebuilds that address from the terms before signing, so a book which
+misdescribes an offer produces an address the borrower does not recognise, and
+the borrower walks away. The book is therefore free to be a plain JSON file with
+an HTTP interface in front of it.
+
+What it holds:
+
+  * OFFERS   a lender advertising terms. Two kinds, and the difference matters
+             to a borrower: `signed` means the lender must be online to
+             co-sign, `funded` means the principal is already locked in an
+             offer covenant and anyone can take it unilaterally. A funded offer
+             carries its outpoint, so a borrower can check it exists and is
+             unspent without asking the book.
+  * LOANS    vaults the book knows about, with whatever the watcher last saw.
+             Advisory: the chain is the record, this is an index of it.
+
+Everything is stored as one JSON document, rewritten atomically. A lending book
+for a testnet does not need a database, and the failure mode of a corrupted
+half-written file is worse than the cost of rewriting a small one.
+"""
+
+import json
+import os
+import tempfile
+import threading
+import time
+
+from .terms import LoanTerms
+
+
+class Book:
+    def __init__(self, path):
+        self.path = str(path)
+        self._lock = threading.Lock()
+        self.offers = {}
+        self.loans = {}
+        self._load()
+
+    # ----------------------------------------------------------- persistence
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                d = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return
+        self.offers = d.get("offers", {})
+        self.loans = d.get("loans", {})
+
+    def _save(self):
+        """Write via a temporary file and rename, so a crash mid-write leaves
+        the previous book intact rather than a truncated one."""
+        d = {"offers": self.offers, "loans": self.loans,
+             "updated": int(time.time())}
+        dirn = os.path.dirname(os.path.abspath(self.path)) or "."
+        fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".book-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(d, f, indent=2, sort_keys=True)
+            os.replace(tmp, self.path)
+        except Exception:
+            os.unlink(tmp)
+            raise
+
+    # ---------------------------------------------------------------- offers
+
+    def put_offer(self, offer: dict) -> dict:
+        """Record an offer. The terms are validated by CONSTRUCTING them, which
+        is the only validation worth doing: a terms document that cannot build a
+        vault address is not an offer, whatever else it looks like."""
+        terms = LoanTerms.from_json(offer["terms"])
+        for w in terms.sanity_check():
+            offer.setdefault("warnings", []).append(w)
+        offer["offer_id"] = offer.get("offer_id") or terms.loan_id()[:32]
+        offer["vault_address"] = terms.script_pubkey().hex()
+        offer["kind"] = offer.get("kind", "signed")
+        if offer["kind"] not in ("signed", "funded"):
+            raise ValueError("an offer is 'signed' or 'funded'")
+        if offer["kind"] == "funded" and not offer.get("outpoint"):
+            raise ValueError(
+                "a funded offer must name the outpoint its principal rests in, "
+                "or a borrower cannot check it is real without asking us")
+        offer["created"] = offer.get("created") or int(time.time())
+        with self._lock:
+            self.offers[offer["offer_id"]] = offer
+            self._save()
+        return offer
+
+    def drop_offer(self, offer_id) -> bool:
+        with self._lock:
+            gone = self.offers.pop(offer_id, None) is not None
+            if gone:
+                self._save()
+        return gone
+
+    def list_offers(self, market=None, kind=None):
+        out = list(self.offers.values())
+        if market:
+            out = [o for o in out
+                   if json.loads(o["terms"])["market"].upper() == market.upper()]
+        if kind:
+            out = [o for o in out if o.get("kind") == kind]
+        return sorted(out, key=lambda o: o.get("created", 0), reverse=True)
+
+    # ----------------------------------------------------------------- loans
+
+    def put_loan(self, terms_json, txid, vout, state="UNCONFIRMED", **extra):
+        terms = LoanTerms.from_json(terms_json)
+        rec = {"loan_id": terms.loan_id(), "terms": terms_json,
+               "txid": txid, "vout": int(vout), "state": state,
+               "market": terms.market, "updated": int(time.time())}
+        rec.update(extra)
+        with self._lock:
+            self.loans[rec["loan_id"]] = rec
+            self._save()
+        return rec
+
+    def update_loan(self, loan_id, **fields):
+        with self._lock:
+            rec = self.loans.get(loan_id)
+            if rec is None:
+                return None
+            rec.update(fields)
+            rec["updated"] = int(time.time())
+            self._save()
+            return rec
+
+    def list_loans(self, state=None, market=None):
+        out = list(self.loans.values())
+        if state:
+            out = [x for x in out if x.get("state") == state]
+        if market:
+            out = [x for x in out if x.get("market", "").upper() == market.upper()]
+        return sorted(out, key=lambda x: x.get("updated", 0), reverse=True)
+
+    def stats(self, prices=None):
+        """A summary a page can render. Health figures need prices, and are
+        simply omitted for markets with none rather than shown as zero -- a
+        health of 0 reads as 'about to be liquidated', which would be a lie."""
+        prices = prices or {}
+        by_state, at_risk, total_debt = {}, [], {}
+        for rec in self.loans.values():
+            by_state[rec["state"]] = by_state.get(rec["state"], 0) + 1
+            if rec["state"] != "LIVE":
+                continue
+            t = LoanTerms.from_json(rec["terms"])
+            total_debt[t.debt_asset] = total_debt.get(t.debt_asset, 0) + t.debt
+            price = prices.get(t.market)
+            if price is not None and t.health(price) < 1.15:
+                at_risk.append({"loan_id": rec["loan_id"], "market": t.market,
+                                "health": round(t.health(price), 4)})
+        return {"loans_by_state": by_state, "offers": len(self.offers),
+                "live_debt_by_asset": total_debt,
+                "at_risk": sorted(at_risk, key=lambda r: r["health"])}
