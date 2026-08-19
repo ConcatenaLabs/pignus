@@ -147,6 +147,24 @@ test "$page" -gt 4000 || { echo "the page looks empty ($page bytes)" >&2; exit 1
 echo "  page served: $page bytes"
 
 echo
+echo "== the page's own modules are served, and nothing else is =="
+for f in app.js pignus.js offer.js flows.js wallet.js pset.js; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$D/$f")
+    test "$code" = "200" || { echo "  $f -> $code" >&2; exit 1; }
+    echo "  $f served"
+done
+# The browser must be able to pin its covenant implementation before it derives
+# anything; without this endpoint the page refuses to run at all.
+curl -fsS "$D/v1/vectors" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+print("  v1/vectors: %d vault cases, %d offer cases" % (len(d["vaults"]), len(d.get("offers", []))))'
+for bad in ../pignusd.json /etc/passwd secrets.txt; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$D/$bad")
+    test "$code" = "404" || { echo "  served something it should not: $bad -> $code" >&2; exit 1; }
+done
+echo "  path traversal and non-web files are refused"
+
+echo
 echo "== withdrawing the offer =="
 OID=$(curl -fsS "$D/v1/offers" | python3 -c 'import json,sys;print(json.load(sys.stdin)["offers"][0]["offer_id"])')
 curl -fsS -X DELETE "$D/v1/offers/$OID" | python3 -c 'import json,sys;assert json.load(sys.stdin)["removed"];print("  removed")'
