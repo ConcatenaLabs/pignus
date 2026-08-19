@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/root/sequentia/pignus
-Environment=SEQUENTIA_SRC=/root/sequentia/SequentiaByClaude
+Environment=SEQUENTIA_SRC=/root/sequentia/Sequentia
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignusd --config /root/sequentia/pignusd.json
 Restart=always
