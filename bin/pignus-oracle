@@ -22,7 +22,7 @@ Config (JSON):
       "markets":     ["GOLD/USDX", "SILVR/USDX", "OILX/USDX", "SEQ/USDX"],
       "precisions":  {"GOLD": 8, "USDX": 8},
       "symbols":     {"BTC": "tBTC"},
-      "source":      {"type": "http", "url": "http://127.0.0.1:8088/price"}
+      "source":      {"type": "http_bulk", "url": "http://127.0.0.1:8088/prices"}
     }
 
 `source` may instead be `{"type": "static", "prices": {"GOLD": 3000, "USDX": 1}}`,
@@ -90,6 +90,10 @@ def build_source(cfg):
     if kind == "http":
         return O.HttpPriceSource(s["url"], timeout=float(s.get("timeout", 5)),
                                  field=s.get("field", "price"))
+    if kind == "http_bulk":
+        return O.BulkHttpPriceSource(s["url"], timeout=float(s.get("timeout", 8)),
+                                     field=s.get("field", "price"),
+                                     max_age=float(s.get("max_age", 300)))
     raise SystemExit(f"unknown price source type: {kind!r}")
 
 

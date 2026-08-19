@@ -302,6 +302,56 @@ class StaticPriceSource(PriceSource):
             raise KeyError(f"no static price configured for {symbol}") from None
 
 
+class BulkHttpPriceSource(PriceSource):
+    """Reads every price in ONE request from a `/prices`-style endpoint.
+
+    Preferred over per-symbol fetching for two reasons. It is one request per
+    signing round instead of one per market, and -- more importantly -- every
+    price in a round comes from the same snapshot, so two markets cannot be
+    signed against feeds that moved between them.
+
+    Lookups are case-insensitive, because feed tickers are not consistently
+    cased (the Sequentia demo feed serves `tBTC`) and a price that is present but
+    unreachable because of capitalisation is the most annoying possible outage.
+    """
+
+    def __init__(self, url: str, timeout: float = 8.0, field: str = "price",
+                 max_age: float = 300.0):
+        self.url = url
+        self.timeout = timeout
+        self.field = field
+        self.max_age = max_age
+        self._snapshot = {}
+        self._fetched = 0.0
+
+    def _refresh(self, force=False):
+        if not force and time.time() - self._fetched < 2.0:
+            return
+        import urllib.request
+        with urllib.request.urlopen(self.url, timeout=self.timeout) as r:
+            data = json.loads(r.read().decode())
+        if not isinstance(data, dict):
+            raise ValueError(f"{self.url} did not return an object")
+        self._snapshot = {k.lower(): v for k, v in data.items()}
+        self._fetched = time.time()
+
+    def reference_price(self, symbol: str) -> float:
+        if time.time() - self._fetched > self.max_age:
+            self._refresh(force=True)
+        else:
+            self._refresh()
+        row = self._snapshot.get(symbol.lower())
+        if row is None:
+            raise KeyError(
+                f"{symbol} is not in {self.url} "
+                f"(have: {', '.join(sorted(self._snapshot)[:12])})")
+        if isinstance(row, (int, float)):
+            return float(row)
+        if self.field not in row:
+            raise KeyError(f"{symbol} has no '{self.field}' field: {row}")
+        return float(row[self.field])
+
+
 class HttpPriceSource(PriceSource):
     """Reads the Sequentia price feed already deployed for the any-asset fee
     market (contrib/price-server). Deliberately not a second price pipeline:
