@@ -7,27 +7,25 @@
   *{box-sizing:border-box}
   body{margin:0;font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
        background:#0f1216;color:#e8eaed}
-  .wrap{max-width:960px;margin:0 auto;padding:44px 24px 72px}
+  .wrap{max-width:1000px;margin:0 auto;padding:40px 24px 72px}
   a{color:#f5b301}
-  header h1{font-size:32px;margin:0 0 6px} header h1 .t{color:#f5b301}
-  .sub{color:#9aa0a6;margin:0 0 10px;max-width:70ch}
-  .crumb{color:#6b7280;font-size:13px;margin:0 0 26px}
-  .crumb a{color:#9aa0a6;text-decoration:none} .crumb a:hover{color:#f5b301}
-  section{margin:34px 0 0}
-  h2{font-size:19px;margin:0 0 4px;color:#fff}
-  h2 .n{color:#6b7280;font-weight:400;font-size:14px;margin-left:8px}
-  .hint{color:#9aa0a6;font-size:14px;margin:0 0 14px;max-width:78ch}
-  .card{background:#171b21;border:1px solid #262b33;border-radius:12px;padding:18px 20px}
-  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(238px,1fr))}
-  .m .mk{font-size:15px;color:#fff;font-weight:600}
-  .m .px{font-size:26px;margin:6px 0 2px;font-variant-numeric:tabular-nums}
-  .m .meta{color:#6b7280;font-size:12px;font-variant-numeric:tabular-nums}
+  h1{font-size:31px;margin:0 0 6px} h1 .t{color:#f5b301}
+  .sub{color:#9aa0a6;margin:0 0 8px;max-width:74ch}
+  .crumb{color:#6b7280;font-size:13px;margin:0 0 22px}
+  .crumb a{color:#9aa0a6;text-decoration:none}
+  h2{font-size:18px;margin:0 0 4px;color:#fff}
+  .hint{color:#9aa0a6;font-size:14px;margin:0 0 12px;max-width:80ch}
+  .card{background:#171b21;border:1px solid #262b33;border-radius:12px;padding:16px 18px}
+  section{margin:26px 0 0}
+  .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}
+  .m .mk{font-size:14px;color:#fff;font-weight:600}
+  .m .px{font-size:23px;margin:4px 0 2px;font-variant-numeric:tabular-nums}
+  .m .meta{color:#6b7280;font-size:11.5px;font-variant-numeric:tabular-nums}
   table{width:100%;border-collapse:collapse;font-size:14px}
-  th{text-align:left;color:#9aa0a6;font-weight:500;padding:8px 10px;
+  th{text-align:left;color:#9aa0a6;font-weight:500;padding:7px 9px;
      border-bottom:1px solid #262b33;white-space:nowrap}
-  td{padding:9px 10px;border-bottom:1px solid #1c2128;font-variant-numeric:tabular-nums}
+  td{padding:8px 9px;border-bottom:1px solid #1c2128;font-variant-numeric:tabular-nums}
   tr:last-child td{border-bottom:0}
-  .scroll{overflow-x:auto}
   .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:#9aa0a6}
   .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;
        border:1px solid #262b33;color:#9aa0a6;white-space:nowrap}
@@ -35,216 +33,137 @@
   .tag.warn{color:#f5b301;border-color:#4a3a10}
   .tag.bad{color:#ff8f8f;border-color:#4d2626}
   .tag.dim{color:#6b7280}
-  .bar{height:5px;background:#262b33;border-radius:3px;overflow:hidden;min-width:64px}
-  .bar i{display:block;height:100%;background:#7ee2a8}
-  .bar i.warn{background:#f5b301} .bar i.bad{background:#ff8f8f}
+  button{background:#222831;color:#e8eaed;border:1px solid #333c48;border-radius:8px;
+         padding:6px 13px;font:inherit;font-size:14px;cursor:pointer}
+  button:hover{border-color:#f5b301}
+  button.primary{background:#f5b301;color:#141414;border-color:#f5b301;font-weight:600}
+  button.warnbtn{border-color:#4a3a10;color:#f5b301}
+  .tabs{display:flex;gap:8px;margin:22px 0 14px;flex-wrap:wrap}
+  .tabs button.on{background:#f5b301;color:#141414;border-color:#f5b301;font-weight:600}
+  .empty{color:#6b7280;font-size:14px;padding:12px 2px}
+  .note{margin:16px 0;padding:13px 16px;border-radius:10px;border:1px solid #262b33;
+        background:#171b21;font-size:14px}
+  .note.ok{border-color:#1f4733} .note.bad{border-color:#4d2626;color:#ffbcbc}
+  .note.warn{border-color:#4a3a10}
+  .note ul{margin:8px 0 0;padding-left:20px} .note li{margin-bottom:3px}
+  .note:empty{display:none}
+  #busy{display:none;margin:12px 0;color:#f5b301;font-size:14px}
+  .wl{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .bals{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
+  form.lend{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+  form.lend label{display:block;font-size:13px;color:#9aa0a6;margin-bottom:4px}
+  form.lend input,form.lend select{width:100%;background:#0f1216;color:#e8eaed;
+    border:1px solid #333c48;border-radius:8px;padding:7px 9px;font:inherit;font-size:14px}
+  form.lend .full{grid-column:1/-1}
   .safe{border-left:3px solid #f5b301}
-  .safe code{background:#0f1216;padding:2px 6px;border-radius:4px;
-             font-size:13px;color:#e8eaed}
-  .safe ol{margin:10px 0 0;padding-left:20px;color:#c9ccd1;font-size:14.5px}
-  .safe li{margin-bottom:7px}
-  .empty{color:#6b7280;font-size:14px;padding:14px 2px}
-  footer{margin-top:44px;border-top:1px solid #262b33;padding-top:18px;
+  .safe code{background:#0f1216;padding:2px 6px;border-radius:4px;font-size:13px}
+  footer{margin-top:40px;border-top:1px solid #262b33;padding-top:16px;
          color:#6b7280;font-size:13px}
-  .err{color:#ff8f8f;font-size:13px;margin-top:8px}
-  .two{display:grid;gap:14px;grid-template-columns:1fr 1fr}
-  @media(max-width:720px){.two{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
 
-<header>
-  <p class="crumb"><a href="/">&larr; Sequentia testnet</a></p>
-  <h1>Pignus <span class="t">lending</span></h1>
-  <p class="sub">Borrow USDX against GOLD, SILVR, OILX, tSEQ or native Bitcoin.
-  The loan's terms are compiled into a covenant and enforced by the script
-  interpreter, so there is no custodian, no term that can be changed after the
-  loan opens, and no permission needed to repay.</p>
-</header>
+<p class="crumb"><a href="/">&larr; Sequentia testnet</a></p>
+<h1>Pignus <span class="t">lending</span></h1>
+<p class="sub">Borrow USDX against GOLD, SILVR, OILX, tSEQ or native Bitcoin.
+The loan's terms are compiled into a covenant the network enforces: nobody holds
+your collateral, nobody can change the deal after you agree it, and repaying
+needs no one's permission.</p>
+<p class="hint" style="margin-bottom:18px">
+  <span class="tag dim" id="pinned">checking&hellip;</span>
+  This page composes every transaction itself and derives every address itself.
+  Your wallet holds the keys and signs; this page never sees them.
+</p>
+
+<div class="card" id="wallet"></div>
+<div id="busy"></div>
+<div class="note" id="note"></div>
 
 <section>
-  <h2>Prices <span class="n">signed by the oracle, verified here before display</span></h2>
-  <p class="hint">A price is quoted as debt-asset atoms per collateral-asset atom.
-  Every one of these carries a signature over the exact numbers a covenant would
-  compute with, and this page checks that signature before showing it.</p>
+  <h2>Prices <span class="tag dim">signed, and verified here before use</span></h2>
   <div class="grid" id="markets"><div class="empty">loading&hellip;</div></div>
-  <div class="err" id="mkerr"></div>
+</section>
+
+<div class="tabs">
+  <button data-tab="borrow" class="on">Borrow</button>
+  <button data-tab="loans">Loans &amp; liquidations</button>
+  <button data-tab="lend">Lend</button>
+  <button id="refresh">Refresh</button>
+</div>
+
+<section data-panel="borrow">
+  <h2>Open offers</h2>
+  <p class="hint">A funded offer holds the lender's principal in a covenant, so
+  you can take it with the lender offline. Taking one locks your collateral in a
+  vault whose address the offer's own script recomputes from your key &mdash; it
+  cannot pay anyone else, and it cannot be pointed anywhere else.</p>
+  <div class="card" id="offers"><div class="empty">loading&hellip;</div></div>
+</section>
+
+<section data-panel="loans" style="display:none">
+  <h2>Live loans</h2>
+  <p class="hint">Health is the current price over the strike. Below 1.00 anyone
+  may liquidate, and the covenant forces the surplus back to the borrower
+  whoever does it &mdash; so a liquidation is a race for the bonus, not a
+  seizure. Your own loans show a Repay button.</p>
+  <div class="card" id="loans"><div class="empty">loading&hellip;</div></div>
+</section>
+
+<section data-panel="lend" style="display:none">
+  <h2>Publish a funded offer</h2>
+  <p class="hint">Your principal goes into an offer covenant with the terms
+  baked in. Borrowers can take it while you are offline; you cannot oversell it,
+  and you cannot change a term afterwards. Anything untaken returns to you after
+  the expiry &mdash; permissionlessly, to your pinned address, so you need no key
+  beyond the one your wallet already has.</p>
+  <form class="lend card" id="lendform">
+    <div><label>Market</label>
+      <select name="market" id="marketsel"></select></div>
+    <div><label>Collateral asset id</label>
+      <input name="collateral_asset" placeholder="64-hex asset id" required></div>
+    <div><label>Debt asset id</label>
+      <input name="debt_asset" placeholder="64-hex asset id" required></div>
+    <div><label>Lend per loan (units)</label>
+      <input name="principal" type="number" step="0.00000001" value="100" required></div>
+    <div><label>Collateral required (units)</label>
+      <input name="collateral" type="number" step="0.00000001" value="1" required></div>
+    <div><label>Interest over the term (%)</label>
+      <input name="rate" type="number" step="0.01" value="3.5" required></div>
+    <div><label>Liquidate below (% of today's price)</label>
+      <input name="strike_ltv" type="number" step="1" value="60" required></div>
+    <div><label>Term (blocks)</label>
+      <input name="term" type="number" value="43200" required></div>
+    <div><label>How many loans</label>
+      <input name="lots" type="number" value="1" min="1" required></div>
+    <input type="hidden" name="height" id="height">
+    <div class="full"><button class="primary" type="submit">Publish offer</button>
+      <span class="hint" style="display:inline;margin-left:8px">You will see the
+      exact terms and the offer address before your wallet asks you to sign.</span>
+    </div>
+  </form>
 </section>
 
 <section class="safe">
   <div class="card">
-    <h2>Before you sign anything</h2>
-    <p class="hint" style="margin-bottom:0">Everything Pignus claims reduces to
-    one check, and it is a check <em>you</em> run, not one you are told has been
-    run. The loan terms and the vault address are the same fact stated twice, so
-    rebuilding the address from the terms you agreed proves the terms have not
-    been altered &mdash; by a counterparty, by a book, or by this page.</p>
-    <ol>
-      <li><code>pignus-cli verify --terms loan.json --txid &lt;funding&gt; --vout 0</code></li>
-      <li>It refuses if a single atom of the debt, the strike, the maturity, the
-      lender, the oracle or the market differs from what you agreed.</li>
-      <li>It also checks the vault has no key path, so the four exits really are
-      the only ways the collateral can move.</li>
-    </ol>
-  </div>
-</section>
-
-<section>
-  <h2>Offers <span class="n" id="offern"></span></h2>
-  <p class="hint">A <b>funded</b> offer has the lender's principal already locked
-  in a covenant: anyone can take it, and the lender need not be online. A
-  <b>signed</b> offer is a quote, and the lender must co-sign when you take it.</p>
-  <div class="card scroll"><table id="offers"><tbody>
-    <tr><td class="empty">loading&hellip;</td></tr></tbody></table></div>
-</section>
-
-<section>
-  <h2>Loans <span class="n" id="loann"></span></h2>
-  <p class="hint">Health is the current price divided by the strike: below 1.00 a
-  position can be liquidated by anyone, and the covenant forces the surplus back
-  to the borrower whoever does it.</p>
-  <div class="card scroll"><table id="loans"><tbody>
-    <tr><td class="empty">loading&hellip;</td></tr></tbody></table></div>
-</section>
-
-<section class="two">
-  <div class="card">
-    <h2>How a loan ends</h2>
-    <p class="hint" style="margin-bottom:0">
-    <b>Repay</b> &mdash; permissionless, needs no oracle and no signature at all.
-    A solvent borrower can always leave.<br><br>
-    <b>Liquidate</b> &mdash; permissionless once the oracle attests a price under
-    the strike. The seizure is computed on chain and the surplus is forced home.<br><br>
-    <b>Default</b> &mdash; the same, at any price, once the term is up.<br><br>
-    <b>Recover</b> &mdash; the lender's backstop, long after maturity, so a dead
-    oracle cannot freeze collateral for ever.</p>
-  </div>
-  <div class="card">
-    <h2>What is trusted</h2>
-    <p class="hint" style="margin-bottom:0">The oracle can assert a price low
-    enough to open a liquidation. That is the whole of its power: it cannot move
-    funds, choose a recipient, change how much is seized, call a loan early, stop
-    a repayment, or keep a borrower's surplus. Every attestation it has ever made
-    is published, so a fabricated price is permanently visible next to the real
-    ones.<br><br>
-    A vault may name several independent oracles with a threshold, in which case
-    no single one can trigger a liquidation and no single one can block it.</p>
+    <h2>What this page does, and what it cannot do</h2>
+    <p class="hint" style="margin-bottom:0">Every vault address here is derived
+    in your browser from the terms shown, and compared to what is actually on
+    chain before anything is signed. That check is the whole of the
+    non-custodial claim, and it is why this page refuses to build a transaction
+    when an offer's address does not match its terms rather than letting your
+    wallet ask you about it.<br><br>
+    It cannot move your money: it holds no keys, and the wallet shows you its own
+    reading of every transaction before you approve it. If the two disagree,
+    reject it &mdash; and tell us.<br><br>
+    Prefer the command line, or want to run this against your own node? The CLI
+    does everything this page does:
+    <code>pignus-cli</code>, on the
+    <a href="/download/">downloads page</a>.</p>
   </div>
 </section>
 
 <footer>
-  <span id="health"></span> &middot;
   <a href="https://github.com/GracedEternalKingCabbageMan/pignus">source</a> &middot;
   <a href="https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/doc/sequentia/pignus-design.md">design &amp; security analysis</a>
   <br>Testnet. The assets have no value and the prices are demo feeds.
 </footer>
 
-</div><script>
-const $ = s => document.querySelector(s);
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
-  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const short = (h, n = 10) => h ? esc(String(h).slice(0, n)) + '&hellip;' : '&mdash;';
-const num = n => n == null ? '&mdash;' : Number(n).toLocaleString();
-const atoms = n => n == null ? '&mdash;' : (Number(n) / 1e8).toLocaleString(
-  undefined, {maximumFractionDigits: 8});
-
-// Paths are RELATIVE, with no leading slash. The page is served both at the
-// domain root during development and behind a stripped /lending/ prefix in
-// production, and an absolute '/v1/...' would escape that prefix and 404. This
-// does mean the page must be reached with a trailing slash; the reverse proxy
-// redirects /lending to /lending/ for exactly that reason.
-async function get(p) {
-  const r = await fetch(p, {headers: {accept: 'application/json'}});
-  if (!r.ok) throw new Error(p + ' -> ' + r.status);
-  return r.json();
-}
-
-function healthTag(h) {
-  if (h == null) return '<span class="tag dim">no price</span>';
-  const cls = h < 1 ? 'bad' : h < 1.15 ? 'warn' : 'ok';
-  const pct = Math.max(4, Math.min(100, h / 2 * 100));
-  return `<div style="display:flex;align-items:center;gap:8px">
-    <span class="tag ${cls}">${h.toFixed(3)}</span>
-    <span class="bar" style="flex:1"><i class="${cls === 'ok' ? '' : cls}"
-      style="width:${pct}%"></i></span></div>`;
-}
-
-const STATE = {LIVE: 'ok', REPAID: 'dim', LIQUIDATED: 'warn', DEFAULTED: 'warn',
-               RECOVERED: 'warn', GHOST: 'bad', UNCONFIRMED: 'dim',
-               SPENT_UNKNOWN: 'dim'};
-
-async function markets() {
-  try {
-    const d = await get('v1/markets');
-    if (!d.markets.length) { $('#markets').innerHTML =
-      '<div class="empty">no markets configured</div>'; return; }
-    $('#markets').innerHTML = d.markets.map(m => {
-      const stale = m.age_seconds != null && m.age_seconds > 600;
-      return `<div class="card m">
-        <div class="mk">${esc(m.market)}</div>
-        <div class="px">${m.unit_price == null ? '&mdash;'
-          : Number(m.unit_price).toLocaleString(undefined,
-              {maximumFractionDigits: 6})}</div>
-        <div class="meta">${m.price == null ? 'no attestation yet'
-          : num(m.price) + ' atoms/atom &middot; ' +
-            (stale ? '<span class="tag bad">stale</span>'
-                   : m.age_seconds + 's ago')}</div></div>`;
-    }).join('');
-  } catch (e) { $('#mkerr').textContent = String(e); }
-}
-
-async function offers() {
-  const d = await get('v1/offers');
-  $('#offern').textContent = d.offers.length ? `${d.offers.length} open` : '';
-  const b = $('#offers').querySelector('tbody');
-  if (!d.offers.length) {
-    b.innerHTML = '<tr><td class="empty">No open offers. A lender publishes one '
-      + 'with <span class="mono">pignus-cli</span>.</td></tr>'; return;
-  }
-  b.innerHTML = '<tr><th>market</th><th>kind</th><th>principal</th><th>repay</th>'
-    + '<th>collateral</th><th>vault address</th></tr>' + d.offers.map(o => {
-    const t = JSON.parse(o.terms);
-    return `<tr>
-      <td>${esc(t.market)}</td>
-      <td><span class="tag ${o.kind === 'funded' ? 'ok' : 'dim'}">${esc(o.kind)}</span></td>
-      <td>${atoms(t.principal)}</td>
-      <td>${atoms(t.debt)}</td>
-      <td>${atoms(t.collateral_amount)}</td>
-      <td class="mono">${short(o.vault_address, 20)}</td></tr>`;
-  }).join('');
-}
-
-async function loans() {
-  const d = await get('v1/loans');
-  $('#loann').textContent = d.loans.length ? `${d.loans.length} known` : '';
-  const b = $('#loans').querySelector('tbody');
-  if (!d.loans.length) {
-    b.innerHTML = '<tr><td class="empty">No loans yet.</td></tr>'; return;
-  }
-  b.innerHTML = '<tr><th>loan</th><th>market</th><th>state</th><th>debt</th>'
-    + '<th>collateral</th><th>oracle</th><th>health</th></tr>' + d.loans.map(l =>
-    `<tr>
-      <td class="mono">${short(l.loan_id, 12)}</td>
-      <td>${esc(l.market)}</td>
-      <td><span class="tag ${STATE[l.state] || 'dim'}">${esc(l.state)}</span></td>
-      <td>${atoms(l.debt)}</td>
-      <td>${atoms(l.collateral_amount)}</td>
-      <td><span class="tag dim">${esc(l.oracle)}</span></td>
-      <td>${healthTag(l.health)}</td></tr>`).join('');
-}
-
-async function health() {
-  try {
-    const h = await get('healthz');
-    const age = h.last_poll ? Math.max(0, Math.floor(Date.now() / 1000) - h.last_poll) : null;
-    $('#health').innerHTML = h.error
-      ? `<span class="tag bad">degraded</span> ${esc(h.error)}`
-      : `<span class="tag ok">live</span> ${h.priced}/${h.markets} markets priced`
-        + (age == null ? '' : `, updated ${age}s ago`);
-  } catch (e) { $('#health').innerHTML = '<span class="tag bad">offline</span>'; }
-}
-
-async function tick() {
-  await Promise.allSettled([markets(), offers(), loans(), health()]);
-}
-tick();
-setInterval(tick, 20000);
-</script></body></html>
+</div><script type="module" src="app.js"></script></body></html>

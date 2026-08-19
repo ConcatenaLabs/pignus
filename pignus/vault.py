@@ -51,6 +51,20 @@ def asset_out(display_hex: str) -> bytes:
     return b"\x01" + bytes.fromhex(display_hex)[::-1]
 
 
+def payout_spk(ver, prog_hex) -> bytes:
+    """A scriptPubKey for a payout program at a witness version."""
+    prog = bytes.fromhex(prog_hex) if isinstance(prog_hex, str) else prog_hex
+    if ver == 0:
+        if len(prog) != 20:
+            raise ValueError("a v0 payout program must be 20 bytes")
+        return b"\x00\x14" + prog
+    if ver == 1:
+        if len(prog) != 32:
+            raise ValueError("a v1 payout program must be 32 bytes")
+        return b"\x51\x20" + prog
+    raise ValueError(f"unsupported witness version {ver}")
+
+
 def taproot_spk(xonly_hex) -> bytes:
     """A v1 taproot scriptPubKey from an x-only key. The payout programs baked
     into the covenant are x-only keys, so this is how a baked program becomes an
@@ -107,8 +121,16 @@ class VaultSpender:
         return tx.serialize().hex()
 
     def _pinned(self):
+        """The two scriptPubKeys the covenant will insist on.
+
+        Built from the terms' payout PROGRAMS and versions, not from the keys:
+        a loan originated by a browser wallet pays segwit v0, and assuming
+        taproot here would silently compose a transaction the covenant refuses.
+        """
         t = self.terms
-        return taproot_spk(t.lender_x), taproot_spk(t.borrower_x)
+        lender, borrower = t.payout_programs
+        return (payout_spk(t.lender_ver, lender),
+                payout_spk(t.borrower_ver, borrower))
 
     # ------------------------------------------------------------------ exits
 
@@ -225,47 +247,25 @@ class VaultSpender:
         witness = make_witness(self.tap, self.leaves)
         return self._assemble(vault, funding, outs, witness, locktime)
 
-    def recover(self, vault, funding, lender_sec, change_spk, locktime=None):
-        """RECOVER: the lender's blunt sweep, long after maturity. The only exit
-        that needs a signature."""
-        m, s = _tf()
+    def recover(self, vault, funding, change_spk, locktime=None):
+        """RECOVER: the oracle-liveness backstop.
+
+        Signature-free, like every other exit. After the backstop height anyone
+        may sweep the vault, but only to the lender's pinned payout -- so a
+        lender who holds nothing but an address can still be made whole, and
+        need not be online to be.
+        """
         t = self.terms
         locktime = t.recover_after if locktime is None else locktime
         if locktime < t.recover_after:
             raise ValueError(
                 f"locktime {locktime} is below recover_after {t.recover_after}")
         lender_spk, _ = self._pinned()
-
-        seq = 0xfffffffe
-        tx = m.CTransaction()
-        tx.nVersion = 2
-        tx.nLockTime = locktime
-        tx.vin.append(m.CTxIn(m.COutPoint(int(vault.txid, 16), vault.vout), nSequence=seq))
-        for o in funding:
-            tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout), nSequence=seq))
-        tx.vout.append(self._out(t.collateral_amount, lender_spk, t.collateral_asset))
-        for (amt, spk, asset) in self._change(funding, {}, change_spk):
-            tx.vout.append(self._out(amt, spk, asset))
-        tx.vout.append(self._fee_out(self.fee_amount))
-
-        signed = self.node.signrawtransactionwithwallet(tx.serialize().hex())
-        tx = m.tx_from_hex(signed["hex"])
-        # The RECOVER leaf signs over the real spent outputs, so the vault's own
-        # output has to be reconstructed here exactly as it was funded.
-        spent = [self._out(t.collateral_amount, bytes(self.tap.scriptPubKey),
-                           t.collateral_asset)]
-        for o in funding:
-            spent.append(self._out(o.amount, self._spk_of(o), o.asset))
-        genesis = m.uint256_from_str(bytes.fromhex(self.node.getblockhash(0))[::-1])
-        msg = s.TaprootSignatureHash(tx, spent, 0, genesis, 0, scriptpath=True,
-                                     script=self.leaves["recover"])
-        from test_framework.key import sign_schnorr
-        sig = sign_schnorr(lender_sec, msg)
-        while len(tx.wit.vtxinwit) < len(tx.vin):
-            tx.wit.vtxinwit.append(m.CTxInWitness())
-        tx.wit.vtxinwit[0].scriptWitness.stack = self.cov.recover_witness(
-            self.tap, self.leaves, sig)
-        return tx.serialize().hex()
+        outs = [(t.collateral_amount, lender_spk, t.collateral_asset)]
+        outs += self._change(funding, {}, change_spk)
+        return self._assemble(vault, funding, outs,
+                              self.cov.recover_witness(self.tap, self.leaves),
+                              locktime)
 
     # ------------------------------------------------------------- accounting
 
