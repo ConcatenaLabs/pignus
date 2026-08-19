@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
+"""The Pignus price oracle: sign prices, publish them, keep the log.
+
+The oracle is trusted for one number and nothing else (doc/sequentia/pignus-design.md
+section 6.1), and the thing that keeps that trust honest is publication: every
+attestation it has ever signed is served, so a fabricated price sits permanently
+next to the real ones and a borrower liquidated on a bad one can point at the
+exact signed bytes.
+
+    pignus-oracle --config oracle.json
+
+Config (JSON):
+
+    {
+      "keyfile":     "/var/lib/pignus/oracle.key",
+      "logfile":     "/var/lib/pignus/attestations.log",
+      "listen":      "127.0.0.1:8730",
+      "interval":    60,
+      "price_scale": 100000,
+      "markets":     ["GOLD/USDX", "SILVR/USDX", "OILX/USDX", "SEQ/USDX"],
+      "precisions":  {"GOLD": 8, "USDX": 8},
+      "source":      {"type": "http", "url": "http://127.0.0.1:8088/price"}
+    }
+
+`source` may instead be `{"type": "static", "prices": {"GOLD": 3000, "USDX": 1}}`,
+which is for tests and drills -- and is safe to offer precisely because every
+attestation it produces is published like any other.
+
+Endpoints:
+
+    GET /v1/pubkey                 the x-only key vaults must bake in
+    GET /v1/markets                the feeds this oracle signs, with feed ids
+    GET /v1/attestation/{market}   the latest signed price
+    GET /v1/log?market=&n=         recent attestations
+    GET /v1/digest                 a hash over the whole log
+    GET /healthz
+"""
+
+import argparse
+import json
+import os
+import stat
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+
+from pignus import oracle as O           # noqa: E402
+from pignus.terms import feed_id         # noqa: E402
+
+
+def load_or_create_key(path):
+    """Read the oracle key, creating it 0600 on first run.
+
+    The key is the whole of the oracle's authority, so it is never logged, never
+    returned by an endpoint, and the file mode is checked on every start rather
+    than only at creation -- a key that became world-readable at some point is
+    exactly what nobody notices.
+    """
+    if os.path.exists(path):
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        if mode & 0o077:
+            raise SystemExit(
+                f"{path} is mode {mode:04o}: the oracle key is readable by other "
+                "users. chmod 600 it and, since it may already have leaked, "
+                "consider rotating to a new key and re-issuing loans against it.")
+        with open(path) as f:
+            return bytes.fromhex(f.read().strip())
+    sec = O.generate_key()
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(sec.hex() + "\n")
+    return sec
+
+
+def build_source(cfg):
+    s = cfg.get("source", {})
+    kind = s.get("type", "static")
+    if kind == "static":
+        return O.StaticPriceSource(s.get("prices", {}))
+    if kind == "http":
+        return O.HttpPriceSource(s["url"], timeout=float(s.get("timeout", 5)),
+                                 field=s.get("field", "price"))
+    raise SystemExit(f"unknown price source type: {kind!r}")
+
+
+class Oracle:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.sec = load_or_create_key(cfg["keyfile"])
+        self.xonly = O.xonly_pubkey(self.sec)
+        self.log = O.AttestationLog(cfg["logfile"])
+        self.source = build_source(cfg)
+        self.markets = list(cfg.get("markets", []))
+        self.precisions = {k.upper(): int(v)
+                           for k, v in cfg.get("precisions", {}).items()}
+        self.price_scale = int(cfg.get("price_scale", 100_000))
+        self.latest = {}
+        self.errors = {}
+        self._lock = threading.Lock()
+
+    def tick(self):
+        """Sign one round of prices. A market that fails is recorded and skipped
+        rather than taking the round down: an oracle that stops signing every
+        feed because one price source hiccuped is an oracle whose outage reaches
+        the RECOVER backstop."""
+        for market in self.markets:
+            try:
+                price = self.source.price_for(market, self.precisions,
+                                              self.price_scale)
+                att = O.sign(self.sec, market, price, self.price_scale)
+            except Exception as e:                # noqa: BLE001 - reported, not raised
+                with self._lock:
+                    self.errors[market] = f"{type(e).__name__}: {e}"
+                continue
+            with self._lock:
+                self.latest[market] = att
+                self.errors.pop(market, None)
+            self.log.append(att)
+
+    def run_forever(self, interval):
+        while True:
+            started = time.time()
+            self.tick()
+            time.sleep(max(1.0, interval - (time.time() - started)))
+
+
+class Handler(BaseHTTPRequestHandler):
+    oracle = None
+    server_version = "pignus-oracle"
+
+    def _send(self, code, payload):
+        body = json.dumps(payload, indent=2).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        # Attestations are public by design; a liquidator, a borrower and a
+        # curious third party should all be able to read them from anywhere.
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def do_GET(self):
+        o = self.oracle
+        u = urlparse(self.path)
+        path = u.path.rstrip("/") or "/"
+        q = parse_qs(u.query)
+        try:
+            if path == "/healthz":
+                return self._send(200, {"ok": True, "markets": len(o.markets),
+                                        "errors": o.errors})
+            if path == "/v1/pubkey":
+                return self._send(200, {"oracle_x": o.xonly.hex(),
+                                        "price_scale": o.price_scale})
+            if path == "/v1/markets":
+                return self._send(200, {"markets": [
+                    {"market": m, "feed_id": feed_id(m).hex(),
+                     "price_scale": o.price_scale,
+                     "error": o.errors.get(m)} for m in o.markets]})
+            if path == "/v1/digest":
+                return self._send(200, {"digest": o.log.digest()})
+            if path.startswith("/v1/attestation/"):
+                market = path[len("/v1/attestation/"):].replace("_", "/").upper()
+                with o._lock:
+                    att = o.latest.get(market)
+                if att is None:
+                    att = o.log.latest(market)
+                if att is None:
+                    return self._send(404, {
+                        "error": f"no attestation for {market}",
+                        "detail": o.errors.get(market),
+                        "markets": o.markets})
+                return self._send(200, att.to_dict())
+            if path == "/v1/log":
+                market = (q.get("market", [None])[0] or None)
+                n = min(int(q.get("n", ["50"])[0]), 1000)
+                return self._send(200, {"attestations": [
+                    a.to_dict() for a in o.log.tail(n, market)]})
+            return self._send(404, {"error": "no such endpoint", "path": path})
+        except Exception as e:                    # noqa: BLE001
+            return self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--once", action="store_true",
+                    help="sign one round and exit, without serving")
+    ap.add_argument("--print-pubkey", action="store_true",
+                    help="print the oracle x-only key and exit")
+    args = ap.parse_args()
+
+    with open(args.config) as f:
+        cfg = json.load(f)
+    o = Oracle(cfg)
+
+    if args.print_pubkey:
+        print(o.xonly.hex())
+        return
+    if args.once:
+        o.tick()
+        for m in o.markets:
+            att = o.latest.get(m)
+            print(f"{m:16s} {att.price if att else '-':>14}  "
+                  f"{o.errors.get(m, 'ok')}")
+        return
+
+    host, _, port = cfg.get("listen", "127.0.0.1:8730").rpartition(":")
+    o.tick()                                   # serve something immediately
+    threading.Thread(target=o.run_forever,
+                     args=(int(cfg.get("interval", 60)),), daemon=True).start()
+    Handler.oracle = o
+    srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
+    print(f"pignus-oracle: key {o.xonly.hex()}", file=sys.stderr)
+    print(f"pignus-oracle: signing {len(o.markets)} market(s) every "
+          f"{cfg.get('interval', 60)}s, serving on {host}:{port}", file=sys.stderr)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
