@@ -97,10 +97,24 @@ def main():
         vout = next(o["n"] for o in raw["vout"]
                     if o["scriptPubKey"]["hex"] == spk.hex())
 
-        # a real output that is NOT an offer, to point at
+        # A real, UNSPENT output that is not an offer, to point at. Taking
+        # vout 0 on faith is what made this flaky: vout 0 may be the change,
+        # or already spent, and then the refusal comes from the wrong reason.
         other = n.sendtoaddress(address=n.getnewaddress(), amount=1,
                                 fee_asset_label="bitcoin")
         rig.seq_mine(1)
+        other_vout = None
+        for cand in n.getrawtransaction(other, True)["vout"]:
+            if n.gettxout(other, cand["n"], False) is not None \
+                    and cand["scriptPubKey"].get("hex"):
+                other_vout = cand["n"]
+                break
+        assert other_vout is not None, "no unspent output on the decoy tx"
+        # And LOCK it. Without this the wallet spends the decoy to fund the
+        # vault a few lines below, and the later refusal then comes back as
+        # "no unspent output" rather than "does not hold" -- a pass turning
+        # into a failure for a reason that has nothing to do with the book.
+        n.lockunspent(False, [{"txid": other, "vout": other_vout}])
 
         port = _free_port()
         cfg = os.path.join(rig.root, "pignusd.json")
@@ -141,7 +155,7 @@ def main():
                   str(code))
 
             code, body = post(base + "/v1/offers", {
-                **good, "outpoint": f"{other}:0"})
+                **good, "outpoint": f"{other}:{other_vout}"})
             check("a real outpoint holding something else is refused",
                   code == 400 and "does not hold" in body.get("error", ""),
                   json.dumps(body)[:120])
@@ -177,7 +191,7 @@ def main():
                   json.dumps(body)[:160])
 
             code, body = post(base + "/v1/loans",
-                              {"terms": tj, "txid": other, "vout": 0})
+                              {"terms": tj, "txid": other, "vout": other_vout})
             check("a loan whose outpoint is not its vault is refused",
                   code == 400 and "does not hold" in body.get("error", ""),
                   json.dumps(body)[:120])

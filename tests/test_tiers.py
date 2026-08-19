@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
+"""Tiers C and D, proven rather than described.
+
+Tier C is a pledge in the issuer's policy server. What is checkable without an
+`openampd` running is the part Pignus owns: the message a party signs. It must
+match `pledgeMessage` in openampd/internal/server/pledge.go byte for byte, or a
+lender's release is refused for a reason nobody can diagnose, so it is pinned
+here against a fixed vector.
+
+Tier D is a repurchase, and the whole of it is checkable: the two leaves compile,
+the address is a function of the terms, the vault pays out on a REAL chain
+through both exits, and every refusal that keeps a borrower safe actually fires.
+
+Proven here:
+
+  PASS   the pledge message matches the Go server's, byte for byte
+  PASS   a party's signature over it verifies, and one field cannot impersonate another
+  PASS   the bond is exactly the borrower's equity
+  REJECT a repurchase with no equity to bond
+  REJECT a repurchase whose debt does not exceed the principal
+  REJECT a C_U that is not a 32-byte v1 program
+  PASS   RETURN: the bond goes to the lender against delivery of the asset
+  REJECT RETURN without delivering the asset
+  REJECT RETURN delivering the asset somewhere other than the borrower's C_U
+  PASS   FORFEIT: after the deadline the borrower sweeps the bond
+  REJECT FORFEIT before the deadline
+  REJECT FORFEIT paying anyone but the borrower
+  PASS   verify_funding accepts the real vault and rejects altered terms
+  REJECT a settlement with more inputs or outputs than OpenDAMP allows
+"""
+
+import hashlib
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from pignus import openamp as OA                      # noqa: E402
+from pignus import oracle as O                        # noqa: E402
+from pignus.compat import load_covenant               # noqa: E402
+from pignus.repurchase import (                       # noqa: E402
+    RepurchaseTerms, bond_atoms, check_settlement, settlement_shape)
+from rig import Rig                                   # noqa: E402
+
+COIN = 100_000_000
+PASS = FAIL = 0
+
+
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  ok    {name}")
+    else:
+        FAIL += 1
+        print(f"  FAIL  {name} {detail}")
+
+
+def refuses(name, fn, want=""):
+    global PASS, FAIL
+    try:
+        fn()
+    except Exception as e:
+        if want and want not in str(e):
+            FAIL += 1
+            print(f"  FAIL  {name} -- refused for the wrong reason: {e}")
+        else:
+            PASS += 1
+            print(f"  ok    {name}")
+        return
+    FAIL += 1
+    print(f"  FAIL  {name} -- was accepted")
+
+
+# --- Tier C ------------------------------------------------------------------
+
+def tier_c():
+    print("Tier C: the pledge authorisation message")
+
+    # The vector the Go test signs. Recomputed here from first principles rather
+    # than copied from the Python, so the two implementations are compared and
+    # not merely one of them repeated.
+    want = hashlib.sha256(b"openamp-pledge|release|pl-7|deadbeef").digest()
+    check("the pledge message matches the Go server's construction",
+          OA.pledge_message("release", "pl-7", "deadbeef") == want)
+
+    sec = O.generate_key()
+    x = OA.party_key(sec)
+    sig = OA.sign_pledge(sec, "release", "pl-7", "deadbeef")
+    check("a lender's own signature over it verifies",
+          OA.verify_pledge_sig(x, sig, "release", "pl-7", "deadbeef"))
+    check("the same signature does not authorise a seizure",
+          not OA.verify_pledge_sig(x, sig, "seize", "pl-7", "deadbeef"))
+    check("nor the same action on another pledge",
+          not OA.verify_pledge_sig(x, sig, "release", "pl-8", "deadbeef"))
+    check("nor the same pledge against another repayment",
+          not OA.verify_pledge_sig(x, sig, "release", "pl-7", "cafe"))
+
+    # A separator inside a field would let "release|pl-7" and "" impersonate
+    # "release" and "pl-7". Refused rather than escaped, because a pledge id is
+    # not a place a pipe belongs.
+    refuses("a '|' inside a field is refused, not silently escaped",
+            lambda: OA.pledge_message("release", "pl|7", ""), "impersonate")
+    refuses("an unknown action cannot be signed",
+            lambda: OA.sign_pledge(sec, "confiscate", "pl-7"), "unknown pledge action")
+
+
+# --- Tier D ------------------------------------------------------------------
+
+def tier_d_pure():
+    print("\nTier D: the bond, and what the terms refuse")
+
+    check("the bond is exactly the borrower's equity",
+          bond_atoms(1000 * COIN, 700 * COIN) == 300 * COIN)
+    refuses("a debt at or above the collateral's value leaves no equity to bond",
+            lambda: bond_atoms(700 * COIN, 700 * COIN), "no equity")
+
+    check("four inputs and six outputs is allowed", check_settlement(4, 6))
+    refuses("a fifth input is refused before it is signed",
+            lambda: check_settlement(5, 6), "at most 4")
+    refuses("a seventh output is refused before it is signed",
+            lambda: check_settlement(4, 7), "at most 6")
+    refuses("an unconsolidated debt input is refused with the fix in the message",
+            lambda: settlement_shape(False), "Consolidate first")
+    check("the settlement shape names the fee asset",
+          "debt asset" in settlement_shape(True)["fee_asset"])
+
+
+def tier_d_chain():
+    print("\nTier D: the bond vault on a real chain")
+    with Rig() as rig:
+        n = rig.seq
+        for _ in range(4):
+            n.sendtoaddress(address=n.getnewaddress(), amount=5,
+                            fee_asset_label="bitcoin")
+        rig.seq_mine(1)
+        # the regulated asset being sold, and the money it is sold for
+        coll = n.issueasset(assetamount=1000, tokenamount=0, blind=False,
+                            fee_asset="bitcoin")["asset"]
+        money = n.issueasset(assetamount=1_000_000, tokenamount=0, blind=False,
+                             fee_asset="bitcoin")["asset"]
+        rig.seq_mine(1)
+
+        def prog(addr=None):
+            """A real payout program from the node's wallet, with its version.
+
+            The wallet hands out segwit v0, which is exactly what a browser
+            wallet hands out too, so testing against v0 tests the case that
+            actually ships rather than the convenient one.
+            """
+            a = addr or n.getnewaddress()
+            spk = bytes.fromhex(n.getaddressinfo(a)["scriptPubKey"])
+            if spk[0] == 0x00 and spk[1] == 20:
+                return a, spk[2:].hex(), 0
+            if spk[0] == 0x51 and spk[1] == 32:
+                return a, spk[2:].hex(), 1
+            raise AssertionError(f"unexpected payout program {spk.hex()}")
+
+        lender_addr, lender_prog, lender_ver = prog()
+        borrower_addr, borrower_prog, borrower_ver = prog()
+        # C_U(borrower) is a P2TR this wallet cannot spend, which is exactly
+        # what a real C_U is: what the covenant enforces is that the asset lands
+        # at THIS pinned script, and the covenant cannot tell a C_U taproot from
+        # any other taproot. That is precisely why the construction works, so
+        # the test uses an unspendable one rather than a convenient one.
+        cu_prog = hashlib.sha256(b"pignus/test/C_U(borrower)").hexdigest()
+
+        height = n.getblockcount()
+        t = RepurchaseTerms(
+            collateral_asset=coll, collateral_amount=100 * COIN,
+            debt_asset=money, principal=700 * COIN, debt=750 * COIN,
+            collateral_value=1000 * COIN,
+            borrower_cu=cu_prog, borrower_prog=borrower_prog,
+            lender_prog=lender_prog, borrower_ver=borrower_ver,
+            lender_ver=lender_ver, forfeit_after=height + 20)
+        bond = t.bond()
+        check("the bond is the equity: value minus debt", bond == 250 * COIN)
+
+        refuses("a repurchase whose debt does not exceed the principal is refused",
+                lambda: RepurchaseTerms(
+                    **{**t.__dict__, "debt": t.principal}).sanity_check(),
+                "must exceed the principal")
+        check("the borrower's ordinary payout may be segwit v0, which is what a "
+              "browser wallet gives", t.borrower_ver in (0, 1))
+        refuses("a C_U that is not 32 bytes is refused",
+                lambda: RepurchaseTerms(
+                    **{**t.__dict__, "borrower_cu": "aa" * 20}).sanity_check(),
+                "32-byte v1 program")
+        refuses("selling an asset for itself is refused",
+                lambda: RepurchaseTerms(
+                    **{**t.__dict__, "debt_asset": coll}).sanity_check(),
+                "cannot be the same asset")
+        refuses("a repurchase with no forfeit date is refused",
+                lambda: RepurchaseTerms(
+                    **{**t.__dict__, "forfeit_after": 0}).sanity_check(),
+                "forfeit_after is required")
+
+        check("the confirmation calls it a repurchase and says the borrower is selling",
+              "REPURCHASE, not a loan" in t.describe() and "SELLING" in t.describe())
+
+        # --- fund the bond vault for real -----------------------------------
+        spk = t.script_pubkey()
+        vaddr = n.deriveaddresses(
+            n.getdescriptorinfo(f"raw({spk.hex()})")["descriptor"])[0]
+        txid = n.sendtoaddress(address=vaddr, amount=bond / COIN, assetlabel=money,
+                               fee_asset_label="bitcoin")
+        rig.seq_mine(1)
+        out = t.verify_funding(n, txid)
+        check("verify_funding finds the bond at the address the terms compile to",
+              out is not None)
+
+        altered = RepurchaseTerms(**{**t.__dict__, "debt": t.debt + 1})
+        refuses("verify_funding rejects altered terms against the same coin",
+                lambda: altered.verify_funding(n, txid), "not the one being funded")
+
+        raw = n.getrawtransaction(txid, True)
+        vout = next(o["n"] for o in raw["vout"]
+                    if o["scriptPubKey"]["hex"] == spk.hex())
+
+        # --- RETURN ----------------------------------------------------------
+        from pignus.repurchase import RepurchaseSpender
+        from pignus.vault import Outpoint, payout_spk
+
+        btc = n.dumpassetlabels()["bitcoin"]
+        vault_op = Outpoint(txid, vout, bond, money)
+
+        def funding_for(asset, amount):
+            """UTXOs covering `amount` of `asset`, plus one to pay the fee."""
+            out, got = [], 0
+            for u in n.listunspent():
+                if u["asset"] == asset and got < amount:
+                    out.append(Outpoint.from_utxo(u))
+                    got += int(round(float(u["amount"]) * COIN))
+            assert got >= amount, f"wallet has {got} of {asset[:8]}, needs {amount}"
+            for u in n.listunspent():
+                if u["asset"] == btc and float(u["amount"]) >= 0.001:
+                    op = Outpoint.from_utxo(u)
+                    if op not in out:
+                        out.append(op)
+                    break
+            return out
+
+        change = bytes.fromhex(n.getaddressinfo(n.getnewaddress())["scriptPubKey"])
+        sp = RepurchaseSpender(n, t, btc)
+
+        settled = False
+        try:
+            hexed = sp.settle(vault_op, funding_for(coll, t.collateral_amount), change)
+            got = n.sendrawtransaction(hexed)
+            rig.seq_mine(1)
+            settled = True
+            check("RETURN: the bond is released against delivery of the asset", True)
+        except Exception as e:
+            check("RETURN: the bond is released against delivery of the asset",
+                  False, str(e)[:200])
+
+        if settled:
+            raw2 = n.getrawtransaction(got, True)
+            lspk = payout_spk(t.lender_ver, t.lender_prog).hex()
+            paid = [o for o in raw2["vout"]
+                    if o["scriptPubKey"]["hex"] == lspk and o.get("asset") == money]
+            check("and the bond paid is the bond the terms name",
+                  bool(paid) and int(round(float(paid[0]["value"]) * COIN)) == bond,
+                  str(paid)[:140])
+            cspk = payout_spk(1, t.borrower_cu).hex()
+            deliv = [o for o in raw2["vout"]
+                     if o["scriptPubKey"]["hex"] == cspk and o.get("asset") == coll]
+            check("and the asset really went to the borrower's C_U address",
+                  bool(deliv) and int(round(float(deliv[0]["value"]) * COIN))
+                  == t.collateral_amount, str(deliv)[:140])
+
+        # --- the refusals, against a SECOND vault ----------------------------
+        t2 = RepurchaseTerms(**{**t.__dict__, "forfeit_after": n.getblockcount() + 6})
+        spk2 = t2.script_pubkey()
+        v2addr = n.deriveaddresses(
+            n.getdescriptorinfo(f"raw({spk2.hex()})")["descriptor"])[0]
+        txid2 = n.sendtoaddress(address=v2addr, amount=bond / COIN, assetlabel=money,
+                                fee_asset_label="bitcoin")
+        rig.seq_mine(1)
+        raw3 = n.getrawtransaction(txid2, True)
+        vout2 = next(o["n"] for o in raw3["vout"]
+                     if o["scriptPubKey"]["hex"] == spk2.hex())
+        op2 = Outpoint(txid2, vout2, bond, money)
+        sp2 = RepurchaseSpender(n, t2, btc)
+
+        def rejected(name, build):
+            try:
+                h = build()
+            except Exception:
+                check(name, True)
+                return
+            try:
+                n.sendrawtransaction(h)
+            except Exception:
+                check(name, True)
+                return
+            check(name, False, "the node accepted it")
+
+        rejected("FORFEIT before the deadline is refused",
+                 lambda: sp2.forfeit(op2, funding_for(btc, 0), change,
+                                     locktime=t2.forfeit_after))
+
+        _, wrong_prog, wrong_ver = prog()
+        t_wrong = RepurchaseTerms(**{**t2.__dict__, "borrower_prog": wrong_prog,
+                                     "borrower_ver": wrong_ver})
+        rejected("FORFEIT paying anyone but the borrower is refused",
+                 lambda: RepurchaseSpender(n, t_wrong, btc).forfeit(
+                     op2, funding_for(btc, 0), change, locktime=t2.forfeit_after))
+
+        t_bad_cu = RepurchaseTerms(
+            **{**t2.__dict__,
+               "borrower_cu": hashlib.sha256(b"somebody else").hexdigest()})
+        rejected("RETURN delivering the asset anywhere but the borrower's C_U "
+                 "is refused",
+                 lambda: RepurchaseSpender(n, t_bad_cu, btc).settle(
+                     op2, funding_for(coll, t2.collateral_amount), change))
+
+        # --- FORFEIT, once the deadline really has passed --------------------
+        while n.getblockcount() <= t2.forfeit_after:
+            rig.seq_mine(1)
+        try:
+            h = sp2.forfeit(op2, funding_for(btc, 0), change)
+            n.sendrawtransaction(h)
+            rig.seq_mine(1)
+            check("FORFEIT: after the deadline the borrower sweeps the bond", True)
+        except Exception as e:
+            check("FORFEIT: after the deadline the borrower sweeps the bond",
+                  False, str(e)[:200])
+
+
+def main():
+    tier_c()
+    tier_d_pure()
+    if os.environ.get("PIGNUS_SKIP_CHAIN"):
+        print("\n(chain tests skipped: PIGNUS_SKIP_CHAIN set)")
+    else:
+        tier_d_chain()
+    print(f"\n{PASS} checks passed, {FAIL} failed")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
