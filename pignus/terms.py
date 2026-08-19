@@ -54,7 +54,9 @@ class LoanTerms:
     # the parties, as 32-byte x-only keys (hex). Payouts are v1 taproot.
     borrower_x: str
     lender_x: str
-    # the oracle
+    # the oracle: EITHER one key in `oracle_x`, OR a set in `oracles` with a
+    # threshold. Both forms compile to different vaults, so naming both is an
+    # error rather than a preference.
     market: str
     oracle_x: str
     strike: int
@@ -68,6 +70,37 @@ class LoanTerms:
     price_scale: int = 100_000
     max_price: int = 0      # the ceiling DEFAULT's overflow bound is pinned to
     memo: str = ""
+    # m-of-n independent oracles. A tuple so the terms stay hashable and frozen;
+    # from_json() converts the JSON list back.
+    oracles: tuple = ()
+    oracle_threshold: int = 0
+
+    def __post_init__(self):
+        if self.oracles and self.oracle_x:
+            raise ValueError("give oracle_x or oracles, not both: they compile "
+                             "to different vaults")
+        if not self.oracles and not self.oracle_x:
+            raise ValueError("a loan needs an oracle: set oracle_x or oracles")
+        if self.oracles:
+            if len(set(self.oracles)) != len(self.oracles):
+                raise ValueError("duplicate oracle key: one signer would fill "
+                                 "two slots and the threshold would not mean "
+                                 "what it says")
+            t = self.oracle_threshold or len(self.oracles)
+            if not 1 <= t <= len(self.oracles):
+                raise ValueError(
+                    f"oracle_threshold {t} outside 1..{len(self.oracles)}")
+
+    @property
+    def oracle_keys(self):
+        """Every key that may sign for this loan, in slot order."""
+        return list(self.oracles) if self.oracles else [self.oracle_x]
+
+    @property
+    def threshold(self):
+        if not self.oracles:
+            return 1
+        return self.oracle_threshold or len(self.oracles)
 
     # ---------------------------------------------------------------- derived
 
@@ -86,7 +119,10 @@ class LoanTerms:
             # program and the signing key are one value, not two that can
             # disagree.
             lender_prog=lender, borrower_prog=borrower, lender_x=lender,
-            feed_id=self.feed, oracle_x=bytes.fromhex(self.oracle_x),
+            feed_id=self.feed,
+            oracle_x=bytes.fromhex(self.oracle_x) if self.oracle_x else None,
+            oracles=[bytes.fromhex(k) for k in self.oracles] or None,
+            oracle_threshold=self.oracle_threshold or None,
             strike=self.strike, maturity=self.maturity,
             recover_after=self.recover_after, not_before=self.not_before,
             bonus_num=self.bonus_num, bonus_den=self.bonus_den,
@@ -200,6 +236,10 @@ class LoanTerms:
         if self.bonus_num <= self.bonus_den:
             w.append("no liquidation bonus: nobody is paid to liquidate this "
                      "position, so it may sit underwater until maturity")
+        if self.oracles and self.threshold == 1:
+            w.append(f"a 1-of-{len(self.oracles)} oracle set is not a threshold: "
+                     "ANY one of those keys can trigger a liquidation alone, so "
+                     "this is weaker than a single oracle, not stronger")
         if self.not_before == 0:
             w.append("not_before is 0: any attestation the oracle has EVER "
                      "signed for this feed can trigger a liquidation")
@@ -214,7 +254,10 @@ class LoanTerms:
 
     @classmethod
     def from_json(cls, s):
-        return cls(**(json.loads(s) if isinstance(s, str) else s))
+        d = dict(json.loads(s) if isinstance(s, str) else s)
+        if "oracles" in d and d["oracles"] is not None:
+            d["oracles"] = tuple(d["oracles"])
+        return cls(**d)
 
     def describe(self, price=None) -> str:
         """A human-readable summary, for the CLI and for anything that asks a
@@ -229,6 +272,9 @@ class LoanTerms:
             f"  strike       {self.strike:>20,}  (liquidates strictly below)",
             f"  maturity     {self.maturity:>20,}   recover after {self.recover_after:,}",
             f"  bonus        {self.bonus_num}/{self.bonus_den}   price scale {self.price_scale:,}",
+            f"  oracle       {self.threshold}-of-{len(self.oracle_keys)}"
+            + ("" if not self.oracles else
+               "  [" + ", ".join(k[:8] for k in self.oracles) + "]"),
         ]
         if price is not None:
             lines += [

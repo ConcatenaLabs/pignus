@@ -58,6 +58,7 @@ PRICE_OPEN = 300 * 100_000
 STRIKE = 180 * 100_000
 PRICE_LOW = 170 * 100_000
 PRICE_HIGH = 400 * 100_000
+PRICE_LOW_HIGHER = 175 * 100_000  # under the strike too, but higher than PRICE_LOW
 
 
 class PignusPlatformTest(BitcoinTestFramework):
@@ -181,6 +182,7 @@ class PignusPlatformTest(BitcoinTestFramework):
         self.verification_case()
         self.repay_case()
         self.liquidate_case()
+        self.threshold_case()
         self.default_case()
         self.recover_case()
         self.report()
@@ -305,6 +307,66 @@ class PignusPlatformTest(BitcoinTestFramework):
         self.log.info("  lender made whole, borrower kept the surplus, watcher: %s",
                       v.state)
 
+    def threshold_case(self):
+        """A 2-of-3 loan, driven through the library exactly as a single-oracle
+        one is. The caller does not choose which attestations to present:
+        pignus.oracle picks the `threshold` LOWEST, because the covenant takes
+        the maximum of whatever is shown and any extra one can only raise it."""
+        node = self.nodes[0]
+        self.log.info("PASS: a 2-of-3 oracle set, end to end")
+        secs = [oracle.generate_key() for _ in range(3)]
+        keys = [oracle.xonly_pubkey(s).hex() for s in secs]
+        self.terms = self.terms_for(oracle_x="", oracles=tuple(keys),
+                                    oracle_threshold=2)
+        assert_equal(self.terms.threshold, 2)
+        vault = self.originate(self.terms)
+        v = self.watcher.track(self.terms.loan_id(), self.terms,
+                               vault.txid, vault.vout)
+        self.watcher.poll()
+        assert_equal(v.state, State.LIVE)
+
+        healthy = {k: oracle.sign(s, "GOLD/USDX", PRICE_OPEN, 100_000)
+                   for k, s in zip(keys, secs)}
+        try:
+            self.spender().liquidate(vault, [], healthy, self.wallet_spk())
+            raise AssertionError("liquidated a healthy 2-of-3 position")
+        except ValueError as e:
+            assert "not liquidatable" in str(e), e
+        self.log.info("  refused while all three attest a healthy price")
+
+        # Only ONE oracle sees the dip: under the threshold, so nothing happens.
+        one_low = dict(healthy)
+        one_low[keys[0]] = oracle.sign(secs[0], "GOLD/USDX", PRICE_LOW, 100_000)
+        try:
+            self.spender().liquidate(vault, [], one_low, self.wallet_spk())
+            raise AssertionError("liquidated on one of three")
+        except ValueError as e:
+            assert "not liquidatable" in str(e), e
+        self.log.info("  refused with only 1 of 3 under the strike")
+
+        # Two see it, at different prices. The library presents both and the
+        # covenant uses the HIGHER, so the borrower keeps the larger surplus.
+        two_low = dict(one_low)
+        two_low[keys[2]] = oracle.sign(secs[2], "GOLD/USDX", PRICE_LOW_HIGHER,
+                                       100_000)
+        slots, price = oracle.liquidatable_slots(self.terms, two_low)
+        assert_equal(price, PRICE_LOW_HIGHER)
+        assert_equal(sum(1 for x in slots if x is not None), 2)
+        surplus = self.terms.surplus_at(PRICE_LOW_HIGHER)
+        assert surplus > self.terms.surplus_at(PRICE_LOW), \
+            "the higher price must leave the borrower more"
+
+        funding = [self.fresh(DEBT // COIN + 10, self.D), self.fresh(1)]
+        raw = self.spender().liquidate(vault, funding, two_low, self.wallet_spk())
+        txid = node.sendrawtransaction(raw)
+        self.generate(node, 1)
+        assert_equal(satoshi_round(node.gettxout(txid, 1)["value"]) * COIN,
+                     Decimal(surplus))
+        self.watcher.poll()
+        assert_equal(v.state, State.LIQUIDATED)
+        self.log.info("  2 of 3 agreed; the HIGHER price was used, borrower kept "
+                      "%d atoms (not %d)", surplus, self.terms.surplus_at(PRICE_LOW))
+
     def default_case(self):
         node = self.nodes[0]
         self.log.info("PASS: the loan is called at maturity, at a price ABOVE "
@@ -360,7 +422,7 @@ class PignusPlatformTest(BitcoinTestFramework):
         for v in self.watcher.vaults.values():
             by_state[v.state.value] = by_state.get(v.state.value, 0) + 1
         self.log.info("watcher final ledger: %s", by_state)
-        assert_equal(by_state, {"REPAID": 1, "LIQUIDATED": 1,
+        assert_equal(by_state, {"REPAID": 1, "LIQUIDATED": 2,
                                 "DEFAULTED": 1, "RECOVERED": 1})
 
 

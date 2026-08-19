@@ -46,10 +46,19 @@ class Node:
         other.url = f"{base}/wallet/{wallet}"
         return other
 
-    def call(self, method, *params):
+    def call(self, method, *params, **named):
+        """Positional or NAMED parameters.
+
+        Named parameters matter here: several Elements RPCs take a long tail of
+        optional arguments (sendtoaddress reaches `fee_asset_label` past eleven
+        of them), and positional calls into that tail are unreadable and break
+        silently when the signature shifts.
+        """
+        if params and named:
+            raise ValueError("pass positional or named parameters, not both")
         self._id += 1
-        body = json.dumps({"jsonrpc": "2.0", "id": self._id,
-                           "method": method, "params": list(params)}).encode()
+        body = json.dumps({"jsonrpc": "2.0", "id": self._id, "method": method,
+                           "params": named or list(params)}).encode()
         headers = {"Content-Type": "application/json"}
         if self._auth:
             headers["Authorization"] = self._auth
@@ -72,7 +81,7 @@ class Node:
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
-        def _m(*params):
-            return self.call(name, *params)
+        def _m(*params, **named):
+            return self.call(name, *params, **named)
         _m.__name__ = name
         return _m
