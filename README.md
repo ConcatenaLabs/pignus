@@ -112,8 +112,9 @@ ignorant of either asset's decimals.
 pignus-cli quote --market GOLD/USDX --collateral-ref 3000 --debt-ref 1
 ```
 
-prints `300000000`, which reads as 300 USDX atoms per GOLD atom, i.e. 3,000 USDX
-per GOLD, along with the strike each loan-to-value ratio implies.
+prints `300000000`: 3,000 USDX atoms per GOLD atom once the 1e5 scale is
+divided out, i.e. 3,000 USDX per GOLD. It also prints the strike each
+loan-to-value ratio implies.
 
 ### Size limit
 

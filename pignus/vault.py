@@ -129,20 +129,66 @@ class VaultSpender:
         return self._assemble(vault, funding, outs,
                               self.cov.repay_witness(self.tap, self.leaves))
 
+    def _oracle_evidence(self, evidence, leaf):
+        """Normalise what the caller brought into (witness price, witness maker).
+
+        A single-oracle vault takes one Attestation. A threshold vault takes a
+        mapping from oracle key to Attestation, and the selection of WHICH ones
+        to present -- and therefore what price the covenant computes -- is done
+        by pignus.oracle, not here, so the rule lives in one place.
+        """
+        from . import oracle as O
+        t = self.terms
+        if isinstance(evidence, dict):
+            if not t.oracles:
+                raise ValueError("this loan names ONE oracle; pass its "
+                                 "Attestation, not a mapping")
+            if leaf == "liquidate":
+                slots, price = O.liquidatable_slots(t, evidence)
+                if slots is None:
+                    raise ValueError(
+                        f"cannot reach the {t.threshold}-of-{len(t.oracle_keys)} "
+                        "threshold with attestations under the strike "
+                        f"{t.strike}: this position is not liquidatable")
+            else:
+                slots, price = O.select_threshold(t, evidence)
+                if slots is None:
+                    raise ValueError(
+                        f"cannot reach the {t.threshold}-of-{len(t.oracle_keys)} "
+                        "threshold with the attestations supplied")
+            return price, lambda tap, leaves: self.cov.threshold_oracle_witness(
+                tap, leaves, leaf, slots)
+
+        if t.oracles:
+            raise ValueError(
+                f"this loan names a {t.threshold}-of-{len(t.oracle_keys)} oracle "
+                "set; pass a {oracle_key: Attestation} mapping, not one "
+                "Attestation")
+        att = evidence
+        if not O.verify(t.oracle_x, att):
+            raise ValueError("attestation does not verify against this loan's "
+                             "oracle key; refusing to build a spend the "
+                             "interpreter would abort on")
+        if att.timestamp < t.not_before:
+            raise ValueError(
+                f"attestation timestamp {att.timestamp} predates the "
+                f"loan's not_before {t.not_before}")
+        if leaf == "liquidate" and not t.is_liquidatable(att.price):
+            raise ValueError(
+                f"price {att.price} is not under the strike {t.strike}: "
+                "this position is not liquidatable")
+        return att.price, lambda tap, leaves: self.cov.oracle_witness(
+            tap, leaves, leaf, bytes.fromhex(att.signature), att.price,
+            att.timestamp)
+
     def liquidate(self, vault, funding, attestation, taker_spk, change_spk=None):
         """LIQUIDATE: pay the lender the debt, keep the seizure, return the
-        surplus to the borrower. Fails to build if the attestation does not
+        surplus to the borrower. Fails to build if the evidence does not
         actually open the leaf, rather than producing a transaction the node
-        will reject after the caller has paid to find out."""
-        t = self.terms
-        if not t.is_liquidatable(attestation.price):
-            raise ValueError(
-                f"price {attestation.price} is not under the strike {t.strike}: "
-                "this position is not liquidatable")
-        if attestation.timestamp < t.not_before:
-            raise ValueError(
-                f"attestation timestamp {attestation.timestamp} predates the "
-                f"loan's not_before {t.not_before}")
+        will reject after the caller has paid to find out.
+
+        `attestation` is one Attestation for a single-oracle loan, or a
+        {oracle_key: Attestation} mapping for a threshold loan."""
         return self._seizure(vault, funding, attestation, taker_spk,
                              change_spk, "liquidate", 0)
 
@@ -158,11 +204,12 @@ class VaultSpender:
         return self._seizure(vault, funding, attestation, taker_spk,
                              change_spk, "default", locktime)
 
-    def _seizure(self, vault, funding, attestation, taker_spk, change_spk,
+    def _seizure(self, vault, funding, evidence, taker_spk, change_spk,
                  leaf, locktime):
         t = self.terms
+        price, make_witness = self._oracle_evidence(evidence, leaf)
         lender_spk, borrower_spk = self._pinned()
-        seize = t.seizure_at(attestation.price)
+        seize = t.seizure_at(price)
         surplus = t.collateral_amount - seize
         outs = [(t.debt, lender_spk, t.debt_asset)]                    # 0 credit
         if surplus > 0:
@@ -175,9 +222,7 @@ class VaultSpender:
             outs.append((t.collateral_amount, taker_spk, t.collateral_asset))
         outs += self._change(funding, {t.debt_asset: t.debt},
                              change_spk or taker_spk)
-        witness = self.cov.oracle_witness(
-            self.tap, self.leaves, leaf, bytes.fromhex(attestation.signature),
-            attestation.price, attestation.timestamp)
+        witness = make_witness(self.tap, self.leaves)
         return self._assemble(vault, funding, outs, witness, locktime)
 
     def recover(self, vault, funding, lender_sec, change_spk, locktime=None):
