@@ -172,6 +172,130 @@ def cmd_check_attestation(args):
     return 0 if ok else 2
 
 
+# --- Tier C: pledged collateral on an OpenAMP asset --------------------------
+
+def cmd_pledge_sign(args):
+    """Produce the authorisation the issuer's server demands.
+
+    Printed rather than sent, deliberately: the party whose key this is may not
+    be the party running the command, and a signature is the thing that travels
+    between them. `pignus-cli pledge-release` sends one.
+    """
+    from pignus import openamp as OA
+    sec = bytes.fromhex(open(args.key).read().strip()) if args.key_file \
+        else bytes.fromhex(args.key)
+    sig = OA.sign_pledge(sec, args.action, args.pledge, args.extra)
+    print(json.dumps({
+        "pledge": args.pledge, "action": args.action, "extra": args.extra,
+        "signed_by": OA.party_key(sec),
+        "message": OA.pledge_message(args.action, args.pledge, args.extra).hex(),
+        "signature": sig,
+    }, indent=2))
+
+
+def _pledge_client(args):
+    from pignus import openamp as OA
+    tok = args.token
+    if not tok:
+        raise SystemExit(
+            "an issuer token is required (--token, or PIGNUS_ISSUER_TOKEN in the "
+            "environment). It authenticates the caller; it does NOT authorise a "
+            "release or a seizure, which need the parties' own signatures.")
+    return OA.PledgeClient(args.issuer, tok)
+
+
+def cmd_pledge_list(args):
+    from pignus import openamp as OA
+    out = _pledge_client(args).list(asset=args.asset, holder=args.holder,
+                                    lender=args.lender, state=args.state)
+    for p in out:
+        print(OA.describe(p))
+    if not out:
+        print("no pledges match")
+
+
+def cmd_pledge_create(args):
+    p = _pledge_client(args).create(
+        args.asset, args.borrower, args.lender, args.atoms, args.maturity,
+        debt_asset=args.debt_asset, debt_atoms=args.debt_atoms, note=args.note)
+    print(json.dumps(p, indent=2))
+
+
+def cmd_pledge_release(args):
+    sec = bytes.fromhex(open(args.key).read().strip()) if args.key_file \
+        else (bytes.fromhex(args.key) if args.key else None)
+    out = _pledge_client(args).release(
+        args.pledge, lender_sec=sec, repaid_txid=args.repaid_txid,
+        force=args.force, reason=args.reason)
+    print(json.dumps(out, indent=2))
+
+
+def cmd_pledge_seize(args):
+    lender = bytes.fromhex(open(args.key).read().strip()) if args.key_file \
+        else bytes.fromhex(args.key)
+    borrower = None
+    if args.borrower_key:
+        borrower = bytes.fromhex(args.borrower_key)
+    out = _pledge_client(args).seize(args.pledge, args.reason, lender, borrower)
+    print(json.dumps(out, indent=2))
+
+
+# --- Tier D: a repurchase against an OpenDAMP asset --------------------------
+
+def cmd_repo_propose(args):
+    from pignus.repurchase import RepurchaseTerms
+    t = RepurchaseTerms(
+        collateral_asset=args.collateral_asset,
+        collateral_amount=args.collateral_amount,
+        debt_asset=args.debt_asset, principal=args.principal, debt=args.debt,
+        collateral_value=args.collateral_value,
+        borrower_cu=args.borrower_cu, borrower_prog=args.borrower_prog,
+        lender_prog=args.lender_prog, borrower_ver=args.borrower_ver,
+        lender_ver=args.lender_ver, forfeit_after=args.forfeit_after,
+    ).sanity_check()
+    doc = json.loads(t.to_json())
+    doc["bond"] = t.bond()
+    doc["address_program"] = t.script_pubkey().hex()
+    doc["product"] = "repurchase"
+    doc["confirmation"] = t.describe()
+    out = json.dumps(doc, indent=2)
+    if args.out:
+        open(args.out, "w").write(out + "\n")
+        print(f"wrote {args.out}")
+    else:
+        print(out)
+
+
+def cmd_repo_show(args):
+    from pignus.repurchase import RepurchaseTerms, settlement_shape
+    t = RepurchaseTerms.from_json(open(args.terms).read())
+    print(t.describe())
+    print()
+    print(f"bond            {t.bond()} atoms of {t.debt_asset}")
+    print(f"vault program   {t.script_pubkey().hex()}")
+    print(f"forfeit after   height {t.forfeit_after}")
+    print()
+    shape = settlement_shape(True)
+    print("settlement (exactly OpenDAMP's limits, no spare slot in either "
+          "direction):")
+    for i in shape["inputs"]:
+        print("  in   " + i)
+    for o in shape["outputs"]:
+        print("  out  " + o)
+
+
+def cmd_repo_verify(args):
+    from pignus.repurchase import RepurchaseTerms
+    t = RepurchaseTerms.from_json(open(args.terms).read())
+    node = node_from(args)
+    o = t.verify_funding(node, args.txid,
+                         None if args.vout is None else args.vout)
+    print(json.dumps({"ok": True, "bond": t.bond(),
+                      "vout": o["n"], "asset": o.get("asset")}, indent=2))
+    print()
+    print(t.describe())
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="pignus-cli", description=__doc__.split("\n")[0],
@@ -179,6 +303,93 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("selftest").set_defaults(fn=cmd_selftest)
+
+    # --- Tier C ---------------------------------------------------------------
+    def issuer_args(q):
+        q.add_argument("--issuer", default=os.environ.get(
+            "PIGNUS_ISSUER", "http://127.0.0.1:8722"),
+            help="the issuer's openampd base url")
+        q.add_argument("--token", default=os.environ.get("PIGNUS_ISSUER_TOKEN", ""),
+                       help="issuer token; authenticates the caller only")
+
+    p = sub.add_parser("pledge-sign",
+                       help="sign a Tier C release or seizure with your own key")
+    p.add_argument("--action", choices=("release", "seize"), required=True)
+    p.add_argument("--pledge", required=True)
+    p.add_argument("--extra", default="",
+                   help="the repayment txid for a release, the reason for a seizure")
+    p.add_argument("--key", required=True, help="your private key, hex")
+    p.add_argument("--key-file", action="store_true",
+                   help="--key names a file holding the key instead")
+    p.set_defaults(fn=cmd_pledge_sign)
+
+    p = sub.add_parser("pledge-list", help="Tier C pledges at an issuer")
+    issuer_args(p)
+    for name in ("asset", "holder", "lender", "state"):
+        p.add_argument("--" + name, default=None)
+    p.set_defaults(fn=cmd_pledge_list)
+
+    p = sub.add_parser("pledge-create", help="lock Tier C collateral in place")
+    issuer_args(p)
+    p.add_argument("--asset", required=True)
+    p.add_argument("--borrower", required=True, help="the borrower's AID")
+    p.add_argument("--lender", required=True, help="the lender's AID")
+    p.add_argument("--atoms", type=int, required=True)
+    p.add_argument("--maturity", type=int, required=True, help="height")
+    p.add_argument("--debt-asset", default="")
+    p.add_argument("--debt-atoms", type=int, default=0)
+    p.add_argument("--note", default="")
+    p.set_defaults(fn=cmd_pledge_create)
+
+    p = sub.add_parser("pledge-release",
+                       help="Tier C: the debt is settled, unlock the collateral")
+    issuer_args(p)
+    p.add_argument("--pledge", required=True)
+    p.add_argument("--key", default=None, help="the LENDER's private key, hex")
+    p.add_argument("--key-file", action="store_true")
+    p.add_argument("--repaid-txid", default="")
+    p.add_argument("--force", action="store_true",
+                   help="issuer override for a lender who cannot sign; needs --reason")
+    p.add_argument("--reason", default="")
+    p.set_defaults(fn=cmd_pledge_release)
+
+    p = sub.add_parser("pledge-seize",
+                       help="Tier C: deliver defaulted collateral to the lender")
+    issuer_args(p)
+    p.add_argument("--pledge", required=True)
+    p.add_argument("--reason", required=True)
+    p.add_argument("--key", required=True, help="the LENDER's private key, hex")
+    p.add_argument("--key-file", action="store_true")
+    p.add_argument("--borrower-key", default=None,
+                   help="the borrower's key; required before maturity")
+    p.set_defaults(fn=cmd_pledge_seize)
+
+    # --- Tier D ---------------------------------------------------------------
+    p = sub.add_parser("repo-propose",
+                       help="write a REPURCHASE document (Tier D; not a loan)")
+    for name in ("collateral-asset", "debt-asset", "borrower-cu",
+                 "borrower-prog", "lender-prog"):
+        p.add_argument("--" + name, required=True)
+    for name in ("collateral-amount", "principal", "debt", "collateral-value",
+                 "forfeit-after"):
+        p.add_argument("--" + name, type=int, required=True)
+    p.add_argument("--borrower-ver", type=int, default=1)
+    p.add_argument("--lender-ver", type=int, default=1)
+    p.add_argument("--out", default=None)
+    p.set_defaults(fn=cmd_repo_propose)
+
+    p = sub.add_parser("repo-show", help="describe a repurchase and its settlement")
+    p.add_argument("terms")
+    p.set_defaults(fn=cmd_repo_show)
+
+    p = sub.add_parser("repo-verify",
+                       help="THE check: does this bond vault match these terms")
+    p.add_argument("terms")
+    p.add_argument("--txid", required=True)
+    p.add_argument("--vout", type=int, default=None)
+    add_node_args(p)
+    p.set_defaults(fn=cmd_repo_verify)
+
 
     p = sub.add_parser("quote", help="reference prices -> the covenant's integer price")
     p.add_argument("--market", required=True)

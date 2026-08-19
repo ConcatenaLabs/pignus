@@ -9,9 +9,14 @@ a stand-in with Elements semantics would prove the wrong thing, and a taproot
 sighash or witness-ordering mistake would sail straight through it.
 
 Environment:
-    BITCOIND        path to bitcoind        (default ~/bitcoin-28.0/bin/bitcoind)
+    PIGNUS_BITCOIND path to Bitcoin Core's bitcoind
+                    (default ~/bitcoin-28.0/bin/bitcoind)
     SEQUENTIAD      path to sequentiad
     SEQUENTIA_SRC   a Sequentia source checkout (for the covenant + framework)
+
+`PIGNUS_BITCOIND` rather than `BITCOIND` on purpose: the node's own
+functional-test framework reads BITCOIND as the SEQUENTIA binary, and a suite
+that runs both kinds of test cannot give one name two meanings.
 """
 
 import os
@@ -114,8 +119,11 @@ class Rig:
         self.daemons = []
 
     def __enter__(self):
-        bitcoind = os.environ.get("BITCOIND",
-                                  _home("bitcoin-28.0", "bin", "bitcoind"))
+        # NOT plain BITCOIND: the node's functional-test framework already
+        # uses that name for the SEQUENTIA binary, and a suite that runs both
+        # kinds of test cannot give one name two meanings.
+        bitcoind = (os.environ.get("PIGNUS_BITCOIND")
+                    or _home("bitcoin-28.0", "bin", "bitcoind"))
         sequentiad = os.environ.get("SEQUENTIAD")
         if not sequentiad:
             src = os.environ.get("SEQUENTIA_SRC", _home("Sequentia"))
