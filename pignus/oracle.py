@@ -149,6 +149,60 @@ def verify(oracle_x, att: Attestation) -> bool:
     return verify_schnorr_varlen(oracle_x, sig, att.message())
 
 
+def select_threshold(terms, attestations):
+    """Choose which attestations to present for a threshold vault, or None.
+
+    `attestations` maps an oracle x-only key to an Attestation. Returns a slot
+    list in the vault's own key order -- one entry per key, each `None`
+    (abstain) or `(sig, price, timestamp)` -- together with the price the
+    covenant will actually compute with.
+
+    The covenant takes the MAXIMUM of the accepted prices, so presenting an
+    extra low attestation cannot drag the seizure up. That means the best (and
+    only sensible) play is to present the `threshold` LOWEST valid attestations
+    available: any further one can only raise the maximum. This function does
+    exactly that, so a liquidator does not have to rediscover the argument.
+    """
+    keys = terms.oracle_keys
+    usable = {}
+    for i, k in enumerate(keys):
+        att = attestations.get(k)
+        if att is None:
+            continue
+        if not verify(k, att):
+            continue
+        if att.timestamp < terms.not_before:
+            continue
+        usable[i] = att
+    # LIQUIDATE additionally needs every presented price under the strike;
+    # DEFAULT does not, and passes strike=None by giving a term whose strike
+    # cannot bind (the caller checks maturity instead).
+    if len(usable) < terms.threshold:
+        return None, None
+    chosen = sorted(usable.items(), key=lambda kv: kv[1].price)[:terms.threshold]
+    slots = [None] * len(keys)
+    for i, att in chosen:
+        slots[i] = (bytes.fromhex(att.signature), att.price, att.timestamp)
+    price = max(att.price for _i, att in chosen)
+    return slots, price
+
+
+def liquidatable_slots(terms, attestations):
+    """The slots for a LIQUIDATION, or None if the position is not liquidatable.
+
+    Every presented price must independently clear the strike, because the
+    covenant checks each one -- so filtering here is not an optimisation, it is
+    the same rule stated where a caller can act on it."""
+    under = {k: a for k, a in attestations.items()
+             if terms.is_liquidatable(a.price)}
+    slots, price = select_threshold(terms, under)
+    if slots is None or price is None:
+        return None, None
+    if not terms.is_liquidatable(price):
+        return None, None
+    return slots, price
+
+
 # ------------------------------------------------------------------ pricing
 
 def quote_price(collateral_ref: float, debt_ref: float,
@@ -170,11 +224,14 @@ def quote_price(collateral_ref: float, debt_ref: float,
 
         (3000 / 1) * 10**0 * 1e5 = 300_000_000
 
-    which reads as "300 USDX atoms per GOLD atom", since one GOLD atom is 1e-8
-    GOLD = 0.00003 USD = 3,000 USDX atoms... and 3000/1e8 USDX = 3e-5 USDX =
-    3,000 atoms. The scaled figure 3e8 divided by price_scale gives 3,000. The
-    two readings agree, which is the check worth doing whenever this function is
-    changed.
+    Divide by the scale and that reads as 3,000 debt atoms per collateral atom.
+    Check it the long way round: one GOLD atom is 1e-8 GOLD = 3e-5 USD, and one
+    USDX atom is 1e-8 USD, so a GOLD atom is worth 3,000 USDX atoms. The two
+    readings agree.
+
+    When the assets have EQUAL precision the atoms-per-atom figure equals the
+    unit price, which is why it is easy to write 300 here by reflex and why
+    tests/test_units.py pins this exact number.
     """
     if debt_ref <= 0:
         raise ValueError("debt asset reference price must be positive")

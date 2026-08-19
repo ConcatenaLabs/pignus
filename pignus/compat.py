@@ -109,7 +109,12 @@ def verify_builder(cov=None):
     for case in v["vaults"]:
         params = {}
         for k, val in case["params"].items():
-            params[k] = bytes.fromhex(val) if isinstance(val, str) else val
+            if isinstance(val, list):          # an oracle set
+                params[k] = [bytes.fromhex(x) for x in val]
+            elif isinstance(val, str):
+                params[k] = bytes.fromhex(val)
+            else:
+                params[k] = val
         tap, leaves = cov.vault_taptree(**params)
         got = bytes(tap.scriptPubKey).hex()
         if got != case["scriptPubKey"]:
