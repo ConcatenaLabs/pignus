@@ -86,6 +86,7 @@ needs no one's permission.</p>
   <button data-tab="borrow" class="on">Borrow</button>
   <button data-tab="loans">Loans &amp; liquidations</button>
   <button data-tab="lend">Lend</button>
+  <button data-tab="repo">Repurchase</button>
   <button id="refresh">Refresh</button>
 </div>
 
@@ -139,6 +140,36 @@ needs no one's permission.</p>
       exact terms and the offer address before your wallet asks you to sign.</span>
     </div>
   </form>
+</section>
+
+<section data-panel="repo" style="display:none">
+  <h2>Check a repurchase <span class="tag">Tier D &mdash; not a loan</span></h2>
+  <p class="hint">A regulated (OpenDAMP) asset cannot be locked in a lending
+  vault: the network requires every output carrying it to pay the holder's own
+  covenant address, exits cannot be pre-signed because the shared verifier
+  output moves on any holder's transfer, and the issuer has no power to move a
+  coin either. So on default nobody could ever reach the collateral, and a loan
+  against one is not something that can be built. What can be built is a
+  <strong>repurchase</strong>: you SELL the asset to the lender, and their
+  obligation to sell it back is secured by a bond in a covenant here.</p>
+  <p class="hint">Settling one needs the regulated asset's own machinery, which
+  a browser does not have, so the transaction is composed elsewhere. What this
+  page does is the part that protects you: rebuild the bond vault's address from
+  the terms you were given and check it against the coin that is actually
+  funded. If they match, every destination and the deadline are exactly what you
+  agreed.</p>
+  <form class="lend card" id="repoform">
+    <div style="grid-column:1/-1"><label>Repurchase terms (JSON)</label>
+      <textarea name="terms" id="repoterms" rows="10"
+        placeholder='{"collateral_asset": "...", "collateral_amount": 10000000000, "debt_asset": "...", "principal": 70000000000, "debt": 75000000000, "collateral_value": 100000000000, "borrower_cu": "...", "borrower_prog": "...", "lender_prog": "...", "borrower_ver": 0, "lender_ver": 0, "forfeit_after": 900000}'></textarea></div>
+    <div><label>Funding txid <span class="dim">(optional)</span></label>
+      <input name="txid" id="repotxid" placeholder="the coin that holds the bond"></div>
+    <div><label>Vout</label><input name="vout" id="repovout" value="0"></div>
+    <div style="grid-column:1/-1">
+      <button type="submit">Check it</button></div>
+  </form>
+  <div class="card" id="repoout"><div class="empty">paste the terms you were
+  sent</div></div>
 </section>
 
 <section class="safe">

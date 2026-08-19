@@ -331,9 +331,38 @@ def tier_d_chain():
                   False, str(e)[:200])
 
 
+def tier_d_vectors():
+    """RepurchaseTerms compiles to the same thing the covenant does.
+
+    This closes the triangle. The covenant builder emits the vectors, the
+    browser is pinned to them by tests/test_repurchase_web.mjs, and this pins
+    the Python client to them too -- so all three implementations of the
+    repurchase composition are the same implementation, or one of the three
+    tests fails.
+    """
+    print("\nTier D: the Python client against the golden vectors")
+    import json as _json
+    vectors = _json.load(open(os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "..", "pignus", "vectors.json")))
+    cases = vectors.get("repurchase") or []
+    check("the vectors carry repurchase cases at all", len(cases) >= 2,
+          f"got {len(cases)}")
+    for c in cases:
+        t = RepurchaseTerms(**c["terms"])
+        lv = t.leaves()
+        check(f"{c['name']}: the RETURN leaf matches the covenant",
+              bytes(lv["return"]).hex() == c["leaves"]["return"])
+        check(f"{c['name']}: the FORFEIT leaf matches the covenant",
+              bytes(lv["forfeit"]).hex() == c["leaves"]["forfeit"])
+        check(f"{c['name']}: the bond vault address matches",
+              t.script_pubkey().hex() == c["script_pubkey"])
+        check(f"{c['name']}: the bond is the equity", t.bond() == c["bond"])
+
+
 def main():
     tier_c()
     tier_d_pure()
+    tier_d_vectors()
     if os.environ.get("PIGNUS_SKIP_CHAIN"):
         print("\n(chain tests skipped: PIGNUS_SKIP_CHAIN set)")
     else:
