@@ -407,14 +407,14 @@ class PignusPlatformTest(BitcoinTestFramework):
 
         self.generate(node, self.terms.recover_after - node.getblockcount() + 1)
         funding = [self.fresh(1)]
-        raw = self.spender().recover(vault, funding, self.lender_sec,
-                                     self.wallet_spk())
+        raw = self.spender().recover(vault, funding, self.wallet_spk())
         txid = node.sendrawtransaction(raw)
         self.generate(node, 1)
         assert_equal(node.gettxout(txid, 0)["scriptPubKey"]["hex"],
                      taproot_spk(self.terms.lender_x).hex())
         self.watcher.poll()
         assert_equal(v.state, State.RECOVERED)
+        self.log.info("  and it took no signature: the destination is pinned")
         self.log.info("  watcher: %s", v.state)
 
     def report(self):
