@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
+"""Pignus platform: the whole loan lifecycle, driven through the library.
+
+feature_pignus_vault.py proves the covenant with hand-built transactions. This
+proves the code people will actually run -- `contrib/pignus` -- by playing the
+real story end to end against a node:
+
+  * a lender and a borrower originate a loan in ONE atomic transaction, with no
+    escrow and no moment where either is exposed to the other;
+  * the borrower rebuilds the vault address from the terms and checks it before
+    signing, and the same check REFUSES a loan whose terms have been altered by
+    a single atom -- the one check every non-custodial claim rests on;
+  * the watcher reconciles the vault to the chain and names each exit by reading
+    the leaf script out of the spending witness;
+  * the oracle signs a price, the library refuses to build a liquidation the
+    covenant would reject, and then a real price drop liquidates the position
+    with the surplus going home;
+  * a second loan is repaid, a third is called at maturity, and a fourth is
+    swept by the lender's backstop.
+
+If this passes, the platform works; if only feature_pignus_vault.py passes, only
+the covenant does.
+"""
+
+import os
+import sys
+import time
+from decimal import Decimal
+
+# This test runs on the node's functional-test framework but lives in the Pignus
+# repository, so the node checkout has to be located before test_framework can be
+# imported at all. pignus.compat already knows how to find one (and how to
+# complain usefully when it cannot), so the search is not duplicated here.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), ".."))
+
+from pignus import compat, oracle  # noqa: E402
+
+compat.load_covenant()          # puts <sequentia>/test/functional on sys.path
+
+from test_framework.test_framework import BitcoinTestFramework  # noqa: E402
+from test_framework.util import assert_equal, satoshi_round, BITCOIN_ASSET  # noqa: E402
+from test_framework.key import compute_xonly_pubkey, generate_privkey  # noqa: E402
+from test_framework.messages import COIN, tx_from_hex  # noqa: E402
+from pignus.terms import LoanTerms  # noqa: E402
+from pignus.vault import (  # noqa: E402
+    Outpoint, VaultSpender, build_origination, taproot_spk,
+)
+from pignus.watcher import VaultWatcher, State  # noqa: E402
+
+FEE = 5000
+COLLATERAL = 10 * COIN
+PRINCIPAL = 1450 * COIN
+DEBT = 1500 * COIN
+PRICE_OPEN = 300 * 100_000
+STRIKE = 180 * 100_000
+PRICE_LOW = 170 * 100_000
+PRICE_HIGH = 400 * 100_000
+
+
+class PignusPlatformTest(BitcoinTestFramework):
+
+    def set_test_params(self):
+        self.setup_clean_chain = True
+        self.num_nodes = 1
+        self.extra_args = [[
+            "-initialfreecoins=2100000000000000",
+            "-anyonecanspendaremine=1",
+            "-blindedaddresses=0",
+            "-validatepegin=0",
+            "-con_parent_chain_signblockscript=51",
+            "-con_any_asset_fees=1",
+            "-maxtxfee=100.0",
+            "-txindex=1",
+        ]]
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+
+    def setup_network(self, split=False):
+        self.setup_nodes()
+
+    # --- helpers -----------------------------------------------------------
+
+    def wallet_spk(self):
+        a = self.nodes[0].getnewaddress()
+        u = self.nodes[0].getaddressinfo(a)["unconfidential"]
+        return bytes.fromhex(self.nodes[0].getaddressinfo(u)["scriptPubKey"])
+
+    def fresh(self, amount, asset_display=None):
+        node = self.nodes[0]
+        bech = node.getnewaddress("", "bech32")
+        unconf = node.getaddressinfo(bech)["unconfidential"]
+        kw = dict(address=unconf, amount=amount, fee_asset_label=BITCOIN_ASSET)
+        if asset_display is not None:
+            kw["assetlabel"] = asset_display
+        node.sendtoaddress(**kw)
+        self.generate(node, 1)
+        target = asset_display or BITCOIN_ASSET
+        for u in node.listunspent():
+            if (u["asset"] == target and abs(float(u["amount"]) - amount) < 1e-9
+                    and u["scriptPubKey"].startswith("0014") and u["spendable"]):
+                return Outpoint.from_utxo(u)
+        raise AssertionError("no fresh utxo for %s" % target)
+
+    def terms_for(self, maturity_offset=400, recover_offset=500, **over):
+        node = self.nodes[0]
+        h = node.getblockcount()
+        kw = dict(
+            collateral_asset=self.C, debt_asset=self.D,
+            collateral_amount=COLLATERAL, principal=PRINCIPAL, debt=DEBT,
+            borrower_x=self.borrower_x.hex(), lender_x=self.lender_x.hex(),
+            market="GOLD/USDX", oracle_x=self.oracle_x.hex(), strike=STRIKE,
+            not_before=self.not_before,
+            maturity=h + maturity_offset, recover_after=h + recover_offset,
+            max_price=1_000_000 * 100_000,
+        )
+        kw.update(over)
+        return LoanTerms(**kw)
+
+    def originate(self, terms):
+        """Run a real origination: build, verify as the borrower would, sign,
+        broadcast, confirm. Returns the vault Outpoint."""
+        node = self.nodes[0]
+        collateral = [self.fresh(COLLATERAL // COIN, self.C)]
+        principal = [self.fresh(PRINCIPAL // COIN + 10, self.D)]
+        fee_in = [self.fresh(1)]
+        raw = build_origination(
+            node, terms, collateral, principal,
+            borrower_change_spk=self.wallet_spk(),
+            lender_change_spk=self.wallet_spk(),
+            fee_asset=BITCOIN_ASSET, fee_amount=FEE, fee_inputs=fee_in)
+
+        # The check that makes the whole thing non-custodial: the borrower
+        # rebuilds the address from the terms they agreed and compares.
+        tx = tx_from_hex(raw)
+        terms.verify_funding(bytes(tx.vout[0].scriptPubKey))
+
+        signed = node.signrawtransactionwithwallet(raw)
+        assert signed["complete"], signed
+        txid = node.sendrawtransaction(signed["hex"])
+        self.generate(node, 2)
+        assert_equal(satoshi_round(node.gettxout(txid, 0)["value"]) * COIN,
+                     Decimal(COLLATERAL))
+        return Outpoint(txid, 0, COLLATERAL, self.C)
+
+    def spender(self):
+        return VaultSpender(self.nodes[0], self.terms, BITCOIN_ASSET, FEE)
+
+    # --- the test ----------------------------------------------------------
+
+    def run_test(self):
+        node = self.nodes[0]
+        n = compat.verify_builder()
+        self.log.info("covenant matches %d golden vault vectors -- the library "
+                      "is building the audited artifact", n)
+
+        self.generate(node, 101)
+        node.sendtoaddress(address=node.getnewaddress(), amount=1000000,
+                           fee_asset_label=BITCOIN_ASSET)
+        self.generate(node, 1)
+
+        self.C = node.issueasset(assetamount=100000, tokenamount=0, blind=False,
+                                 fee_asset=BITCOIN_ASSET)["asset"]
+        self.generate(node, 1)
+        self.D = node.issueasset(assetamount=1000000, tokenamount=0, blind=False,
+                                 fee_asset=BITCOIN_ASSET)["asset"]
+        self.generate(node, 1)
+
+        self.borrower_x = compute_xonly_pubkey(generate_privkey())[0]
+        self.lender_sec = generate_privkey()
+        self.lender_x = compute_xonly_pubkey(self.lender_sec)[0]
+        self.oracle_sec = oracle.generate_key()
+        self.oracle_x = oracle.xonly_pubkey(self.oracle_sec)
+        self.not_before = int(time.time()) - 60
+
+        self.watcher = VaultWatcher(node, min_depth=2)
+
+        self.verification_case()
+        self.repay_case()
+        self.liquidate_case()
+        self.default_case()
+        self.recover_case()
+        self.report()
+
+        self.log.info("Pignus platform: origination, verification, watching, "
+                      "attestation and all four exits driven through the library")
+
+    # --- cases -------------------------------------------------------------
+
+    def verification_case(self):
+        """The borrower's check, and what it catches."""
+        self.log.info("verify_funding: the check every claim rests on")
+        t = self.terms_for()
+        spk = t.script_pubkey()
+        t.verify_funding(spk)      # the honest case
+
+        # One atom more debt is a different loan and therefore a different
+        # address. A book, a counterparty or a compromised UI that misstates a
+        # term by any amount is caught here, before anything is signed.
+        for label, altered in [
+            ("debt +1 atom", self.terms_for(debt=DEBT + 1)),
+            ("strike raised", self.terms_for(strike=STRIKE * 2)),
+            ("lender swapped", self.terms_for(
+                lender_x=compute_xonly_pubkey(generate_privkey())[0].hex())),
+            ("oracle swapped", self.terms_for(
+                oracle_x=oracle.xonly_pubkey(oracle.generate_key()).hex())),
+            ("market swapped", self.terms_for(market="SILVR/USDX")),
+        ]:
+            try:
+                altered.verify_funding(spk)
+                raise AssertionError(f"verify_funding accepted {label}")
+            except ValueError as e:
+                assert "does NOT match" in str(e), e
+            self.log.info("  refused: %s", label)
+
+        # Sanity warnings are surfaced, not swallowed.
+        risky = self.terms_for(recover_offset=410, not_before=0)
+        warns = risky.sanity_check()
+        assert any("RECOVER opens only" in w for w in warns), warns
+        assert any("not_before is 0" in w for w in warns), warns
+        self.log.info("  sanity_check flagged %d bad-idea terms", len(warns))
+
+    def repay_case(self):
+        node = self.nodes[0]
+        self.log.info("PASS: originate then REPAY, through the library")
+        self.terms = self.terms_for()
+        vault = self.originate(self.terms)
+        v = self.watcher.track(self.terms.loan_id(), self.terms, vault.txid, vault.vout)
+        self.watcher.poll()
+        assert_equal(v.state, State.LIVE)
+        self.log.info("  watcher: %s at %d confirmations", v.state, v.confirmations)
+
+        funding = [self.fresh(DEBT // COIN + 10, self.D), self.fresh(1)]
+        raw = self.spender().repay(vault, funding, self.wallet_spk())
+        txid = node.sendrawtransaction(raw)
+        self.generate(node, 1)
+        assert_equal(node.gettxout(txid, 0)["scriptPubKey"]["hex"],
+                     taproot_spk(self.terms.lender_x).hex())
+        assert_equal(satoshi_round(node.gettxout(txid, 1)["value"]) * COIN,
+                     Decimal(COLLATERAL))
+        self.watcher.poll()
+        assert_equal(v.state, State.REPAID)
+        self.log.info("  watcher named the exit from the witness leaf: %s", v.state)
+
+    def liquidate_case(self):
+        node = self.nodes[0]
+        self.log.info("PASS: oracle attests a dip, the position is liquidated")
+        self.terms = self.terms_for()
+        vault = self.originate(self.terms)
+        v = self.watcher.track(self.terms.loan_id(), self.terms, vault.txid, vault.vout)
+        self.watcher.poll()
+        assert_equal(v.state, State.LIVE)
+
+        # A healthy price: the library refuses to build a liquidation the
+        # covenant would reject, rather than letting the caller pay to find out.
+        healthy = oracle.sign(self.oracle_sec, "GOLD/USDX", PRICE_OPEN, 100_000)
+        assert oracle.verify(self.oracle_x, healthy)
+        assert not self.watcher.liquidatable({"GOLD/USDX": PRICE_OPEN})
+        try:
+            self.spender().liquidate(vault, [], healthy, self.wallet_spk())
+            raise AssertionError("built a liquidation at a healthy price")
+        except ValueError as e:
+            assert "not liquidatable" in str(e), e
+        self.log.info("  refused to liquidate at %d (strike %d): %s",
+                      PRICE_OPEN, STRIKE, "not liquidatable")
+
+        # A stale attestation is refused for the same reason, by the same layer.
+        stale = oracle.sign(self.oracle_sec, "GOLD/USDX", PRICE_LOW, 100_000,
+                            timestamp=self.not_before - 10)
+        try:
+            self.spender().liquidate(vault, [], stale, self.wallet_spk())
+            raise AssertionError("built a liquidation on a stale attestation")
+        except ValueError as e:
+            assert "predates" in str(e), e
+        self.log.info("  refused a pre-origination attestation")
+
+        # Now a real dip.
+        dip = oracle.sign(self.oracle_sec, "GOLD/USDX", PRICE_LOW, 100_000)
+        assert oracle.verify(self.oracle_x, dip)
+        hits = self.watcher.liquidatable({"GOLD/USDX": PRICE_LOW})
+        assert_equal(len(hits), 1)
+        seize = self.terms.seizure_at(PRICE_LOW)
+        surplus = self.terms.surplus_at(PRICE_LOW)
+        self.log.info("  health %.3f -> liquidatable; seize %d, surplus %d",
+                      self.terms.health(PRICE_LOW), seize, surplus)
+
+        funding = [self.fresh(DEBT // COIN + 10, self.D), self.fresh(1)]
+        taker = self.wallet_spk()
+        raw = self.spender().liquidate(vault, funding, dip, taker)
+        txid = node.sendrawtransaction(raw)
+        self.generate(node, 1)
+        assert_equal(satoshi_round(node.gettxout(txid, 0)["value"]) * COIN,
+                     Decimal(DEBT))
+        assert_equal(node.gettxout(txid, 1)["scriptPubKey"]["hex"],
+                     taproot_spk(self.terms.borrower_x).hex())
+        assert_equal(satoshi_round(node.gettxout(txid, 1)["value"]) * COIN,
+                     Decimal(surplus))
+        assert_equal(satoshi_round(node.gettxout(txid, 2)["value"]) * COIN,
+                     Decimal(seize))
+        self.watcher.poll()
+        assert_equal(v.state, State.LIQUIDATED)
+        self.log.info("  lender made whole, borrower kept the surplus, watcher: %s",
+                      v.state)
+
+    def default_case(self):
+        node = self.nodes[0]
+        self.log.info("PASS: the loan is called at maturity, at a price ABOVE "
+                      "the strike")
+        self.terms = self.terms_for(maturity_offset=6, recover_offset=200)
+        vault = self.originate(self.terms)
+        v = self.watcher.track(self.terms.loan_id(), self.terms, vault.txid, vault.vout)
+        self.watcher.poll()
+        assert_equal(v.state, State.LIVE)
+
+        self.generate(node, self.terms.maturity - node.getblockcount() + 1)
+        due = self.watcher.due(node.getblockcount())
+        assert v in due, "watcher did not report the loan as due"
+        self.log.info("  watcher reports %d loan(s) due at height %d",
+                      len(due), node.getblockcount())
+
+        att = oracle.sign(self.oracle_sec, "GOLD/USDX", PRICE_HIGH, 100_000)
+        seize = self.terms.seizure_at(PRICE_HIGH)
+        funding = [self.fresh(DEBT // COIN + 10, self.D), self.fresh(1)]
+        raw = self.spender().call_default(vault, funding, att, self.wallet_spk())
+        txid = node.sendrawtransaction(raw)
+        self.generate(node, 1)
+        assert_equal(satoshi_round(node.gettxout(txid, 1)["value"]) * COIN,
+                     Decimal(COLLATERAL - seize))
+        self.watcher.poll()
+        assert_equal(v.state, State.DEFAULTED)
+        self.log.info("  called at %d: borrower kept %d atoms, watcher: %s",
+                      PRICE_HIGH, COLLATERAL - seize, v.state)
+
+    def recover_case(self):
+        node = self.nodes[0]
+        self.log.info("PASS: the lender's oracle-liveness backstop")
+        h = node.getblockcount()
+        self.terms = self.terms_for(maturity_offset=3, recover_offset=8)
+        vault = self.originate(self.terms)
+        v = self.watcher.track(self.terms.loan_id(), self.terms, vault.txid, vault.vout)
+        self.watcher.poll()
+
+        self.generate(node, self.terms.recover_after - node.getblockcount() + 1)
+        funding = [self.fresh(1)]
+        raw = self.spender().recover(vault, funding, self.lender_sec,
+                                     self.wallet_spk())
+        txid = node.sendrawtransaction(raw)
+        self.generate(node, 1)
+        assert_equal(node.gettxout(txid, 0)["scriptPubKey"]["hex"],
+                     taproot_spk(self.terms.lender_x).hex())
+        self.watcher.poll()
+        assert_equal(v.state, State.RECOVERED)
+        self.log.info("  watcher: %s", v.state)
+
+    def report(self):
+        by_state = {}
+        for v in self.watcher.vaults.values():
+            by_state[v.state.value] = by_state.get(v.state.value, 0) + 1
+        self.log.info("watcher final ledger: %s", by_state)
+        assert_equal(by_state, {"REPAID": 1, "LIQUIDATED": 1,
+                                "DEFAULTED": 1, "RECOVERED": 1})
+
+
+if __name__ == "__main__":
+    PignusPlatformTest().main()
