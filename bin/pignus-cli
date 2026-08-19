@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
+"""Pignus command line: propose loans, and check the ones you are offered.
+
+The command that matters is `verify`. Everything Pignus claims about being
+non-custodial reduces to one check -- rebuild the vault address from the terms
+you agreed and confirm it is the address being funded -- and this is where a
+person can run it themselves, without trusting a wallet, a book or a
+counterparty's description of the deal.
+
+    pignus-cli selftest
+    pignus-cli quote     --market GOLD/USDX --collateral-ref 3000 --debt-ref 1
+    pignus-cli propose   --collateral-asset <id> --debt-asset <id> ... > loan.json
+    pignus-cli show      --terms loan.json --price 30000000
+    pignus-cli address   --terms loan.json
+    pignus-cli verify    --terms loan.json --txid <funding> --vout 0
+    pignus-cli status    --terms loan.json --txid <funding> --vout 0
+    pignus-cli check-attestation --oracle-x <hex> --attestation att.json
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+
+from pignus import compat, oracle as O          # noqa: E402
+from pignus.node import Node                    # noqa: E402
+from pignus.terms import LoanTerms, feed_id     # noqa: E402
+from pignus.watcher import VaultWatcher         # noqa: E402
+
+
+def read_terms(path):
+    with open(path) as f:
+        return LoanTerms.from_json(f.read())
+
+
+def node_from(args):
+    return Node(url=args.rpc, user=args.rpc_user, password=args.rpc_password,
+                wallet=args.rpc_wallet, cookie_path=args.rpc_cookie)
+
+
+def add_node_args(p):
+    p.add_argument("--rpc", default="http://127.0.0.1:18443")
+    p.add_argument("--rpc-user")
+    p.add_argument("--rpc-password")
+    p.add_argument("--rpc-wallet")
+    p.add_argument("--rpc-cookie")
+
+
+# --------------------------------------------------------------- commands
+
+def cmd_selftest(args):
+    n = compat.verify_builder()
+    print(f"covenant builder matches all {n} golden vault vectors")
+    sec = O.generate_key()
+    x = O.xonly_pubkey(sec)
+    att = O.sign(sec, "GOLD/USDX", 300 * 100_000, 100_000)
+    assert O.verify(x, att), "self-signed attestation failed to verify"
+    print("oracle sign/verify round-trip ok (48-byte BIP340 message)")
+    return 0
+
+
+def cmd_quote(args):
+    price = O.quote_price(args.collateral_ref, args.debt_ref,
+                          args.collateral_precision, args.debt_precision,
+                          args.price_scale)
+    back = O.unquote_price(price, args.collateral_precision,
+                           args.debt_precision, args.price_scale)
+    c, d = [p.strip().upper() for p in args.market.split("/")]
+    print(json.dumps({
+        "market": args.market.upper(),
+        "feed_id": feed_id(args.market).hex(),
+        "price": price,
+        "price_scale": args.price_scale,
+        "reads_as": f"1 {c} = {back:,.8f} {d}",
+        "strike_at_ltv": {
+            f"{int(ltv*100)}%": round(price * ltv)
+            for ltv in (0.5, 0.6, 0.7, 0.8)},
+    }, indent=2))
+    return 0
+
+
+def cmd_propose(args):
+    t = LoanTerms(
+        collateral_asset=args.collateral_asset, debt_asset=args.debt_asset,
+        collateral_amount=args.collateral_amount, principal=args.principal,
+        debt=args.debt, borrower_x=args.borrower_x, lender_x=args.lender_x,
+        market=args.market, oracle_x=args.oracle_x, strike=args.strike,
+        not_before=args.not_before, maturity=args.maturity,
+        recover_after=args.recover_after, bonus_num=args.bonus_num,
+        bonus_den=args.bonus_den, price_scale=args.price_scale,
+        max_price=args.max_price, memo=args.memo or "")
+    warnings = t.sanity_check()
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    print(t.to_json())
+    return 0
+
+
+def cmd_show(args):
+    t = read_terms(args.terms)
+    print(t.describe(args.price))
+    print(f"  vault address (scriptPubKey) {t.script_pubkey().hex()}")
+    return 0
+
+
+def cmd_address(args):
+    print(read_terms(args.terms).script_pubkey().hex())
+    return 0
+
+
+def cmd_verify(args):
+    """The check. Prints what it compared, so a person can see it was done."""
+    t = read_terms(args.terms)
+    if args.spk:
+        funded = args.spk
+    else:
+        node = node_from(args)
+        tx = node.getrawtransaction(args.txid, True)
+        funded = tx["vout"][args.vout]["scriptPubKey"]["hex"]
+    try:
+        t.verify_funding(funded)
+    except ValueError as e:
+        print(f"REFUSED\n{e}", file=sys.stderr)
+        return 2
+    print("OK: the funded output is exactly what these terms compile to")
+    print(f"  terms      {t.loan_id()}")
+    print(f"  scriptPubKey {funded}")
+    print("  internal key is NUMS: there is no key path, so the four leaves are")
+    print("  the only ways this collateral can move.")
+    for w in t.sanity_check():
+        print(f"  ! {w}")
+    return 0
+
+
+def cmd_status(args):
+    t = read_terms(args.terms)
+    node = node_from(args)
+    w = VaultWatcher(node, min_depth=args.min_depth)
+    v = w.track(t.loan_id(), t, args.txid, args.vout)
+    w.poll()
+    out = v.to_dict()
+    if args.price is not None:
+        out["price"] = args.price
+        out["health"] = round(t.health(args.price), 4)
+        out["ltv"] = round(t.ltv(args.price), 4)
+        out["liquidatable"] = t.is_liquidatable(args.price)
+        out["seizure_if_liquidated"] = t.seizure_at(args.price)
+        out["surplus_if_liquidated"] = t.surplus_at(args.price)
+    out["height"] = node.getblockcount()
+    out["past_maturity"] = out["height"] >= t.maturity
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cmd_check_attestation(args):
+    with open(args.attestation) as f:
+        att = O.Attestation.from_dict(json.load(f))
+    ok = O.verify(args.oracle_x, att)
+    print(json.dumps({
+        "valid": ok,
+        "market": att.market,
+        "feed_id": att.feed_id,
+        "feed_matches_market": feed_id(att.market).hex() == att.feed_id,
+        "price": att.price,
+        "timestamp": att.timestamp,
+        "message": att.message().hex(),
+    }, indent=2))
+    return 0 if ok else 2
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="pignus-cli", description=__doc__.split("\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("selftest").set_defaults(fn=cmd_selftest)
+
+    p = sub.add_parser("quote", help="reference prices -> the covenant's integer price")
+    p.add_argument("--market", required=True)
+    p.add_argument("--collateral-ref", type=float, required=True)
+    p.add_argument("--debt-ref", type=float, required=True)
+    p.add_argument("--collateral-precision", type=int, default=8)
+    p.add_argument("--debt-precision", type=int, default=8)
+    p.add_argument("--price-scale", type=int, default=100_000)
+    p.set_defaults(fn=cmd_quote)
+
+    p = sub.add_parser("propose", help="write a loan terms document")
+    for name in ("collateral-asset", "debt-asset", "borrower-x", "lender-x",
+                 "oracle-x", "market"):
+        p.add_argument("--" + name, required=True)
+    for name, default in (("collateral-amount", None), ("principal", None),
+                          ("debt", None), ("strike", None), ("maturity", None),
+                          ("recover-after", None), ("not-before", 0),
+                          ("bonus-num", 105), ("bonus-den", 100),
+                          ("price-scale", 100_000), ("max-price", 0)):
+        p.add_argument("--" + name, type=int, default=default,
+                       required=default is None)
+    p.add_argument("--memo", default="")
+    p.set_defaults(fn=cmd_propose)
+
+    p = sub.add_parser("show", help="describe a loan, optionally at a price")
+    p.add_argument("--terms", required=True)
+    p.add_argument("--price", type=int)
+    p.set_defaults(fn=cmd_show)
+
+    p = sub.add_parser("address", help="the vault scriptPubKey these terms compile to")
+    p.add_argument("--terms", required=True)
+    p.set_defaults(fn=cmd_address)
+
+    p = sub.add_parser("verify", help="THE check: do these terms match the funded vault")
+    p.add_argument("--terms", required=True)
+    p.add_argument("--spk", help="the funded scriptPubKey, if you have it directly")
+    p.add_argument("--txid")
+    p.add_argument("--vout", type=int, default=0)
+    add_node_args(p)
+    p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("status", help="reconcile a loan against the chain")
+    p.add_argument("--terms", required=True)
+    p.add_argument("--txid", required=True)
+    p.add_argument("--vout", type=int, default=0)
+    p.add_argument("--price", type=int)
+    p.add_argument("--min-depth", type=int, default=2)
+    add_node_args(p)
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("check-attestation", help="verify a signed price")
+    p.add_argument("--oracle-x", required=True)
+    p.add_argument("--attestation", required=True)
+    p.set_defaults(fn=cmd_check_attestation)
+
+    args = ap.parse_args()
+    if args.cmd == "verify" and not args.spk and not args.txid:
+        ap.error("verify needs --spk or --txid")
+    try:
+        return args.fn(args)
+    except compat.CovenantUnavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

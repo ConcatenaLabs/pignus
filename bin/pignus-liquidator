@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
+"""A liquidator bot: watch loans, and close the ones that cross.
+
+Nothing here is privileged. The covenant does not know or care which liquidator
+wins, every racer must pay the lender in full and return the borrower's surplus,
+and the bonus is what prices the race. So this is one participant among however
+many choose to run one -- which is the point, because a lending platform whose
+liquidations depend on the operator's bot is a platform with an operator.
+
+    pignus-liquidator --loans loans.json --oracle http://127.0.0.1:8730 \
+        --rpc-wallet liquidator --taker-address <addr> [--dry-run]
+
+`loans.json` is a list of {"terms": {...}, "txid": "...", "vout": 0}. In a
+deployment the loan book feeds this; for a drill, write it by hand.
+
+--dry-run reports what it would do and touches nothing, which is how this should
+be run first against any real book.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+
+from pignus import oracle as O                       # noqa: E402
+from pignus.node import Node, RpcError               # noqa: E402
+from pignus.terms import LoanTerms                   # noqa: E402
+from pignus.vault import Outpoint, VaultSpender      # noqa: E402
+from pignus.watcher import VaultWatcher, State       # noqa: E402
+
+COIN = 100_000_000
+
+
+def fetch_attestation(base, market):
+    url = f"{base.rstrip('/')}/v1/attestation/{market.replace('/', '_')}"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return O.Attestation.from_dict(json.loads(r.read().decode()))
+
+
+def fetch_oracle_key(base):
+    with urllib.request.urlopen(f"{base.rstrip('/')}/v1/pubkey", timeout=10) as r:
+        return json.loads(r.read().decode())["oracle_x"]
+
+
+def select_funding(node, asset, need, fee_asset, fee_amount):
+    """Pick wallet utxos covering the debt and the fee.
+
+    Deliberately simple and deliberately explicit about failure: a liquidator
+    that silently under-funds produces a transaction the node rejects, and the
+    reason it gives says nothing about which asset was short.
+    """
+    chosen, totals = [], {}
+    want = {asset: need, fee_asset: fee_amount}
+    for u in node.listunspent():
+        if not u.get("spendable"):
+            continue
+        a = u["asset"]
+        if a not in want or totals.get(a, 0) >= want[a]:
+            continue
+        chosen.append(Outpoint.from_utxo(u))
+        totals[a] = totals.get(a, 0) + int(round(float(u["amount"]) * COIN))
+    short = {a: want[a] - totals.get(a, 0) for a in want if totals.get(a, 0) < want[a]}
+    if short:
+        raise RuntimeError(f"wallet cannot fund the liquidation, short: {short}")
+    return chosen
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__)
+    ap.add_argument("--loans", required=True)
+    ap.add_argument("--oracle", required=True)
+    ap.add_argument("--rpc", default="http://127.0.0.1:18443")
+    ap.add_argument("--rpc-user")
+    ap.add_argument("--rpc-password")
+    ap.add_argument("--rpc-wallet")
+    ap.add_argument("--rpc-cookie")
+    ap.add_argument("--taker-spk", help="hex scriptPubKey to receive seized collateral")
+    ap.add_argument("--taker-address", help="address to receive seized collateral")
+    ap.add_argument("--fee-asset", required=True)
+    ap.add_argument("--fee-amount", type=int, default=5000)
+    ap.add_argument("--interval", type=float, default=30.0)
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--call-due", action="store_true",
+                    help="also call loans past maturity via DEFAULT")
+    args = ap.parse_args()
+
+    node = Node(url=args.rpc, user=args.rpc_user, password=args.rpc_password,
+                wallet=args.rpc_wallet, cookie_path=args.rpc_cookie)
+    if args.taker_spk:
+        taker_spk = bytes.fromhex(args.taker_spk)
+    elif args.taker_address:
+        info = node.getaddressinfo(args.taker_address)
+        unconf = info.get("unconfidential", args.taker_address)
+        taker_spk = bytes.fromhex(node.getaddressinfo(unconf)["scriptPubKey"])
+    else:
+        ap.error("need --taker-spk or --taker-address")
+
+    oracle_x = fetch_oracle_key(args.oracle)
+    with open(args.loans) as f:
+        entries = json.load(f)
+
+    watcher = VaultWatcher(node)
+    loans = {}
+    for e in entries:
+        t = LoanTerms.from_json(e["terms"])
+        watcher.track(t.loan_id(), t, e["txid"], int(e.get("vout", 0)))
+        loans[t.loan_id()] = (t, Outpoint(e["txid"], int(e.get("vout", 0)),
+                                          t.collateral_amount, t.collateral_asset))
+    print(f"watching {len(loans)} loan(s); oracle key {oracle_x}", file=sys.stderr)
+
+    while True:
+        watcher.poll()
+        prices, attestations = {}, {}
+        for market in {t.market for t, _ in loans.values()}:
+            try:
+                att = fetch_attestation(args.oracle, market)
+            except Exception as e:               # noqa: BLE001
+                print(f"oracle: {market}: {type(e).__name__}: {e}", file=sys.stderr)
+                continue
+            # Never act on a price this bot has not verified itself. The oracle
+            # is trusted for the number, not for the transport that carried it.
+            if not O.verify(oracle_x, att):
+                print(f"oracle: {market}: attestation FAILED verification, "
+                      "ignoring", file=sys.stderr)
+                continue
+            prices[market] = att.price
+            attestations[market] = att
+
+        targets = [(v, prices[v.terms.market], attestations[v.terms.market],
+                    "liquidate")
+                   for v, _p in watcher.liquidatable(prices)]
+        if args.call_due:
+            height = node.getblockcount()
+            for v in watcher.due(height):
+                if v.terms.market in attestations and not any(
+                        t[0] is v for t in targets):
+                    targets.append((v, prices[v.terms.market],
+                                    attestations[v.terms.market], "default"))
+
+        for v, price, att, kind in targets:
+            t = v.terms
+            seize, surplus = t.seizure_at(price), t.surplus_at(price)
+            print(f"{kind}: {t.loan_id()[:16]} {t.market} price={price} "
+                  f"health={t.health(price):.3f} seize={seize} surplus={surplus}",
+                  file=sys.stderr)
+            if args.dry_run:
+                continue
+            try:
+                spender = VaultSpender(node, t, args.fee_asset, args.fee_amount)
+                funding = select_funding(node, t.debt_asset, t.debt,
+                                         args.fee_asset, args.fee_amount)
+                _, outpoint = loans[t.loan_id()]
+                if kind == "liquidate":
+                    raw = spender.liquidate(outpoint, funding, att, taker_spk)
+                else:
+                    raw = spender.call_default(outpoint, funding, att, taker_spk)
+                txid = node.sendrawtransaction(raw)
+                print(f"  broadcast {txid}", file=sys.stderr)
+            except (RpcError, RuntimeError, ValueError) as e:
+                # Losing a race is normal and is not an error worth stopping for:
+                # another liquidator got there first and the borrower and lender
+                # are no worse off for it.
+                print(f"  skipped: {type(e).__name__}: {e}", file=sys.stderr)
+
+        for v in watcher.vaults.values():
+            if v.state not in (State.LIVE, State.UNCONFIRMED):
+                loans.pop(v.loan_id, None)
+
+        if args.once:
+            return 0
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
