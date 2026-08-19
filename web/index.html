@@ -146,6 +146,11 @@ const num = n => n == null ? '&mdash;' : Number(n).toLocaleString();
 const atoms = n => n == null ? '&mdash;' : (Number(n) / 1e8).toLocaleString(
   undefined, {maximumFractionDigits: 8});
 
+// Paths are RELATIVE, with no leading slash. The page is served both at the
+// domain root during development and behind a stripped /lending/ prefix in
+// production, and an absolute '/v1/...' would escape that prefix and 404. This
+// does mean the page must be reached with a trailing slash; the reverse proxy
+// redirects /lending to /lending/ for exactly that reason.
 async function get(p) {
   const r = await fetch(p, {headers: {accept: 'application/json'}});
   if (!r.ok) throw new Error(p + ' -> ' + r.status);
@@ -168,7 +173,7 @@ const STATE = {LIVE: 'ok', REPAID: 'dim', LIQUIDATED: 'warn', DEFAULTED: 'warn',
 
 async function markets() {
   try {
-    const d = await get('/v1/markets');
+    const d = await get('v1/markets');
     if (!d.markets.length) { $('#markets').innerHTML =
       '<div class="empty">no markets configured</div>'; return; }
     $('#markets').innerHTML = d.markets.map(m => {
@@ -187,7 +192,7 @@ async function markets() {
 }
 
 async function offers() {
-  const d = await get('/v1/offers');
+  const d = await get('v1/offers');
   $('#offern').textContent = d.offers.length ? `${d.offers.length} open` : '';
   const b = $('#offers').querySelector('tbody');
   if (!d.offers.length) {
@@ -208,7 +213,7 @@ async function offers() {
 }
 
 async function loans() {
-  const d = await get('/v1/loans');
+  const d = await get('v1/loans');
   $('#loann').textContent = d.loans.length ? `${d.loans.length} known` : '';
   const b = $('#loans').querySelector('tbody');
   if (!d.loans.length) {
@@ -228,7 +233,7 @@ async function loans() {
 
 async function health() {
   try {
-    const h = await get('/healthz');
+    const h = await get('healthz');
     const age = h.last_poll ? Math.max(0, Math.floor(Date.now() / 1000) - h.last_poll) : null;
     $('#health').innerHTML = h.error
       ? `<span class="tag bad">degraded</span> ${esc(h.error)}`
