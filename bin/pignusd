@@ -54,11 +54,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 from pignus import oracle as O                     # noqa: E402
 from pignus.book import Book                       # noqa: E402
 from pignus.node import Node, RpcError             # noqa: E402
+from pignus.offers import (                        # noqa: E402
+    NotOnChain, check_outpoint, offer_address, offer_vault_address,
+)
 from pignus.terms import LoanTerms, feed_id        # noqa: E402
 from pignus.watcher import VaultWatcher, State     # noqa: E402
 
 WEB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "web")
 MAX_BODY = 256 * 1024
+# A book anyone can write to is a book anyone can flood. These are generous for
+# a testnet and small enough that the whole file stays cheap to rewrite.
+MAX_OFFERS = 2000
+MAX_LOANS = 5000
 
 
 class Service:
@@ -138,6 +145,54 @@ class Service:
             self.last_poll = int(time.time())
             time.sleep(max(2.0, interval - (time.time() - started)))
 
+    # ----------------------------------------------------------- verification
+
+    def verify_offer(self, body):
+        """Refuse to publish an offer that is not actually funded where it says.
+
+        The site checks an offer for itself before composing anything against
+        it, so this is not what stands between a borrower and a loss. It is what
+        stands between a borrower and a screen full of plausible fiction: an
+        unchecked book can be filled with offers that do not exist, and every
+        one of them wastes somebody's attention.
+        """
+        terms = LoanTerms.from_json(body["terms"])
+        if body.get("kind") != "funded":
+            return
+        outpoint = str(body.get("outpoint") or "")
+        if ":" not in outpoint:
+            raise ValueError("a funded offer must name outpoint 'txid:vout'")
+        txid, _, vout = outpoint.rpartition(":")
+        if not self.node:
+            raise NotOnChain(
+                "this book has no node, so it cannot check that a funded offer "
+                "is real, and it will not publish one it cannot check")
+        want = offer_address(terms, terms.principal, terms.collateral_amount,
+                             int(body.get("expiry_locktime") or terms.maturity))
+        got = check_outpoint(self.node, txid, vout, want, "offer")
+        if got["asset"] and got["asset"] != terms.debt_asset:
+            raise NotOnChain(
+                f"that outpoint holds {got['asset'][:16]}…, not the debt asset "
+                f"{terms.debt_asset[:16]}…")
+        if got["value"] < terms.principal:
+            raise NotOnChain(
+                f"that outpoint holds {got['value']} atoms, less than one "
+                f"principal of {terms.principal}")
+        body["funded_value"] = str(got["value"])
+        body["confirmations"] = got["confirmations"]
+
+    def verify_loan(self, body):
+        """Refuse to track a loan whose outpoint is not the vault its terms
+        compile to. Same reason as above, and the same cheap check."""
+        terms = LoanTerms.from_json(body["terms"])
+        if not self.node:
+            raise NotOnChain(
+                "this book has no node, so it cannot check that a loan is real")
+        single = bool(body.get("single_leaf"))
+        want = (offer_vault_address(terms) if single
+                else terms.script_pubkey())
+        check_outpoint(self.node, body["txid"], body["vout"], want, "loan")
+
     # -------------------------------------------------------------- rendering
 
     def market_rows(self):
@@ -167,7 +222,13 @@ class Service:
         out["strike"] = t.strike
         out["maturity"] = t.maturity
         out["oracle"] = f"{t.threshold}-of-{len(t.oracle_keys)}"
-        out["vault_address"] = t.script_pubkey().hex()
+        # A loan originated through a funded offer lives in the SINGLE-LEAF
+        # vault; the browser needs to know which, because the two have
+        # different addresses and different witnesses.
+        single = bool(rec.get("single_leaf"))
+        out["single_leaf"] = single
+        out["vault_address"] = (offer_vault_address(t) if single
+                                else t.script_pubkey()).hex()
         if price is not None:
             out["price"] = price
             out["health"] = round(t.health(price), 4)
@@ -321,13 +382,22 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._body()
             if path == "/v1/offers":
+                if len(s.book.offers) >= MAX_OFFERS:
+                    return self._send(429, {"error": "the book is full"})
+                s.verify_offer(body)
                 return self._send(200, s.book.put_offer(body))
             if path == "/v1/loans":
+                if len(s.book.loans) >= MAX_LOANS:
+                    return self._send(429, {"error": "the book is full"})
+                s.verify_loan(body)
                 rec = s.book.put_loan(body["terms"], body["txid"], body["vout"],
-                                      state=body.get("state", "UNCONFIRMED"))
+                                      state=body.get("state", "UNCONFIRMED"),
+                                      single_leaf=bool(body.get("single_leaf")))
                 s.refresh_chain()
                 return self._send(200, s.book.loans.get(rec["loan_id"], rec))
             return self._send(404, {"error": "no such endpoint", "path": path})
+        except NotOnChain as e:
+            return self._send(400, {"error": str(e)})
         except (KeyError, ValueError, TypeError) as e:
             return self._send(400, {"error": f"{type(e).__name__}: {e}"})
         except Exception as e:                      # noqa: BLE001
