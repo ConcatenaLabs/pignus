@@ -25,7 +25,7 @@ mkdir -p /root/sequentia/pignus-data
 
 # the node source the covenant is imported from (NOT the committee run
 # directory; nothing here needs the running nodes)
-cd /root/sequentia/SequentiaByClaude && git fetch origin && git checkout master \
+cd /root/sequentia/Sequentia && git fetch origin && git checkout master \
   && git pull --ff-only
 
 cp /root/sequentia/pignus/deploy/*.service /etc/systemd/system/
@@ -84,7 +84,7 @@ loudly at start rather than quietly producing wrong addresses.
 curl -s localhost:8740/healthz
 curl -s localhost:8741/healthz
 curl -s localhost:8741/v1/markets | head -40
-SEQUENTIA_SRC=/root/sequentia/SequentiaByClaude \
+SEQUENTIA_SRC=/root/sequentia/Sequentia \
   /root/sequentia/pignus/tests/cli_drill.sh
 ```
 

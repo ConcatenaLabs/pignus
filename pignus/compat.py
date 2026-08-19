@@ -49,9 +49,8 @@ def _candidate_dirs():
         # may differ from the one the operator meant to use.
         yield Path(env) / "test" / "functional"
         return
-    for name in ("Sequentia", "SequentiaByClaude"):
-        yield _REPO_ROOT.parent / name / "test" / "functional"
-        yield Path.home() / name / "test" / "functional"
+    yield _REPO_ROOT.parent / "Sequentia" / "test" / "functional"
+    yield Path.home() / "Sequentia" / "test" / "functional"
     # Vendored, for a deployment that would rather not carry a second checkout.
     yield _REPO_ROOT / "vendor" / "sequentia" / "test" / "functional"
 
