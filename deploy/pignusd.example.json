@@ -1,0 +1,16 @@
+{
+  "listen": "127.0.0.1:8741",
+  "book": "/root/sequentia/pignus-data/book.json",
+  "oracle": "http://127.0.0.1:8740",
+  "markets": ["GOLD/USDX", "SILVR/USDX", "OILX/USDX", "SEQ/USDX",
+              "EURX/USDX", "BTC/USDX"],
+  "poll": 30,
+  "_rpc_note": "Optional. Without it the book still serves offers and whatever it last knew, and says so in /healthz rather than presenting stale states as fresh. Fill in ONE of cookie or user/password.",
+  "rpc": {
+    "url": "http://127.0.0.1:18200",
+    "cookie": "",
+    "user": "",
+    "password": "",
+    "wallet": ""
+  }
+}

@@ -1,0 +1,25 @@
+[Unit]
+Description=Pignus price oracle (Sequentia testnet)
+Documentation=https://github.com/GracedEternalKingCabbageMan/pignus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/sequentia/pignus
+Environment=SEQUENTIA_SRC=/root/sequentia/SequentiaByClaude
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignus-oracle --config /root/sequentia/pignus-oracle.json
+Restart=always
+RestartSec=5
+# The oracle key is the whole of this service's authority: keep anything it
+# creates unreadable to other users, and keep the process away from what it does
+# not need.
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
