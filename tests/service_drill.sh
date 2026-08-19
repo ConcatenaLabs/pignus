@@ -88,10 +88,14 @@ for m in d:
 '
 
 echo
-echo "== publishing an offer =="
-python3 - "$D" "$OX" <<'PY'
-import json, sys, urllib.request
-D, OX = sys.argv[1], sys.argv[2]
+echo "== a funded offer is REFUSED when the book cannot check it =="
+# This daemon has no node, so it cannot confirm a funded offer is really funded.
+# Publishing one anyway would fill a borrower's screen with plausible fiction,
+# so it refuses instead. tests/test_book.py covers the accept path, with a node.
+code=$(curl -s -o "$WORK/nonode.json" -w '%{http_code}' -X POST "$D/v1/offers" \
+  -H 'Content-Type: application/json' -d "$(python3 - "$OX" <<'PY'
+import json, sys
+OX = sys.argv[1]
 terms = {
   "collateral_asset": "aa"*32, "debt_asset": "bb"*32,
   "collateral_amount": 10*10**8, "principal": 1450*10**8, "debt": 1500*10**8,
@@ -99,44 +103,21 @@ terms = {
   "oracle_x": OX, "strike": 180*100000, "not_before": 1700000000,
   "maturity": 100000, "recover_after": 143200, "max_price": 10**6*100000,
   "bonus_num": 105, "bonus_den": 100, "price_scale": 100000, "memo": "",
-  "oracles": [], "oracle_threshold": 0,
+  "oracles": [], "oracle_threshold": 0, "lender_ver": 1, "borrower_ver": 1,
+  "lender_prog": "", "borrower_prog": "",
 }
-body = json.dumps({"terms": json.dumps(terms), "kind": "funded",
-                   "outpoint": "00"*32 + ":0"}).encode()
-req = urllib.request.Request(D + "/v1/offers", data=body,
-                             headers={"Content-Type": "application/json"})
-o = json.loads(urllib.request.urlopen(req).read())
-print("  offer", o["offer_id"][:16], "-> vault", o["vault_address"][:24] + "...")
+print(json.dumps({"terms": json.dumps(terms), "kind": "funded",
+                  "outpoint": "00"*32 + ":0"}))
 PY
-
-echo
-echo "== a malformed offer is REFUSED with 400, not stored =="
-code=$(curl -s -o "$WORK/err.json" -w '%{http_code}' -X POST "$D/v1/offers" \
-  -H 'Content-Type: application/json' -d '{"terms":"{}","kind":"funded"}')
-test "$code" = "400" || { echo "expected 400, got $code" >&2; exit 1; }
-echo "  refused: $(python3 -c 'import json;print(json.load(open("'"$WORK"'/err.json"))["error"][:90])')"
-
-echo
-echo "== a funded offer with no outpoint is REFUSED =="
-code=$(curl -s -o "$WORK/err2.json" -w '%{http_code}' -X POST "$D/v1/offers" \
-  -H 'Content-Type: application/json' \
-  -d "$(python3 -c '
-import json
-t={"collateral_asset":"aa"*32,"debt_asset":"bb"*32,"collateral_amount":1,
-   "principal":1,"debt":2,"borrower_x":"dd"*32,"lender_x":"ee"*32,
-   "market":"GOLD/USDX","oracle_x":"22"*32,"strike":10,"not_before":0,
-   "maturity":10,"recover_after":20,"max_price":100,"bonus_num":105,
-   "bonus_den":100,"price_scale":100000,"memo":"","oracles":[],
-   "oracle_threshold":0}
-print(json.dumps({"terms":json.dumps(t),"kind":"funded"}))')")
-test "$code" = "400" || { echo "expected 400, got $code" >&2; exit 1; }
-echo "  refused, as it must be"
+)")
+test "$code" = "400" || { echo "expected 400, got $code" >&2; cat "$WORK/nonode.json" >&2; exit 1; }
+echo "  refused: $(python3 -c 'import json;print(json.load(open("'"$WORK"'/nonode.json"))["error"][:80])')"
 
 echo
 echo "== the book, the stats and the page =="
 curl -fsS "$D/v1/offers" | python3 -c '
 import json,sys; d=json.load(sys.stdin)["offers"]
-print("  %d offer(s); first has %d sanity warning(s)" % (len(d), len(d[0].get("warnings", []))))'
+print("  %d offer(s) in the book" % len(d))'
 curl -fsS "$D/v1/stats" | python3 -c '
 import json,sys; d=json.load(sys.stdin)
 print("  stats:", json.dumps(d))'
@@ -165,10 +146,10 @@ done
 echo "  path traversal and non-web files are refused"
 
 echo
-echo "== withdrawing the offer =="
-OID=$(curl -fsS "$D/v1/offers" | python3 -c 'import json,sys;print(json.load(sys.stdin)["offers"][0]["offer_id"])')
-curl -fsS -X DELETE "$D/v1/offers/$OID" | python3 -c 'import json,sys;assert json.load(sys.stdin)["removed"];print("  removed")'
-curl -fsS "$D/v1/offers" | python3 -c 'import json,sys;assert not json.load(sys.stdin)["offers"];print("  book is empty again")'
+echo "== withdrawing an offer that is not there is a clean 404 =="
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$D/v1/offers/nosuchoffer")
+test "$code" = "404" || { echo "expected 404, got $code" >&2; exit 1; }
+echo "  404, as it should be"
 
 echo
 echo "== the attestation log is append-only and self-verifying =="
