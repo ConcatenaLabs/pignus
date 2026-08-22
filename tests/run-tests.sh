@@ -52,8 +52,7 @@ run "browser: repurchase vs vectors"  node tests/test_repurchase_web.mjs
 # built in.
 CONFIG=""
 for c in "${SEQUENTIA_SRC:-$HOME/Sequentia}/test/config.ini" \
-         "$HOME/Sequentia/test/config.ini" \
-         "$HOME/SequentiaByClaude/test/config.ini"; do
+         "$HOME/Sequentia/test/config.ini"; do
     [ -f "$c" ] && { CONFIG="$c"; break; }
 done
 if [ -n "$CONFIG" ]; then
