@@ -43,7 +43,10 @@ node-repo covenant change means someone has broken the pinning.
 
 `tests/test_platform.py` and `tests/test_btc_collateral.py` run on the node's
 functional-test framework but live here, because they test this library rather
-than the node. They need `SEQUENTIA_SRC` and a built `sequentiad`.
+than the node. They need `SEQUENTIA_SRC` and a built `sequentiad`;
+`test_btc_collateral.py` also needs a Bitcoin Core `bitcoind` (`PIGNUS_BITCOIND`,
+default `~/bitcoin-28.0/bin/bitcoind`), and the `tests/*.mjs` browser checks need
+Node.
 
 Every test asserts the **refusals**, not just the successes. A lending covenant
 that accepts the honest case is worth nothing on its own; what matters is that
@@ -82,12 +85,13 @@ source on the box, never copy binaries onto it.
 
 ## Related
 
-- Design and security analysis: `doc/sequentia/pignus-design.md` in the node
-  repository. It is the authority on the trust surface, the replay window, the
-  64-bit bound and the collateral tiers; this repo's README summarises it.
-- `openamp-design.md` (restricted assets, Tier C) and
+- Design and security analysis: `docs/pignus-design.md` here. It is the
+  authority on the trust surface, the replay window, the 64-bit bound and the
+  collateral tiers; this repo's README summarises it.
+- `openamp-design.md` and `opendamp-design.md` (restricted assets, Tiers C and
+  D) in the node repository's `doc/sequentia/`, and
   `simplicity-dex-covenant-offers-design.md` (where the output-map and
-  self-replication techniques came from), both in the node repository.
+  self-replication techniques came from) in the `seqdex` repository's `docs/`.
 
 <!-- BEGIN SHARED AGENT CONVENTIONS: identical in every Sequentia repo. Change it in all of them together. -->
 ## Working with git and GitHub here

@@ -5,7 +5,7 @@ SILVR, OILX, tSEQ or any other unrestricted issued asset; the loan's terms are
 compiled into a covenant and enforced by the script interpreter, not by an
 operator.
 
-Design and security analysis: `doc/sequentia/pignus-design.md` in the [node repository](https://github.com/GracedEternalKingCabbageMan/Sequentia).
+Design and security analysis: [`docs/pignus-design.md`](docs/pignus-design.md).
 
 ## What it actually guarantees
 
@@ -45,25 +45,41 @@ a wallet or a book that skips it has quietly reintroduced a trusted party.
 ## Layout
 
 ```
-pignus/compat.py    imports the PROVEN covenant and refuses a drifted one
-pignus/terms.py     LoanTerms: the agreement, the address, and verify_funding()
-pignus/oracle.py    attestation format, signing, verification, price quoting
-pignus/vault.py     the origination and all four exit transactions
-pignus/watcher.py   reconcile loans to the chain; name each exit; catch ghosts
-pignus/node.py      a thin JSON-RPC client
-bin/pignus-oracle   sign prices on a timer and publish them
-bin/pignus-cli      propose, show, address, verify, status, check-attestation
-bin/pignus-liquidator  one liquidator among however many people run one
+pignus/compat.py         imports the PROVEN covenant and refuses a drifted one
+pignus/terms.py          LoanTerms: the agreement, the address, and verify_funding()
+pignus/oracle.py         attestation format, signing, verification, price quoting
+pignus/vault.py          the origination and all four exit transactions
+pignus/watcher.py        reconcile loans to the chain; name each exit; catch ghosts
+pignus/book.py           the loan book: discovery, nothing else
+pignus/offers.py         funded resting offers (the node repo's pignus_offer.py)
+pignus/btc_collateral.py native BTC collateral (Tier B): the Bitcoin-side leaves
+pignus/adaptor.py        Schnorr adaptor signatures, the cross-chain link
+pignus/dlc.py            the DLC that settles BTC collateral at maturity
+pignus/btcscript.py      the Bitcoin script and taproot primitives Tier B needs
+pignus/openamp.py        Tier C pledges at an OpenAMP policy server
+pignus/repurchase.py     Tier D: the OpenDAMP repurchase, labelled as one, never a loan
+pignus/node.py           a thin JSON-RPC client
+bin/pignus-oracle        sign prices on a timer and publish them
+bin/pignusd              the loan book, the watcher, and the page at /lending/
+bin/pignus-cli           selftest, quote, propose, show, address, verify, status,
+                         check-attestation; pledge-* (Tier C); repo-* (repurchase)
+bin/pignus-liquidator    one liquidator among however many people run one
+web/                     the browser client pignusd serves: pignus.js, offer.js,
+                         repurchase.js, pset.js, flows.js, wallet.js, app.js
+deploy/                  the two systemd units, example configs, DEPLOY.md
+docs/pignus-design.md    the design and security analysis
 ```
 
-There is **one** implementation of the covenant, in
-`test/functional/pignus_covenant.py`, proven against a node by
+There is one **proven** implementation of the covenant, in the node
+repository's `test/functional/pignus_covenant.py`, proven against a node by
 `feature_pignus_vault.py`. This package imports it rather than porting it: a
 port that differs by a single byte derives a different address, and the failure
 mode of a wrong vault address is collateral nobody can ever spend.
 `pignus/vectors.json` exists for implementations that genuinely cannot import
-Python -- a browser wallet, a Go daemon -- and `compat.verify_builder()` uses it
-here as a tripwire, refusing to derive addresses from a builder that has changed.
+Python: `web/pignus.js` and `web/offer.js` are that second implementation, for
+the browser, pinned byte for byte to the same vectors, and the page refuses to
+run if the pinning fails. `compat.verify_builder()` uses the vectors here as a
+tripwire, refusing to derive addresses from a builder that has changed.
 
 ## Running it
 
@@ -75,6 +91,17 @@ otherwise set `SEQUENTIA_SRC`.
 tests/cli_drill.sh        # offline, no node, ~2 seconds
 pignus-cli selftest                      # vectors + an oracle round trip
 ```
+
+`tests/test_btc_collateral.py` also needs a Bitcoin Core `bitcoind`
+(`PIGNUS_BITCOIND`, default `~/bitcoin-28.0/bin/bitcoind`), and the
+`tests/*.mjs` browser checks need Node.
+
+### The book and the page
+
+`pignusd` serves the loan book, the chain watcher and the browser client, and
+on the testnet it is what `/lending/` is. `deploy/DEPLOY.md` covers running it
+and the oracle as systemd units behind Caddy, with `deploy/pignusd.example.json`
+as the starting configuration.
 
 ### The oracle
 
@@ -93,6 +120,9 @@ pignus-oracle --config oracle.json
   "source":      {"type": "http", "url": "http://127.0.0.1:8088/price"}
 }
 ```
+
+8730 is the built-in listen default; the testnet box runs the oracle on 8740
+and `pignusd` on 8741, see `deploy/DEPLOY.md`.
 
 The key is created 0600 on first run and its mode is re-checked on every start.
 It is never logged and never served. Prices come from the price feed that
@@ -151,9 +181,15 @@ Two collateral types are weaker on purpose and are labelled as such:
 ## Tests
 
 ```
-test/functional/feature_pignus_vault.py      the covenant: 4 exits, 11 refusals
+test/functional/feature_pignus_vault.py      the covenant: 4 exits, 12 refusals
+test/functional/feature_pignus_oracle_set.py the on-chain oracle set
+test/functional/feature_pignus_offer.py      funded offers
+test/functional/feature_pignus_attack.py     the attack suite
 tests/test_platform.py                       this library, end to end
+tests/test_btc_collateral.py                 Tier B, on a bitcoind + sequentiad rig
+tests/run-tests.sh                           everything here, fastest first
 tests/cli_drill.sh            the commands, offline
 ```
 
-`feature_pignus_vault.py` is in the node repo's `test_runner.py`.
+The four `feature_pignus_*.py` tests live in the node repository and are in its
+`test_runner.py`.
