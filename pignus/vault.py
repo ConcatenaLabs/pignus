@@ -448,9 +448,11 @@ def prepare_explicit(node, wants, fee_asset=None):
         addr = node.getnewaddress("", "bech32")
         info = node.getaddressinfo(addr)
         addr = info.get("unconfidential") or addr
-        kw = dict(address=addr, amount=f"{amount / COIN:.8f}", assetlabel=asset)
-        if fee_asset:
-            kw["fee_asset_label"] = fee_asset
+        # The preparing send needs its OWN fee asset named -- this chain has no
+        # default fee asset. Prefer one the caller is not preparing; fall back
+        # to the policy asset, which every wallet on this chain can hold.
+        kw = dict(address=addr, amount=f"{amount / COIN:.8f}", assetlabel=asset,
+                  fee_asset_label=fee_asset or "bitcoin")
         txids.append(node.sendtoaddress(**kw))
     return txids
 
@@ -488,6 +490,8 @@ def select_funding(node, wants, exclude=(), prepare=True):
 
     chosen, short = pick()
     if short and prepare:
+        # A fee asset for the PREPARING sends: one that is not itself short (so
+        # preparing it does not need preparing), else the policy asset.
         fee_asset = next((a for a in want if a not in short), None)
         prepare_explicit(node, short, fee_asset)
         chosen, short = pick()
