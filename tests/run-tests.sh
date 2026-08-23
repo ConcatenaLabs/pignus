@@ -43,6 +43,7 @@ run() {
 run "CLI drill (offline)"             bash tests/cli_drill.sh
 run "service drill (offline)"         bash tests/service_drill.sh
 run "unit: covenant vectors + oracle" python3 tests/test_units.py
+run "unit: Tier C pledge message pin" python3 tests/test_openamp.py
 run "browser: covenant vs vectors"    node tests/test_web.mjs
 run "browser: offers vs vectors"      node tests/test_offer_web.mjs
 run "browser: repurchase vs vectors"  node tests/test_repurchase_web.mjs
@@ -66,6 +67,7 @@ run "browser flows through a loan"    python3 tests/test_flows.py
 run "loan book against a chain"       python3 tests/test_book.py
 run "tiers C and D on a chain"         python3 tests/test_tiers.py
 run "CLI lifecycle + book discovery"   python3 tests/test_lifecycle.py
+run "threshold oracles end to end"     python3 tests/test_threshold.py
 run "BTC collateral (bitcoind + sequentiad)" python3 tests/test_btc_collateral.py
 
 echo

@@ -222,33 +222,29 @@ def tier_d_chain():
 
         # --- RETURN ----------------------------------------------------------
         from pignus.repurchase import RepurchaseSpender
-        from pignus.vault import Outpoint, payout_spk
+        from pignus.vault import Outpoint, payout_spk, select_funding
 
         btc = n.dumpassetlabels()["bitcoin"]
         vault_op = Outpoint(txid, vout, bond, money)
 
-        def funding_for(asset, amount):
-            """UTXOs covering `amount` of `asset`, plus one to pay the fee."""
-            out, got = [], 0
-            for u in n.listunspent():
-                if u["asset"] == asset and got < amount:
-                    out.append(Outpoint.from_utxo(u))
-                    got += int(round(float(u["amount"]) * COIN))
-            assert got >= amount, f"wallet has {got} of {asset[:8]}, needs {amount}"
-            for u in n.listunspent():
-                if u["asset"] == btc and float(u["amount"]) >= 0.001:
-                    op = Outpoint.from_utxo(u)
-                    if op not in out:
-                        out.append(op)
-                    break
-            return out
+        def funding_for(asset, amount, exclude=()):
+            """Explicit UTXOs covering `amount` of `asset` plus the fee. Uses the
+            library's coin selection, which prepares explicit (unblinded) coins
+            when the wallet only holds blinded change -- a covenant cannot read a
+            blinded input's value."""
+            wants = {btc: 5000}
+            if amount:
+                wants[asset] = wants.get(asset, 0) + amount
+            return select_funding(n, wants, exclude=exclude)
 
         change = bytes.fromhex(n.getaddressinfo(n.getnewaddress())["scriptPubKey"])
         sp = RepurchaseSpender(n, t, btc)
 
         settled = False
         try:
-            hexed = sp.settle(vault_op, funding_for(coll, t.collateral_amount), change)
+            hexed = sp.settle(vault_op, funding_for(
+                coll, t.collateral_amount,
+                exclude=[(vault_op.txid, vault_op.vout)]), change)
             got = n.sendrawtransaction(hexed)
             rig.seq_mine(1)
             settled = True
@@ -300,15 +296,17 @@ def tier_d_chain():
             check(name, False, "the node accepted it")
 
         rejected("FORFEIT before the deadline is refused",
-                 lambda: sp2.forfeit(op2, funding_for(btc, 0), change,
-                                     locktime=t2.forfeit_after))
+                 lambda: sp2.forfeit(op2, funding_for(
+                     btc, 0, exclude=[(op2.txid, op2.vout)]), change,
+                     locktime=t2.forfeit_after))
 
         _, wrong_prog, wrong_ver = prog()
         t_wrong = RepurchaseTerms(**{**t2.__dict__, "borrower_prog": wrong_prog,
                                      "borrower_ver": wrong_ver})
         rejected("FORFEIT paying anyone but the borrower is refused",
                  lambda: RepurchaseSpender(n, t_wrong, btc).forfeit(
-                     op2, funding_for(btc, 0), change, locktime=t2.forfeit_after))
+                     op2, funding_for(btc, 0, exclude=[(op2.txid, op2.vout)]),
+                     change, locktime=t2.forfeit_after))
 
         t_bad_cu = RepurchaseTerms(
             **{**t2.__dict__,
@@ -316,13 +314,15 @@ def tier_d_chain():
         rejected("RETURN delivering the asset anywhere but the borrower's C_U "
                  "is refused",
                  lambda: RepurchaseSpender(n, t_bad_cu, btc).settle(
-                     op2, funding_for(coll, t2.collateral_amount), change))
+                     op2, funding_for(coll, t2.collateral_amount,
+                                      exclude=[(op2.txid, op2.vout)]), change))
 
         # --- FORFEIT, once the deadline really has passed --------------------
         while n.getblockcount() <= t2.forfeit_after:
             rig.seq_mine(1)
         try:
-            h = sp2.forfeit(op2, funding_for(btc, 0), change)
+            h = sp2.forfeit(op2, funding_for(
+                btc, 0, exclude=[(op2.txid, op2.vout)]), change)
             n.sendrawtransaction(h)
             rig.seq_mine(1)
             check("FORFEIT: after the deadline the borrower sweeps the bond", True)
