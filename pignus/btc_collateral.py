@@ -67,6 +67,9 @@ from . import btcscript as B
 from .compat import load_covenant
 
 
+COIN = 100_000_000
+
+
 def sha256(b):
     return hashlib.sha256(b).digest()
 
@@ -195,6 +198,14 @@ def complete_reclaim(loan, tx, adaptor_sig, secret, borrower_sec):
     return tx
 
 
+def seize_sighash(loan, funding_txid, vout, dest_spk, fee):
+    """The exact sighash the ORACLE co-signs for a seizure. The lender computes
+    it, sends it to the oracle, and passes the oracle's signature to `seize_tx`
+    -- which rebuilds the identical transaction, so the two sighashes match."""
+    tx = _spend_tx(funding_txid, vout, loan.btc_amount, dest_spk, fee)
+    return sighash_for(loan, tx, "seize")
+
+
 def seize_tx(loan, funding_txid, vout, dest_spk, fee, lender_sec, oracle_sig):
     """Liquidation on the Bitcoin side: lender and oracle jointly.
 
@@ -240,3 +251,217 @@ def seize_is_justified(loan, attestation, strike, oracle_keys=None) -> bool:
     if not any(O.verify(k, attestation) for k in keys):
         return False
     return attestation.price < strike
+
+
+# --------------------------------------------------------- loan serialisation
+
+def _loan_fields():
+    from dataclasses import fields
+    return [f.name for f in fields(BtcLoan)]
+
+
+def loan_to_dict(loan) -> dict:
+    from dataclasses import asdict
+    return asdict(loan)
+
+
+def loan_from_dict(d) -> "BtcLoan":
+    keep = set(_loan_fields())
+    return BtcLoan(**{k: v for k, v in d.items() if k in keep})
+
+
+def loan_to_json(loan) -> str:
+    import json
+    return json.dumps(loan_to_dict(loan), sort_keys=True, indent=2)
+
+
+def loan_from_json(s) -> "BtcLoan":
+    import json
+    return loan_from_dict(json.loads(s) if isinstance(s, str) else s)
+
+
+# ----------------------------------------------- the Sequentia repayment legs
+#
+# Lifted out of tests/test_btc_collateral.py so the CLI and, in time, the
+# browser drive the SAME construction the consensus tests prove, rather than a
+# second copy. Every function here takes a Sequentia node (pignus.node.Node or a
+# test proxy) and the caller's own secret; no key is derived or stored here.
+
+SEQ_FEE = 5000
+
+
+def _seq_tf():
+    load_covenant()
+    from test_framework import messages as m
+    from test_framework import script as s
+    return m, s
+
+
+def _aout(display_hex):
+    return b"\x01" + bytes.fromhex(display_hex)[::-1]
+
+
+def _seq_explicit(node, asset, atoms):
+    """One or more explicit (unblinded) wallet utxos of `asset` covering
+    `atoms`. A covenant reads the values it checks, so a blinded input is
+    useless; prepare an explicit coin if the wallet only has blinded change."""
+    from .vault import select_funding, Outpoint          # noqa
+    return select_funding(node, {asset: atoms})
+
+
+def seq_bitcoin_label(node):
+    return node.dumpassetlabels()["bitcoin"]
+
+
+def pay_repayment(node, loan, change_spk=None, fee=SEQ_FEE):
+    """The BORROWER pays the debt into the hashlocked CLAIM/REFUND output. This
+    is the step that forces the lender to reveal `t` on chain to be paid.
+
+    Returns (txid, vout) of the repayment output.
+    """
+    m, _ = _seq_tf()
+    btc = seq_bitcoin_label(node)
+    debt_coins = _seq_explicit(node, loan.debt_asset, loan.debt)
+    fee_coins = _seq_explicit(node, btc, fee)
+    seen, ins = set(), []
+    for o in list(debt_coins) + list(fee_coins):
+        if (o.txid, o.vout) in seen:
+            continue
+        seen.add((o.txid, o.vout)); ins.append(o)
+    if change_spk is None:
+        from .vault import wallet_payout
+        change_spk = wallet_payout(node)[2]
+    have = {}
+    for o in ins:
+        have[o.asset] = have.get(o.asset, 0) + o.amount
+    tx = m.CTransaction(); tx.nVersion = 2
+    for o in ins:
+        tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout)))
+    tx.vout.append(m.CTxOut(m.CTxOutValue(loan.debt), loan.repayment_spk(),
+                            m.CTxOutAsset(_aout(loan.debt_asset))))
+    for asset, total in have.items():
+        need = (loan.debt if asset == loan.debt_asset else 0) \
+            + (fee if asset == btc else 0)
+        if total - need > 0:
+            tx.vout.append(m.CTxOut(m.CTxOutValue(total - need), change_spk,
+                                    m.CTxOutAsset(_aout(asset))))
+    tx.vout.append(m.CTxOut(m.CTxOutValue(fee), nAsset=m.CTxOutAsset(_aout(btc))))
+    signed = node.signrawtransactionwithwallet(tx.serialize().hex())
+    if not signed["complete"]:
+        raise ValueError("wallet could not sign the repayment inputs")
+    txid = node.sendrawtransaction(signed["hex"])
+    return txid, 0
+
+
+def _spend_repayment(node, loan, txid, vout, leaf, *, sec, secret=None,
+                     locktime=0, dest_spk=None, fee=SEQ_FEE):
+    """Spend the repayment output: the lender's CLAIM (reveals the preimage) or
+    the borrower's REFUND (after the deadline). `sec` is the spender's key."""
+    m, _ = _seq_tf()
+    from test_framework.script import TaprootSignatureHash
+    from test_framework.key import sign_schnorr
+    from test_framework.messages import uint256_from_str, tx_from_hex
+    btc = seq_bitcoin_label(node)
+    tap, leaves = loan.repayment_tree()
+    fee_coins = _seq_explicit(node, btc, fee)
+    if dest_spk is None:
+        from .vault import wallet_payout
+        dest_spk = wallet_payout(node)[2]
+    tx = m.CTransaction(); tx.nVersion = 2; tx.nLockTime = locktime
+    seq_no = 0xfffffffe if locktime else 0xffffffff
+    tx.vin.append(m.CTxIn(m.COutPoint(int(txid, 16), vout), nSequence=seq_no))
+    for o in fee_coins:
+        tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout), nSequence=seq_no))
+    tx.vout.append(m.CTxOut(m.CTxOutValue(loan.debt), dest_spk,
+                            m.CTxOutAsset(_aout(loan.debt_asset))))
+    have = sum(o.amount for o in fee_coins)
+    if have - fee > 0:
+        tx.vout.append(m.CTxOut(m.CTxOutValue(have - fee), dest_spk,
+                                m.CTxOutAsset(_aout(btc))))
+    tx.vout.append(m.CTxOut(m.CTxOutValue(fee), nAsset=m.CTxOutAsset(_aout(btc))))
+    partial = node.signrawtransactionwithwallet(tx.serialize().hex())
+    tx = tx_from_hex(partial["hex"])
+    spent = [m.CTxOut(m.CTxOutValue(loan.debt), bytes(tap.scriptPubKey),
+                      m.CTxOutAsset(_aout(loan.debt_asset)))]
+    for o in fee_coins:
+        raw = node.getrawtransaction(o.txid, True)
+        spk = bytes.fromhex(raw["vout"][o.vout]["scriptPubKey"]["hex"])
+        spent.append(m.CTxOut(m.CTxOutValue(o.amount), spk,
+                              m.CTxOutAsset(_aout(o.asset))))
+    genesis = uint256_from_str(bytes.fromhex(node.getblockhash(0))[::-1])
+    msg = TaprootSignatureHash(tx, spent, 0, genesis, 0, scriptpath=True,
+                               script=leaves[leaf])
+    sig = sign_schnorr(sec, msg)
+    cb = (bytes([tap.leaves[leaf].version + tap.negflag])
+          + tap.internal_pubkey + tap.leaves[leaf].merklebranch)
+    stack = ([sig, secret] if leaf == "claim" else [sig])
+    while len(tx.wit.vtxinwit) < len(tx.vin):
+        tx.wit.vtxinwit.append(m.CTxInWitness())
+    tx.wit.vtxinwit[0].scriptWitness.stack = stack + [bytes(leaves[leaf]), cb]
+    return node.sendrawtransaction(tx.serialize().hex())
+
+
+def claim_repayment(node, loan, txid, vout, lender_sec, secret, **kw):
+    """LENDER takes the repayment, revealing `t` in the witness."""
+    return _spend_repayment(node, loan, txid, vout, "claim",
+                            sec=lender_sec, secret=secret, **kw)
+
+
+def refund_repayment(node, loan, txid, vout, borrower_sec, locktime, **kw):
+    """BORROWER reclaims the repayment after the deadline (lender stalled)."""
+    return _spend_repayment(node, loan, txid, vout, "refund",
+                            sec=borrower_sec, locktime=locktime, **kw)
+
+
+def preimage_from_claim(node, claim_txid, vout=0):
+    """Read `t` off the Sequentia chain from a CLAIM spend's witness. The
+    covenant forces the lender to put it there, which is the whole point."""
+    raw = node.getrawtransaction(claim_txid, True)
+    for vin in raw.get("vin", []):
+        wit = vin.get("txinwitness") or []
+        # claim witness: [sig, preimage, leaf, control]
+        if len(wit) == 4 and len(wit[1]) == 64:      # 32-byte preimage, hex
+            return bytes.fromhex(wit[1])
+    raise ValueError("no 32-byte preimage in that transaction's witnesses")
+
+
+def anchor_safe(node, txid, min_depth=6):
+    """A pragmatic anchor-safety check before acting on a revealed preimage.
+
+    The chain's first principle: a Bitcoin-driven reorg can undo a Sequentia
+    transaction. Before a borrower spends BTC on the strength of a `t` read off
+    the Sequentia claim, the claim must be buried enough that undoing it would
+    take a Bitcoin reorg the borrower is willing to discount. Returns
+    (ok, confirmations). A full node with -validateanchor lowers the finalized
+    point in real time; here we require plain depth and say what we saw.
+    """
+    try:
+        raw = node.getrawtransaction(txid, True)
+    except Exception:                                # noqa: BLE001
+        return False, 0
+    conf = int(raw.get("confirmations", 0) or 0)
+    return conf >= min_depth, conf
+
+
+# ------------------------------------------------------------- Bitcoin funding
+
+def fund_bitcoin(btc_node, loan, feerate=5, broadcast=True):
+    """Fund the Bitcoin collateral output from a Bitcoin Core wallet.
+
+    Built without broadcasting when the caller wants the txid first: the
+    lender's adaptor signature commits to a reclaim transaction that spends this
+    outpoint, so a borrower must know the txid BEFORE committing the collateral.
+    Returns (txid, vout, hex).
+    """
+    addr = loan.funding_address(btc_node)
+    raw = btc_node.createrawtransaction([], [{addr: loan.btc_amount / COIN}])
+    funded = btc_node.fundrawtransaction(raw, {"fee_rate": feerate})
+    signed = btc_node.signrawtransactionwithwallet(funded["hex"])
+    if not signed["complete"]:
+        raise ValueError("Bitcoin wallet could not fund the collateral")
+    dec = btc_node.decoderawtransaction(signed["hex"])
+    vout = next(o["n"] for o in dec["vout"]
+                if o["scriptPubKey"]["hex"] == loan.funding_spk().hex())
+    if broadcast:
+        btc_node.sendrawtransaction(signed["hex"])
+    return dec["txid"], vout, signed["hex"]

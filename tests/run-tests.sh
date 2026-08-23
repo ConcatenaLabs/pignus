@@ -68,7 +68,9 @@ run "loan book against a chain"       python3 tests/test_book.py
 run "tiers C and D on a chain"         python3 tests/test_tiers.py
 run "CLI lifecycle + book discovery"   python3 tests/test_lifecycle.py
 run "threshold oracles end to end"     python3 tests/test_threshold.py
-run "BTC collateral (bitcoind + sequentiad)" python3 tests/test_btc_collateral.py
+run "BTC collateral: the covenant + crypto" python3 tests/test_btc_collateral.py
+run "BTC collateral: the library legs"  python3 tests/test_btc_cli.py
+run "BTC collateral: the CLI handshake" python3 tests/test_btc_cli_flow.py
 
 echo
 if [ "$fails" -eq 0 ]; then
