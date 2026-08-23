@@ -690,4 +690,5 @@ export const _internals = { sha256, taggedHash, hexToBytes, bytesToHex, le8, big
                             // ONE definition of each leaf in the browser, which
                             // is the whole reason the golden vectors mean
                             // anything.
-                            repayLeaf, recoverLeaf, NUMS };
+                            repayLeaf, recoverLeaf, NUMS,
+                            pointAdd, pointMul, liftX, mod, N, P, Gx, Gy };
