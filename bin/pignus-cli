@@ -827,6 +827,396 @@ def add_wallet_commands(sub):
         common(p)
         p.set_defaults(fn=fn)
 
+
+# --- Tier B: native BTC collateral, the cross-chain loan ----------------------
+#
+# A two-party protocol: the loan lives half on Bitcoin (the collateral) and half
+# on Sequentia (the debt), bound by an adaptor signature. Each party holds a
+# keyfile; a `ticket` JSON carries the PUBLIC state between them (never a secret,
+# never `t`). The commands below are each one party's move. The oracle's only
+# move is to sign a seize sighash, which `btc-seize-sighash` prints for it.
+
+import secrets as _secrets                                    # noqa: E402
+
+
+def btc_node_from(args):
+    from pignus.node import Node
+    return Node(url=args.btc_rpc, user=args.btc_rpc_user,
+                password=args.btc_rpc_password, wallet=args.btc_rpc_wallet,
+                cookie_path=args.btc_rpc_cookie)
+
+
+def add_btc_node_args(p):
+    p.add_argument("--btc-rpc", default="http://127.0.0.1:8332")
+    p.add_argument("--btc-rpc-user")
+    p.add_argument("--btc-rpc-password")
+    p.add_argument("--btc-rpc-wallet")
+    p.add_argument("--btc-rpc-cookie")
+
+
+def _read_key(path):
+    with open(path) as f:
+        return bytes.fromhex(f.read().strip())
+
+
+def _write_key(path, sec):
+    import os as _os
+    fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+    with _os.fdopen(fd, "w") as f:
+        f.write(sec.hex() + "\n")
+
+
+def _ticket(args):
+    with open(args.ticket) as f:
+        return json.load(f)
+
+
+def _save_ticket(args, tk):
+    dst = getattr(args, "out", None) or args.ticket
+    with open(dst, "w") as f:
+        json.dump(tk, f, indent=2, sort_keys=True)
+    print(f"wrote {dst}", file=sys.stderr)
+
+
+def _loan(tk):
+    from pignus.btc_collateral import loan_from_dict
+    return loan_from_dict(tk)
+
+
+def cmd_btc_keygen(args):
+    from pignus import adaptor as A
+    sec = A.new_secret()
+    _write_key(args.out, sec)
+    print(json.dumps({"pubkey_x": A.xonly_pubkey(sec).hex(),
+                      "keyfile": args.out}, indent=2))
+    return 0
+
+
+def cmd_btc_propose(args):
+    """LENDER: pick the secret t, publish T and h, and write the ticket. The
+    secret is written beside the key as {keyfile}.t so `btc-adaptor`/`btc-claim`
+    can find it; it never enters the ticket."""
+    from pignus import adaptor as A
+    from pignus.btc_collateral import BtcLoan, sha256, loan_to_dict
+    lender = _read_key(args.lender_key)
+    t = A.new_secret()
+    _write_key(args.lender_key + ".t", t)
+    loan = BtcLoan(
+        btc_amount=args.btc_amount, borrower_x=args.borrower_x,
+        lender_x=A.xonly_pubkey(lender).hex(), oracle_x=args.oracle_x,
+        recover_after=args.recover_after, debt_asset=args.debt_asset,
+        debt=args.debt, repay_deadline=args.repay_deadline,
+        adaptor_point=A.point(t).hex(), payment_hash=sha256(t).hex())
+    tk = loan_to_dict(loan)
+    tk["_stage"] = "proposed"
+    _save_ticket(args, tk)
+    print(json.dumps({"funding_address": None, "stage": "proposed",
+                      "note": "send this ticket to the borrower"}, indent=2))
+    return 0
+
+
+def cmd_btc_prepare(args):
+    """BORROWER: build the Bitcoin funding UNBROADCAST (so its txid is known
+    before any collateral is committed) and the reclaim transaction, and add
+    both to the ticket. The funding hex is kept locally to broadcast only after
+    the lender's adaptor signature has verified."""
+    from pignus.btc_collateral import fund_bitcoin, reclaim_tx
+    btc = btc_node_from(args)
+    tk = _ticket(args)
+    loan = _loan(tk)
+    txid, vout, fhex = fund_bitcoin(btc, loan, feerate=args.feerate,
+                                    broadcast=False)
+    if args.reclaim_address:
+        info = btc.getaddressinfo(args.reclaim_address)
+        dest = bytes.fromhex(info["scriptPubKey"])
+    else:
+        dest = bytes.fromhex(btc.getaddressinfo(
+            btc.getnewaddress())["scriptPubKey"])
+    rtx = reclaim_tx(loan, txid, vout, dest, args.btc_fee)
+    tk.update(funding_txid=txid, funding_vout=vout, funding_hex=fhex,
+              reclaim_dest=dest.hex(), reclaim_hex=rtx.hex(), _stage="prepared")
+    _save_ticket(args, tk)
+    print(json.dumps({"funding_txid": txid, "vout": vout, "stage": "prepared",
+                      "note": "send this ticket to the lender for the adaptor "
+                              "signature; do NOT broadcast the funding yet"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_adaptor(args):
+    """LENDER: adaptor-sign the borrower's reclaim transaction under T, so the
+    borrower holds a release only `t` can complete."""
+    from pignus.btc_collateral import lender_release_adaptor
+    from pignus.btcscript import Tx
+    lender = _read_key(args.lender_key)
+    tk = _ticket(args)
+    loan = _loan(tk)
+    rtx = Tx.from_hex(tk["reclaim_hex"]) if hasattr(Tx, "from_hex") else None
+    if rtx is None:
+        # rebuild the reclaim tx from the ticket's fields
+        from pignus.btc_collateral import reclaim_tx
+        rtx = reclaim_tx(loan, tk["funding_txid"], tk["funding_vout"],
+                         bytes.fromhex(tk["reclaim_dest"]), args.btc_fee)
+    asig = lender_release_adaptor(loan, lender, rtx)
+    tk["adaptor_sig"] = asig.hex()
+    tk["_stage"] = "adaptor-signed"
+    _save_ticket(args, tk)
+    print(json.dumps({"adaptor_sig": asig.hex()[:24] + "...",
+                      "stage": "adaptor-signed"}, indent=2))
+    return 0
+
+
+def cmd_btc_originate(args):
+    """BORROWER: verify the lender's adaptor signature, and only then broadcast
+    the funding. This is the check that makes the loan safe to enter."""
+    from pignus.btc_collateral import reclaim_tx, check_release_adaptor
+    btc = btc_node_from(args)
+    tk = _ticket(args)
+    loan = _loan(tk)
+    rtx = reclaim_tx(loan, tk["funding_txid"], tk["funding_vout"],
+                     bytes.fromhex(tk["reclaim_dest"]), args.btc_fee)
+    asig = bytes.fromhex(tk["adaptor_sig"])
+    if not check_release_adaptor(loan, rtx, asig):
+        raise SystemExit("REFUSED: the lender's release signature does not "
+                         "verify. Do NOT fund; the release could be worthless.")
+    txid = btc.sendrawtransaction(tk["funding_hex"])
+    tk["_stage"] = "funded"
+    _save_ticket(args, tk)
+    print(json.dumps({"funded_txid": txid, "stage": "funded",
+                      "note": "collateral is committed; the adaptor release "
+                              "verified first"}, indent=2))
+    return 0
+
+
+def cmd_btc_repay(args):
+    """BORROWER: pay the debt into the Sequentia hashlock. The lender can only
+    take it by publishing t."""
+    from pignus.btc_collateral import pay_repayment
+    node = node_from(args)
+    tk = _ticket(args)
+    loan = _loan(tk)
+    txid, vout = pay_repayment(node, loan)
+    tk.update(repay_txid=txid, repay_vout=vout, _stage="repaid")
+    _save_ticket(args, tk)
+    print(json.dumps({"repay_txid": txid, "vout": vout, "stage": "repaid"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_claim(args):
+    """LENDER: take the repayment, which forces t onto the Sequentia chain."""
+    from pignus.btc_collateral import claim_repayment
+    node = node_from(args)
+    lender = _read_key(args.lender_key)
+    t = _read_key(args.lender_key + ".t")
+    tk = _ticket(args)
+    loan = _loan(tk)
+    txid = claim_repayment(node, loan, tk["repay_txid"], tk["repay_vout"],
+                           lender, t)
+    tk.update(claim_txid=txid, _stage="claimed")
+    _save_ticket(args, tk)
+    print(json.dumps({"claim_txid": txid, "stage": "claimed",
+                      "note": "t is now public on the Sequentia chain"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_reclaim(args):
+    """BORROWER: read t off the chain, check the claim is anchor-safe, and take
+    the collateral back on Bitcoin."""
+    from pignus.btc_collateral import (
+        reclaim_tx, complete_reclaim, preimage_from_claim, anchor_safe)
+    node = node_from(args)
+    btc = btc_node_from(args)
+    borrower = _read_key(args.borrower_key)
+    tk = _ticket(args)
+    loan = _loan(tk)
+    ok, conf = anchor_safe(node, tk["claim_txid"], min_depth=args.min_depth)
+    if not ok and not args.force:
+        raise SystemExit(f"the claim has {conf} confirmations, below the "
+                         f"{args.min_depth} this asks for; a Bitcoin-driven "
+                         "reorg could still undo it. Re-run with --force to "
+                         "accept that risk.")
+    t = preimage_from_claim(node, tk["claim_txid"])
+    rtx = reclaim_tx(loan, tk["funding_txid"], tk["funding_vout"],
+                     bytes.fromhex(tk["reclaim_dest"]), args.btc_fee)
+    asig = bytes.fromhex(tk["adaptor_sig"])
+    tx = complete_reclaim(loan, rtx, asig, t, borrower)
+    txid = btc.sendrawtransaction(tx.hex())
+    tk["_stage"] = "reclaimed"
+    _save_ticket(args, tk)
+    print(json.dumps({"reclaim_txid": txid, "stage": "reclaimed"}, indent=2))
+    return 0
+
+
+def cmd_btc_seize_sighash(args):
+    """LENDER: print the exact sighash the ORACLE co-signs for a seizure."""
+    from pignus.btc_collateral import seize_sighash
+    btc = btc_node_from(args)
+    tk = _ticket(args)
+    loan = _loan(tk)
+    dest = (bytes.fromhex(btc.getaddressinfo(args.dest)["scriptPubKey"])
+            if args.dest else
+            bytes.fromhex(btc.getaddressinfo(btc.getnewaddress())["scriptPubKey"]))
+    sh = seize_sighash(loan, tk["funding_txid"], tk["funding_vout"], dest,
+                       args.btc_fee)
+    print(json.dumps({"seize_sighash": sh.hex(), "dest": dest.hex(),
+                      "note": "the oracle signs this with BIP340; pass its "
+                              "signature and the SAME --dest to btc-seize"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_seize(args):
+    """LENDER: with the oracle's signature over the seize sighash, take the
+    collateral jointly."""
+    from pignus.btc_collateral import seize_tx
+    btc = btc_node_from(args)
+    lender = _read_key(args.lender_key)
+    tk = _ticket(args)
+    loan = _loan(tk)
+    dest = bytes.fromhex(btc.getaddressinfo(args.dest)["scriptPubKey"])
+    tx = seize_tx(loan, tk["funding_txid"], tk["funding_vout"], dest,
+                  args.btc_fee, lender, bytes.fromhex(args.oracle_sig))
+    txid = btc.sendrawtransaction(tx.hex())
+    print(json.dumps({"seize_txid": txid, "stage": "seized"}, indent=2))
+    return 0
+
+
+def cmd_btc_timeout(args):
+    """LENDER: sweep the collateral after the term, if the borrower never
+    repaid."""
+    from pignus.btc_collateral import timeout_tx
+    btc = btc_node_from(args)
+    lender = _read_key(args.lender_key)
+    tk = _ticket(args)
+    loan = _loan(tk)
+    dest = (bytes.fromhex(btc.getaddressinfo(args.dest)["scriptPubKey"])
+            if args.dest else
+            bytes.fromhex(btc.getaddressinfo(btc.getnewaddress())["scriptPubKey"]))
+    tx = timeout_tx(loan, tk["funding_txid"], tk["funding_vout"], dest,
+                    args.btc_fee, lender, locktime=btc.getblockcount())
+    txid = btc.sendrawtransaction(tx.hex())
+    print(json.dumps({"timeout_txid": txid, "stage": "timed-out"}, indent=2))
+    return 0
+
+
+def cmd_btc_refund(args):
+    """BORROWER: recover the repayment on Sequentia after the deadline, if the
+    lender stalled."""
+    from pignus.btc_collateral import refund_repayment
+    node = node_from(args)
+    borrower = _read_key(args.borrower_key)
+    tk = _ticket(args)
+    loan = _loan(tk)
+    txid = refund_repayment(node, loan, tk["repay_txid"], tk["repay_vout"],
+                            borrower, loan.repay_deadline)
+    print(json.dumps({"refund_txid": txid, "stage": "refunded"}, indent=2))
+    return 0
+
+
+def add_btc_commands(sub):
+    p = sub.add_parser("btc-keygen", help="a party keypair for a BTC loan")
+    p.add_argument("--out", required=True, help="keyfile path (0600)")
+    p.set_defaults(fn=cmd_btc_keygen)
+
+    p = sub.add_parser("btc-propose", help="LENDER: propose a BTC-collateral loan")
+    p.add_argument("--lender-key", required=True)
+    p.add_argument("--borrower-x", required=True)
+    p.add_argument("--oracle-x", required=True)
+    p.add_argument("--btc-amount", type=int, required=True, help="collateral, sats")
+    p.add_argument("--debt-asset", required=True)
+    p.add_argument("--debt", type=int, required=True, help="atoms to repay")
+    p.add_argument("--recover-after", type=int, required=True,
+                   help="Bitcoin height the TIMEOUT sweep opens at")
+    p.add_argument("--repay-deadline", type=int, required=True,
+                   help="Sequentia height the REFUND opens at")
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_btc_propose)
+
+    p = sub.add_parser("btc-prepare",
+                       help="BORROWER: build the funding (unbroadcast) + reclaim")
+    p.add_argument("ticket")
+    p.add_argument("--reclaim-address", help="where the collateral returns")
+    p.add_argument("--feerate", type=float, default=5.0, help="sat/vB")
+    p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--out")
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_prepare)
+
+    p = sub.add_parser("btc-adaptor",
+                       help="LENDER: adaptor-sign the borrower's reclaim")
+    p.add_argument("ticket")
+    p.add_argument("--lender-key", required=True)
+    p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--out")
+    p.set_defaults(fn=cmd_btc_adaptor)
+
+    p = sub.add_parser("btc-originate",
+                       help="BORROWER: verify the release, then fund Bitcoin")
+    p.add_argument("ticket")
+    p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--out")
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_originate)
+
+    p = sub.add_parser("btc-repay", help="BORROWER: pay the debt into the hashlock")
+    p.add_argument("ticket")
+    p.add_argument("--out")
+    add_node_args(p)
+    p.set_defaults(fn=cmd_btc_repay)
+
+    p = sub.add_parser("btc-claim", help="LENDER: take the repayment, revealing t")
+    p.add_argument("ticket")
+    p.add_argument("--lender-key", required=True)
+    p.add_argument("--out")
+    add_node_args(p)
+    p.set_defaults(fn=cmd_btc_claim)
+
+    p = sub.add_parser("btc-reclaim",
+                       help="BORROWER: read t, check anchor-safety, take the BTC")
+    p.add_argument("ticket")
+    p.add_argument("--borrower-key", required=True)
+    p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--min-depth", type=int, default=6)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--out")
+    add_node_args(p)
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_reclaim)
+
+    p = sub.add_parser("btc-seize-sighash",
+                       help="LENDER: the sighash the oracle co-signs to seize")
+    p.add_argument("ticket")
+    p.add_argument("--dest")
+    p.add_argument("--btc-fee", type=int, default=3000)
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_seize_sighash)
+
+    p = sub.add_parser("btc-seize", help="LENDER+oracle: seize the collateral")
+    p.add_argument("ticket")
+    p.add_argument("--lender-key", required=True)
+    p.add_argument("--oracle-sig", required=True)
+    p.add_argument("--dest", required=True)
+    p.add_argument("--btc-fee", type=int, default=3000)
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_seize)
+
+    p = sub.add_parser("btc-timeout", help="LENDER: sweep after the term")
+    p.add_argument("ticket")
+    p.add_argument("--lender-key", required=True)
+    p.add_argument("--dest")
+    p.add_argument("--btc-fee", type=int, default=3000)
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_timeout)
+
+    p = sub.add_parser("btc-refund", help="BORROWER: recover the repayment")
+    p.add_argument("ticket")
+    p.add_argument("--borrower-key", required=True)
+    p.add_argument("--out")
+    add_node_args(p)
+    p.set_defaults(fn=cmd_btc_refund)
+
 def main():
     ap = argparse.ArgumentParser(
         prog="pignus-cli", description=__doc__.split("\n")[0],
@@ -1003,6 +1393,7 @@ def main():
     p.set_defaults(fn=cmd_check_attestation)
 
     add_wallet_commands(sub)
+    add_btc_commands(sub)
 
     args = ap.parse_args()
     if args.cmd == "verify" and not args.spk and not args.txid:
