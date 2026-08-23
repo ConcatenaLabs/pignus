@@ -25,6 +25,7 @@ for a testnet does not need a database, and the failure mode of a corrupted
 half-written file is worse than the cost of rewriting a small one.
 """
 
+import hashlib
 import json
 import os
 import tempfile
@@ -87,10 +88,27 @@ class Book:
                 "a funded offer must name the outpoint its principal rests in, "
                 "or a borrower cannot check it is real without asking us")
         offer["created"] = offer.get("created") or int(time.time())
+        offer["status"] = offer.get("status") or "open"
+        offer["market"] = terms.market
+        offer["principal"] = str(offer.get("principal") or terms.principal)
+        offer["collateral"] = str(offer.get("collateral")
+                                  or terms.collateral_amount)
+        offer["expiry_locktime"] = int(offer.get("expiry_locktime")
+                                       or terms.maturity)
         with self._lock:
             self.offers[offer["offer_id"]] = offer
             self._save()
         return offer
+
+    def update_offer(self, offer_id, **fields):
+        with self._lock:
+            rec = self.offers.get(offer_id)
+            if rec is None:
+                return None
+            rec.update(fields)
+            rec["updated"] = int(time.time())
+            self._save()
+            return rec
 
     def drop_offer(self, offer_id) -> bool:
         with self._lock:
@@ -99,8 +117,12 @@ class Book:
                 self._save()
         return gone
 
-    def list_offers(self, market=None, kind=None):
+    def list_offers(self, market=None, kind=None, status="open"):
+        """Open offers by default. `status="all"` includes taken, withdrawn
+        and vanished ones, which are history rather than something to take."""
         out = list(self.offers.values())
+        if status and status != "all":
+            out = [o for o in out if o.get("status", "open") == status]
         if market:
             out = [o for o in out
                    if json.loads(o["terms"])["market"].upper() == market.upper()]
@@ -110,14 +132,26 @@ class Book:
 
     # ----------------------------------------------------------------- loans
 
+    @staticmethod
+    def loan_key(terms, txid, vout):
+        """A loan is a VAULT COIN, not a terms document: the same borrower
+        taking the same offer twice opens two loans at one address, and an
+        index keyed on the terms alone would quietly show one of them."""
+        return hashlib.sha256(
+            f"{terms.loan_id()}:{txid}:{int(vout)}".encode()).hexdigest()
+
     def put_loan(self, terms_json, txid, vout, state="UNCONFIRMED", **extra):
         terms = LoanTerms.from_json(terms_json)
-        rec = {"loan_id": terms.loan_id(), "terms": terms_json,
-               "txid": txid, "vout": int(vout), "state": state,
-               "market": terms.market, "updated": int(time.time())}
-        rec.update(extra)
+        key = self.loan_key(terms, txid, vout)
         with self._lock:
-            self.loans[rec["loan_id"]] = rec
+            rec = self.loans.get(key) or {
+                "loan_id": key, "terms_id": terms.loan_id(),
+                "terms": terms_json, "txid": txid, "vout": int(vout),
+                "state": state, "market": terms.market,
+                "created": int(time.time())}
+            rec.update(extra)
+            rec["updated"] = int(time.time())
+            self.loans[key] = rec
             self._save()
         return rec
 

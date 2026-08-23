@@ -3,197 +3,222 @@
 <title>Pignus: collateralised lending on Sequentia</title>
 <link rel="icon" href="/explorer/img/icons/SequentiaTestnet-menu-logo.svg">
 <style>
-  :root{color-scheme:dark}
+  :root{color-scheme:dark;
+    --bg:#0f1216;--card:#171b21;--card2:#1c2128;--line:#262b33;--line2:#333c48;
+    --ink:#e8eaed;--dim:#9aa0a6;--mute:#6b7280;--gold:#ffc629;--gold-ink:#141414;
+    --ok:#7ee2a8;--ok-line:#1f4733;--warn:#ffc629;--warn-line:#4a3a10;
+    --bad:#ff8f8f;--bad-line:#4d2626;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
   *{box-sizing:border-box}
-  body{margin:0;font:16px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-       background:#0f1216;color:#e8eaed}
-  .wrap{max-width:1000px;margin:0 auto;padding:40px 24px 72px}
-  a{color:#f5b301}
-  h1{font-size:31px;margin:0 0 6px} h1 .t{color:#f5b301}
-  .sub{color:#9aa0a6;margin:0 0 8px;max-width:74ch}
-  .crumb{color:#6b7280;font-size:13px;margin:0 0 22px}
-  .crumb a{color:#9aa0a6;text-decoration:none}
-  h2{font-size:18px;margin:0 0 4px;color:#fff}
-  .hint{color:#9aa0a6;font-size:14px;margin:0 0 12px;max-width:80ch}
-  .card{background:#171b21;border:1px solid #262b33;border-radius:12px;padding:16px 18px}
-  section{margin:26px 0 0}
-  .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}
+  body{margin:0;font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 24px 72px}
+  a{color:var(--gold)}
+  h1{font-size:30px;margin:0 0 4px;letter-spacing:-.01em}
+  h1 .t{color:var(--gold)}
+  h2{font-size:17px;margin:0 0 4px;color:#fff}
+  h3{font-size:15px;margin:0 0 6px;color:#fff}
+  p{margin:0 0 10px}
+  .sub{color:var(--dim);margin:0 0 10px;max-width:78ch}
+  .crumb{color:var(--mute);font-size:13px;margin:0 0 18px}
+  .crumb a{color:var(--dim);text-decoration:none}
+  .hint{color:var(--dim);font-size:14px;margin:0 0 12px;max-width:84ch}
+  .small{font-size:13px;color:var(--mute)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  section{margin:24px 0 0}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .status{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px}
+  .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}
   .m .mk{font-size:14px;color:#fff;font-weight:600}
-  .m .px{font-size:23px;margin:4px 0 2px;font-variant-numeric:tabular-nums}
-  .m .meta{color:#6b7280;font-size:11.5px;font-variant-numeric:tabular-nums}
+  .m .px{font-size:22px;margin:2px 0 0;font-variant-numeric:tabular-nums}
+  .m .meta{color:var(--mute);font-size:11.5px;font-variant-numeric:tabular-nums}
+  .tbl{overflow-x:auto}
   table{width:100%;border-collapse:collapse;font-size:14px}
-  th{text-align:left;color:#9aa0a6;font-weight:500;padding:7px 9px;
-     border-bottom:1px solid #262b33;white-space:nowrap}
-  td{padding:8px 9px;border-bottom:1px solid #1c2128;font-variant-numeric:tabular-nums}
+  th{text-align:left;color:var(--dim);font-weight:500;padding:7px 9px;
+     border-bottom:1px solid var(--line);white-space:nowrap;font-size:12.5px}
+  td{padding:9px 9px;border-bottom:1px solid var(--card2);font-variant-numeric:tabular-nums;
+     vertical-align:top}
   tr:last-child td{border-bottom:0}
-  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:#9aa0a6}
+  td .sub2{display:block;color:var(--mute);font-size:12px;margin-top:1px}
+  .mono{font-family:var(--mono);font-size:12.5px;color:var(--dim)}
   .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;
-       border:1px solid #262b33;color:#9aa0a6;white-space:nowrap}
-  .tag.ok{color:#7ee2a8;border-color:#1f4733}
-  .tag.warn{color:#f5b301;border-color:#4a3a10}
-  .tag.bad{color:#ff8f8f;border-color:#4d2626}
-  .tag.dim{color:#6b7280}
-  button{background:#222831;color:#e8eaed;border:1px solid #333c48;border-radius:8px;
-         padding:6px 13px;font:inherit;font-size:14px;cursor:pointer}
-  button:hover{border-color:#f5b301}
-  button.primary{background:#f5b301;color:#141414;border-color:#f5b301;font-weight:600}
-  button.warnbtn{border-color:#4a3a10;color:#f5b301}
-  .tabs{display:flex;gap:8px;margin:22px 0 14px;flex-wrap:wrap}
-  .tabs button.on{background:#f5b301;color:#141414;border-color:#f5b301;font-weight:600}
-  .empty{color:#6b7280;font-size:14px;padding:12px 2px}
-  .note{margin:16px 0;padding:13px 16px;border-radius:10px;border:1px solid #262b33;
-        background:#171b21;font-size:14px}
-  .note.ok{border-color:#1f4733} .note.bad{border-color:#4d2626;color:#ffbcbc}
-  .note.warn{border-color:#4a3a10}
+       border:1px solid var(--line);color:var(--dim);white-space:nowrap;vertical-align:middle}
+  .tag.ok{color:var(--ok);border-color:var(--ok-line)}
+  .tag.warn{color:var(--warn);border-color:var(--warn-line)}
+  .tag.bad{color:var(--bad);border-color:var(--bad-line)}
+  .tag.dim{color:var(--mute)}
+  .tag.gold{color:var(--gold-ink);background:var(--gold);border-color:var(--gold);font-weight:600}
+  button{background:#222831;color:var(--ink);border:1px solid var(--line2);border-radius:8px;
+         padding:6px 13px;font:inherit;font-size:14px;cursor:pointer;white-space:nowrap}
+  button:hover{border-color:var(--gold)}
+  button:disabled{opacity:.45;cursor:default}
+  button.primary{background:var(--gold);color:var(--gold-ink);border-color:var(--gold);font-weight:600}
+  button.warnbtn{border-color:var(--warn-line);color:var(--gold)}
+  button.sm{padding:4px 10px;font-size:13px}
+  .tabs{display:flex;gap:8px;margin:22px 0 14px;flex-wrap:wrap;align-items:center}
+  .tabs button.on{background:var(--gold);color:var(--gold-ink);border-color:var(--gold);font-weight:600}
+  .tabs .spacer{flex:1}
+  .empty{color:var(--mute);font-size:14px;padding:12px 2px}
+  .note{margin:16px 0;padding:13px 16px;border-radius:10px;border:1px solid var(--line);
+        background:var(--card);font-size:14px}
+  .note.ok{border-color:var(--ok-line)} .note.bad{border-color:var(--bad-line);color:#ffbcbc}
+  .note.warn{border-color:var(--warn-line)}
   .note ul{margin:8px 0 0;padding-left:20px} .note li{margin-bottom:3px}
   .note:empty{display:none}
-  #busy{display:none;margin:12px 0;color:#f5b301;font-size:14px}
-  .wl{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-  .bals{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
-  form.lend{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
-  form.lend label{display:block;font-size:13px;color:#9aa0a6;margin-bottom:4px}
-  form.lend input,form.lend select{width:100%;background:#0f1216;color:#e8eaed;
-    border:1px solid #333c48;border-radius:8px;padding:7px 9px;font:inherit;font-size:14px}
+  #busy{display:none;margin:12px 0;color:var(--gold);font-size:14px}
+  .bals{margin-top:10px;display:flex;gap:6px;flex-wrap:wrap}
+  .bal{display:inline-flex;gap:6px;align-items:baseline;padding:3px 10px;border-radius:8px;
+       border:1px solid var(--line);font-size:13px;font-variant-numeric:tabular-nums}
+  .bal b{color:#fff;font-weight:600} .bal .ref{color:var(--mute);font-size:12px}
+  form.lend{display:grid;gap:12px 14px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+  form.lend label{display:block;font-size:12.5px;color:var(--dim);margin-bottom:4px}
+  form.lend input,form.lend select,form.lend textarea{width:100%;background:var(--bg);color:var(--ink);
+    border:1px solid var(--line2);border-radius:8px;padding:7px 9px;font:inherit;font-size:14px}
   form.lend .full{grid-column:1/-1}
-  .safe{border-left:3px solid #f5b301}
-  .safe code{background:#0f1216;padding:2px 6px;border-radius:4px;font-size:13px}
-  footer{margin-top:40px;border-top:1px solid #262b33;padding-top:16px;
-         color:#6b7280;font-size:13px}
+  .preview{grid-column:1/-1;background:var(--bg);border:1px solid var(--line);border-radius:10px;
+           padding:12px 14px;font-size:14px}
+  .preview b{color:#fff}
+  .preview .k{color:var(--mute)}
+  .kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;font-size:14px}
+  .kv .k{color:var(--mute)}
+  .safe{border-left:3px solid var(--gold)}
+  .safe code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:13px}
+  details summary{cursor:pointer;color:var(--dim);font-size:14px}
+  footer{margin-top:40px;border-top:1px solid var(--line);padding-top:16px;
+         color:var(--mute);font-size:13px}
+  .health{display:inline-block;min-width:52px;text-align:center}
 </style></head><body><div class="wrap">
 
 <p class="crumb"><a href="/">&larr; Sequentia testnet</a></p>
 <h1>Pignus <span class="t">lending</span></h1>
-<p class="sub">Borrow USDX against GOLD, SILVR, OILX, tSEQ or native Bitcoin.
-The loan's terms are compiled into a covenant the network enforces: nobody holds
-your collateral, nobody can change the deal after you agree it, and repaying
-needs no one's permission.</p>
-<p class="hint" style="margin-bottom:18px">
-  <span class="tag dim" id="pinned">checking&hellip;</span>
-  This page composes every transaction itself and derives every address itself.
-  Your wallet holds the keys and signs; this page never sees them.
-</p>
+<p class="sub">Borrow USDX against GOLD, SILVR, OILX or tSEQ. Every term of a loan
+is compiled into a covenant the network enforces: nobody holds the collateral,
+nobody can change the deal once it is struck, and repaying needs no one's
+permission.</p>
+<div class="status">
+  <span class="tag dim" id="pinned">checking the covenant&hellip;</span>
+  <span class="tag dim" id="chain">chain&hellip;</span>
+  <span class="tag dim" id="daemon">book&hellip;</span>
+</div>
 
 <div class="card" id="wallet"></div>
 <div id="busy"></div>
 <div class="note" id="note"></div>
 
 <section>
-  <h2>Prices <span class="tag dim">signed, and verified here before use</span></h2>
+  <h2>Prices <span class="tag dim">oracle-signed, verified here before use</span></h2>
   <div class="grid" id="markets"><div class="empty">loading&hellip;</div></div>
 </section>
 
 <div class="tabs">
   <button data-tab="borrow" class="on">Borrow</button>
-  <button data-tab="loans">Loans &amp; liquidations</button>
   <button data-tab="lend">Lend</button>
+  <button data-tab="loans">Loans</button>
   <button data-tab="repo">Repurchase</button>
-  <button id="refresh">Refresh</button>
+  <span class="spacer"></span>
+  <button id="refresh" class="sm">Refresh</button>
 </div>
 
 <section data-panel="borrow">
   <h2>Open offers</h2>
-  <p class="hint">A funded offer holds the lender's principal in a covenant, so
-  you can take it with the lender offline. Taking one locks your collateral in a
-  vault whose address the offer's own script recomputes from your key &mdash; it
-  cannot pay anyone else, and it cannot be pointed anywhere else.</p>
-  <div class="card" id="offers"><div class="empty">loading&hellip;</div></div>
-</section>
-
-<section data-panel="loans" style="display:none">
-  <h2>Live loans</h2>
-  <p class="hint">Health is the current price over the strike. Below 1.00 anyone
-  may liquidate, and the covenant forces the surplus back to the borrower
-  whoever does it &mdash; so a liquidation is a race for the bonus, not a
-  seizure. Your own loans show a Repay button.</p>
-  <div class="card" id="loans"><div class="empty">loading&hellip;</div></div>
+  <p class="hint">Each offer holds a lender's principal in a covenant, so you can
+  take it while they are offline. Taking one locks your collateral in a vault
+  whose address the offer's own script recomputes from your wallet &mdash; it
+  cannot pay anyone else, and nobody can point it elsewhere. Repay any time
+  before maturity and the collateral comes straight back.</p>
+  <div class="card tbl" id="offers"><div class="empty">loading&hellip;</div></div>
 </section>
 
 <section data-panel="lend" style="display:none">
-  <h2>Publish a funded offer</h2>
-  <p class="hint">Your principal goes into an offer covenant with the terms
-  baked in. Borrowers can take it while you are offline; you cannot oversell it,
-  and you cannot change a term afterwards. Anything untaken returns to you after
-  the expiry &mdash; permissionlessly, to your pinned address, so you need no key
-  beyond the one your wallet already has.</p>
+  <h2>Lend</h2>
+  <p class="hint">Your principal goes into an offer covenant with the terms baked
+  in. Borrowers take it while you are offline; you cannot oversell it and cannot
+  change a term afterwards. Anything untaken comes back to you after the expiry,
+  permissionlessly, to the address this wallet already has.</p>
   <form class="lend card" id="lendform">
-    <div><label>Market</label>
-      <select name="market" id="marketsel"></select></div>
-    <div><label>Collateral asset id</label>
-      <input name="collateral_asset" placeholder="64-hex asset id" required></div>
-    <div><label>Debt asset id</label>
-      <input name="debt_asset" placeholder="64-hex asset id" required></div>
-    <div><label>Lend per loan (units)</label>
-      <input name="principal" type="number" step="0.00000001" value="100" required></div>
-    <div><label>Collateral required (units)</label>
-      <input name="collateral" type="number" step="0.00000001" value="1" required></div>
-    <div><label>Interest over the term (%)</label>
-      <input name="rate" type="number" step="0.01" value="3.5" required></div>
-    <div><label>Liquidate below (% of today's price)</label>
-      <input name="strike_ltv" type="number" step="1" value="60" required></div>
-    <div><label>Term (blocks)</label>
-      <input name="term" type="number" value="43200" required></div>
+    <div><label>Market</label><select name="market" id="marketsel"></select></div>
+    <div><label>Lend per loan <span id="lend_unit"></span></label>
+      <input name="principal" type="number" step="any" min="0" value="100" required></div>
     <div><label>How many loans</label>
-      <input name="lots" type="number" value="1" min="1" required></div>
-    <input type="hidden" name="height" id="height">
-    <div class="full"><button class="primary" type="submit">Publish offer</button>
-      <span class="hint" style="display:inline;margin-left:8px">You will see the
-      exact terms and the offer address before your wallet asks you to sign.</span>
-    </div>
+      <input name="lots" type="number" value="1" min="1" step="1" required></div>
+    <div><label>Interest over the term (%)</label>
+      <input name="rate" type="number" step="0.01" min="0" value="3" required></div>
+    <div><label>Collateral required (loan-to-value %)</label>
+      <input name="open_ltv" type="number" step="1" min="1" max="99" value="50" required></div>
+    <div><label>Liquidate at (loan-to-value %)</label>
+      <input name="liq_ltv" type="number" step="1" min="2" max="100" value="75" required></div>
+    <div><label>Term (days)</label>
+      <input name="term_days" type="number" step="any" min="0.01" value="30" required></div>
+    <div><label>Offer open for (days)</label>
+      <input name="offer_days" type="number" step="any" min="0.01" value="30" required></div>
+    <div class="preview" id="preview">Pick a market.</div>
+    <div class="full row"><button class="primary" type="submit">Publish offer</button>
+      <span class="hint" style="margin:0">You will see the exact terms and the offer
+      address before your wallet asks you to sign.</span></div>
   </form>
 </section>
 
+<section data-panel="loans" style="display:none">
+  <div class="row" style="justify-content:space-between">
+    <h2>Loans</h2>
+    <span class="row">
+      <button class="sm on" data-lf="live">Live</button>
+      <button class="sm" data-lf="mine">Mine</button>
+      <button class="sm" data-lf="all">History</button>
+    </span>
+  </div>
+  <p class="hint">Health is the current price over the liquidation price. Under
+  1.00 anyone may liquidate, and the covenant forces the surplus back to the
+  borrower whoever does it &mdash; a liquidation is a race for the bonus, not a
+  seizure. After maturity a loan can be called at any price; long after, the
+  lender can sweep it without an oracle.</p>
+  <div class="card tbl" id="loans"><div class="empty">loading&hellip;</div></div>
+</section>
+
 <section data-panel="repo" style="display:none">
-  <h2>Check a repurchase <span class="tag">Tier D &mdash; not a loan</span></h2>
-  <p class="hint">A regulated (OpenDAMP) asset cannot be locked in a lending
-  vault: the network requires every output carrying it to pay the holder's own
-  covenant address, exits cannot be pre-signed because the shared verifier
-  output moves on any holder's transfer, and the issuer has no power to move a
-  coin either. So on default nobody could ever reach the collateral, and a loan
-  against one is not something that can be built. What can be built is a
-  <strong>repurchase</strong>: you SELL the asset to the lender, and their
-  obligation to sell it back is secured by a bond in a covenant here.</p>
-  <p class="hint">Settling one needs the regulated asset's own machinery, which
-  a browser does not have, so the transaction is composed elsewhere. What this
-  page does is the part that protects you: rebuild the bond vault's address from
-  the terms you were given and check it against the coin that is actually
-  funded. If they match, every destination and the deadline are exactly what you
-  agreed.</p>
+  <h2>Check a repurchase <span class="tag">regulated assets &mdash; not a loan</span></h2>
+  <p class="hint">A regulated (OpenDAMP) asset cannot sit in a lending vault:
+  every output carrying it must pay the holder's own covenant address, so on
+  default nobody could ever reach the collateral. What can be built is a
+  <strong>repurchase</strong>: you sell the asset to the lender, and their
+  obligation to sell it back is secured by a bond in a covenant here. Settling
+  one needs the asset's own machinery, so the transaction is composed elsewhere;
+  this page does the half that protects you &mdash; rebuild the bond vault's
+  address from the terms and check it against the funded coin.</p>
   <form class="lend card" id="repoform">
-    <div style="grid-column:1/-1"><label>Repurchase terms (JSON)</label>
-      <textarea name="terms" id="repoterms" rows="10"
+    <div class="full"><label>Repurchase terms (JSON)</label>
+      <textarea name="terms" id="repoterms" rows="8"
         placeholder='{"collateral_asset": "...", "collateral_amount": 10000000000, "debt_asset": "...", "principal": 70000000000, "debt": 75000000000, "collateral_value": 100000000000, "borrower_cu": "...", "borrower_prog": "...", "lender_prog": "...", "borrower_ver": 0, "lender_ver": 0, "forfeit_after": 900000}'></textarea></div>
-    <div><label>Funding txid <span class="dim">(optional)</span></label>
+    <div><label>Funding txid <span class="small">(optional)</span></label>
       <input name="txid" id="repotxid" placeholder="the coin that holds the bond"></div>
     <div><label>Vout</label><input name="vout" id="repovout" value="0"></div>
-    <div style="grid-column:1/-1">
-      <button type="submit">Check it</button></div>
+    <div class="full"><button type="submit">Check it</button></div>
   </form>
-  <div class="card" id="repoout"><div class="empty">paste the terms you were
-  sent</div></div>
+  <div class="card" id="repoout"><div class="empty">paste the terms you were sent</div></div>
 </section>
 
 <section class="safe">
   <div class="card">
     <h2>What this page does, and what it cannot do</h2>
     <p class="hint" style="margin-bottom:0">Every vault address here is derived
-    in your browser from the terms shown, and compared to what is actually on
+    in your browser from the terms shown and compared with what is actually on
     chain before anything is signed. That check is the whole of the
     non-custodial claim, and it is why this page refuses to build a transaction
-    when an offer's address does not match its terms rather than letting your
+    when an offer's address does not match its terms, rather than letting your
     wallet ask you about it.<br><br>
-    It cannot move your money: it holds no keys, and the wallet shows you its own
-    reading of every transaction before you approve it. If the two disagree,
+    It cannot move your money: it holds no keys, and your wallet shows you its
+    own reading of every transaction before you approve it. If the two disagree,
     reject it &mdash; and tell us.<br><br>
-    Prefer the command line, or want to run this against your own node? The CLI
-    does everything this page does:
-    <code>pignus-cli</code>, on the
-    <a href="/download/">downloads page</a>.</p>
+    Network fees are paid in whichever asset your wallet holds; Sequentia has no
+    privileged fee coin. Prefer the command line, or your own node?
+    <code>pignus-cli</code> does everything this page does, from a node wallet.</p>
   </div>
 </section>
 
 <footer>
   <a href="https://github.com/GracedEternalKingCabbageMan/pignus">source</a> &middot;
-  <a href="https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/doc/sequentia/pignus-design.md">design &amp; security analysis</a>
+  <a href="https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/doc/sequentia/pignus-design.md">design &amp; security analysis</a> &middot;
+  <a href="/pignus-oracle/v1/log">oracle log</a>
   <br>Testnet. The assets have no value and the prices are demo feeds.
 </footer>
 

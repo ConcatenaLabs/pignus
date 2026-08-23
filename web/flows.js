@@ -283,19 +283,36 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
 
   const outs = [{ asset: terms.debt_asset, value: b(terms.debt),
                   script: lenderSpk }];
+  const change = changeOutputs(spend, changeSpk);
+  let feePlaced = false;
   if (surplus > 0n) {
     outs.push({ asset: terms.collateral_asset, value: surplus,
                 script: borrowerSpk });
     outs.push({ asset: terms.collateral_asset,
                 value: b(collateralAmount) - surplus, script: takerSpk });
   } else {
-    // under water: the covenant requires no return, so everything is the
-    // liquidator's and output 1 must NOT be collateral to the borrower
+    // Under water: the covenant requires no return, but its probe treats ANY
+    // collateral-asset output at 2k+1 as a return and then demands the
+    // borrower's program there. So output 1 must carry something that is not
+    // the collateral asset: the fee, or change in another asset when the fee
+    // is being paid in the collateral asset itself.
+    if (feeAsset !== terms.collateral_asset) {
+      outs.push(feeOutput(feeAsset, feeAmount));
+      feePlaced = true;
+    } else {
+      const filler = change.find(o => o.asset !== terms.collateral_asset);
+      if (!filler)
+        throw new WalletError(
+          "an underwater seizure needs an output at index 1 that is not the " +
+          "collateral asset; pay the fee in another asset, or bring change in one");
+      change.splice(change.indexOf(filler), 1);
+      outs.push(filler);
+    }
     outs.push({ asset: terms.collateral_asset, value: b(collateralAmount),
                 script: takerSpk });
   }
-  outs.push(...changeOutputs(spend, changeSpk));
-  outs.push(feeOutput(feeAsset, feeAmount));
+  outs.push(...change);
+  if (!feePlaced) outs.push(feeOutput(feeAsset, feeAmount));
 
   const exit = atMaturity ? "default" : "liquidate";
   const data = [attestation.signature,
@@ -360,3 +377,93 @@ const fmt = (atoms) => (Number(b(atoms)) / 1e8).toLocaleString(undefined,
   { maximumFractionDigits: 8 });
 
 export const _flowInternals = { gather, changeOutputs, fourLeafWitness };
+
+// --------------------------------------------------------------- withdraw
+
+/**
+ * Return an expired offer's remaining principal to the lender.
+ *
+ * Pinned, not signed: the refund leaf pays the lender's program baked into
+ * the offer and nothing else, so anyone may build this and it can only ever
+ * go home. The offer input is at index 0, so the credit is output 0, and
+ * the refund leaf wants every atom the offer held.
+ */
+export function buildWithdrawOffer({ terms, offerOutpoint, offerValue,
+                                     principal, collateral, expiryLocktime,
+                                     utxos, changeSpk, feeAsset, feeAmount }) {
+  const tree = offer.offerTree({ terms, principal, collateral, expiryLocktime });
+  const offerSpk = P.bytesToHex(tree.scriptPubKey);
+  if (offerSpk !== offerOutpoint.scriptPubkey)
+    throw new WalletError(
+      "this offer's address is NOT what these terms compile to -- refusing " +
+      "to build a spend for it");
+  const lenderSpk = scriptPubKeyFor(terms.lender_ver ?? 1,
+                                    terms.lender_prog ?? terms.lender_x);
+  const wants = [[feeAsset, b(feeAmount)]];
+  const { inputs, spend } = gather(utxos, wants);
+  const outs = [{ asset: terms.debt_asset, value: b(offerValue), script: lenderSpk }];
+  outs.push(...changeOutputs(spend, changeSpk));
+  outs.push(feeOutput(feeAsset, feeAmount));
+  const witness = [tree.leaves.refund, tree.controlBlocks.refund].map(P.bytesToHex);
+  return {
+    pset: buildPset({
+      inputs: [{
+        txid: offerOutpoint.txid, vout: offerOutpoint.vout,
+        witnessUtxo: { asset: terms.debt_asset, value: b(offerValue),
+                       script: offerSpk },
+        finalWitness: witness,
+      }, ...inputs.map(psetInput)],
+      outputs: outs,
+      locktime: Number(expiryLocktime),
+    }),
+    summary: [
+      `Return ${fmt(offerValue)} of ${short(terms.debt_asset)} to the lender's pinned address`,
+      `The offer expired at ${expiryLocktime}; nothing else can be done with it`,
+    ],
+  };
+}
+
+// ---------------------------------------------------------------- recover
+
+/**
+ * The lender's backstop: long after maturity, sweep the whole collateral to
+ * the lender's pinned program. No oracle, no signature -- it exists so a
+ * vault whose oracle has vanished is not locked forever.
+ */
+export function buildRecover({ terms, vaultOutpoint, collateralAmount, singleLeaf,
+                               utxos, changeSpk, feeAsset, feeAmount }) {
+  const lenderSpk = scriptPubKeyFor(terms.lender_ver ?? 1,
+                                    terms.lender_prog ?? terms.lender_x);
+  const vaultSpk = singleLeaf
+    ? P.bytesToHex(offer.offerVaultScriptPubKey(terms))
+    : P.bytesToHex(vaultScriptPubKey(terms));
+  if (vaultSpk !== vaultOutpoint.scriptPubkey)
+    throw new WalletError(
+      "the vault at that outpoint is not what these terms compile to -- " +
+      "refusing to build a spend for it");
+  const wants = [[feeAsset, b(feeAmount)]];
+  const { inputs, spend } = gather(utxos, wants);
+  const outs = [{ asset: terms.collateral_asset, value: b(collateralAmount),
+                  script: lenderSpk }];
+  outs.push(...changeOutputs(spend, changeSpk));
+  outs.push(feeOutput(feeAsset, feeAmount));
+  const witness = singleLeaf
+    ? offer.offerVaultWitness(terms, "recover").map(P.bytesToHex)
+    : fourLeafWitness(terms, "recover");
+  return {
+    pset: buildPset({
+      inputs: [{
+        txid: vaultOutpoint.txid, vout: vaultOutpoint.vout,
+        witnessUtxo: { asset: terms.collateral_asset,
+                       value: b(collateralAmount), script: vaultSpk },
+        finalWitness: witness,
+      }, ...inputs.map(psetInput)],
+      outputs: outs,
+      locktime: Number(terms.recover_after),
+    }),
+    summary: [
+      `Sweep all ${fmt(collateralAmount)} of ${short(terms.collateral_asset)} to the lender`,
+      `Open since block ${terms.recover_after}: the oracle-liveness backstop`,
+    ],
+  };
+}

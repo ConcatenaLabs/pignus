@@ -25,10 +25,14 @@ def _offer_module():
 def _vault_kwargs(terms):
     """The covenant arguments an offer's vault is built from: everything except
     the borrower, who does not exist until someone takes it."""
-    cov = load_covenant()
     kw = terms._covenant_kwargs()
     kw.pop("borrower_prog", None)
-    kw.pop("borrower_ver", None)
+    # `borrower_ver` STAYS. It is a constant of the vault the offer rebuilds in
+    # script (a v0 program is 20 bytes, a v1 program 32), so an offer for
+    # extension-wallet borrowers compiles to a different address from one for
+    # taproot borrowers. Dropping it here once made this book compute a
+    # different offer address from the browser for every v0 lender, and refuse
+    # every real offer as "does not hold".
     # `max_price` is passed as None when unset, which the builders accept
     return {k: v for k, v in kw.items() if k != "recover_after"} | {
         "recover_after": terms.recover_after}
@@ -45,13 +49,30 @@ def offer_address(terms, principal, collateral, expiry_locktime) -> bytes:
     return bytes(tap.scriptPubKey)
 
 
-def offer_vault_address(terms) -> bytes:
-    """The single-leaf vault an offer creates for a given borrower."""
+def offer_vault_taptree(terms):
+    """The single-leaf vault an offer creates for a given borrower:
+    (taproot, leaf)."""
     off = _offer_module()
     kw = terms._covenant_kwargs()
     borrower = kw.pop("borrower_prog")
-    tap, _leaf = off.offer_vault_taptree(borrower_prog=borrower, **kw)
+    return off.offer_vault_taptree(borrower_prog=borrower, **kw)
+
+
+def offer_vault_address(terms) -> bytes:
+    """The single-leaf vault's scriptPubKey."""
+    tap, _leaf = offer_vault_taptree(terms)
     return bytes(tap.scriptPubKey)
+
+
+def offer_leaves(terms, principal, collateral, expiry_locktime):
+    """The offer's {take, refund} leaves as hex, for naming a spend."""
+    off = _offer_module()
+    kw = _vault_kwargs(terms)
+    _tap, leaves = off.offer_taptree(
+        asset_c=kw["asset_c"], asset_d=kw["asset_d"],
+        principal=int(principal), collateral=int(collateral),
+        vault_kwargs=kw, expiry_locktime=int(expiry_locktime))
+    return {name: bytes(script).hex() for name, script in leaves.items()}
 
 
 class NotOnChain(ValueError):
@@ -66,7 +87,10 @@ def check_outpoint(node, txid, vout, expected_spk, what="offer"):
     is that the unchecked thing must not be published.
     """
     try:
-        got = node.gettxout(txid, int(vout), False)
+        # Mempool included: a page publishes an offer, or registers a loan,
+        # the moment it has broadcast the funding, and a book that only
+        # believes in confirmed outputs would refuse every honest one.
+        got = node.gettxout(txid, int(vout), True)
     except Exception as e:                              # noqa: BLE001
         raise NotOnChain(f"cannot reach the node to check this {what}: {e}")
     if got is None:

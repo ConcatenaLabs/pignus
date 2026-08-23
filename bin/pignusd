@@ -16,6 +16,7 @@ Config:
       "listen":   "127.0.0.1:8741",
       "book":     "/var/lib/pignus/book.json",
       "oracle":   "http://127.0.0.1:8740",
+      "registry": "http://127.0.0.1:3005",
       "markets":  ["GOLD/USDX", "SILVR/USDX", "OILX/USDX"],
       "poll":     30,
       "rpc":      {"url": "http://127.0.0.1:18200", "user": "...",
@@ -24,18 +25,32 @@ Config:
 
 `rpc` is optional: without a node the book still serves offers and whatever it
 last knew, and says so in /healthz rather than pretending the states are fresh.
+`registry` resolves each market's tickers to asset ids and precisions, so
+nobody has to type a 64-hex id into a form; the node's own asset labels are
+the fallback.
+
+The book follows the chain on its own. An offer's coin is watched; when it is
+taken, the borrower's payout program is read out of the witness, the new vault
+is registered as a loan, and the offer moves to its remainder. So a loan taken
+by ANY wallet -- through this page or not -- turns up here.
 
 Endpoints:
     GET  /                     the page
-    GET  /v1/markets           markets, with live oracle prices
-    GET  /v1/offers            the book        (?market=, ?kind=)
-    POST /v1/offers            publish an offer
-    DELETE /v1/offers/{id}     withdraw one
+    GET  /v1/markets           markets: prices, asset ids, tickers, precisions
+    GET  /v1/assets            the registry, keyed by asset id
+    GET  /v1/fees              the node's fee exchange rates and relay floor
+    GET  /v1/offers            open offers      (?market=, ?status=all)
+    GET  /v1/offer/{id}        one offer, with what its coin holds right now
+    POST /v1/offers            publish a funded offer (checked on chain first)
+    DELETE /v1/offers/{id}     drop a listing (the coin is untouched)
     GET  /v1/loans             known loans     (?state=, ?market=)
-    POST /v1/loans             register a loan for watching
+    POST /v1/loans             register a loan for watching (checked first)
     GET  /v1/loan/{id}         one loan, with health at the current price
+    GET  /v1/outpoint/{txid}/{vout}   what an outpoint holds (mempool included)
+    GET  /v1/attestation/{market}     the latest verified attestation
     GET  /v1/stats             counts, live debt, positions near their strike
     GET  /v1/oracle            the oracle key and feeds this book quotes against
+    GET  /v1/vectors           the golden vectors the browser pins itself to
     GET  /healthz
 """
 
@@ -52,6 +67,7 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
 from pignus import oracle as O                     # noqa: E402
+from pignus import fees as F                       # noqa: E402
 from pignus.book import Book                       # noqa: E402
 from pignus.node import Node, RpcError             # noqa: E402
 from pignus.offers import (                        # noqa: E402
@@ -66,6 +82,13 @@ MAX_BODY = 256 * 1024
 # a testnet and small enough that the whole file stays cheap to rewrite.
 MAX_OFFERS = 2000
 MAX_LOANS = 5000
+COIN = 100_000_000
+
+# Market symbols that are not registry tickers. The Sequence token is listed
+# as tSEQ on the testnet; native Bitcoin has no Sequentia asset id at all, so a
+# BTC market is cross-chain and this page cannot originate against it.
+ALIASES = {"SEQ": "tSEQ", "TSEQ": "tSEQ"}
+NATIVE = {"BTC", "TBTC"}
 
 
 class Service:
@@ -73,13 +96,22 @@ class Service:
         self.cfg = cfg
         self.book = Book(cfg["book"])
         self.oracle_url = cfg.get("oracle", "").rstrip("/")
+        self.registry_url = cfg.get("registry", "").rstrip("/")
         self.markets = list(cfg.get("markets", []))
         self.prices = {}
         self.attestations = {}
         self.oracle_x = None
         self.node = None
         self.node_error = None
+        self.oracle_error = None
         self.last_poll = 0
+        self.height = None
+        self.assets = {}            # asset id -> {ticker, name, precision}
+        self.by_ticker = {}         # TICKER (upper) -> asset id
+        self.fee_table = {"rates": {}, "relay_floor_rfa_per_kvb": 100,
+                          "feerate_rfa_per_kvb": F.DEFAULT_FEERATE_RFA_PER_KVB,
+                          "vsize": dict(F.VSIZE)}
+        self._registry_at = 0
         rpc = cfg.get("rpc")
         if rpc and rpc.get("url"):
             self.node = Node(url=rpc["url"], user=rpc.get("user"),
@@ -99,8 +131,9 @@ class Service:
                                         timeout=8) as r:
                 self.oracle_x = json.loads(r.read().decode())["oracle_x"]
         except Exception as e:                      # noqa: BLE001
-            self.node_error = f"oracle: {type(e).__name__}: {e}"
+            self.oracle_error = f"oracle: {type(e).__name__}: {e}"
             return
+        self.oracle_error = None
         for m in self.markets:
             try:
                 url = f"{self.oracle_url}/v1/attestation/{m.replace('/', '_')}"
@@ -117,30 +150,150 @@ class Service:
                 self.prices[m] = att.price
                 self.attestations[m] = att
 
+    # ----------------------------------------------------------- the registry
+
+    def refresh_registry(self, force=False):
+        """Asset ids and precisions by ticker, from the registry's minimal
+        index, with the node's own labels underneath it."""
+        if not force and time.time() - self._registry_at < 600:
+            return
+        found = {}
+        if self.node:
+            try:
+                for label, asset in (self.node.dumpassetlabels() or {}).items():
+                    if len(asset) == 64 and label != "bitcoin":
+                        found[asset] = {"ticker": label, "name": label,
+                                        "precision": 8}
+            except Exception:                       # noqa: BLE001
+                pass
+        if self.registry_url:
+            try:
+                with urllib.request.urlopen(
+                        f"{self.registry_url}/index.minimal.json",
+                        timeout=8) as r:
+                    idx = json.loads(r.read().decode())
+                for asset, row in idx.items():
+                    if len(asset) != 64 or not isinstance(row, list):
+                        continue
+                    ticker = str(row[1] or "")
+                    if not ticker:
+                        continue
+                    found[asset] = {"ticker": ticker, "name": str(row[2] or ticker),
+                                    "precision": int(row[3] or 0) if row[3] is not None else 8}
+            except Exception as e:                  # noqa: BLE001
+                print(f"registry: {type(e).__name__}: {e}", file=sys.stderr)
+        if found:
+            with self._lock:
+                self.assets = found
+                self.by_ticker = {v["ticker"].upper(): k for k, v in found.items()}
+        self._registry_at = time.time()
+
+    def resolve(self, symbol):
+        """A market symbol -> (asset id | None, ticker)."""
+        sym = symbol.strip()
+        up = sym.upper()
+        if up in NATIVE:
+            return None, "BTC"
+        ticker = ALIASES.get(up, sym)
+        asset = self.by_ticker.get(ticker.upper()) or self.by_ticker.get(up)
+        return asset, (self.assets[asset]["ticker"] if asset else ticker)
+
     # ------------------------------------------------------------ the watcher
+
+    def refresh_fees(self):
+        if not self.node:
+            return
+        try:
+            self.fee_table = F.fee_table(self.node)
+        except Exception as e:                      # noqa: BLE001
+            print(f"fees: {type(e).__name__}: {e}", file=sys.stderr)
 
     def refresh_chain(self):
         if not self.watcher:
             return
+        w = self.watcher
         try:
+            self.height = self.node.getblockcount()
             for rec in self.book.list_loans():
-                if rec["loan_id"] in self.watcher.vaults:
+                if rec["loan_id"] not in w.vaults:
+                    w.track(rec["loan_id"], LoanTerms.from_json(rec["terms"]),
+                            rec["txid"], rec["vout"],
+                            single_leaf=bool(rec.get("single_leaf")))
+            for off in self.book.list_offers(status="open"):
+                if off.get("kind") != "funded" or off["offer_id"] in w.offers:
                     continue
-                self.watcher.track(rec["loan_id"],
-                                   LoanTerms.from_json(rec["terms"]),
-                                   rec["txid"], rec["vout"])
-            for v in self.watcher.poll():
+                txid, _, vout = str(off["outpoint"]).rpartition(":")
+                w.track_offer(off["offer_id"], LoanTerms.from_json(off["terms"]),
+                              txid, int(vout), int(off["principal"]),
+                              int(off["collateral"]), int(off["expiry_locktime"]))
+            for v in w.poll():
                 self.book.update_loan(v.loan_id, state=v.state.value,
                                       confirmations=v.confirmations,
                                       spent_by=v.spent_by, note=v.note)
+            for v in w.vaults.values():
+                rec = self.book.loans.get(v.loan_id)
+                if rec and rec.get("confirmations") != v.confirmations:
+                    self.book.update_loan(v.loan_id, confirmations=v.confirmations)
+            for ev in w.drain_events():
+                self._apply_offer_event(ev)
+            for o in w.offers.values():
+                rec = self.book.offers.get(o.offer_id)
+                if rec and o.status == "open" and (
+                        rec.get("funded_value") != str(o.value)
+                        or rec.get("confirmations") != o.confirmations):
+                    self.book.update_offer(o.offer_id, funded_value=str(o.value),
+                                           confirmations=o.confirmations)
             self.node_error = None
         except Exception as e:                      # noqa: BLE001
             self.node_error = f"node: {type(e).__name__}: {e}"
 
+    def _apply_offer_event(self, ev):
+        """What the chain did to an offer, written into the book."""
+        off = self.book.offers.get(ev["offer_id"])
+        if off is None:
+            return
+        kind = ev["kind"]
+        if kind == "taken":
+            base = json.loads(off["terms"])
+            prog = ev["borrower_prog"]
+            terms = LoanTerms(**{**base, "borrower_prog": prog,
+                                 "borrower_x": prog})
+            v = ev["vault"]
+            rec = self.book.put_loan(terms.to_json(), v["txid"], v["vout"],
+                                     single_leaf=True, offer_id=off["offer_id"],
+                                     discovered="chain")
+            if rec["loan_id"] not in self.watcher.vaults:
+                self.watcher.track(rec["loan_id"], terms, v["txid"], v["vout"],
+                                   single_leaf=True)
+            print(f"offer {off['offer_id'][:12]} taken in {ev['txid'][:12]}: "
+                  f"loan {rec['loan_id'][:12]} at {v['txid'][:12]}:{v['vout']}",
+                  file=sys.stderr)
+            rem = ev.get("remainder")
+            if rem:
+                self.book.update_offer(off["offer_id"],
+                                       outpoint=f"{rem['txid']}:{rem['vout']}",
+                                       funded_value=str(rem["value"]),
+                                       confirmations=0,
+                                       taken=int(off.get("taken", 0)) + 1)
+            else:
+                self.book.update_offer(off["offer_id"], status="taken",
+                                       funded_value="0",
+                                       taken=int(off.get("taken", 0)) + 1,
+                                       spent_by=ev["txid"])
+        elif kind == "withdrawn":
+            self.book.update_offer(off["offer_id"], status="withdrawn",
+                                   spent_by=ev["txid"])
+        else:
+            self.book.update_offer(off["offer_id"], status="gone",
+                                   spent_by=ev.get("txid", ""),
+                                   note=ev.get("note", ""))
+
     def loop(self, interval):
         while True:
             started = time.time()
+            self.refresh_registry()
             self.refresh_prices()
+            self.refresh_fees()
             self.refresh_chain()
             self.last_poll = int(time.time())
             time.sleep(max(2.0, interval - (time.time() - started)))
@@ -158,7 +311,9 @@ class Service:
         """
         terms = LoanTerms.from_json(body["terms"])
         if body.get("kind") != "funded":
-            return
+            raise ValueError("this book lists FUNDED offers: a signed offer "
+                             "needs the lender online and has nothing on chain "
+                             "to check")
         outpoint = str(body.get("outpoint") or "")
         if ":" not in outpoint:
             raise ValueError("a funded offer must name outpoint 'txid:vout'")
@@ -167,17 +322,22 @@ class Service:
             raise NotOnChain(
                 "this book has no node, so it cannot check that a funded offer "
                 "is real, and it will not publish one it cannot check")
-        want = offer_address(terms, terms.principal, terms.collateral_amount,
-                             int(body.get("expiry_locktime") or terms.maturity))
+        principal = int(body.get("principal") or terms.principal)
+        collateral = int(body.get("collateral") or terms.collateral_amount)
+        expiry = int(body.get("expiry_locktime") or terms.maturity)
+        want = offer_address(terms, principal, collateral, expiry)
         got = check_outpoint(self.node, txid, vout, want, "offer")
         if got["asset"] and got["asset"] != terms.debt_asset:
             raise NotOnChain(
                 f"that outpoint holds {got['asset'][:16]}…, not the debt asset "
                 f"{terms.debt_asset[:16]}…")
-        if got["value"] < terms.principal:
+        if got["value"] < principal:
             raise NotOnChain(
                 f"that outpoint holds {got['value']} atoms, less than one "
-                f"principal of {terms.principal}")
+                f"principal of {principal}")
+        body["principal"] = str(principal)
+        body["collateral"] = str(collateral)
+        body["expiry_locktime"] = expiry
         body["funded_value"] = str(got["value"])
         body["confirmations"] = got["confirmations"]
 
@@ -199,8 +359,17 @@ class Service:
         rows = []
         for m in self.markets:
             att = self.attestations.get(m)
+            c_sym, _, d_sym = m.partition("/")
+            c_asset, c_tick = self.resolve(c_sym)
+            d_asset, d_tick = self.resolve(d_sym)
             rows.append({
                 "market": m, "feed_id": feed_id(m).hex(),
+                "collateral_ticker": c_tick, "debt_ticker": d_tick,
+                "collateral_asset": c_asset, "debt_asset": d_asset,
+                "collateral_precision": (self.assets.get(c_asset) or {}).get("precision", 8),
+                "debt_precision": (self.assets.get(d_asset) or {}).get("precision", 8),
+                "cross_chain": c_sym.strip().upper() in NATIVE,
+                "lendable": bool(c_asset and d_asset and att),
                 "price": att.price if att else None,
                 "price_scale": att.price_scale if att else None,
                 "unit_price": (O.unquote_price(att.price,
@@ -211,16 +380,56 @@ class Service:
             })
         return rows
 
+    def _tickers(self, out, t):
+        c = self.assets.get(t.collateral_asset) or {}
+        d = self.assets.get(t.debt_asset) or {}
+        out["collateral_ticker"] = c.get("ticker") or t.collateral_asset[:8] + "…"
+        out["debt_ticker"] = d.get("ticker") or t.debt_asset[:8] + "…"
+        out["collateral_precision"] = c.get("precision", 8)
+        out["debt_precision"] = d.get("precision", 8)
+
+    def offer_view(self, rec):
+        t = LoanTerms.from_json(rec["terms"])
+        out = dict(rec)
+        self._tickers(out, t)
+        out["collateral_asset"] = t.collateral_asset
+        out["debt_asset"] = t.debt_asset
+        out["debt"] = str(t.debt)
+        out["strike"] = str(t.strike)
+        out["maturity"] = t.maturity
+        out["lender_prog"] = t.payout_programs[0]
+        out["lender_ver"] = t.lender_ver
+        price = self.prices.get(t.market)
+        if price is not None:
+            out["price"] = price
+            out["open_ltv"] = round(t.principal / max(1, t.collateral_value(price)), 4)
+        if self.height is not None:
+            out["expired"] = self.height >= int(rec.get("expiry_locktime") or 0)
+            out["height"] = self.height
+        try:
+            out["lots_left"] = int(rec.get("funded_value") or 0) // int(rec["principal"])
+        except (ValueError, ZeroDivisionError, KeyError):
+            out["lots_left"] = None
+        return out
+
     def loan_view(self, rec):
         t = LoanTerms.from_json(rec["terms"])
         price = self.prices.get(t.market)
         out = dict(rec)
+        self._tickers(out, t)
         out["collateral_asset"] = t.collateral_asset
         out["debt_asset"] = t.debt_asset
-        out["debt"] = t.debt
-        out["collateral_amount"] = t.collateral_amount
-        out["strike"] = t.strike
+        out["principal"] = str(t.principal)
+        out["debt"] = str(t.debt)
+        out["collateral_amount"] = str(t.collateral_amount)
+        out["strike"] = str(t.strike)
+        out["price_scale"] = t.price_scale
         out["maturity"] = t.maturity
+        out["recover_after"] = t.recover_after
+        out["lender_prog"] = t.payout_programs[0]
+        out["borrower_prog"] = t.payout_programs[1]
+        out["lender_ver"] = t.lender_ver
+        out["borrower_ver"] = t.borrower_ver
         out["oracle"] = f"{t.threshold}-of-{len(t.oracle_keys)}"
         # A loan originated through a funded offer lives in the SINGLE-LEAF
         # vault; the browser needs to know which, because the two have
@@ -229,18 +438,37 @@ class Service:
         out["single_leaf"] = single
         out["vault_address"] = (offer_vault_address(t) if single
                                 else t.script_pubkey()).hex()
+        if self.height is not None:
+            out["height"] = self.height
+            out["past_maturity"] = self.height >= t.maturity
+            out["recover_open"] = self.height >= t.recover_after
         if price is not None:
             out["price"] = price
             out["health"] = round(t.health(price), 4)
             out["ltv"] = round(t.ltv(price), 4)
             out["liquidatable"] = t.is_liquidatable(price)
+            out["seizure_if_liquidated"] = t.seizure_at(price)
             out["surplus_if_liquidated"] = t.surplus_at(price)
         return out
+
+    def health(self):
+        return {
+            "ok": self.node_error is None and self.oracle_error is None,
+            "error": self.node_error or self.oracle_error,
+            "height": self.height,
+            "last_poll": self.last_poll, "markets": len(self.markets),
+            "priced": len(self.prices),
+            "offers": len(self.book.list_offers(status="open")),
+            "loans": len(self.book.loans),
+            "assets": len(self.assets),
+            "fee_rates": len(self.fee_table.get("rates", {})),
+            "node": bool(self.node)}
 
 
 class Handler(BaseHTTPRequestHandler):
     svc = None
     server_version = "pignusd"
+    protocol_version = "HTTP/1.1"
 
     def _send(self, code, payload, ctype="application/json"):
         body = (json.dumps(payload, indent=2).encode()
@@ -248,12 +476,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+        return True
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -270,18 +500,21 @@ class Handler(BaseHTTPRequestHandler):
     def _static(self, path):
         name = os.path.basename(path)
         if name != path.lstrip("/"):
-            return None
+            return False
         ext = os.path.splitext(name)[1]
         if ext not in self.STATIC or not name:
-            return None
+            return False
         full = os.path.realpath(os.path.join(WEB, name))
         if os.path.dirname(full) != os.path.realpath(WEB) or not os.path.isfile(full):
-            return None
+            return False
         with open(full, "rb") as f:
             return self._send(200, f.read(), self.STATIC[ext])
 
     def do_OPTIONS(self):
         self._send(204, b"", "text/plain")
+
+    def do_HEAD(self):
+        self.do_GET()
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -289,92 +522,94 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("request body too large")
         return json.loads(self.rfile.read(n).decode() or "{}")
 
-    def do_GET(self):
+    def _get(self, path, q):
         s = self.svc
+        if path == "/":
+            with open(os.path.join(WEB, "index.html"), "rb") as f:
+                return self._send(200, f.read(), "text/html; charset=utf-8")
+        if self._static(path):
+            return True
+        if path == "/healthz":
+            return self._send(200, s.health())
+        if path == "/v1/markets":
+            return self._send(200, {"markets": s.market_rows(),
+                                    "height": s.height})
+        if path == "/v1/assets":
+            return self._send(200, {"assets": s.assets})
+        if path == "/v1/fees":
+            return self._send(200, s.fee_table)
+        if path == "/v1/vectors":
+            # The browser pins its own covenant implementation against
+            # these before deriving any address a user will act on. Parsed
+            # rather than streamed, so a corrupt file fails here and not in
+            # a browser that is about to derive an address from it.
+            with open(os.path.join(
+                    os.path.dirname(WEB), "pignus", "vectors.json")) as f:
+                return self._send(200, json.load(f))
+        if path == "/v1/oracle":
+            return self._send(200, {
+                "oracle_x": s.oracle_x, "url": s.oracle_url,
+                "note": "verify every attestation against the key the VAULT "
+                        "bakes in, not against this one"})
+        if path == "/v1/offers":
+            rows = s.book.list_offers(market=q.get("market", [None])[0],
+                                      kind=q.get("kind", [None])[0],
+                                      status=q.get("status", ["open"])[0])
+            return self._send(200, {"offers": [s.offer_view(r) for r in rows]})
+        if path.startswith("/v1/offer/"):
+            rec = s.book.offers.get(path[len("/v1/offer/"):])
+            if not rec:
+                return self._send(404, {"error": "no such offer"})
+            return self._send(200, s.offer_view(rec))
+        if path == "/v1/loans":
+            rows = s.book.list_loans(state=q.get("state", [None])[0],
+                                     market=q.get("market", [None])[0])
+            return self._send(200, {"loans": [s.loan_view(r) for r in rows]})
+        if path.startswith("/v1/loan/"):
+            rec = s.book.loans.get(path[len("/v1/loan/"):])
+            if not rec:
+                return self._send(404, {"error": "no such loan"})
+            return self._send(200, s.loan_view(rec))
+        if path.startswith("/v1/outpoint/"):
+            # What is actually at an outpoint right now, mempool included. The
+            # browser uses this to confirm an offer still exists and holds what
+            # the book says before composing anything against it.
+            parts = path[len("/v1/outpoint/"):].split("/")
+            if len(parts) != 2 or not parts[1].isdigit() or not s.node:
+                return self._send(404, {"error": "no node, or bad outpoint"})
+            txid, vout = parts[0], int(parts[1])
+            got = s.node.gettxout(txid, vout, True)
+            if got is None:
+                return self._send(404, {"error": "unspent output not found; "
+                                                 "it may already be spent"})
+            return self._send(200, {
+                "txid": txid, "vout": vout,
+                "scriptPubKey": got["scriptPubKey"]["hex"],
+                "asset": got.get("asset"),
+                "value": str(int(round(float(got["value"]) * COIN))),
+                "confirmations": got.get("confirmations", 0)})
+        if path.startswith("/v1/attestation/"):
+            market = path[len("/v1/attestation/"):].replace("_", "/").upper()
+            att = s.attestations.get(market)
+            if att is None:
+                return self._send(404, {"error": f"no attestation for {market}"})
+            return self._send(200, att.to_dict())
+        if path == "/v1/stats":
+            return self._send(200, s.book.stats(s.prices))
+        return self._send(404, {"error": "no such endpoint", "path": path})
+
+    def do_GET(self):
         u = urlparse(self.path)
         path = u.path.rstrip("/") or "/"
-        q = parse_qs(u.query)
         try:
-            if path == "/":
-                with open(os.path.join(WEB, "index.html"), "rb") as f:
-                    return self._send(200, f.read(), "text/html; charset=utf-8")
-            asset = self._static(path)
-            if asset is not None:
-                return asset
-            if path == "/healthz":
-                height = None
-                try:
-                    height = s.node.getblockcount() if s.node else None
-                except Exception:                    # noqa: BLE001
-                    pass
-                return self._send(200, {
-                    "ok": s.node_error is None, "error": s.node_error,
-                    "height": height,
-                    "last_poll": s.last_poll, "markets": len(s.markets),
-                    "priced": len(s.prices), "offers": len(s.book.offers),
-                    "loans": len(s.book.loans),
-                    "node": bool(s.node)})
-            if path == "/v1/markets":
-                return self._send(200, {"markets": s.market_rows()})
-            if path == "/v1/vectors":
-                # The browser pins its own covenant implementation against
-                # these before deriving any address a user will act on.
-                # Parsed rather than streamed: _send serialises whatever it
-                # is given for a JSON response, and this doubles as a check
-                # that the file on disk is still valid JSON before a browser
-                # tries to pin itself against it.
-                with open(os.path.join(
-                        os.path.dirname(WEB), "pignus", "vectors.json")) as f:
-                    return self._send(200, json.load(f))
-            if path == "/v1/oracle":
-                return self._send(200, {
-                    "oracle_x": s.oracle_x, "url": s.oracle_url,
-                    "note": "verify every attestation against the key the VAULT "
-                            "bakes in, not against this one"})
-            if path == "/v1/offers":
-                return self._send(200, {"offers": s.book.list_offers(
-                    market=q.get("market", [None])[0],
-                    kind=q.get("kind", [None])[0])})
-            if path == "/v1/loans":
-                rows = s.book.list_loans(state=q.get("state", [None])[0],
-                                         market=q.get("market", [None])[0])
-                return self._send(200, {"loans": [s.loan_view(r) for r in rows]})
-            if path.startswith("/v1/loan/"):
-                rec = s.book.loans.get(path[len("/v1/loan/"):])
-                if not rec:
-                    return self._send(404, {"error": "no such loan"})
-                return self._send(200, s.loan_view(rec))
-            if path.startswith("/v1/outpoint/"):
-                # What is actually at an outpoint right now. The browser uses
-                # this to confirm an offer still exists and holds what the book
-                # says before composing anything against it.
-                parts = path[len("/v1/outpoint/"):].split("/")
-                if len(parts) != 2 or not s.node:
-                    return self._send(404, {"error": "no node, or bad outpoint"})
-                txid, vout = parts[0], int(parts[1])
-                got = s.node.gettxout(txid, vout, False)
-                if got is None:
-                    return self._send(404, {"error": "unspent output not found; "
-                                                     "it may already be spent"})
-                return self._send(200, {
-                    "txid": txid, "vout": vout,
-                    "scriptPubKey": got["scriptPubKey"]["hex"],
-                    "asset": got.get("asset"),
-                    "value": str(int(round(float(got["value"]) * 1e8))),
-                    "confirmations": got.get("confirmations", 0)})
-            if path.startswith("/v1/attestation/"):
-                market = path[len("/v1/attestation/"):].replace("_", "/").upper()
-                att = s.attestations.get(market)
-                if att is None:
-                    return self._send(404, {"error": f"no attestation for {market}"})
-                return self._send(200, att.to_dict())
-            if path == "/v1/stats":
-                return self._send(200, s.book.stats(s.prices))
-            return self._send(404, {"error": "no such endpoint", "path": path})
+            self._get(path, parse_qs(u.query))
+        except (BrokenPipeError, ConnectionResetError):
+            # The client went away mid-response. There is nobody to tell.
+            self.close_connection = True
         except FileNotFoundError:
-            return self._send(500, {"error": "web/index.html is missing"})
+            self._send(500, {"error": "web/index.html is missing"})
         except Exception as e:                      # noqa: BLE001
-            return self._send(500, {"error": f"{type(e).__name__}: {e}"})
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def do_POST(self):
         s = self.svc
@@ -385,17 +620,24 @@ class Handler(BaseHTTPRequestHandler):
                 if len(s.book.offers) >= MAX_OFFERS:
                     return self._send(429, {"error": "the book is full"})
                 s.verify_offer(body)
-                return self._send(200, s.book.put_offer(body))
+                rec = s.book.put_offer(body)
+                s.refresh_chain()
+                return self._send(200, s.offer_view(s.book.offers.get(
+                    rec["offer_id"], rec)))
             if path == "/v1/loans":
                 if len(s.book.loans) >= MAX_LOANS:
                     return self._send(429, {"error": "the book is full"})
                 s.verify_loan(body)
                 rec = s.book.put_loan(body["terms"], body["txid"], body["vout"],
                                       state=body.get("state", "UNCONFIRMED"),
-                                      single_leaf=bool(body.get("single_leaf")))
+                                      single_leaf=bool(body.get("single_leaf")),
+                                      offer_id=body.get("offer_id"))
                 s.refresh_chain()
-                return self._send(200, s.book.loans.get(rec["loan_id"], rec))
+                return self._send(200, s.loan_view(
+                    s.book.loans.get(rec["loan_id"], rec)))
             return self._send(404, {"error": "no such endpoint", "path": path})
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
         except NotOnChain as e:
             return self._send(400, {"error": str(e)})
         except (KeyError, ValueError, TypeError) as e:
@@ -405,10 +647,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path.rstrip("/")
-        if path.startswith("/v1/offers/"):
-            gone = self.svc.book.drop_offer(path[len("/v1/offers/"):])
-            return self._send(200 if gone else 404, {"removed": gone})
-        return self._send(404, {"error": "no such endpoint"})
+        try:
+            if path.startswith("/v1/offers/"):
+                gone = self.svc.book.drop_offer(path[len("/v1/offers/"):])
+                return self._send(200 if gone else 404, {"removed": gone})
+            return self._send(404, {"error": "no such endpoint"})
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
 
 def main():
@@ -421,23 +666,23 @@ def main():
         cfg = json.load(f)
     svc = Service(cfg)
 
+    svc.refresh_registry(force=True)
+    svc.refresh_prices()
+    svc.refresh_fees()
+    svc.refresh_chain()
     if args.once:
-        svc.refresh_prices()
-        svc.refresh_chain()
         print(json.dumps({"markets": svc.market_rows(),
                           "stats": svc.book.stats(svc.prices),
-                          "error": svc.node_error}, indent=2))
+                          "health": svc.health()}, indent=2))
         return
 
-    svc.refresh_prices()
-    svc.refresh_chain()
     threading.Thread(target=svc.loop, args=(int(cfg.get("poll", 30)),),
                      daemon=True).start()
     host, _, port = cfg.get("listen", "127.0.0.1:8741").rpartition(":")
     Handler.svc = svc
     srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
-    print(f"pignusd: {len(svc.markets)} market(s), book {cfg['book']}, "
-          f"serving on {host}:{port}", file=sys.stderr)
+    print(f"pignusd: {len(svc.markets)} market(s), {len(svc.assets)} asset(s) "
+          f"named, book {cfg['book']}, serving on {host}:{port}", file=sys.stderr)
     srv.serve_forever()
 
 
