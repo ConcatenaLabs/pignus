@@ -311,49 +311,56 @@ class VaultWatcher:
 
     def _refresh(self, v, tip):
         """Update one vault's confirmations, and catch a funding that has been
-        reorged away. Returns True if the state changed."""
+        reorged away. Returns True if the state changed.
+
+        Reads liveness from `gettxout`, not `getrawtransaction`: a node without
+        `-txindex` cannot look up a mined transaction by id once it leaves the
+        mempool, so a confirmed vault would look gone and every loan would ghost
+        the moment it buried. `gettxout` answers "is this output still there,
+        and how deep" without an index, which is exactly the question.
+        """
         before = (v.state, v.confirmations)
         if v.state in CLOSED and v.state is not State.GHOST:
             return False
+
+        out = None
         try:
-            raw = self.node.getrawtransaction(v.txid, True)
+            out = self.node.gettxout(v.txid, v.vout, True)   # include mempool
         except RpcFailure:
-            # The funding transaction is gone. If we had previously seen it
-            # confirmed, an anchor-driven reorg took it: the loan never happened.
+            out = None
+
+        if out is not None:
+            v.confirmations = int(out.get("confirmations", 0) or 0)
+            if v.state is State.GHOST and v.confirmations >= 0:
+                v.note = "funding reappeared after a reorg"
+            v.state = (State.LIVE if v.confirmations >= self.min_depth
+                       else State.UNCONFIRMED)
+            return before != (v.state, v.confirmations)
+
+        # The output is not there: spent by an exit, or its funding was undone.
+        # A spend in a block we walked forward over is already CLOSED above;
+        # this catches one that happened before we started watching, or in the
+        # mempool, via a bounded search.
+        found = self._find_spender(v.txid, v.vout, tip)
+        if found is not None:
+            tx, k, h = found
+            v.spent_by, v.spent_height = tx["txid"], h
+            v.state = self._name_exit(v, tx["vin"][k].get("txinwitness") or [])
+            return before != (v.state, v.confirmations)
+
+        # No output and no spender. If the funding had never buried, this is the
+        # reorg the chain's first principle warns about: a funding a lender may
+        # have seen, undone by a Bitcoin-driven reorg. If it HAD buried, it was
+        # spent by an exit we simply cannot name without an index.
+        if before[0] in (State.UNCONFIRMED, State.GHOST):
             v.state = State.GHOST
             v.confirmations = 0
-            v.note = ("funding transaction is no longer known to the node; a "
-                      "Bitcoin-driven reorg undid it")
-            return before != (v.state, v.confirmations)
-
-        v.confirmations = int(raw.get("confirmations", 0) or 0)
-        if v.state is State.GHOST and v.confirmations > 0:
-            v.state = State.UNCONFIRMED       # it came back; re-evaluate below
-            v.note = "funding reappeared after a reorg"
-        if v.state in CLOSED:
-            return before != (v.state, v.confirmations)
-
-        unspent = None
-        try:
-            unspent = self.node.gettxout(v.txid, v.vout, True)
-        except RpcFailure:
-            pass
-        if unspent is None:
-            # Spent, and the forward scan did not see it (it happened before we
-            # started watching). Look for it before guessing at an exit.
-            found = self._find_spender(v.txid, v.vout, tip)
-            if found is not None:
-                tx, k, h = found
-                v.spent_by, v.spent_height = tx["txid"], h
-                v.state = self._name_exit(v, tx["vin"][k].get("txinwitness") or [])
-            elif v.state is not State.SPENT_UNKNOWN:
-                v.state = State.SPENT_UNKNOWN
-                v.note = ("spent before this watcher began scanning; re-scan "
-                          "from the funding height to name the exit")
-        elif v.confirmations >= self.min_depth:
-            v.state = State.LIVE
+            v.note = ("funding is no longer known to the node and never buried; "
+                      "a Bitcoin-driven reorg undid it")
         else:
-            v.state = State.UNCONFIRMED
+            v.state = State.SPENT_UNKNOWN
+            v.note = ("spent by a transaction this watcher could not find; "
+                      "re-scan from the funding height to name the exit")
         return before != (v.state, v.confirmations)
 
     # -------------------------------------------------------------- reporting
