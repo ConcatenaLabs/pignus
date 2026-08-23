@@ -17,6 +17,8 @@ import * as pig from "./pignus.js";
 import * as offer from "./offer.js";
 import * as flows from "./flows.js";
 import * as repo from "./repurchase.js";
+import * as btc from "./btc.js";
+import * as badaptor from "./adaptor.js";
 import { Wallet, payoutProgram, WalletError } from "./wallet.js";
 
 const $ = (s) => document.querySelector(s);
@@ -186,9 +188,18 @@ async function pinCovenant() {
     state.repoPinned = 0;
     state.repoWhy = e.message;
   }
+  // The BTC-collateral crypto pins SEPARATELY, against its own vectors; a
+  // deployment without them can still run the loan page.
+  try {
+    const bv = await api("btc_vectors.json");
+    state.btcPinned = btc.selfTest(bv);
+    const av = await api("adaptor_vectors.json");
+    state.adaptorPinned = badaptor.selfTest(av);
+  } catch (e) { state.btcPinned = 0; state.btcWhy = e.message; }
   $("#pinned").textContent =
     `covenant pinned to ${state.pinned} golden vectors` +
-    (state.repoPinned ? `, repurchase to ${state.repoPinned}` : "");
+    (state.repoPinned ? `, repurchase to ${state.repoPinned}` : "") +
+    (state.btcPinned ? `, BTC + adaptor pinned` : "");
   $("#pinned").className = "tag ok";
 }
 
@@ -757,6 +768,58 @@ async function lend(ev) {
 
 // ------------------------------------------------------------ repurchase
 
+async function checkBtc(ev) {
+  ev.preventDefault();
+  const out = $("#btcout");
+  const say = (cls, html) => { out.innerHTML = `<div class="${cls}">${html}</div>`; };
+  if (!state.btcPinned) {
+    say("bad", "This page cannot check a BTC-collateral loan: its Bitcoin " +
+        "crypto is not pinned to the golden vectors" +
+        (state.btcWhy ? ` (${esc(state.btcWhy)})` : "") + ".");
+    return;
+  }
+  let loan;
+  try { loan = JSON.parse($("#btcticket").value); }
+  catch (e) { say("bad", "That ticket is not valid JSON: " + esc(e.message)); return; }
+  try {
+    const need = ["btc_amount", "lender_x", "oracle_x", "recover_after",
+                  "debt_asset", "debt", "repay_deadline", "adaptor_point",
+                  "payment_hash", "borrower_x"];
+    const missing = need.filter(k => loan[k] === undefined);
+    if (missing.length)
+      throw new Error("the ticket is missing: " + missing.join(", ") +
+                      (missing.includes("borrower_x")
+                        ? " (your wallet's Bitcoin key fills borrower_x once the "
+                          + "extension exposes it; until then paste a fully "
+                          + "prepared ticket)" : ""));
+    const fundingSpk = pig._internals.bytesToHex(btc.fundingSpk(loan));
+    const repaySpk = pig._internals.bytesToHex(btc.repaymentSpk(loan));
+    let lines = `<p><strong>These terms compile to:</strong></p><div class="kv">
+      <span class="k">Bitcoin funding output</span><span><code>${fundingSpk}</code></span>
+      <span class="k">Sequentia repayment output</span><span><code>${repaySpk}</code></span>
+      <span class="k">Collateral</span><span>${(Number(BigInt(loan.btc_amount))/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC</span>
+      <span class="k">Debt</span><span>${units(loan.debt, loan.debt_asset)} ${esc(meta(loan.debt_asset).ticker)}</span>
+      <span class="k">Repay by</span><span>Sequentia block ${Number(loan.repay_deadline).toLocaleString()}</span>
+      <span class="k">Lender sweep after</span><span>Bitcoin block ${Number(loan.recover_after).toLocaleString()}</span>
+      </div>`;
+    // If the ticket has a funding outpoint + reclaim dest + the lender's
+    // adaptor sig, check the release the borrower would rely on.
+    if (loan.funding_txid && loan.reclaim_dest && loan.adaptor_sig) {
+      const sh = pig._internals.bytesToHex(btc.reclaimSighash(loan,
+        loan.funding_txid, loan.funding_vout || 0,
+        pig._internals.hexToBytes(loan.reclaim_dest), loan.reclaim_fee || 3000));
+      const ok = state.adaptorPinned && badaptor.verifyAdaptor(
+        loan.lender_x, sh, loan.adaptor_point, loan.adaptor_sig);
+      lines += ok
+        ? `<p class="tag ok" style="margin-top:10px">The lender's release signature verifies: once you know t you can always reclaim the collateral. Safe to fund.</p>`
+        : `<p class="tag bad" style="margin-top:10px">The lender's release signature does NOT verify. Do not fund — the release could be worthless.</p>`;
+    } else {
+      lines += `<p class="hint" style="margin-top:10px">Add <code>funding_txid</code>, <code>reclaim_dest</code> and the lender's <code>adaptor_sig</code> to also check the release before you fund.</p>`;
+    }
+    say("ok", lines);
+  } catch (e) { say("bad", "<strong>Cannot verify.</strong> " + esc(e.message)); }
+}
+
 async function checkRepurchase(ev) {
   ev.preventDefault();
   const out = $("#repoout");
@@ -816,6 +879,7 @@ async function boot() {
   $("#lendform").onsubmit = lend;
   $("#lendform").oninput = renderPreview;
   $("#repoform").onsubmit = checkRepurchase;
+  $("#btcform").onsubmit = checkBtc;
   $("#refresh").onclick = () => refresh().catch(e => note(esc(e.message), "bad"));
   $$("[data-tab]").forEach(b => {
     b.setAttribute("role", "tab");

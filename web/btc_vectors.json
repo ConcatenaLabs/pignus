@@ -29,5 +29,6 @@
   "reclaim_sighash": "17ea60e86534984ed53adc37dd406c89a1ba367f9065128f0d3438c0cf870a60",
   "seize_sighash": "ba4ca3dac701cb8321e768faecd59c5c27e137cff8dadbe09e71be26011bfdd6",
   "nums": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
-  "leaf_version": 192
+  "leaf_version": 192,
+  "repayment_spk": "512080d373b92c3f1172125c89fd6a9a494eb60ba61e48ab44ec8439429563d419a8"
 }

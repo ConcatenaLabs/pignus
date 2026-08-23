@@ -134,6 +134,7 @@ permission.</p>
   <button data-tab="lend">Lend</button>
   <button data-tab="loans">Loans</button>
   <button data-tab="repo">Repurchase</button>
+  <button data-tab="btc">BTC collateral</button>
   <span class="spacer"></span>
   <button id="refresh" class="sm">Refresh</button>
 </div>
@@ -225,6 +226,29 @@ permission.</p>
     <div class="full"><button type="submit">Check it</button></div>
   </form>
   <div class="card" id="repoout"><div class="empty">paste the terms you were sent</div></div>
+</section>
+
+<section data-panel="btc" style="display:none">
+  <h2>Native Bitcoin collateral <span class="tag">cross-chain</span></h2>
+  <p class="hint">Borrow a Sequentia asset against <strong>real Bitcoin</strong>,
+  not a pegged token. The collateral is a Bitcoin UTXO on the parent chain; the
+  debt is on Sequentia; the two are bound by an adaptor signature so that
+  repaying and getting the collateral back are one act, not two hopes. Because
+  Bitcoin has no covenants, this is the one tier where the lender is an active
+  counterparty: liquidation needs the oracle to co-sign on the Bitcoin side, and
+  origination is a short two-party handshake. The full flow runs from
+  <code>pignus-cli btc-*</code>; what this page does is the part that protects a
+  borrower &mdash; rebuild every address and check the lender's release
+  <em>before</em> any Bitcoin is committed.</p>
+  <form class="lend card" id="btcform">
+    <div class="full"><label>Loan ticket (JSON)</label>
+      <textarea name="ticket" id="btcticket" rows="9"
+        placeholder='paste the loan ticket the lender sent: btc_amount, lender_x, oracle_x, recover_after, debt_asset, debt, repay_deadline, adaptor_point, payment_hash — and, once you have prepared funding, funding_txid, reclaim_dest, adaptor_sig'></textarea></div>
+    <div class="full"><button type="submit">Check it</button>
+      <span class="hint" style="display:inline;margin-left:8px">Keyless: this
+      derives addresses and verifies the release; it signs nothing.</span></div>
+  </form>
+  <div class="card" id="btcout"><div class="empty">paste a ticket to verify it</div></div>
 </section>
 
 <section class="safe">
