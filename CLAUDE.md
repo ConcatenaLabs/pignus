@@ -48,6 +48,29 @@ than the node. They need `SEQUENTIA_SRC` and a built `sequentiad`;
 default `~/bitcoin-28.0/bin/bitcoind`), and the `tests/*.mjs` browser checks need
 Node.
 
+`tests/test_lifecycle.py` is the one to run after touching the daemon, the
+watcher, the CLI or `pignus/vault.py`: it drives the CLI through a whole
+lifecycle against a real node with the real oracle and daemon running, and
+checks the book's view at every step -- including an under-water seizure,
+which the node's own covenant test does not cover.
+
+Three things the chain does that are easy to get wrong here, all learned the
+hard way:
+
+- **A node wallet's change is blinded.** Every input of a covenant transaction
+  must be explicit, and the wallet blinds change the moment it has ever held a
+  blinded coin. `select_funding()` therefore pays the wallet's own
+  unconfidential address the exact amount first. Never "fix" a `short` error
+  by passing blinded coins through.
+- **Under water, output `2k+1` must not be the collateral asset.** The
+  covenant's return probe treats any collateral-asset output there as a return
+  to the borrower and then demands the borrower's program. Both composers put
+  the fee output there; keep them in step.
+- **`borrower_ver` is part of an offer's address.** The take leaf rebuilds a
+  vault for a 20- or 32-byte borrower program, so dropping the version when
+  deriving an offer address makes the book disagree with the browser for
+  every extension-wallet lender.
+
 Every test asserts the **refusals**, not just the successes. A lending covenant
 that accepts the honest case is worth nothing on its own; what matters is that
 it refuses underpayment, redirected payouts, forged attestations, replayed

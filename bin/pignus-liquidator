@@ -9,11 +9,14 @@ and the bonus is what prices the race. So this is one participant among however
 many choose to run one -- which is the point, because a lending platform whose
 liquidations depend on the operator's bot is a platform with an operator.
 
-    pignus-liquidator --loans loans.json --oracle http://127.0.0.1:8730 \
+    pignus-liquidator --book http://127.0.0.1:8741 --oracle http://127.0.0.1:8740 \
         --rpc-wallet liquidator --taker-address <addr> [--dry-run]
+    pignus-liquidator --loans loans.json ...
 
-`loans.json` is a list of {"terms": {...}, "txid": "...", "vout": 0}. In a
-deployment the loan book feeds this; for a drill, write it by hand.
+With `--book` the live loans are read from a pignusd, re-read every round, so
+a loan that appears while this runs is watched too. `loans.json` is a list of
+{"terms": {...}, "txid": "...", "vout": 0, "single_leaf": bool}, for a drill
+or a book of one's own.
 
 --dry-run reports what it would do and touches nothing, which is how this should
 be run first against any real book.
@@ -31,7 +34,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 from pignus import oracle as O                       # noqa: E402
 from pignus.node import Node, RpcError               # noqa: E402
 from pignus.terms import LoanTerms                   # noqa: E402
-from pignus.vault import Outpoint, VaultSpender      # noqa: E402
+from pignus import fees as F                         # noqa: E402
+from pignus.vault import Outpoint, VaultSpender, select_funding   # noqa: E402
 from pignus.watcher import VaultWatcher, State       # noqa: E402
 
 COIN = 100_000_000
@@ -48,34 +52,18 @@ def fetch_oracle_key(base):
         return json.loads(r.read().decode())["oracle_x"]
 
 
-def select_funding(node, asset, need, fee_asset, fee_amount):
-    """Pick wallet utxos covering the debt and the fee.
-
-    Deliberately simple and deliberately explicit about failure: a liquidator
-    that silently under-funds produces a transaction the node rejects, and the
-    reason it gives says nothing about which asset was short.
-    """
-    chosen, totals = [], {}
-    want = {asset: need, fee_asset: fee_amount}
-    for u in node.listunspent():
-        if not u.get("spendable"):
-            continue
-        a = u["asset"]
-        if a not in want or totals.get(a, 0) >= want[a]:
-            continue
-        chosen.append(Outpoint.from_utxo(u))
-        totals[a] = totals.get(a, 0) + int(round(float(u["amount"]) * COIN))
-    short = {a: want[a] - totals.get(a, 0) for a in want if totals.get(a, 0) < want[a]}
-    if short:
-        raise RuntimeError(f"wallet cannot fund the liquidation, short: {short}")
-    return chosen
+def fetch_book_loans(base):
+    url = f"{base.rstrip('/')}/v1/loans?state=LIVE"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return json.loads(r.read().decode())["loans"]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
-    ap.add_argument("--loans", required=True)
+    ap.add_argument("--loans", help="a JSON list of loans to watch")
+    ap.add_argument("--book", help="a pignusd to read LIVE loans from instead")
     ap.add_argument("--oracle", required=True)
     ap.add_argument("--rpc", default="http://127.0.0.1:18443")
     ap.add_argument("--rpc-user")
@@ -84,8 +72,10 @@ def main():
     ap.add_argument("--rpc-cookie")
     ap.add_argument("--taker-spk", help="hex scriptPubKey to receive seized collateral")
     ap.add_argument("--taker-address", help="address to receive seized collateral")
-    ap.add_argument("--fee-asset", required=True)
-    ap.add_argument("--fee-amount", type=int, default=5000)
+    ap.add_argument("--fee-asset", help="label or hex; default: the debt asset "
+                    "being spent, else anything held with a published rate")
+    ap.add_argument("--fee-amount", type=int, help="atoms; default: priced "
+                    "from the node's exchange rates")
     ap.add_argument("--interval", type=float, default=30.0)
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -104,20 +94,52 @@ def main():
     else:
         ap.error("need --taker-spk or --taker-address")
 
+    if not args.loans and not args.book:
+        ap.error("need --loans or --book")
     oracle_x = fetch_oracle_key(args.oracle)
-    with open(args.loans) as f:
-        entries = json.load(f)
 
     watcher = VaultWatcher(node)
     loans = {}
-    for e in entries:
-        t = LoanTerms.from_json(e["terms"])
-        watcher.track(t.loan_id(), t, e["txid"], int(e.get("vout", 0)))
-        loans[t.loan_id()] = (t, Outpoint(e["txid"], int(e.get("vout", 0)),
-                                          t.collateral_amount, t.collateral_asset))
+
+    def track(entries):
+        for e in entries:
+            t = LoanTerms.from_json(e["terms"])
+            key = f"{e['txid']}:{int(e.get('vout', 0))}"
+            if key in loans:
+                continue
+            watcher.track(key, t, e["txid"], int(e.get("vout", 0)),
+                          single_leaf=bool(e.get("single_leaf")))
+            loans[key] = (t, Outpoint(e["txid"], int(e.get("vout", 0)),
+                                      t.collateral_amount, t.collateral_asset),
+                          bool(e.get("single_leaf")))
+
+    if args.loans:
+        with open(args.loans) as f:
+            track(json.load(f))
+    if args.book:
+        track(fetch_book_loans(args.book))
     print(f"watching {len(loans)} loan(s); oracle key {oracle_x}", file=sys.stderr)
 
+    def fee_for(t, flow):
+        table = F.fee_table(node)
+        labels = node.dumpassetlabels()
+        if args.fee_amount and args.fee_asset:
+            return labels.get(args.fee_asset, args.fee_asset), args.fee_amount
+        have = {}
+        for u in node.listunspent():
+            if u.get("spendable"):
+                have[u["asset"]] = have.get(u["asset"], 0) + int(
+                    round(float(u["amount"]) * COIN))
+        prefer = [labels.get(args.fee_asset, args.fee_asset)] if args.fee_asset \
+            else [t.debt_asset]
+        return F.pick_fee(table, have, flow, prefer)
+
     while True:
+        if args.book:
+            try:
+                track(fetch_book_loans(args.book))
+            except Exception as e:               # noqa: BLE001
+                print(f"book: {type(e).__name__}: {e}", file=sys.stderr)
         watcher.poll()
         prices, attestations = {}, {}
         for market in {t.market for t, _ in loans.values()}:
@@ -155,10 +177,15 @@ def main():
             if args.dry_run:
                 continue
             try:
-                spender = VaultSpender(node, t, args.fee_asset, args.fee_amount)
-                funding = select_funding(node, t.debt_asset, t.debt,
-                                         args.fee_asset, args.fee_amount)
-                _, outpoint = loans[t.loan_id()]
+                _, outpoint, single = loans[v.loan_id]
+                fee_asset, fee_amount = fee_for(
+                    t, (kind if single else kind + "4"))
+                spender = VaultSpender(node, t, fee_asset, fee_amount,
+                                       single_leaf=single)
+                wants = {t.debt_asset: t.debt}
+                wants[fee_asset] = wants.get(fee_asset, 0) + fee_amount
+                funding = select_funding(node, wants,
+                                         exclude=[(outpoint.txid, outpoint.vout)])
                 if kind == "liquidate":
                     raw = spender.liquidate(outpoint, funding, att, taker_spk)
                 else:

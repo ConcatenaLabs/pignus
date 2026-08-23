@@ -65,6 +65,7 @@ run "browser PSET against a node"     python3 tests/test_pset.py
 run "browser flows through a loan"    python3 tests/test_flows.py
 run "loan book against a chain"       python3 tests/test_book.py
 run "tiers C and D on a chain"         python3 tests/test_tiers.py
+run "CLI lifecycle + book discovery"   python3 tests/test_lifecycle.py
 run "BTC collateral (bitcoind + sequentiad)" python3 tests/test_btc_collateral.py
 
 echo
