@@ -48,8 +48,11 @@ a wallet or a book that skips it has quietly reintroduced a trusted party.
 pignus/compat.py         imports the PROVEN covenant and refuses a drifted one
 pignus/terms.py          LoanTerms: the agreement, the address, and verify_funding()
 pignus/oracle.py         attestation format, signing, verification, price quoting
-pignus/vault.py          the origination and all four exit transactions
-pignus/watcher.py        reconcile loans to the chain; name each exit; catch ghosts
+pignus/vault.py          every transaction: fund/take/withdraw an offer, the four
+                         exits, explicit-coin preparation for node wallets
+pignus/fees.py           a fee in any asset, from the node's exchange rates
+pignus/watcher.py        reconcile loans AND offers to the chain; name each exit;
+                         discover loans from take witnesses; catch ghosts
 pignus/book.py           the loan book: discovery, nothing else
 pignus/offers.py         funded resting offers (the node repo's pignus_offer.py)
 pignus/btc_collateral.py native BTC collateral (Tier B): the Bitcoin-side leaves
@@ -62,7 +65,9 @@ pignus/node.py           a thin JSON-RPC client
 bin/pignus-oracle        sign prices on a timer and publish them
 bin/pignusd              the loan book, the watcher, and the page at /lending/
 bin/pignus-cli           selftest, quote, propose, show, address, verify, status,
-                         check-attestation; pledge-* (Tier C); repo-* (repurchase)
+                         check-attestation; with a node wallet: offer-fund,
+                         offer-take, offer-withdraw, repay, liquidate, default,
+                         recover; pledge-* (Tier C); repo-* (repurchase)
 bin/pignus-liquidator    one liquidator among however many people run one
 web/                     the browser client pignusd serves: pignus.js, offer.js,
                          repurchase.js, pset.js, flows.js, wallet.js, app.js
@@ -80,6 +85,30 @@ Python: `web/pignus.js` and `web/offer.js` are that second implementation, for
 the browser, pinned byte for byte to the same vectors, and the page refuses to
 run if the pinning fails. `compat.verify_builder()` uses the vectors here as a
 tripwire, refusing to derive addresses from a builder that has changed.
+
+The book follows the chain on its own. An offer's coin is watched; when it is
+taken, the borrower's payout program is read out of the take witness, the new
+vault is registered as a loan, and the offer moves to its remainder. A loan
+taken by any wallet, through the page or not, turns up on the page.
+
+## From the command line
+
+Everything the page does, from a node wallet. Each command derives the address
+it acts on from the terms and checks it against the coin before building
+anything; fees are priced from the node's exchange rates in whatever the wallet
+holds; and coins are prepared explicit when the wallet only has blinded change,
+which a covenant cannot spend.
+
+```
+pignus-cli offer-fund --market GOLD/USDX --principal 100 --lots 3 \
+    --interest 3 --open-ltv 50 --liq-ltv 75 --term-days 30 --rpc-wallet me
+pignus-cli offer-take --offer <id> --rpc-wallet me
+pignus-cli repay | liquidate | default | recover --loan <id> --rpc-wallet me
+pignus-cli offer-withdraw --offer <id> --rpc-wallet me
+```
+
+`--book` names the pignusd to read markets and offers from (default
+`http://127.0.0.1:8741`); `--rpc*` the node wallet that signs.
 
 ## Running it
 
@@ -187,6 +216,9 @@ test/functional/feature_pignus_offer.py      funded offers
 test/functional/feature_pignus_attack.py     the attack suite
 tests/test_platform.py                       this library, end to end
 tests/test_btc_collateral.py                 Tier B, on a bitcoind + sequentiad rig
+tests/test_lifecycle.py                      the CLI through fund, take, repay,
+                                             liquidate, withdraw, default, with
+                                             the daemon discovering every step
 tests/run-tests.sh                           everything here, fastest first
 tests/cli_drill.sh            the commands, offline
 ```

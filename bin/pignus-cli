@@ -17,12 +17,21 @@ counterparty's description of the deal.
     pignus-cli verify    --terms loan.json --txid <funding> --vout 0
     pignus-cli status    --terms loan.json --txid <funding> --vout 0
     pignus-cli check-attestation --oracle-x <hex> --attestation att.json
+
+With a node wallet, everything the page does:
+
+    pignus-cli offer-fund --market GOLD/USDX --principal 100 --lots 3 \\
+        --interest 3 --open-ltv 50 --liq-ltv 75 --term-days 30 --rpc-wallet me
+    pignus-cli offer-take --offer <id> --rpc-wallet me
+    pignus-cli repay | liquidate | default | recover --loan <id> --rpc-wallet me
+    pignus-cli offer-withdraw --offer <id> --rpc-wallet me
 """
 
 import argparse
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
@@ -296,6 +305,375 @@ def cmd_repo_verify(args):
     print(t.describe())
 
 
+
+# --- driving a loan from a node wallet ---------------------------------------
+#
+# Everything the page does, from the command line, with a node wallet holding
+# the keys. Each command derives the address it acts on from the terms and
+# checks it against the coin before building anything, which is the same check
+# `verify` makes by hand.
+
+import math                                                  # noqa: E402
+import urllib.error                                          # noqa: E402
+import urllib.request                                        # noqa: E402
+
+from pignus import fees as F                                 # noqa: E402
+from pignus.offers import offer_address, offer_vault_address  # noqa: E402
+from pignus.vault import (                                   # noqa: E402
+    Outpoint, VaultSpender, fund_offer, take_offer, withdraw_offer,
+    select_funding, wallet_payout, payout_spk,
+)
+
+BLOCKS_PER_DAY = 1440          # 60-second blocks
+RECOVER_GAP = 43200            # 30 days after maturity
+
+
+def book_get(base, path):
+    with urllib.request.urlopen(f"{base.rstrip('/')}{path}", timeout=15) as r:
+        return json.loads(r.read().decode())
+
+
+def book_post(base, path, body):
+    req = urllib.request.Request(
+        f"{base.rstrip('/')}{path}", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def add_book_arg(p):
+    p.add_argument("--book", default=os.environ.get(
+        "PIGNUS_BOOK", "http://127.0.0.1:8741"),
+        help="the loan book (pignusd) to read markets and offers from")
+
+
+def wallet_holdings(node):
+    have = {}
+    for u in node.listunspent():
+        if u.get("spendable"):
+            have[u["asset"]] = have.get(u["asset"], 0) + int(
+                round(float(u["amount"]) * 100_000_000))
+    return have
+
+
+def choose_fee(node, args, flow, prefer=()):
+    """(fee_asset, fee_atoms) for this flow, from the node's own rates."""
+    table = F.fee_table(node)
+    if args.fee_amount:
+        asset = args.fee_asset or next(iter(prefer), None)
+        if not asset:
+            raise SystemExit("--fee-amount needs --fee-asset")
+        return resolve_asset(node, asset), int(args.fee_amount)
+    holdings = wallet_holdings(node)
+    if args.fee_asset:
+        asset = resolve_asset(node, args.fee_asset)
+        rate = table["rates"].get(asset)
+        if not rate:
+            raise SystemExit(f"the node publishes no fee rate for {args.fee_asset}")
+        return asset, F.fee_atoms(rate, F.VSIZE[flow], table["feerate_rfa_per_kvb"])
+    return F.pick_fee(table, holdings, flow, prefer)
+
+
+def resolve_asset(node, label_or_hex):
+    if len(label_or_hex) == 64:
+        return label_or_hex
+    labels = node.dumpassetlabels()
+    if label_or_hex in labels:
+        return labels[label_or_hex]
+    raise SystemExit(f"unknown asset {label_or_hex!r}: give a 64-hex id or a "
+                     "label the node knows")
+
+
+def units_to_atoms(x, precision):
+    return int(round(float(x) * 10 ** int(precision)))
+
+
+def fmt_atoms(n, precision=8):
+    return f"{int(n) / 10 ** int(precision):,.{int(precision)}f}".rstrip("0").rstrip(".")
+
+
+def cmd_offer_fund(args):
+    node = node_from(args)
+    mk = next((m for m in book_get(args.book, "/v1/markets")["markets"]
+               if m["market"].upper() == args.market.upper()), None)
+    if mk is None:
+        raise SystemExit(f"the book has no market {args.market}")
+    if not mk.get("lendable"):
+        raise SystemExit(f"{mk['market']} is not lendable here: "
+                         + ("native BTC is cross-chain" if mk.get("cross_chain")
+                            else "no asset id or no verified price"))
+    oracle_x = book_get(args.book, "/v1/oracle")["oracle_x"]
+    height = node.getblockcount()
+    price, scale = int(mk["price"]), int(mk["price_scale"])
+    cp, dp = int(mk["collateral_precision"]), int(mk["debt_precision"])
+
+    principal = units_to_atoms(args.principal, dp)
+    debt = principal + int(round(principal * args.interest / 100))
+    open_ltv, liq_ltv = args.open_ltv / 100, args.liq_ltv / 100
+    if not 0 < open_ltv < liq_ltv <= 1:
+        raise SystemExit("need 0 < --open-ltv < --liq-ltv <= 100")
+    # collateral value must be principal / open_ltv, in debt atoms
+    collateral = math.ceil(principal * scale / (price * open_ltv))
+    strike = math.ceil(debt * scale / (collateral * liq_ltv))
+    maturity = height + int(args.term_days * BLOCKS_PER_DAY)
+    expiry = height + int((args.offer_days or args.term_days) * BLOCKS_PER_DAY)
+    ver, prog, change_spk = wallet_payout(node)
+    bver = 0 if args.borrower_ver is None else int(args.borrower_ver)
+    placeholder = "00" * (20 if bver == 0 else 32)
+    terms = LoanTerms(
+        collateral_asset=mk["collateral_asset"], debt_asset=mk["debt_asset"],
+        collateral_amount=collateral, principal=principal, debt=debt,
+        lender_x=prog, lender_prog=prog, lender_ver=ver,
+        borrower_x=placeholder, borrower_prog=placeholder, borrower_ver=bver,
+        market=mk["market"], oracle_x=oracle_x, strike=strike,
+        not_before=int(time.time()), maturity=maturity,
+        recover_after=maturity + RECOVER_GAP,
+        bonus_num=100 + int(args.bonus), bonus_den=100, price_scale=scale,
+        memo=args.memo or "")
+    fee_asset, fee = choose_fee(node, args, "fund", prefer=[terms.debt_asset])
+    spk = offer_address(terms, principal, collateral, expiry)
+    print(f"offer on {mk['market']}: lend {fmt_atoms(principal, dp)} "
+          f"{mk['debt_ticker']} per loan x{args.lots}, repay "
+          f"{fmt_atoms(debt, dp)}, against {fmt_atoms(collateral, cp)} "
+          f"{mk['collateral_ticker']} (open LTV {args.open_ltv}%), liquidate "
+          f"under {strike / scale:.8g} {mk['debt_ticker']}/atom "
+          f"(LTV {args.liq_ltv}%), matures {maturity}, offer expires {expiry}",
+          file=sys.stderr)
+    print(f"  offer address {spk.hex()}", file=sys.stderr)
+    for w in terms.sanity_check():
+        print(f"  ! {w}", file=sys.stderr)
+    if args.dry_run:
+        print(terms.to_json())
+        return 0
+    raw, _spk = fund_offer(node, terms, principal, collateral, expiry, args.lots,
+                           fee_asset, fee, change_spk)
+    txid = node.sendrawtransaction(raw)
+    print(f"  funded {txid}:0  (fee {fee} atoms of {fee_asset[:8]}…)",
+          file=sys.stderr)
+    body = {"terms": terms.to_json(), "kind": "funded", "outpoint": f"{txid}:0",
+            "principal": str(principal), "collateral": str(collateral),
+            "expiry_locktime": expiry}
+    if args.publish:
+        code, rec = book_post(args.book, "/v1/offers", body)
+        if code != 200:
+            print(f"  book refused the offer: {rec.get('error')}", file=sys.stderr)
+            print(json.dumps(body))
+            return 2
+        print(f"  published as offer {rec['offer_id']}", file=sys.stderr)
+        print(json.dumps(rec, indent=2))
+    else:
+        print(json.dumps(body))
+    return 0
+
+
+def _load_offer(args, node):
+    off = book_get(args.book, f"/v1/offer/{args.offer}")
+    terms = LoanTerms.from_json(off["terms"])
+    txid, _, vout = off["outpoint"].rpartition(":")
+    principal, collateral = int(off["principal"]), int(off["collateral"])
+    expiry = int(off["expiry_locktime"])
+    got = node.gettxout(txid, int(vout), True)
+    if got is None:
+        raise SystemExit("that offer's coin is gone: it was taken in full or "
+                         "withdrawn")
+    want = offer_address(terms, principal, collateral, expiry).hex()
+    have = got["scriptPubKey"]["hex"]
+    if want != have:
+        raise SystemExit("REFUSED: the offer's coin is not what its terms "
+                         f"compile to\n  terms compile to: {want}\n"
+                         f"  the coin pays:    {have}")
+    value = int(round(float(got["value"]) * 100_000_000))
+    return off, terms, Outpoint(txid, int(vout), value, terms.debt_asset), \
+        principal, collateral, expiry
+
+
+def cmd_offer_take(args):
+    node = node_from(args)
+    off, base, coin, principal, collateral, expiry = _load_offer(args, node)
+    ver, prog, spk = wallet_payout(node)
+    if ver != base.borrower_ver:
+        raise SystemExit(f"this offer is for witness-v{base.borrower_ver} "
+                         f"borrowers and this wallet pays out at v{ver}")
+    terms = LoanTerms(**{**json.loads(base.to_json()),
+                         "borrower_x": prog, "borrower_prog": prog})
+    vault = offer_vault_address(terms)
+    print(f"taking offer {off['offer_id'][:12]}: borrow "
+          f"{fmt_atoms(principal, off['debt_precision'])} {off['debt_ticker']}, "
+          f"lock {fmt_atoms(collateral, off['collateral_precision'])} "
+          f"{off['collateral_ticker']}, repay "
+          f"{fmt_atoms(terms.debt, off['debt_precision'])} by block "
+          f"{terms.maturity}", file=sys.stderr)
+    print(f"  vault {vault.hex()}", file=sys.stderr)
+    fee_asset, fee = choose_fee(node, args, "take",
+                                prefer=[terms.collateral_asset, terms.debt_asset])
+    if args.dry_run:
+        print(terms.to_json())
+        return 0
+    raw, vault_spk = take_offer(node, terms, coin, coin.amount, principal,
+                                collateral, expiry, fee_asset, fee, spk, spk)
+    assert vault_spk == vault
+    txid = node.sendrawtransaction(raw)
+    print(f"  broadcast {txid}; the vault is {txid}:0", file=sys.stderr)
+    code, rec = book_post(args.book, "/v1/loans", {
+        "terms": terms.to_json(), "txid": txid, "vout": 0, "single_leaf": True,
+        "offer_id": off["offer_id"]})
+    if code != 200:
+        print(f"  book did not register it ({rec.get('error')}); it will "
+              "discover the vault from the chain anyway", file=sys.stderr)
+    print(json.dumps({"txid": txid, "vout": 0, "terms": json.loads(terms.to_json()),
+                      "single_leaf": True,
+                      "loan_id": rec.get("loan_id") if code == 200 else None},
+                     indent=2))
+    return 0
+
+
+def cmd_offer_withdraw(args):
+    node = node_from(args)
+    off, terms, coin, principal, collateral, expiry = _load_offer(args, node)
+    height = node.getblockcount()
+    if height < expiry:
+        raise SystemExit(f"the offer expires at block {expiry}; it is {height}")
+    _ver, _prog, spk = wallet_payout(node)
+    fee_asset, fee = choose_fee(node, args, "withdraw")
+    raw = withdraw_offer(node, terms, coin, coin.amount, principal, collateral,
+                         expiry, fee_asset, fee, spk)
+    if args.dry_run:
+        print(raw)
+        return 0
+    txid = node.sendrawtransaction(raw)
+    print(f"withdrawn: {fmt_atoms(coin.amount, off['debt_precision'])} "
+          f"{off['debt_ticker']} back to the lender in {txid}", file=sys.stderr)
+    print(json.dumps({"txid": txid}))
+    return 0
+
+
+def _load_loan(args, node):
+    loan = book_get(args.book, f"/v1/loan/{args.loan}")
+    terms = LoanTerms.from_json(loan["terms"])
+    single = bool(loan.get("single_leaf"))
+    got = node.gettxout(loan["txid"], int(loan["vout"]), True)
+    if got is None:
+        raise SystemExit("that vault is already spent")
+    want = (offer_vault_address(terms) if single else terms.script_pubkey()).hex()
+    if got["scriptPubKey"]["hex"] != want:
+        raise SystemExit("REFUSED: the vault coin is not what these terms "
+                         "compile to")
+    coin = Outpoint(loan["txid"], int(loan["vout"]),
+                    int(round(float(got["value"]) * 100_000_000)),
+                    terms.collateral_asset)
+    return loan, terms, coin, single
+
+
+def _exit(args, exit_name):
+    node = node_from(args)
+    loan, terms, coin, single = _load_loan(args, node)
+    _ver, _prog, spk = wallet_payout(node)
+    flow = exit_name if single else exit_name + "4"
+    fee_asset, fee = choose_fee(node, args, flow, prefer=[terms.debt_asset])
+    spender = VaultSpender(node, terms, fee_asset, fee, single_leaf=single)
+    need = {terms.debt_asset: terms.debt} if exit_name != "recover" else {}
+    need[fee_asset] = need.get(fee_asset, 0) + fee
+    funding = select_funding(node, need, exclude=[(coin.txid, coin.vout)])
+    if exit_name == "repay":
+        raw = spender.repay(coin, funding, spk)
+    elif exit_name == "recover":
+        raw = spender.recover(coin, funding, spk)
+    else:
+        market = terms.market.replace("/", "_")
+        att = O.Attestation.from_dict(book_get(args.book, f"/v1/attestation/{market}"))
+        if not O.verify(terms.oracle_x, att):
+            raise SystemExit("the attestation does not verify against the "
+                             "oracle THIS LOAN names; refusing to build it")
+        if exit_name == "liquidate":
+            raw = spender.liquidate(coin, funding, att, spk)
+        else:
+            raw = spender.call_default(coin, funding, att, spk)
+    if args.dry_run:
+        print(raw)
+        return 0
+    txid = node.sendrawtransaction(raw)
+    print(f"{exit_name}: {txid}  (fee {fee} atoms of {fee_asset[:8]}…)",
+          file=sys.stderr)
+    print(json.dumps({"txid": txid, "exit": exit_name}))
+    return 0
+
+
+def cmd_repay(args):
+    return _exit(args, "repay")
+
+
+def cmd_liquidate(args):
+    return _exit(args, "liquidate")
+
+
+def cmd_default(args):
+    return _exit(args, "default")
+
+
+def cmd_recover(args):
+    return _exit(args, "recover")
+
+
+def add_wallet_commands(sub):
+    def common(p, flow_fee=True):
+        add_book_arg(p)
+        add_node_args(p)
+        p.add_argument("--fee-asset", help="label or 64-hex id; default: the "
+                       "asset already being spent, else anything held that "
+                       "the node publishes a rate for")
+        p.add_argument("--fee-amount", type=int, help="atoms; default: priced "
+                       "from the node's exchange rates at 20x the relay floor")
+        p.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("offer-fund", help="lock principal in a funded offer, "
+                       "and publish it")
+    p.add_argument("--market", required=True, help="e.g. GOLD/USDX")
+    p.add_argument("--principal", type=float, required=True,
+                   help="lent per loan, in units of the debt asset")
+    p.add_argument("--interest", type=float, default=3.0,
+                   help="%% over the whole term (default 3)")
+    p.add_argument("--open-ltv", type=float, default=50.0,
+                   help="collateral required, as loan-to-value %% (default 50)")
+    p.add_argument("--liq-ltv", type=float, default=75.0,
+                   help="liquidate when loan-to-value crosses this %% (default 75)")
+    p.add_argument("--term-days", type=float, default=30.0)
+    p.add_argument("--offer-days", type=float,
+                   help="how long the offer stays open (default: the term)")
+    p.add_argument("--lots", type=int, default=1, help="how many loans")
+    p.add_argument("--bonus", type=float, default=5.0,
+                   help="liquidation bonus %% (default 5)")
+    p.add_argument("--borrower-ver", type=int, default=0,
+                   help="witness version borrowers pay out at: 0 for "
+                   "extension/bech32 wallets (default), 1 for taproot")
+    p.add_argument("--memo", default="")
+    p.add_argument("--no-publish", dest="publish", action="store_false")
+    common(p)
+    p.set_defaults(fn=cmd_offer_fund)
+
+    p = sub.add_parser("offer-take", help="borrow from a funded offer")
+    p.add_argument("--offer", required=True, help="offer id from the book")
+    common(p)
+    p.set_defaults(fn=cmd_offer_take)
+
+    p = sub.add_parser("offer-withdraw", help="return an expired offer's "
+                       "principal to its lender")
+    p.add_argument("--offer", required=True)
+    common(p)
+    p.set_defaults(fn=cmd_offer_withdraw)
+
+    for name, fn, help_ in (
+            ("repay", cmd_repay, "pay the debt and take the collateral back"),
+            ("liquidate", cmd_liquidate, "close an under-water loan for the bonus"),
+            ("default", cmd_default, "seize a loan past maturity, at any price"),
+            ("recover", cmd_recover, "sweep a long-overdue vault to the lender")):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("--loan", required=True, help="loan id from the book")
+        common(p)
+        p.set_defaults(fn=fn)
+
 def main():
     ap = argparse.ArgumentParser(
         prog="pignus-cli", description=__doc__.split("\n")[0],
@@ -444,6 +822,8 @@ def main():
     p.add_argument("--oracle-x", required=True)
     p.add_argument("--attestation", required=True)
     p.set_defaults(fn=cmd_check_attestation)
+
+    add_wallet_commands(sub)
 
     args = ap.parse_args()
     if args.cmd == "verify" and not args.spk and not args.txid:
