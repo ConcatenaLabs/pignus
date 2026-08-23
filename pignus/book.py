@@ -11,12 +11,12 @@ an HTTP interface in front of it.
 
 What it holds:
 
-  * OFFERS   a lender advertising terms. Two kinds, and the difference matters
-             to a borrower: `signed` means the lender must be online to
-             co-sign, `funded` means the principal is already locked in an
-             offer covenant and anyone can take it unilaterally. A funded offer
+  * OFFERS   a lender advertising FUNDED terms: the principal is already locked
+             in an offer covenant and anyone can take it unilaterally. The offer
              carries its outpoint, so a borrower can check it exists and is
-             unspent without asking the book.
+             unspent without asking the book. (There is no "signed" offer that
+             needs the lender online -- a funded lender can go offline, which is
+             the whole point, so a signed one would be strictly worse.)
   * LOANS    vaults the book knows about, with whatever the watcher last saw.
              Advisory: the chain is the record, this is an index of it.
 
@@ -82,10 +82,17 @@ class Book:
             offer.setdefault("warnings", []).append(w)
         offer["offer_id"] = offer.get("offer_id") or terms.loan_id()[:32]
         offer["vault_address"] = terms.script_pubkey().hex()
-        offer["kind"] = offer.get("kind", "signed")
-        if offer["kind"] not in ("signed", "funded"):
-            raise ValueError("an offer is 'signed' or 'funded'")
-        if offer["kind"] == "funded" and not offer.get("outpoint"):
+        # Only FUNDED offers exist: the principal is locked in an offer covenant
+        # a borrower takes unilaterally. A "signed" offer -- one a lender must be
+        # online to co-sign -- was in an earlier model and is strictly worse
+        # (the covenant's whole point is that a funded lender can go offline), so
+        # it is refused rather than left as a half-feature.
+        offer["kind"] = offer.get("kind", "funded")
+        if offer["kind"] != "funded":
+            raise ValueError(
+                "only funded offers exist: the principal must already be locked "
+                "in an offer covenant a borrower can take unilaterally")
+        if not offer.get("outpoint"):
             raise ValueError(
                 "a funded offer must name the outpoint its principal rests in, "
                 "or a borrower cannot check it is real without asking us")

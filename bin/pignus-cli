@@ -312,6 +312,96 @@ def cmd_repo_verify(args):
     print(t.describe())
 
 
+def _repo_terms(args):
+    from pignus.repurchase import RepurchaseTerms
+    return RepurchaseTerms.from_json(open(args.terms).read())
+
+
+def cmd_repo_fund(args):
+    """Pay the bond into the repurchase vault -- the coin every other repo
+    command acts on. Derives the address from the terms; nobody has to trust a
+    supplied one."""
+    from pignus.vault import select_funding, wallet_payout
+    node = node_from(args)
+    t = _repo_terms(args)
+    spk = t.script_pubkey()
+    addr = node.deriveaddresses(
+        node.getdescriptorinfo(f"raw({spk.hex()})")["descriptor"])[0]
+    fee_asset, fee = choose_fee(node, args, "fund", prefer=[t.debt_asset])
+    _ver, _prog, change = wallet_payout(node)
+    select_funding(node, {t.debt_asset: t.bond(), fee_asset: fee})   # ensure explicit
+    txid = node.sendtoaddress(address=addr, amount=f"{t.bond()/1e8:.8f}",
+                              assetlabel=t.debt_asset,
+                              fee_asset_label=t.debt_asset)
+    print(f"funded the bond ({t.bond()} atoms of {t.debt_asset[:12]}...) at "
+          f"{txid}:0", file=sys.stderr)
+    print(json.dumps({"txid": txid, "vout": 0}))
+    return 0
+
+
+def _repo_spender(args, node, t):
+    from pignus.repurchase import RepurchaseSpender
+    from pignus.vault import Outpoint
+    got = node.gettxout(args.txid, args.vout, True)
+    if got is None:
+        raise SystemExit("that bond vault is already spent")
+    if got["scriptPubKey"]["hex"] != t.script_pubkey().hex():
+        raise SystemExit("REFUSED: the coin is not the vault these terms "
+                         "compile to")
+    bond = int(round(float(got["value"]) * 100_000_000))
+    coin = Outpoint(args.txid, args.vout, bond, t.debt_asset)
+    return RepurchaseSpender, coin
+
+
+def cmd_repo_forfeit(args):
+    """FORFEIT: after the deadline, sweep the bond back to the borrower.
+    Permissionless -- it can only ever pay the borrower."""
+    from pignus.vault import select_funding, wallet_payout
+    node = node_from(args)
+    t = _repo_terms(args)
+    RepurchaseSpender, coin = _repo_spender(args, node, t)
+    height = node.getblockcount()
+    if height < t.forfeit_after:
+        raise SystemExit(f"forfeit opens at height {t.forfeit_after}; it is {height}")
+    fee_asset, fee = choose_fee(node, args, "recover")
+    _ver, _prog, change = wallet_payout(node)
+    funding = select_funding(node, {fee_asset: fee},
+                             exclude=[(coin.txid, coin.vout)])
+    sp = RepurchaseSpender(node, t, fee_asset, fee)
+    raw = sp.forfeit(coin, funding, change)
+    if args.dry_run:
+        print(raw); return 0
+    txid = node.sendrawtransaction(raw)
+    print(f"forfeit swept the bond to the borrower: {txid}", file=sys.stderr)
+    print(json.dumps({"txid": txid, "exit": "forfeit"}))
+    return 0
+
+
+def cmd_repo_settle(args):
+    """RETURN: deliver the asset to the borrower's C_U and release the bond to
+    the lender. The borrower's DEBT payment is a separate output a full
+    settlement adds; this composes the covenant's own two outputs, which is the
+    part the covenant enforces."""
+    from pignus.vault import select_funding, wallet_payout
+    node = node_from(args)
+    t = _repo_terms(args)
+    RepurchaseSpender, coin = _repo_spender(args, node, t)
+    fee_asset, fee = choose_fee(node, args, "repay", prefer=[t.collateral_asset])
+    _ver, _prog, change = wallet_payout(node)
+    funding = select_funding(node, {t.collateral_asset: t.collateral_amount,
+                                    fee_asset: fee},
+                             exclude=[(coin.txid, coin.vout)])
+    sp = RepurchaseSpender(node, t, fee_asset, fee)
+    raw = sp.settle(coin, funding, change)
+    if args.dry_run:
+        print(raw); return 0
+    txid = node.sendrawtransaction(raw)
+    print(f"settled: asset delivered to the borrower, bond released to the "
+          f"lender: {txid}", file=sys.stderr)
+    print(json.dumps({"txid": txid, "exit": "return"}))
+    return 0
+
+
 
 # --- driving a loan from a node wallet ---------------------------------------
 #
@@ -830,6 +920,27 @@ def main():
     p.add_argument("--vout", type=int, default=None)
     add_node_args(p)
     p.set_defaults(fn=cmd_repo_verify)
+
+    p = sub.add_parser("repo-fund", help="pay the bond into the repurchase vault")
+    p.add_argument("terms")
+    add_node_args(p)
+    p.add_argument("--fee-asset"); p.add_argument("--fee-amount", type=int)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_repo_fund)
+
+    for name, fn, helptext in (
+            ("repo-forfeit", cmd_repo_forfeit,
+             "after the deadline, sweep the bond back to the borrower"),
+            ("repo-settle", cmd_repo_settle,
+             "RETURN: deliver the asset to the borrower, release the bond")):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("terms")
+        p.add_argument("--txid", required=True)
+        p.add_argument("--vout", type=int, default=0)
+        add_node_args(p)
+        p.add_argument("--fee-asset"); p.add_argument("--fee-amount", type=int)
+        p.add_argument("--dry-run", action="store_true")
+        p.set_defaults(fn=fn)
 
 
     p = sub.add_parser("quote", help="reference prices -> the covenant's integer price")
