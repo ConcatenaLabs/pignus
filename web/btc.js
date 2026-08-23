@@ -17,6 +17,7 @@
 import { _internals as P } from "./pignus.js";
 
 const { sha256, taggedHash, hexToBytes, bytesToHex } = P;
+const u8 = (...b) => Uint8Array.from(b);
 
 export const NUMS = hexToBytes(
   "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0");
@@ -183,6 +184,27 @@ export function sighashFor(loan, tx, leafName, inputIndex = 0) {
   return taprootSighash(tx, spent, inputIndex, tree.scripts[leafName]);
 }
 
+/**
+ * The Sequentia repayment output (an ELEMENTS taproot): the hashlocked
+ * CLAIM / REFUND the debt is paid into. A borrower rebuilds this from the
+ * loan to confirm they are paying the address the terms compile to -- the
+ * cross-chain analog of verify_funding. Uses pignus.js's Elements taproot
+ * (leaf version 0xc4, /elements tags), not the Bitcoin one above.
+ */
+export function repaymentSpk(loan) {
+  const h = hexToBytes(loan.payment_hash);
+  const lx = hexToBytes(loan.lender_x), bx = hexToBytes(loan.borrower_x);
+  const pushd = (d) => concat(u8(d.length), d);
+  const claim = concat(u8(0xa8), pushd(h), u8(0x88), pushd(lx), u8(0xac));
+  const dl = scriptNum(loan.repay_deadline);
+  const refund = concat(pushd(dl), u8(0xb1, 0x75), pushd(bx), u8(0xac));
+  const root = P.branchHash(P.leafHash(claim), P.leafHash(refund));
+  const tweak = taggedHash("TapTweak/elements", concat(NUMS, root));
+  const { x } = P.tweakAddPubkey(NUMS, tweak);
+  return concat(u8(0x51, 0x20), x);
+}
+
+
 /** The reclaim sighash a borrower needs signed (BIP340) to leave a solvent loan. */
 export function reclaimSighash(loan, fundingTxid, vout, destSpk, fee) {
   return sighashFor(loan, reclaimTx(loan, fundingTxid, vout, destSpk, fee), "reclaim");
@@ -229,6 +251,8 @@ export function selfTest(v) {
   eq("seize_sighash",
      bytesToHex(seizeSighash(loan, v.reclaim_txid, v.reclaim_vout, dest, v.reclaim_fee)),
      v.seize_sighash);
+  if (v.repayment_spk)
+    eq("repayment_spk", bytesToHex(repaymentSpk(loan)), v.repayment_spk);
   return 3;   // leaves proven
 }
 
