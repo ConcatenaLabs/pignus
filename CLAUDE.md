@@ -161,3 +161,34 @@ deleting it.
 **Push the same day you commit.** The testnet server pulls only from GitHub, so a
 branch left on one laptop is invisible to every other machine and to the box.
 <!-- END SHARED AGENT CONVENTIONS -->
+
+## Native BTC collateral is a different animal
+
+Tier B (borrow a Sequentia asset against real Bitcoin) is NOT a covenant loan
+and does not behave like one. Bitcoin has no introspection, so none of the loan
+covenant runs there: the collateral is a plain Bitcoin taproot UTXO, the debt is
+on Sequentia, and the two are bound by a BIP340 adaptor signature. Consequences
+worth keeping straight:
+
+- **The lender cannot be offline.** A funded covenant offer lets the lender walk
+  away because the script reconstructs everything; the Bitcoin side cannot, so
+  origination is a two-party handshake (the ticket in `pignus/btc_collateral.py`)
+  and liquidation needs the oracle to co-sign a Bitcoin transaction. This is why
+  Tier B is CLI-first: a two-party interactive protocol is what a CLI is for.
+- **The browser does the keyless half.** `web/btc.js` (Bitcoin taproot: address,
+  BIP341 sighash, witness) and `web/adaptor.js` (adaptor verify + decrypt) are
+  faithful ports of `pignus/btcscript.py` and `pignus/adaptor.py`, pinned
+  byte-for-byte to `web/btc_vectors.json` / `web/adaptor_vectors.json` (emitted
+  by the proven Python) before they derive anything. A borrower can rebuild the
+  funding and repayment addresses and verify the lender's release entirely in
+  the page. Regenerate the vectors only when the Python changes, in the same
+  commit, and re-run `test_btc_web.mjs` / `test_adaptor_web.mjs`.
+- **The SWK wasm's `adaptorSign` is a DIFFERENT scheme** (the DEX swap spec),
+  not interoperable with `pignus/adaptor.py`. Do not wire it into the Pignus
+  flow. A browser LENDER (adaptor-sign + the Sequentia claim) would need either
+  Pignus's adaptor added to the wasm or the CLI; the borrower path needs only a
+  plain BIP340 signer, which the current bundled wasm does not expose either --
+  exposing Bitcoin signing to dapps is a wasm rebuild, tracked separately.
+- **`anchor_safe` before acting on a revealed `t`.** The claim that reveals `t`
+  is a Sequentia transaction, and Sequentia reorgs when Bitcoin reorgs; a
+  borrower must not spend BTC on the strength of a `t` that a reorg could undo.

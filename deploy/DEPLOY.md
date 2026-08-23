@@ -99,6 +99,35 @@ SEQUENTIA_SRC=/root/sequentia/Sequentia \
 the node or the oracle, and the page shows "degraded" rather than stale numbers
 dressed as live ones.
 
+## Threshold oracles
+
+The book can quote against several INDEPENDENT oracles, which is what an m-of-n
+loan needs. Run more than one `pignus-oracle` (each its own keyfile and port)
+and list the extra ones in `pignusd.json`:
+
+```json
+{ "oracle": "http://127.0.0.1:8740",
+  "oracles": ["http://127.0.0.1:8742", "http://127.0.0.1:8743"],
+  "reference_ticker": "USDX", "block_seconds": 60 }
+```
+
+`/v1/oracles` then lists the set and `/v1/attestations/{market}` returns one
+attestation per oracle; a lender opens a 2-of-3 with `offer-fund --oracles book
+--oracle-threshold 2`. On the testnet box the extra oracles are
+`pignus-oracle2` / `pignus-oracle3` (systemd units, ports 8742/8743).
+
+## Native BTC collateral (Tier B)
+
+This tier is cross-chain and, unlike the covenant tiers, needs the lender as an
+active counterparty (Bitcoin has no covenants, so liquidation needs the oracle
+to co-sign and origination is a two-party adaptor handshake). It runs from
+`pignus-cli btc-*` against a Bitcoin Core node (the box already runs one on
+testnet4) and the Sequentia node; the page carries a keyless VERIFIER so a
+borrower can rebuild every address and check the lender's release before funding.
+There is no daemon service to deploy for it beyond the book that lists the
+markets. See the README for the command sequence and the design doc section 7
+for the trust model.
+
 ## Seeding the book
 
 The page is only as useful as what is on it. Offers and loans can be put on the
