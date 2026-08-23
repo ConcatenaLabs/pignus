@@ -1,0 +1,33 @@
+{
+  "loan": {
+    "btc_amount": 100000000,
+    "borrower_x": "c3bf9d7c56d3a34a304275de6e6fa3adab2f6d92a3d98fbd54fb07bc456f5bea",
+    "lender_x": "54ed51d405a77d1e4405c8eab30cc348fbaa75165521affdd8db4e3b25891b4e",
+    "oracle_x": "5bbe3b001504f3cba1d4cfdf4fa4289cde1c6eab9a935bf80a7f47c5038cbad1",
+    "recover_after": 200000,
+    "debt_asset": "1111111111111111111111111111111111111111111111111111111111111111",
+    "debt": 5000000000,
+    "repay_deadline": 150000,
+    "adaptor_point": "e8fc2781594c6bf012d42dbaac7ebb685dc9b2d2e056fc50c3dd17a12d3e0102",
+    "payment_hash": "9bce6c1dde2360a55150ec1bcb20f631d560a7c1a0d83ca3a2d557deb5506607"
+  },
+  "funding_spk": "5120b92e5037a59864334568bda51ec970c42d1d811e6e374b52b49ab7b63724b80a",
+  "leaves": {
+    "reclaim": "20c3bf9d7c56d3a34a304275de6e6fa3adab2f6d92a3d98fbd54fb07bc456f5beaad2054ed51d405a77d1e4405c8eab30cc348fbaa75165521affdd8db4e3b25891b4eac",
+    "seize": "2054ed51d405a77d1e4405c8eab30cc348fbaa75165521affdd8db4e3b25891b4ead205bbe3b001504f3cba1d4cfdf4fa4289cde1c6eab9a935bf80a7f47c5038cbad1ac",
+    "timeout": "03400d03b1752054ed51d405a77d1e4405c8eab30cc348fbaa75165521affdd8db4e3b25891b4eac"
+  },
+  "control_blocks": {
+    "reclaim": "c050929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0339d68451486cad7b4093ea70e61b67707cc289004a5d9bcc6b8b2c28cab64d5e410e3dafb8d34e8ae5e06c472ab5182f6e4ee97349f1745d936a3d38bc45b57",
+    "seize": "c050929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac08e69b2e26b0823a9d62e78f4150e4c0ed5f50c3be3a82437441268443522e371e410e3dafb8d34e8ae5e06c472ab5182f6e4ee97349f1745d936a3d38bc45b57",
+    "timeout": "c050929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0d8e29b8d3801c10c27c6b35932c6203a60d632ea2afe7c2faed547b973ef66c2"
+  },
+  "reclaim_dest_spk": "00142222222222222222222222222222222222222222",
+  "reclaim_txid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "reclaim_vout": 0,
+  "reclaim_fee": 3000,
+  "reclaim_sighash": "17ea60e86534984ed53adc37dd406c89a1ba367f9065128f0d3438c0cf870a60",
+  "seize_sighash": "ba4ca3dac701cb8321e768faecd59c5c27e137cff8dadbe09e71be26011bfdd6",
+  "nums": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+  "leaf_version": 192
+}

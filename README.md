@@ -110,6 +110,44 @@ pignus-cli offer-withdraw --offer <id> --rpc-wallet me
 `--book` names the pignusd to read markets and offers from (default
 `http://127.0.0.1:8741`); `--rpc*` the node wallet that signs.
 
+### Threshold oracles
+
+An m-of-n loan bakes in several independent oracles and needs `threshold` of
+them to agree before it can be liquidated:
+
+```
+pignus-cli offer-fund --market GOLD/USDX --principal 100 \
+    --oracles book --oracle-threshold 2 --rpc-wallet me
+```
+
+`--oracles book` uses every oracle the book quotes against; the CLI, the
+liquidator and the browser all assemble the threshold witness.
+
+### Native BTC collateral (Tier B, cross-chain)
+
+Borrow a Sequentia asset against real Bitcoin. The collateral sits on Bitcoin,
+the debt on Sequentia, bound by an adaptor signature so repaying and reclaiming
+are one act. A two-party handshake, one command per move, a `ticket` JSON
+passed between the parties (public state only, never a key or `t`):
+
+```
+pignus-cli btc-keygen --out lender.key            # each party once
+pignus-cli btc-propose --lender-key lender.key --borrower-x <x> --oracle-x <x> \
+    --btc-amount 100000 --debt-asset <id> --debt 5000000000 \
+    --recover-after <btc-height> --repay-deadline <seq-height> --out loan.json
+pignus-cli btc-prepare  loan.json --btc-rpc ...   # borrower: fund unbroadcast
+pignus-cli btc-adaptor  loan.json --lender-key lender.key
+pignus-cli btc-originate loan.json --btc-rpc ...  # borrower: verify, then fund
+pignus-cli btc-repay    loan.json --rpc ...       # borrower: pay the hashlock
+pignus-cli btc-claim    loan.json --lender-key lender.key --rpc ...   # reveals t
+pignus-cli btc-reclaim  loan.json --borrower-key borrower.key --rpc ... --btc-rpc ...
+```
+
+and the other endings: `btc-seize-sighash` / `btc-seize` (lender + oracle),
+`btc-timeout` (lender, after the term), `btc-refund` (borrower, if the lender
+stalls). The trust model and why liquidation needs the oracle to co-sign on the
+Bitcoin side are in the design doc, section 7.
+
 ## Running it
 
 The package needs a Sequentia **source** checkout, because that is where the
@@ -219,6 +257,10 @@ tests/test_btc_collateral.py                 Tier B, on a bitcoind + sequentiad 
 tests/test_lifecycle.py                      the CLI through fund, take, repay,
                                              liquidate, withdraw, default, with
                                              the daemon discovering every step
+tests/test_threshold.py                      a 2-of-3 oracle loan, end to end
+tests/test_openamp.py                        the Tier C pledge message, pinned
+tests/test_btc_cli.py                        the BTC-collateral library legs
+tests/test_btc_cli_flow.py                   the BTC-collateral CLI handshake
 tests/run-tests.sh                           everything here, fastest first
 tests/cli_drill.sh            the commands, offline
 ```
