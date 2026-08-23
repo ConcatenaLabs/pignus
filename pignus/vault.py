@@ -568,6 +568,17 @@ def _fold_dust(outs, fee_asset, fee_amount):
     return kept, fee_amount
 
 
+def _need(*pairs):
+    """Sum {asset: atoms} requirements. A plain dict literal collapses when two
+    keys are the same asset -- which happens whenever the fee is paid in the
+    asset already being spent -- and silently under-funds the transaction, so
+    every requirement is accumulated here instead."""
+    out = {}
+    for asset, atoms in pairs:
+        out[asset] = out.get(asset, 0) + int(atoms)
+    return out
+
+
 def _offer_tree(terms, principal, collateral, expiry_locktime):
     from .offers import _offer_module, _vault_kwargs
     off = _offer_module()
@@ -590,10 +601,10 @@ def fund_offer(node, terms, principal, collateral, expiry_locktime, lots,
     _off, tap, _leaves = _offer_tree(terms, principal, collateral, expiry_locktime)
     spk = bytes(tap.scriptPubKey)
     total = int(principal) * int(lots)
-    funding = select_funding(node, {terms.debt_asset: total, fee_asset: fee_amount})
+    need = _need((terms.debt_asset, total), (fee_asset, fee_amount))
+    funding = select_funding(node, need)
     outs = [(total, spk, terms.debt_asset)]
-    outs += _change_outs(funding, {terms.debt_asset: total,
-                                   fee_asset: fee_amount}, change_spk)
+    outs += _change_outs(funding, need, change_spk)
     outs, fee_amount = _fold_dust(outs, fee_asset, fee_amount)
     tx = _raw_tx(funding, outs, fee_asset, fee_amount)
     signed = node.signrawtransactionwithwallet(tx.serialize().hex())
@@ -622,11 +633,9 @@ def take_offer(node, terms, offer, offer_value, principal, collateral,
     if remainder < 0:
         raise ValueError("this offer no longer holds a whole principal")
 
-    funding = select_funding(node, {terms.collateral_asset: int(collateral),
-                                    fee_asset: fee_amount},
-                             exclude=[(offer.txid, offer.vout)])
-    change = _change_outs(funding, {terms.collateral_asset: int(collateral),
-                                    fee_asset: fee_amount}, change_spk)
+    need = _need((terms.collateral_asset, int(collateral)), (fee_asset, fee_amount))
+    funding = select_funding(node, need, exclude=[(offer.txid, offer.vout)])
+    change = _change_outs(funding, need, change_spk)
     outs = [(int(collateral), vault_spk, terms.collateral_asset)]
     if remainder > 0:
         outs.append((remainder, offer_spk, terms.debt_asset))
