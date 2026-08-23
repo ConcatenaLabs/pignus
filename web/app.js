@@ -26,16 +26,19 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c =>
 const shortHex = (h, n = 10) => h ? esc(String(h).slice(0, n)) + "…" : "—";
 const big = (x) => (typeof x === "bigint" ? x : BigInt(x));
 
-const BLOCK_SECONDS = 60;
-const BLOCKS_PER_DAY = 86400 / BLOCK_SECONDS;
-const RECOVER_GAP = 30 * BLOCKS_PER_DAY;   // the lender's backstop, after maturity
+const DEFAULT_BLOCK_SECONDS = 60;          // overridden by the daemon's /healthz
+const blockSeconds = () => state.blockSeconds || DEFAULT_BLOCK_SECONDS;
+const blocksPerDay = () => 86400 / blockSeconds();
+const RECOVER_GAP_DAYS = 30;               // the lender's backstop, after maturity
 const BONUS = 5;                            // liquidation bonus, percent
 
 const state = {
   wallet: null, account: null, utxos: [], balances: {},
   markets: [], assets: {}, fees: { rates: {}, vsize: {} },
-  offers: [], loans: [], oracleX: null, height: 0, healthy: null,
+  offers: [], loans: [], oracleX: null, oracles: [], height: 0, healthy: null,
   payout: null, pinned: 0, loansFilter: "live",
+  reference: "USDX", blockSeconds: DEFAULT_BLOCK_SECONDS,
+  offersFilter: "open",
 };
 
 async function api(p) {
@@ -88,15 +91,15 @@ function amount(atoms, asset) {
 /** One unit of `asset`, in units of the reference (USDX-quoted markets). */
 function unitValue(asset) {
   for (const m of state.markets) {
-    if (m.collateral_asset === asset && m.unit_price != null) return Number(m.unit_price);
-    if (m.debt_asset === asset) return 1;
+    if (m.collateral_asset === asset && m.unit_price != null && m.debt_is_reference)
+      return Number(m.unit_price);
+    if (m.debt_asset === asset && m.debt_is_reference) return 1;
   }
   return null;
 }
 
 function refUnit() {
-  const m = state.markets.find(x => x.debt_ticker);
-  return m ? m.debt_ticker : "USDX";
+  return state.reference || "USDX";
 }
 
 /** "≈ 1,234.56 USDX" for an amount of any priced asset, or "". */
@@ -119,7 +122,7 @@ function money(n, digits = 2) {
 }
 
 function whenBlock(h) {
-  const dt = (Number(h) - state.height) * BLOCK_SECONDS * 1000;
+  const dt = (Number(h) - state.height) * blockSeconds() * 1000;
   const d = new Date(Date.now() + dt);
   const rel = Math.abs(dt) < 3600e3 ? `${Math.round(dt / 60e3)} min`
     : Math.abs(dt) < 86400e3 * 2 ? `${(dt / 3600e3).toFixed(1)} h`
@@ -190,9 +193,10 @@ async function pinCovenant() {
 }
 
 async function refresh() {
-  const [m, a, f, o, l, or, hz] = await Promise.all([
-    api("v1/markets"), api("v1/assets"), api("v1/fees"), api("v1/offers"),
-    api("v1/loans"), api("v1/oracle"), api("healthz"),
+  const [m, a, f, o, l, or, ors, hz] = await Promise.all([
+    api("v1/markets"), api("v1/assets"), api("v1/fees"), api("v1/offers?status=all"),
+    api("v1/loans"), api("v1/oracle"), api("v1/oracles").catch(() => ({ oracles: [] })),
+    api("healthz"),
   ]);
   state.height = hz.height ?? m.height ?? 0;
   state.healthy = hz;
@@ -202,6 +206,9 @@ async function refresh() {
   state.offers = o.offers;
   state.loans = l.loans;
   state.oracleX = or.oracle_x;
+  state.oracles = ors.oracles || [];
+  state.reference = m.reference_ticker || "USDX";
+  if (m.block_seconds) state.blockSeconds = m.block_seconds;
   $("#chain").textContent = `block ${Number(state.height).toLocaleString()}`;
   $("#chain").className = "tag " + (hz.node ? "ok" : "dim");
   $("#daemon").textContent = hz.ok ? `book live · ${hz.offers} open offer${hz.offers === 1 ? "" : "s"} · ${hz.loans} loan${hz.loans === 1 ? "" : "s"}`
@@ -304,15 +311,21 @@ function mine(prog) {
 
 function renderOffers() {
   const b = $("#offers");
-  const open = state.offers.filter(o => o.kind === "funded" && (o.status || "open") === "open");
-  if (!open.length) {
-    b.innerHTML = `<div class="empty">No open offers. Publish one from the Lend tab
-      and a borrower can take it while you are offline.</div>`;
+  const funded = state.offers.filter(o => o.kind === "funded");
+  const open = funded.filter(o => (o.status || "open") === "open");
+  const view = state.offersFilter === "mine"
+    ? funded.filter(o => mine(o.lender_prog) || manageToken(o.offer_id))
+    : state.offersFilter === "all" ? funded : open;
+  if (!view.length) {
+    b.innerHTML = `<div class="empty">${state.offersFilter === "mine"
+      ? "No offers from this wallet." : state.offersFilter === "all"
+      ? "No offers yet." : "No open offers. Publish one from the Lend tab and a "
+      + "borrower can take it while you are offline."}</div>`;
     return;
   }
   b.innerHTML = `<table><tr><th>market</th><th>borrow</th><th>repay</th>
       <th>collateral to lock</th><th>liquidation price</th><th>matures</th><th>left</th><th></th></tr>` +
-    open.map((o, i) => {
+    view.map((o, i) => {
       const t = JSON.parse(o.terms);
       const m = marketFor(t);
       const rate = (Number(big(t.debt)) / Number(big(t.principal)) - 1) * 100;
@@ -320,26 +333,34 @@ function renderOffers() {
       const now = m?.unit_price != null ? Number(m.unit_price) : null;
       const drop = now ? ((1 - liq / now) * 100).toFixed(0) : null;
       const isMine = mine(o.lender_prog);
+      const canCancel = manageToken(o.offer_id);
       const action = isMine
         ? (o.expired ? `<button data-withdraw="${i}" class="sm">Withdraw</button>`
-                     : `<span class="tag gold">your offer</span>`)
+             : `<span class="tag gold">your offer</span>${canCancel ? ` <button data-cancel="${i}" class="sm">Cancel listing</button>` : ""}`)
         : o.expired ? `<span class="tag dim">expired</span>`
         : `<button data-borrow="${i}" class="primary sm">Borrow</button>`;
+      const st = (o.status && o.status !== "open")
+        ? `<span class="tag ${o.status === "ghost" ? "bad" : "dim"}">${esc(o.status)}</span>` : "";
+      const oracle = (t.oracles && t.oracles.length)
+        ? ` <span class="tag dim">${t.oracle_threshold}-of-${t.oracles.length} oracles</span>` : "";
       return `<tr>
-        <td>${esc(o.collateral_ticker)} / ${esc(o.debt_ticker)}</td>
-        <td><b>${amount(t.principal, t.debt_asset)}</b></td>
-        <td>${amount(t.debt, t.debt_asset)}<span class="sub2">+${rate.toFixed(2)}% over the term</span></td>
-        <td>${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}${o.open_ltv != null ? ` · LTV ${(o.open_ltv * 100).toFixed(0)}%` : ""}</span></td>
-        <td>${money(liq, liq < 10 ? 4 : 2)} ${esc(o.debt_ticker)}<span class="sub2">${drop != null ? `${drop}% below now` : ""}</span></td>
-        <td>${whenBlock(t.maturity)}<span class="sub2">offer expires ${o.expiry_locktime ? whenBlock(o.expiry_locktime).replace(/<span.*span>/, "") : "—"}</span></td>
-        <td>${o.lots_left ?? "?"}</td>
-        <td>${action}</td></tr>`;
+        <td data-label="market">${esc(o.collateral_ticker)} / ${esc(o.debt_ticker)}${oracle}${st}</td>
+        <td data-label="borrow"><b>${amount(t.principal, t.debt_asset)}</b></td>
+        <td data-label="repay">${amount(t.debt, t.debt_asset)}<span class="sub2">+${rate.toFixed(2)}% over the term</span></td>
+        <td data-label="collateral">${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}${o.open_ltv != null ? ` · LTV ${(o.open_ltv * 100).toFixed(0)}%` : ""}</span></td>
+        <td data-label="liquidation">${money(liq, liq < 10 ? 4 : 2)} ${esc(o.debt_ticker)}<span class="sub2">${drop != null ? `${drop}% below now` : ""}</span></td>
+        <td data-label="matures">${whenBlock(t.maturity)}<span class="sub2">offer expires ${o.expiry_locktime ? whenBlock(o.expiry_locktime).replace(/<span.*span>/, "") : "—"}</span></td>
+        <td data-label="left">${o.lots_left ?? "?"}</td>
+        <td data-label="">${action}</td></tr>`;
     }).join("") + "</table>";
   b.querySelectorAll("[data-borrow]").forEach(btn => {
-    btn.onclick = () => borrow(open[Number(btn.dataset.borrow)]);
+    btn.onclick = () => borrow(view[Number(btn.dataset.borrow)]);
   });
   b.querySelectorAll("[data-withdraw]").forEach(btn => {
-    btn.onclick = () => withdraw(open[Number(btn.dataset.withdraw)]);
+    btn.onclick = () => withdraw(view[Number(btn.dataset.withdraw)]);
+  });
+  b.querySelectorAll("[data-cancel]").forEach(btn => {
+    btn.onclick = () => cancelListing(view[Number(btn.dataset.cancel)]);
   });
 }
 
@@ -381,16 +402,18 @@ function renderLoans() {
       if (live && l.recover_open)
         acts.push(`<button data-recover="${i}" class="sm">Recover</button>`);
       const closed = l.spent_by ? `<a class="small" href="/tx/${esc(l.spent_by)}">closing tx</a>` : "";
+      const oracle = (t.oracles && t.oracles.length)
+        ? `<span class="sub2">${esc(l.oracle || "")} oracles</span>` : "";
       return `<tr>
-        <td class="mono"><a href="/tx/${esc(l.txid)}" style="color:inherit;text-decoration:none">${shortHex(l.txid, 10)}</a>${role ? "<br>" + role : ""}</td>
-        <td>${esc(l.collateral_ticker)} / ${esc(l.debt_ticker)}</td>
-        <td>${amount(t.debt, t.debt_asset)}<span class="sub2">borrowed ${units(t.principal, t.debt_asset)}</span></td>
-        <td>${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}</span></td>
-        <td>${now != null ? money(now, now < 10 ? 4 : 2) : "—"} / ${money(liq, liq < 10 ? 4 : 2)}<span class="sub2">${esc(l.debt_ticker)} per ${esc(l.collateral_ticker)}${l.ltv != null ? ` · LTV ${(l.ltv * 100).toFixed(0)}%` : ""}</span></td>
-        <td><span class="tag health ${cls}">${h == null ? "no price" : h.toFixed(3)}</span></td>
-        <td>${whenBlock(t.maturity)}</td>
-        <td><span class="tag ${STATE_CLS[l.state] || "dim"}">${esc(l.state)}</span>${l.confirmations != null && l.state === "UNCONFIRMED" ? "" : ""}<br>${closed}</td>
-        <td class="row" style="gap:6px">${acts.join("")}</td></tr>`;
+        <td data-label="loan" class="mono"><a href="/tx/${esc(l.txid)}" style="color:inherit;text-decoration:none">${shortHex(l.txid, 10)}</a>${role ? "<br>" + role : ""}</td>
+        <td data-label="market">${esc(l.collateral_ticker)} / ${esc(l.debt_ticker)}${oracle}</td>
+        <td data-label="owed">${amount(t.debt, t.debt_asset)}<span class="sub2">borrowed ${units(t.principal, t.debt_asset)}</span></td>
+        <td data-label="collateral">${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}</span></td>
+        <td data-label="price / liq.">${now != null ? money(now, now < 10 ? 4 : 2) : "—"} / ${money(liq, liq < 10 ? 4 : 2)}<span class="sub2">${esc(l.debt_ticker)} per ${esc(l.collateral_ticker)}${l.ltv != null ? ` · LTV ${(l.ltv * 100).toFixed(0)}%` : ""}</span></td>
+        <td data-label="health"><span class="tag health ${cls}">${h == null ? "no price" : h.toFixed(3)}</span></td>
+        <td data-label="matures">${whenBlock(t.maturity)}</td>
+        <td data-label="state"><span class="tag ${STATE_CLS[l.state] || "dim"}">${esc(l.state)}</span>${l.state === "UNCONFIRMED" && l.confirmations != null ? ` <span class="small">${l.confirmations}/2</span>` : ""}<br>${closed}</td>
+        <td data-label="" class="row" style="gap:6px">${acts.join("")}</td></tr>`;
     }).join("") + "</table>";
   const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
     btn.onclick = () => fn(rows[Number(btn.dataset[attr])]);
@@ -428,27 +451,44 @@ function lendTerms() {
   const dp = m.debt_precision ?? 8;
   const scale = BigInt(m.price_scale || 100000);
   const price = BigInt(m.price);
+  const ceilDiv = (a, d) => (a + d - 1n) / d;
+  // Read the form's own percents as integers/basis points so the covenant
+  // amounts are computed entirely in BigInt -- no IEEE double rounding, which
+  // would lose atoms on a loan above ~90M units.
+  const f2 = new FormData($("#lendform"));
+  const openPct = BigInt(Math.round(Number(f2.get("open_ltv"))));   // step=1
+  const liqPct = BigInt(Math.round(Number(f2.get("liq_ltv"))));     // step=1
+  const rateBps = BigInt(Math.round(Number(f2.get("rate")) * 100)); // % -> bps
   const principal = BigInt(Math.round(i.principal * 10 ** dp));
-  const debt = principal + BigInt(Math.round(Number(principal) * i.rate));
-  // collateral value = principal / openLtv, in debt atoms; collateral atoms =
-  // value * scale / price, rounded up so the borrower never posts one atom short
-  const collateral = BigInt(Math.ceil(Number(principal) * Number(scale) / (Number(price) * i.openLtv)));
-  const strike = BigInt(Math.ceil(Number(debt) * Number(scale) / (Number(collateral) * i.liqLtv)));
-  const maturity = state.height + Math.round(i.termDays * BLOCKS_PER_DAY);
-  const expiry = state.height + Math.round(i.offerDays * BLOCKS_PER_DAY);
+  const debt = principal + ceilDiv(principal * rateBps, 10000n);
+  // collateral value = principal * 100 / openPct, in debt atoms; collateral
+  // atoms = value * scale / price, rounded up so the borrower is never short.
+  const collateral = ceilDiv(principal * scale * 100n, price * openPct);
+  const strike = ceilDiv(debt * scale * 100n, collateral * liqPct);
+  const bpd = blocksPerDay();
+  const maturity = state.height + Math.round(i.termDays * bpd);
+  const expiry = state.height + Math.round(i.offerDays * bpd);
   const ver = state.payout?.ver ?? 0;
   const placeholder = "00".repeat(ver === 0 ? 20 : 32);
+  const oMode = ($("#oraclesel") || {}).value || "single";
+  let oracle_x = state.oracleX, oracles = [], oracle_threshold = 0;
+  if (oMode !== "single") {
+    const m = Number(oMode);
+    if (!(state.oracles.length >= m && m >= 2))
+      throw new Error("that oracle set is no longer available");
+    oracle_x = ""; oracles = state.oracles.slice(); oracle_threshold = m;
+  }
   const terms = {
     collateral_asset: m.collateral_asset, debt_asset: m.debt_asset,
     collateral_amount: String(collateral), principal: String(principal), debt: String(debt),
     lender_x: state.payout?.prog || placeholder, lender_prog: state.payout?.prog || placeholder,
     lender_ver: ver,
     borrower_x: placeholder, borrower_prog: placeholder, borrower_ver: ver,
-    market: m.market, oracle_x: state.oracleX,
+    market: m.market, oracle_x,
     strike: String(strike), not_before: String(Math.floor(Date.now() / 1000)),
-    maturity, recover_after: maturity + RECOVER_GAP,
+    maturity, recover_after: maturity + Math.round(RECOVER_GAP_DAYS * bpd),
     bonus_num: 100 + BONUS, bonus_den: 100, price_scale: Number(scale),
-    max_price: 0, memo: "", oracles: [], oracle_threshold: 0,
+    max_price: 0, memo: "", oracles, oracle_threshold,
   };
   return { terms, m, principal, collateral, debt, strike, expiry, maturity, lots: i.lots, i };
 }
@@ -459,6 +499,18 @@ function renderLendForm() {
   sel.innerHTML = state.markets.filter(m => m.lendable).map(m =>
     `<option value="${esc(m.market)}">${esc(m.collateral_ticker)} / ${esc(m.debt_ticker)}</option>`).join("");
   if (cur) sel.value = cur;
+  // Oracle-set choices: the single default, plus an m-of-n for every m>=2 the
+  // book can actually reach right now (a threshold you cannot meet is a trap).
+  const osel = $("#oraclesel");
+  const n = state.oracles.length;
+  const ocur = osel.value;
+  const opts = ['<option value="single">Single oracle (default)</option>'];
+  for (let m = 2; m <= n; m++)
+    opts.push(`<option value="${m}">Require ${m} of ${n} oracles</option>`);
+  osel.innerHTML = opts.join("");
+  if (ocur) osel.value = ocur;
+  $("#oracle_count").textContent = n > 1
+    ? `${n} independent oracles available` : "";
   renderPreview();
 }
 
@@ -476,7 +528,7 @@ function renderPreview() {
     <span class="k">Each borrower locks</span><span><b>${amount(t.collateral_amount, t.collateral_asset)}</b> <span class="k">${ref(t.collateral_amount, t.collateral_asset)} at today's price, ${(x.i.openLtv * 100).toFixed(0)}% loan-to-value</span></span>
     <span class="k">and repays</span><span><b>${amount(t.debt, t.debt_asset)}</b> <span class="k">by ${whenBlock(t.maturity)}</span></span>
     <span class="k">Liquidation</span><span>if ${esc(m.collateral_ticker)} falls below <b>${money(liq, liq < 10 ? 4 : 2)} ${esc(m.debt_ticker)}</b> <span class="k">(${((1 - liq / now) * 100).toFixed(0)}% below now); whoever liquidates keeps a ${BONUS}% bonus and the rest of the collateral goes back to the borrower</span></span>
-    <span class="k">After maturity</span><span class="k">anyone may call the loan at any price; ${RECOVER_GAP / BLOCKS_PER_DAY} days later you can sweep the vault without an oracle</span>
+    <span class="k">After maturity</span><span class="k">anyone may call the loan at any price; ${RECOVER_GAP_DAYS} days later you can sweep the vault without an oracle</span>
   </div>`;
 }
 
@@ -504,6 +556,33 @@ async function confirmAndSend(label, built, fee, extra = []) {
 
 function tickers(t) {
   return { c: meta(t.collateral_asset).ticker, d: meta(t.debt_asset).ticker };
+}
+
+function rememberToken(offerId, token) {
+  try {
+    const m = JSON.parse(localStorage.getItem("pignus.manage") || "{}");
+    m[offerId] = token;
+    localStorage.setItem("pignus.manage", JSON.stringify(m));
+  } catch { /* private mode: cancellation just won't be available here */ }
+}
+function manageToken(offerId) {
+  try { return JSON.parse(localStorage.getItem("pignus.manage") || "{}")[offerId] || null; }
+  catch { return null; }
+}
+async function cancelListing(o) {
+  const token = manageToken(o.offer_id);
+  if (!token) { note("This browser did not publish that offer, so it has no " +
+    "token to cancel the listing. The coin is untouched either way; it returns " +
+    "to you on the offer's own expiry.", "warn"); return; }
+  busy(true, "cancelling the listing…");
+  try {
+    const r = await fetch(`v1/offers/${encodeURIComponent(o.offer_id)}?token=${encodeURIComponent(token)}`,
+                          { method: "DELETE" });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `DELETE -> ${r.status}`);
+    note("Listing removed. Your principal is untouched in the offer covenant " +
+         "and returns to you after the expiry.", "ok");
+    refresh();
+  } catch (e) { note(esc(e.message), "bad"); } finally { busy(false); }
 }
 
 async function borrow(o) {
@@ -594,17 +673,35 @@ async function seize(l, atMaturity) {
   if (needWallet()) return;
   try {
     const t = JSON.parse(l.terms);
-    const att = await api(`v1/attestation/${t.market.replace("/", "_")}`);
-    // Verify the SIGNATURE against the key THIS LOAN bakes in. The oracle is
-    // trusted for a number and never for the transport that carried it, and a
-    // loan only accepts the oracle it named -- not whichever one this site is
-    // serving today.
-    if (!pig.verifyAttestation(t, att))
-      throw new Error("that attestation does not verify against the oracle this " +
-                      "loan names, so the covenant would refuse it. Refusing to build it.");
+    const market = t.market.replace("/", "_");
+    const isThreshold = !!(t.oracles && t.oracles.length);
+    let single = null, set = null;
+    if (isThreshold) {
+      // A threshold loan is closed with several oracles' attestations, one
+      // per key; the book aggregates them, and each is verified here against
+      // the key THIS LOAN names before it is used.
+      const got = await api(`v1/attestations/${market}`);
+      set = (got.attestations || []).filter(a =>
+        t.oracles.includes(a.oracle_x) &&
+        pig.verifySchnorr(a.oracle_x,
+          pig.attestationMessage(pig.feedId(t.market), a.timestamp, a.price),
+          a.signature));
+      if (!set.length)
+        throw new Error("none of this loan's oracles have a verifiable " +
+                        "attestation right now; the covenant would refuse it.");
+    } else {
+      single = await api(`v1/attestation/${market}`);
+      // Verify the SIGNATURE against the key THIS LOAN bakes in. The oracle is
+      // trusted for a number and never for the transport that carried it, and a
+      // loan only accepts the oracle it named.
+      if (!pig.verifyAttestation(t, single))
+        throw new Error("that attestation does not verify against the oracle this " +
+                        "loan names, so the covenant would refuse it. Refusing to build it.");
+    }
     const flow = (atMaturity ? "default" : "liquidate") + (l.single_leaf ? "" : "4");
     const fee = feeFor(flow, [t.debt_asset]);
-    const built = flows.buildLiquidate({ ...vaultArgs(l, t), attestation: att, atMaturity,
+    const built = flows.buildLiquidate({ ...vaultArgs(l, t),
+      attestation: single, attestations: set, atMaturity,
       takerSpk: state.payout.spk, feeAsset: fee.asset, feeAmount: fee.atoms });
     const { c, d } = tickers(t);
     built.summary = [`Pay ${units(t.debt, t.debt_asset)} ${d} to the lender`,
@@ -645,10 +742,13 @@ async function lend(ev) {
     const txid = await confirmAndSend("Publish a funded offer", built, fee, [
       `Offer address: ${built.offerScriptPubKey.slice(0, 24)}…`]);
     if (txid) {
-      await post("v1/offers", {
+      const rec = await post("v1/offers", {
         terms: JSON.stringify(x.terms), kind: "funded", outpoint: `${txid}:0`,
         principal: String(x.principal), collateral: String(x.collateral),
         expiry_locktime: x.expiry });
+      // The manage token lets this browser cancel the LISTING later without a
+      // key. It is shown once by the daemon; keep it locally, per offer.
+      if (rec.manage_token && rec.offer_id) rememberToken(rec.offer_id, rec.manage_token);
       $$("[data-tab]")[0].click();
       refresh();
     }
@@ -718,8 +818,14 @@ async function boot() {
   $("#repoform").onsubmit = checkRepurchase;
   $("#refresh").onclick = () => refresh().catch(e => note(esc(e.message), "bad"));
   $$("[data-tab]").forEach(b => {
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", b.classList.contains("on") ? "true" : "false");
     b.onclick = () => {
-      $$("[data-tab]").forEach(x => x.classList.toggle("on", x === b));
+      $$("[data-tab]").forEach(x => {
+        const on = x === b;
+        x.classList.toggle("on", on);
+        x.setAttribute("aria-selected", on ? "true" : "false");
+      });
       $$("[data-panel]").forEach(p =>
         p.style.display = p.dataset.panel === b.dataset.tab ? "" : "none");
     };
@@ -729,6 +835,13 @@ async function boot() {
       state.loansFilter = b.dataset.lf;
       $$("[data-lf]").forEach(x => x.classList.toggle("on", x === b));
       renderLoans();
+    };
+  });
+  $$("[data-of]").forEach(b => {
+    b.onclick = () => {
+      state.offersFilter = b.dataset.of;
+      $$("[data-of]").forEach(x => x.classList.toggle("on", x === b));
+      renderOffers();
     };
   });
   // resume a prior connection without prompting

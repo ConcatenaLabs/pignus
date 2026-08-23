@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
@@ -45,6 +46,20 @@ def fetch_attestation(base, market):
     url = f"{base.rstrip('/')}/v1/attestation/{market.replace('/', '_')}"
     with urllib.request.urlopen(url, timeout=10) as r:
         return O.Attestation.from_dict(json.loads(r.read().decode()))
+
+
+def fetch_attestation_set(base, market):
+    """{oracle_x: Attestation} for a threshold loan, from the book."""
+    url = f"{base.rstrip('/')}/v1/attestations/{market.replace('/', '_')}"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        data = json.loads(r.read().decode())["attestations"]
+    out = {}
+    for d in data:
+        ox = d.get("oracle_x")
+        if ox:
+            out[ox] = O.Attestation.from_dict({k: v for k, v in d.items()
+                                               if k != "oracle_x"})
+    return out
 
 
 def fetch_oracle_key(base):
@@ -186,10 +201,22 @@ def main():
                 wants[fee_asset] = wants.get(fee_asset, 0) + fee_amount
                 funding = select_funding(node, wants,
                                          exclude=[(outpoint.txid, outpoint.vout)])
-                if kind == "liquidate":
-                    raw = spender.liquidate(outpoint, funding, att, taker_spk)
+                # A threshold loan is closed with a MAPPING of attestations,
+                # one per oracle, which only the book aggregates.
+                if t.oracles:
+                    if not args.book:
+                        print("  skip: threshold loan needs --book for the "
+                              "attestation set", file=sys.stderr)
+                        continue
+                    ev = fetch_attestation_set(args.book, t.market)
+                    evidence = {k: a for k, a in ev.items()
+                                if k in t.oracles and O.verify(k, a)}
                 else:
-                    raw = spender.call_default(outpoint, funding, att, taker_spk)
+                    evidence = att
+                if kind == "liquidate":
+                    raw = spender.liquidate(outpoint, funding, evidence, taker_spk)
+                else:
+                    raw = spender.call_default(outpoint, funding, evidence, taker_spk)
                 txid = node.sendrawtransaction(raw)
                 print(f"  broadcast {txid}", file=sys.stderr)
             except (RpcError, RuntimeError, ValueError) as e:

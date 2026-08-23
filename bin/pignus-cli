@@ -93,11 +93,18 @@ def cmd_quote(args):
 
 
 def cmd_propose(args):
+    oracles = tuple(k.strip() for k in args.oracles.split(",") if k.strip())
+    threshold = args.oracle_threshold or (len(oracles) if oracles else 0)
+    if oracles and not (1 <= threshold <= len(oracles)):
+        raise SystemExit(f"--oracle-threshold {threshold} outside 1..{len(oracles)}")
+    if not oracles and not args.oracle_x:
+        raise SystemExit("give --oracle-x or --oracles")
     t = LoanTerms(
         collateral_asset=args.collateral_asset, debt_asset=args.debt_asset,
         collateral_amount=args.collateral_amount, principal=args.principal,
         debt=args.debt, borrower_x=args.borrower_x, lender_x=args.lender_x,
-        market=args.market, oracle_x=args.oracle_x, strike=args.strike,
+        market=args.market, oracle_x=args.oracle_x,
+        oracles=oracles, oracle_threshold=threshold, strike=args.strike,
         not_before=args.not_before, maturity=args.maturity,
         recover_after=args.recover_after, bonus_num=args.bonus_num,
         bonus_den=args.bonus_den, price_scale=args.price_scale,
@@ -395,6 +402,51 @@ def fmt_atoms(n, precision=8):
     return f"{int(n) / 10 ** int(precision):,.{int(precision)}f}".rstrip("0").rstrip(".")
 
 
+def _resolve_oracles(args):
+    """(oracle_x, oracles, threshold) from --oracles / --oracle-threshold.
+
+    --oracles is a comma-separated list of x-only keys, or the literal `book`
+    to use every oracle the book quotes against. Absent, the loan uses the
+    book's single primary oracle -- exactly as before.
+    """
+    spec = (args.oracles or "").strip()
+    if not spec:
+        return book_get(args.book, "/v1/oracle")["oracle_x"], (), 0
+    if spec.lower() == "book":
+        keys = book_get(args.book, "/v1/oracles")["oracles"]
+    else:
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+    if len(keys) == 1:
+        return keys[0], (), 0
+    if not keys:
+        raise SystemExit("--oracles resolved to no keys")
+    thr = args.oracle_threshold or len(keys)
+    if not 1 <= thr <= len(keys):
+        raise SystemExit(f"--oracle-threshold {thr} outside 1..{len(keys)}")
+    if thr == 1:
+        raise SystemExit("a 1-of-n oracle set is WEAKER than one oracle (any "
+                         "one key alone can liquidate); pick a threshold >= 2")
+    return "", keys, thr
+
+
+def _threshold_evidence(args, terms, market):
+    """The {oracle_key: Attestation} mapping a threshold spend needs, verified
+    against the keys THIS LOAN names."""
+    data = book_get(args.book, f"/v1/attestations/{market}")["attestations"]
+    ev = {}
+    for d in data:
+        ox = d.get("oracle_x")
+        if ox in terms.oracles:
+            att = O.Attestation.from_dict({k: v for k, v in d.items()
+                                           if k != "oracle_x"})
+            if O.verify(ox, att):
+                ev[ox] = att
+    if not ev:
+        raise SystemExit("none of this loan's oracles have a verifiable "
+                         "attestation right now")
+    return ev
+
+
 def cmd_offer_fund(args):
     node = node_from(args)
     mk = next((m for m in book_get(args.book, "/v1/markets")["markets"]
@@ -405,7 +457,7 @@ def cmd_offer_fund(args):
         raise SystemExit(f"{mk['market']} is not lendable here: "
                          + ("native BTC is cross-chain" if mk.get("cross_chain")
                             else "no asset id or no verified price"))
-    oracle_x = book_get(args.book, "/v1/oracle")["oracle_x"]
+    oracle_x, oracles, threshold = _resolve_oracles(args)
     height = node.getblockcount()
     price, scale = int(mk["price"]), int(mk["price_scale"])
     cp, dp = int(mk["collateral_precision"]), int(mk["debt_precision"])
@@ -428,7 +480,8 @@ def cmd_offer_fund(args):
         collateral_amount=collateral, principal=principal, debt=debt,
         lender_x=prog, lender_prog=prog, lender_ver=ver,
         borrower_x=placeholder, borrower_prog=placeholder, borrower_ver=bver,
-        market=mk["market"], oracle_x=oracle_x, strike=strike,
+        market=mk["market"], oracle_x=oracle_x or "",
+        oracles=tuple(oracles), oracle_threshold=threshold, strike=strike,
         not_before=int(time.time()), maturity=maturity,
         recover_after=maturity + RECOVER_GAP,
         bonus_num=100 + int(args.bonus), bonus_den=100, price_scale=scale,
@@ -583,14 +636,19 @@ def _exit(args, exit_name):
         raw = spender.recover(coin, funding, spk)
     else:
         market = terms.market.replace("/", "_")
-        att = O.Attestation.from_dict(book_get(args.book, f"/v1/attestation/{market}"))
-        if not O.verify(terms.oracle_x, att):
-            raise SystemExit("the attestation does not verify against the "
-                             "oracle THIS LOAN names; refusing to build it")
-        if exit_name == "liquidate":
-            raw = spender.liquidate(coin, funding, att, spk)
+        if terms.oracles:
+            evidence = _threshold_evidence(args, terms, market)
         else:
-            raw = spender.call_default(coin, funding, att, spk)
+            att = O.Attestation.from_dict(
+                book_get(args.book, f"/v1/attestation/{market}"))
+            if not O.verify(terms.oracle_x, att):
+                raise SystemExit("the attestation does not verify against the "
+                                 "oracle THIS LOAN names; refusing to build it")
+            evidence = att
+        if exit_name == "liquidate":
+            raw = spender.liquidate(coin, funding, evidence, spk)
+        else:
+            raw = spender.call_default(coin, funding, evidence, spk)
     if args.dry_run:
         print(raw)
         return 0
@@ -648,6 +706,11 @@ def add_wallet_commands(sub):
     p.add_argument("--borrower-ver", type=int, default=0,
                    help="witness version borrowers pay out at: 0 for "
                    "extension/bech32 wallets (default), 1 for taproot")
+    p.add_argument("--oracles", default="",
+                   help="comma-separated oracle x-only keys, or 'book' to use "
+                   "every oracle the book quotes against, for an m-of-n loan")
+    p.add_argument("--oracle-threshold", type=int, default=0,
+                   help="m in an m-of-n oracle set (default: all of them)")
     p.add_argument("--memo", default="")
     p.add_argument("--no-publish", dest="publish", action="store_false")
     common(p)
@@ -780,8 +843,13 @@ def main():
 
     p = sub.add_parser("propose", help="write a loan terms document")
     for name in ("collateral-asset", "debt-asset", "borrower-x", "lender-x",
-                 "oracle-x", "market"):
+                 "market"):
         p.add_argument("--" + name, required=True)
+    p.add_argument("--oracle-x", default="",
+                   help="a single oracle key; or use --oracles for m-of-n")
+    p.add_argument("--oracles", default="",
+                   help="comma-separated oracle keys for an m-of-n loan")
+    p.add_argument("--oracle-threshold", type=int, default=0)
     for name, default in (("collateral-amount", None), ("principal", None),
                           ("debt", None), ("strike", None), ("maturity", None),
                           ("recover-after", None), ("not-before", 0),
