@@ -20,7 +20,7 @@
 
 import {
   vaultScriptPubKey, vaultLeaves, seizureAt, surplusAt, isLiquidatable,
-  _internals as P,
+  feedId, verifySchnorr, attestationMessage, _internals as P,
 } from "./pignus.js";
 import * as offer from "./offer.js";
 import { buildPset } from "./pset.js";
@@ -255,18 +255,79 @@ export function buildRepay({ terms, vaultOutpoint, collateralAmount, singleLeaf,
 
 // -------------------------------------------------------------- liquidate
 
+/**
+ * Choose which oracles' attestations to present for a threshold vault, and
+ * assemble the witness `data` in the order the covenant reads it.
+ *
+ * A faithful port of pignus.oracle.select_threshold: the covenant takes the
+ * MAXIMUM of the presented prices, so the only sensible play is the `threshold`
+ * LOWEST valid attestations. Returns `{ data, price }`, where `data` is the
+ * per-slot witness items (reversed slot order; a present slot is
+ * price, timestamp, signature; an absent one is 0, 0, empty push).
+ */
+export function thresholdEvidence(terms, attestations, { liquidate }) {
+  const keys = (terms.oracles && terms.oracles.length)
+    ? terms.oracles : [terms.oracle_x];
+  const threshold = Number(terms.oracle_threshold || keys.length);
+  const notBefore = b(terms.not_before);
+  const strike = b(terms.strike);
+  const feed = feedId(terms.market);
+  const byKey = {};
+  for (const a of attestations) byKey[a.oracle_x] = a;
+  const usable = [];
+  keys.forEach((k, i) => {
+    const a = byKey[k];
+    if (!a) return;
+    if (!verifySchnorr(k, attestationMessage(feed, a.timestamp, a.price), a.signature))
+      return;
+    if (b(a.timestamp) < notBefore) return;
+    if (liquidate && !(b(a.price) < strike)) return;
+    usable.push({ i, a });
+  });
+  if (usable.length < threshold)
+    throw new WalletError(
+      `only ${usable.length} of this loan's oracles have a usable ` +
+      `attestation, and it needs ${threshold}`);
+  usable.sort((x, y) => (b(x.a.price) < b(y.a.price) ? -1 : 1));
+  const chosen = usable.slice(0, threshold);
+  const slots = keys.map(() => null);
+  for (const { i, a } of chosen) slots[i] = a;
+  let price = 0n;
+  for (const { a } of chosen) if (b(a.price) > price) price = b(a.price);
+  const data = [];
+  for (let j = slots.length - 1; j >= 0; j--) {
+    const a = slots[j];
+    if (!a) data.push(P.bytesToHex(P.le8(0n)), P.bytesToHex(P.le8(0n)), "");
+    else data.push(P.bytesToHex(P.le8(b(a.price))),
+                   P.bytesToHex(P.le8(b(a.timestamp))), a.signature);
+  }
+  return { data, price };
+}
+
 export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
-                                 attestation, singleLeaf, takerSpk, utxos,
-                                 changeSpk, feeAsset, feeAmount,
-                                 atMaturity = false }) {
-  const price = b(attestation.price);
-  if (!atMaturity && !isLiquidatable(terms, price))
-    throw new WalletError(
-      `at ${price} this position is not liquidatable: the strike is ` +
-      `${terms.strike}, and the covenant checks that itself`);
-  if (b(attestation.timestamp) < b(terms.not_before))
-    throw new WalletError(
-      "that attestation predates the loan, so the covenant will refuse it");
+                                 attestation, attestations, singleLeaf,
+                                 takerSpk, utxos, changeSpk, feeAsset,
+                                 feeAmount, atMaturity = false }) {
+  const isThreshold = !!(terms.oracles && terms.oracles.length);
+  let price, evidenceData;
+  if (isThreshold) {
+    const set = attestations || (Array.isArray(attestation) ? attestation : []);
+    ({ data: evidenceData, price } =
+       thresholdEvidence(terms, set, { liquidate: !atMaturity }));
+    if (!atMaturity && !isLiquidatable(terms, price))
+      throw new WalletError(
+        `at ${price} this position is not liquidatable: the strike is ` +
+        `${terms.strike}, and the covenant checks that itself`);
+  } else {
+    price = b(attestation.price);
+    if (!atMaturity && !isLiquidatable(terms, price))
+      throw new WalletError(
+        `at ${price} this position is not liquidatable: the strike is ` +
+        `${terms.strike}, and the covenant checks that itself`);
+    if (b(attestation.timestamp) < b(terms.not_before))
+      throw new WalletError(
+        "that attestation predates the loan, so the covenant will refuse it");
+  }
 
   const lenderSpk = scriptPubKeyFor(terms.lender_ver ?? 1,
                                     terms.lender_prog ?? terms.lender_x);
@@ -315,9 +376,9 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
   if (!feePlaced) outs.push(feeOutput(feeAsset, feeAmount));
 
   const exit = atMaturity ? "default" : "liquidate";
-  const data = [attestation.signature,
-                P.bytesToHex(P.le8(price)),
-                P.bytesToHex(P.le8(b(attestation.timestamp)))];
+  const data = isThreshold ? evidenceData
+    : [attestation.signature, P.bytesToHex(P.le8(price)),
+       P.bytesToHex(P.le8(b(attestation.timestamp)))];
   const witness = singleLeaf
     ? offer.offerVaultWitness(terms, exit, data.map(P.hexToBytes)).map(P.bytesToHex)
     : fourLeafWitness(terms, exit, data);

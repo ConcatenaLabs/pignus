@@ -26,8 +26,10 @@ half-written file is worse than the cost of rewriting a small one.
 """
 
 import hashlib
+import hmac
 import json
 import os
+import secrets
 import tempfile
 import threading
 import time
@@ -89,16 +91,35 @@ class Book:
                 "or a borrower cannot check it is real without asking us")
         offer["created"] = offer.get("created") or int(time.time())
         offer["status"] = offer.get("status") or "open"
+        # A manage token lets whoever published an offer withdraw the LISTING
+        # (not the coin -- the coin is the truth and untouched) without a flood
+        # of anonymous deletes. The token is returned once, in the clear, to the
+        # publisher; the book keeps only its hash, so a leak of the book file
+        # does not hand anyone the ability to cancel someone else's listing.
+        token = offer.pop("manage_token", None) or secrets.token_urlsafe(24)
+        offer["manage_hash"] = hashlib.sha256(token.encode()).hexdigest()
+        offer["_manage_token"] = token          # stripped before storage below
         offer["market"] = terms.market
         offer["principal"] = str(offer.get("principal") or terms.principal)
         offer["collateral"] = str(offer.get("collateral")
                                   or terms.collateral_amount)
         offer["expiry_locktime"] = int(offer.get("expiry_locktime")
                                        or terms.maturity)
+        token = offer.pop("_manage_token")
         with self._lock:
             self.offers[offer["offer_id"]] = offer
             self._save()
-        return offer
+        out = dict(offer)
+        out["manage_token"] = token             # once, to the publisher only
+        return out
+
+    def manage_token_ok(self, offer_id, token) -> bool:
+        rec = self.offers.get(offer_id)
+        if not rec or not token:
+            return False
+        want = rec.get("manage_hash", "")
+        return bool(want) and hmac.compare_digest(
+            want, hashlib.sha256(str(token).encode()).hexdigest())
 
     def update_offer(self, offer_id, **fields):
         with self._lock:
@@ -120,7 +141,8 @@ class Book:
     def list_offers(self, market=None, kind=None, status="open"):
         """Open offers by default. `status="all"` includes taken, withdrawn
         and vanished ones, which are history rather than something to take."""
-        out = list(self.offers.values())
+        with self._lock:
+            out = list(self.offers.values())
         if status and status != "all":
             out = [o for o in out if o.get("status", "open") == status]
         if market:
@@ -166,7 +188,8 @@ class Book:
             return rec
 
     def list_loans(self, state=None, market=None):
-        out = list(self.loans.values())
+        with self._lock:
+            out = list(self.loans.values())
         if state:
             out = [x for x in out if x.get("state") == state]
         if market:
@@ -179,7 +202,9 @@ class Book:
         health of 0 reads as 'about to be liquidated', which would be a lie."""
         prices = prices or {}
         by_state, at_risk, total_debt = {}, [], {}
-        for rec in self.loans.values():
+        with self._lock:
+            records = list(self.loans.values())
+        for rec in records:
             by_state[rec["state"]] = by_state.get(rec["state"], 0) + 1
             if rec["state"] != "LIVE":
                 continue

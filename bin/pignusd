@@ -91,11 +91,62 @@ ALIASES = {"SEQ": "tSEQ", "TSEQ": "tSEQ"}
 NATIVE = {"BTC", "TBTC"}
 
 
+class _RateLimiter:
+    """A token bucket per client, so the public book cannot be flooded with
+    writes. Generous for a testnet -- a real user publishes a handful of
+    offers, not hundreds a second."""
+    def __init__(self, rate=1.0, burst=20):
+        self.rate, self.burst = rate, burst
+        self._buckets = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key, now):
+        with self._lock:
+            tokens, last = self._buckets.get(key, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - last) * self.rate)
+            if tokens < 1.0:
+                self._buckets[key] = (tokens, now)
+                return False
+            self._buckets[key] = (tokens - 1.0, now)
+            return True
+
+
+WRITE_LIMIT = _RateLimiter()
+
+
+def _views(render, rows):
+    """Render each record, skipping any that cannot be rendered rather than
+    500-ing the whole list because one stored record is malformed."""
+    out = []
+    for r in rows:
+        try:
+            out.append(render(r))
+        except Exception as e:                      # noqa: BLE001
+            sys.stderr.write(f"skipping unrenderable record "
+                             f"{r.get('offer_id') or r.get('loan_id') or '?'}: "
+                             f"{type(e).__name__}: {e}\n")
+    return out
+
+
 class Service:
     def __init__(self, cfg):
         self.cfg = cfg
         self.book = Book(cfg["book"])
         self.oracle_url = cfg.get("oracle", "").rstrip("/")
+        # One book can quote against several INDEPENDENT oracles, which is what
+        # a threshold (m-of-n) loan needs. `oracle` is the default single one;
+        # `oracles` is a list of additional endpoints. Each has its own key.
+        urls = []
+        if self.oracle_url:
+            urls.append(self.oracle_url)
+        for u in cfg.get("oracles", []):
+            u = str(u).rstrip("/")
+            if u and u not in urls:
+                urls.append(u)
+        self.oracle_urls = urls
+        self.oracle_keys = []                       # x-only hex, in url order
+        self.oracle_key_by_url = {}
+        self.att_by_oracle = {}                     # (oracle_x, market) -> att
         self.registry_url = cfg.get("registry", "").rstrip("/")
         self.markets = list(cfg.get("markets", []))
         self.prices = {}
@@ -120,35 +171,59 @@ class Service:
                              cookie_path=rpc.get("cookie"))
         self.watcher = VaultWatcher(self.node) if self.node else None
         self._lock = threading.Lock()
+        # refresh_chain runs on the poll thread AND synchronously inside a POST
+        # handler thread; VaultWatcher.poll mutates shared state, so the two
+        # must never run at once.
+        self._chain_lock = threading.Lock()
+        self.block_seconds = int(cfg.get("block_seconds", 60))
+        # The reference/numeraire the page quotes value in. Markets are
+        # "COLLATERAL/DEBT"; the debt asset of a market whose debt ticker
+        # matches this is worth 1 reference unit. Configurable, not hardcoded.
+        self.reference_ticker = cfg.get("reference_ticker", "USDX")
 
     # ------------------------------------------------------------- the oracle
 
     def refresh_prices(self):
-        if not self.oracle_url:
+        if not self.oracle_urls:
             return
-        try:
-            with urllib.request.urlopen(f"{self.oracle_url}/v1/pubkey",
-                                        timeout=8) as r:
-                self.oracle_x = json.loads(r.read().decode())["oracle_x"]
-        except Exception as e:                      # noqa: BLE001
-            self.oracle_error = f"oracle: {type(e).__name__}: {e}"
-            return
-        self.oracle_error = None
-        for m in self.markets:
+        keys, key_by_url, errors = [], {}, []
+        for url in self.oracle_urls:
             try:
-                url = f"{self.oracle_url}/v1/attestation/{m.replace('/', '_')}"
-                with urllib.request.urlopen(url, timeout=8) as r:
-                    att = O.Attestation.from_dict(json.loads(r.read().decode()))
-            except Exception:                       # noqa: BLE001
+                with urllib.request.urlopen(f"{url}/v1/pubkey", timeout=8) as r:
+                    ox = json.loads(r.read().decode())["oracle_x"]
+                keys.append(ox)
+                key_by_url[url] = ox
+            except Exception as e:                  # noqa: BLE001
+                errors.append(f"{url}: {type(e).__name__}: {e}")
+        with self._lock:
+            self.oracle_keys = keys
+            self.oracle_key_by_url = key_by_url
+            # The FIRST oracle is the "primary": its price is what the page
+            # shows and what a plain single-oracle loan bakes in.
+            self.oracle_x = keys[0] if keys else None
+        self.oracle_error = "; ".join(errors) if errors and not keys else None
+        for url in self.oracle_urls:
+            ox = key_by_url.get(url)
+            if not ox:
                 continue
-            # Verify before storing. A price this service displays is a price
-            # someone may act on, and the oracle is trusted for the number, not
-            # for the transport that carried it.
-            if not O.verify(self.oracle_x, att):
-                continue
-            with self._lock:
-                self.prices[m] = att.price
-                self.attestations[m] = att
+            for m in self.markets:
+                try:
+                    a_url = f"{url}/v1/attestation/{m.replace('/', '_')}"
+                    with urllib.request.urlopen(a_url, timeout=8) as r:
+                        att = O.Attestation.from_dict(
+                            json.loads(r.read().decode()))
+                except Exception:                   # noqa: BLE001
+                    continue
+                # Verify before storing. A price this service displays is a
+                # price someone may act on, and an oracle is trusted for the
+                # number, not for the transport that carried it.
+                if not O.verify(ox, att):
+                    continue
+                with self._lock:
+                    self.att_by_oracle[(ox, m)] = att
+                    if ox == self.oracle_x:
+                        self.prices[m] = att.price
+                        self.attestations[m] = att
 
     # ----------------------------------------------------------- the registry
 
@@ -212,20 +287,34 @@ class Service:
         if not self.watcher:
             return
         w = self.watcher
+        if not self._chain_lock.acquire(blocking=False):
+            return          # a reconcile is already in flight; let it finish
         try:
             self.height = self.node.getblockcount()
             for rec in self.book.list_loans():
-                if rec["loan_id"] not in w.vaults:
-                    w.track(rec["loan_id"], LoanTerms.from_json(rec["terms"]),
-                            rec["txid"], rec["vout"],
-                            single_leaf=bool(rec.get("single_leaf")))
+                if rec["loan_id"] in w.vaults:
+                    continue
+                try:
+                    terms = LoanTerms.from_json(rec["terms"])
+                except Exception as e:              # noqa: BLE001
+                    print(f"loan {rec.get('loan_id','?')[:12]}: unparseable "
+                          f"terms, skipping: {e}", file=sys.stderr)
+                    continue
+                w.track(rec["loan_id"], terms, rec["txid"], rec["vout"],
+                        single_leaf=bool(rec.get("single_leaf")))
             for off in self.book.list_offers(status="open"):
                 if off.get("kind") != "funded" or off["offer_id"] in w.offers:
                     continue
-                txid, _, vout = str(off["outpoint"]).rpartition(":")
-                w.track_offer(off["offer_id"], LoanTerms.from_json(off["terms"]),
-                              txid, int(vout), int(off["principal"]),
-                              int(off["collateral"]), int(off["expiry_locktime"]))
+                try:
+                    txid, _, vout = str(off["outpoint"]).rpartition(":")
+                    w.track_offer(off["offer_id"],
+                                  LoanTerms.from_json(off["terms"]), txid,
+                                  int(vout), int(off["principal"]),
+                                  int(off["collateral"]),
+                                  int(off["expiry_locktime"]))
+                except Exception as e:              # noqa: BLE001
+                    print(f"offer {off.get('offer_id','?')[:12]}: cannot track, "
+                          f"skipping: {e}", file=sys.stderr)
             for v in w.poll():
                 self.book.update_loan(v.loan_id, state=v.state.value,
                                       confirmations=v.confirmations,
@@ -246,6 +335,8 @@ class Service:
             self.node_error = None
         except Exception as e:                      # noqa: BLE001
             self.node_error = f"node: {type(e).__name__}: {e}"
+        finally:
+            self._chain_lock.release()
 
     def _apply_offer_event(self, ev):
         """What the chain did to an offer, written into the book."""
@@ -283,8 +374,8 @@ class Service:
         elif kind == "withdrawn":
             self.book.update_offer(off["offer_id"], status="withdrawn",
                                    spent_by=ev["txid"])
-        else:
-            self.book.update_offer(off["offer_id"], status="gone",
+        else:   # "gone" or "ghost"
+            self.book.update_offer(off["offer_id"], status=kind,
                                    spent_by=ev.get("txid", ""),
                                    note=ev.get("note", ""))
 
@@ -359,6 +450,8 @@ class Service:
         rows = []
         for m in self.markets:
             att = self.attestations.get(m)
+            n_oracles = sum(1 for ox in self.oracle_keys
+                            if (ox, m) in self.att_by_oracle)
             c_sym, _, d_sym = m.partition("/")
             c_asset, c_tick = self.resolve(c_sym)
             d_asset, d_tick = self.resolve(d_sym)
@@ -370,6 +463,7 @@ class Service:
                 "debt_precision": (self.assets.get(d_asset) or {}).get("precision", 8),
                 "cross_chain": c_sym.strip().upper() in NATIVE,
                 "lendable": bool(c_asset and d_asset and att),
+                "debt_is_reference": d_tick.upper() == self.reference_ticker.upper(),
                 "price": att.price if att else None,
                 "price_scale": att.price_scale if att else None,
                 "unit_price": (O.unquote_price(att.price,
@@ -377,6 +471,7 @@ class Service:
                                if att else None),
                 "timestamp": att.timestamp if att else None,
                 "age_seconds": (int(time.time()) - att.timestamp) if att else None,
+                "oracles_available": n_oracles,
             })
         return rows
 
@@ -391,6 +486,7 @@ class Service:
     def offer_view(self, rec):
         t = LoanTerms.from_json(rec["terms"])
         out = dict(rec)
+        out.pop("manage_hash", None)             # never serve the manage secret
         self._tickers(out, t)
         out["collateral_asset"] = t.collateral_asset
         out["debt_asset"] = t.debt_asset
@@ -462,6 +558,9 @@ class Service:
             "loans": len(self.book.loans),
             "assets": len(self.assets),
             "fee_rates": len(self.fee_table.get("rates", {})),
+            "block_seconds": self.block_seconds,
+            "reference_ticker": self.reference_ticker,
+            "oracles": len(self.oracle_keys),
             "node": bool(self.node)}
 
 
@@ -533,7 +632,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, s.health())
         if path == "/v1/markets":
             return self._send(200, {"markets": s.market_rows(),
-                                    "height": s.height})
+                                    "height": s.height,
+                                    "reference_ticker": s.reference_ticker,
+                                    "block_seconds": s.block_seconds})
         if path == "/v1/assets":
             return self._send(200, {"assets": s.assets})
         if path == "/v1/fees":
@@ -551,11 +652,16 @@ class Handler(BaseHTTPRequestHandler):
                 "oracle_x": s.oracle_x, "url": s.oracle_url,
                 "note": "verify every attestation against the key the VAULT "
                         "bakes in, not against this one"})
+        if path == "/v1/oracles":
+            # The set of independent oracles this book quotes against, so a
+            # lender can pick an m-of-n subset for a threshold loan.
+            return self._send(200, {"oracles": list(s.oracle_keys),
+                                    "urls": list(s.oracle_urls)})
         if path == "/v1/offers":
             rows = s.book.list_offers(market=q.get("market", [None])[0],
                                       kind=q.get("kind", [None])[0],
                                       status=q.get("status", ["open"])[0])
-            return self._send(200, {"offers": [s.offer_view(r) for r in rows]})
+            return self._send(200, {"offers": _views(s.offer_view, rows)})
         if path.startswith("/v1/offer/"):
             rec = s.book.offers.get(path[len("/v1/offer/"):])
             if not rec:
@@ -564,7 +670,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/loans":
             rows = s.book.list_loans(state=q.get("state", [None])[0],
                                      market=q.get("market", [None])[0])
-            return self._send(200, {"loans": [s.loan_view(r) for r in rows]})
+            return self._send(200, {"loans": _views(s.loan_view, rows)})
         if path.startswith("/v1/loan/"):
             rec = s.book.loans.get(path[len("/v1/loan/"):])
             if not rec:
@@ -588,6 +694,16 @@ class Handler(BaseHTTPRequestHandler):
                 "asset": got.get("asset"),
                 "value": str(int(round(float(got["value"]) * COIN))),
                 "confirmations": got.get("confirmations", 0)})
+        if path.startswith("/v1/attestations/"):
+            market = path[len("/v1/attestations/"):].replace("_", "/").upper()
+            out = []
+            for ox in s.oracle_keys:
+                att = s.att_by_oracle.get((ox, market))
+                if att is not None:
+                    d = att.to_dict()
+                    d["oracle_x"] = ox
+                    out.append(d)
+            return self._send(200, {"market": market, "attestations": out})
         if path.startswith("/v1/attestation/"):
             market = path[len("/v1/attestation/"):].replace("_", "/").upper()
             att = s.attestations.get(market)
@@ -614,16 +730,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         s = self.svc
         path = urlparse(self.path).path.rstrip("/") or "/"
+        if not WRITE_LIMIT.allow(self.client_address[0], time.time()):
+            return self._send(429, {"error": "too many writes; slow down"})
         try:
             body = self._body()
             if path == "/v1/offers":
                 if len(s.book.offers) >= MAX_OFFERS:
                     return self._send(429, {"error": "the book is full"})
                 s.verify_offer(body)
-                rec = s.book.put_offer(body)
+                rec = s.book.put_offer(body)      # carries manage_token once
                 s.refresh_chain()
-                return self._send(200, s.offer_view(s.book.offers.get(
-                    rec["offer_id"], rec)))
+                view = s.offer_view(s.book.offers.get(rec["offer_id"], rec))
+                view["manage_token"] = rec.get("manage_token")
+                return self._send(200, view)
             if path == "/v1/loans":
                 if len(s.book.loans) >= MAX_LOANS:
                     return self._send(429, {"error": "the book is full"})
@@ -646,10 +765,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def do_DELETE(self):
-        path = urlparse(self.path).path.rstrip("/")
+        u = urlparse(self.path)
+        path = u.path.rstrip("/")
+        if not WRITE_LIMIT.allow(self.client_address[0], time.time()):
+            return self._send(429, {"error": "too many writes; slow down"})
         try:
             if path.startswith("/v1/offers/"):
-                gone = self.svc.book.drop_offer(path[len("/v1/offers/"):])
+                offer_id = path[len("/v1/offers/"):]
+                token = (parse_qs(u.query).get("token", [None])[0]
+                         or self.headers.get("X-Manage-Token"))
+                rec = self.svc.book.offers.get(offer_id)
+                if rec is None:
+                    return self._send(404, {"removed": False})
+                if not self.svc.book.manage_token_ok(offer_id, token):
+                    # An anonymous flood cannot cancel a listing; only whoever
+                    # published it holds the token. A stale listing whose coin
+                    # is already spent is retired by the watcher regardless.
+                    return self._send(403, {"error": "a listing can only be "
+                                            "cancelled with the manage token "
+                                            "returned when it was published"})
+                gone = self.svc.book.drop_offer(offer_id)
                 return self._send(200 if gone else 404, {"removed": gone})
             return self._send(404, {"error": "no such endpoint"})
         except (BrokenPipeError, ConnectionResetError):

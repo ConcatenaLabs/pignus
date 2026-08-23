@@ -276,11 +276,20 @@ class VaultWatcher:
         # the mempool, then a bounded way back, before giving up on it.
         found = self._find_spender(o.txid, o.vout, tip)
         if found is None:
-            o.status = "gone"
-            self.events.append({"offer_id": o.offer_id, "kind": "gone",
-                                "txid": "", "height": 0, "input_index": -1,
-                                "note": "outpoint spent by a transaction this "
-                                        "watcher could not find"})
+            # No coin and no spender. If the offer had buried, it was taken or
+            # withdrawn by a transaction we cannot see; if it never buried, a
+            # Bitcoin-driven reorg undid its funding -- the same first principle
+            # the vault side calls GHOST. An offer that never buried had
+            # confirmations 0.
+            reorg = o.confirmations == 0
+            o.status = "ghost" if reorg else "gone"
+            self.events.append({
+                "offer_id": o.offer_id, "kind": o.status,
+                "txid": "", "height": 0, "input_index": -1,
+                "note": ("funding undone by a Bitcoin-driven reorg before it "
+                         "buried" if reorg else
+                         "outpoint spent by a transaction this watcher could "
+                         "not find")})
             return
         tx, k, height = found
         self._offer_spent(o, tx, k, tx["vin"][k].get("txinwitness") or [],
