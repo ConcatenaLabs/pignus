@@ -1128,7 +1128,8 @@ def cmd_btc_offer_publish(args):
         btc_amount=args.btc_amount, borrower_x="00" * 32,
         lender_x=A.xonly_pubkey(lender).hex(), oracle_x=args.oracle_x,
         recover_after=args.recover_after, debt_asset=args.debt_asset,
-        debt=args.debt, repay_deadline=args.repay_deadline,
+        debt=args.debt, principal=args.principal or args.debt,
+        repay_deadline=args.repay_deadline,
         adaptor_point=A.point(t).hex(), payment_hash=sha256(t).hex())
     d = loan_to_dict(loan)
     d.pop("borrower_x", None)          # no borrower yet
@@ -1154,16 +1155,17 @@ def cmd_btc_respond(args):
     lender = _read_key(args.lender_key)
     lender_x = A.xonly_pubkey(lender).hex()
 
-    def one_pass():
+    from pignus.btc_collateral import (loan_from_dict, disburse_principal,
+                                        funding_confirmed)
+    seq_node = node_from(args) if args.rpc_user or args.rpc_password or args.rpc_cookie else None
+    btc_node = btc_node_from(args) if args.btc_rpc_user or args.btc_rpc_password or args.btc_rpc_cookie else None
+
+    def sign_pass():
         n = 0
-        takes = book_get(args.book, "/v1/btc/takes?status=pending")["takes"]
-        for tk in takes:
-            loan = BtcLoan.__new__(BtcLoan) if False else None
-            ld = dict(tk["loan"])
-            if ld.get("lender_x") != lender_x:
+        for tk in book_get(args.book, "/v1/btc/takes?status=pending")["takes"]:
+            if dict(tk["loan"]).get("lender_x") != lender_x:
                 continue                      # not our offer
-            from pignus.btc_collateral import loan_from_dict
-            loan = loan_from_dict(ld)
+            loan = loan_from_dict(dict(tk["loan"]))
             rtx = reclaim_tx(loan, tk["funding_txid"], int(tk["funding_vout"]),
                              bytes.fromhex(tk["reclaim_dest"]),
                              int(tk.get("reclaim_fee", 3000)))
@@ -1175,6 +1177,39 @@ def cmd_btc_respond(args):
             else:
                 print(f"take {tk['take_id']}: {r.get('error')}", file=sys.stderr)
         return n
+
+    def disburse_pass():
+        """The other half of a loan: once a borrower's collateral is confirmed on
+        Bitcoin, send them the principal on Sequentia. Without a Sequentia wallet
+        (--rpc*) and a Bitcoin node (--btc-rpc*) this is skipped, and the
+        responder only does origination."""
+        if not (seq_node and btc_node):
+            return 0
+        n = 0
+        for tk in book_get(args.book, "/v1/btc/takes?status=signed")["takes"]:
+            loan_d = dict(tk["loan"])
+            if loan_d.get("lender_x") != lender_x or not tk.get("borrower_seq_spk"):
+                continue
+            loan = loan_from_dict(loan_d)
+            if not funding_confirmed(btc_node, tk["funding_txid"],
+                                     int(tk["funding_vout"]),
+                                     min_conf=args.disburse_conf):
+                continue                      # collateral not buried yet
+            try:
+                txid = disburse_principal(seq_node, loan, tk["borrower_seq_spk"],
+                                          fee_asset=args.fee_asset or "bitcoin")
+            except Exception as e:            # noqa: BLE001
+                print(f"disburse {tk['take_id']}: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+                continue
+            book_post(args.book, "/v1/btc/disbursed",
+                      {"take_id": tk["take_id"], "disbursement_txid": txid})
+            print(f"disbursed {int(loan.principal) or int(loan.debt)} to "
+                  f"{tk['take_id']}: {txid}", file=sys.stderr); n += 1
+        return n
+
+    def one_pass():
+        return sign_pass() + disburse_pass()
 
     if not args.watch:
         print(json.dumps({"signed": one_pass()}))
@@ -1297,6 +1332,9 @@ def add_btc_commands(sub):
     p.add_argument("--btc-amount", type=int, required=True)
     p.add_argument("--debt-asset", required=True)
     p.add_argument("--debt", type=int, required=True)
+    p.add_argument("--principal", type=int, default=0,
+                   help="atoms disbursed to the borrower (default: = debt, "
+                   "a zero-interest loan)")
     p.add_argument("--recover-after", type=int, required=True)
     p.add_argument("--repay-deadline", type=int, required=True)
     p.add_argument("--market", default="")
@@ -1305,11 +1343,17 @@ def add_btc_commands(sub):
     p.set_defaults(fn=cmd_btc_offer_publish)
 
     p = sub.add_parser("btc-respond",
-                       help="LENDER responder: adaptor-sign pending takes")
+                       help="LENDER responder: adaptor-sign takes and disburse "
+                       "the principal once collateral confirms")
     p.add_argument("--lender-key", required=True)
     p.add_argument("--watch", action="store_true")
     p.add_argument("--interval", type=float, default=5.0)
+    p.add_argument("--disburse-conf", type=int, default=1,
+                   help="Bitcoin confirmations required before disbursing")
+    p.add_argument("--fee-asset", help="fee asset for the disbursement send")
     add_book_arg(p)
+    add_node_args(p)           # --rpc*: the lender's Sequentia wallet (disburse)
+    add_btc_node_args(p)       # --btc-rpc*: to see the collateral confirm
     p.set_defaults(fn=cmd_btc_respond)
 
 def main():

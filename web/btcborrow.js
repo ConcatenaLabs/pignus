@@ -33,16 +33,29 @@ export async function borrow(wallet, offer, ui) {
   const reclaimSpk = "5120" + borrower_x;
   const sighash = hex(btc.reclaimSighash(loan, prep.txid, prep.vout || 0, toBytes(reclaimSpk), 3000));
   ui.busy(true, "asking the lender to sign your release…");
-  const take = await ui.post("v1/btc/take", { btc_offer_id: offer.btc_offer_id, borrower_x, funding_txid: prep.txid, funding_vout: prep.vout || 0, reclaim_dest: reclaimSpk, reclaim_fee: 3000, reclaim_sighash: sighash });
+  // borrower_seq_spk is where the lender disburses the PRINCIPAL once the
+  // collateral confirms -- the other half of the loan.
+  const take = await ui.post("v1/btc/take", { btc_offer_id: offer.btc_offer_id, borrower_x, borrower_seq_spk: ui.seqSpk || "", funding_txid: prep.txid, funding_vout: prep.vout || 0, reclaim_dest: reclaimSpk, reclaim_fee: 3000, reclaim_sighash: sighash });
   let signed = null;
-  for (let i = 0; i < 30 && !signed; i++) { await new Promise(r => setTimeout(r, 2000)); const t = await ui.api("v1/btc/take/" + take.take_id); if (t.status === "signed") signed = t; }
+  for (let i = 0; i < 30 && !signed; i++) { await new Promise(r => setTimeout(r, 2000)); const t = await ui.api("v1/btc/take/" + take.take_id); if (t.status === "signed" || t.status === "disbursed") signed = t; }
   if (!signed) throw new Error("the lender did not sign in time; nothing was broadcast. Try again when their responder is online.");
   if (!badaptor.verifyAdaptor(loan.lender_x, sighash, loan.adaptor_point, signed.adaptor_sig)) throw new Error("the lender's release does NOT verify. Refusing to fund.");
   ui.busy(true, "broadcasting the collateral…");
   const ftxid = await wallet.request("broadcast", { chain: "bitcoin", hex: prep.hex });
   const rec = { loan, take_id: take.take_id, funding_txid: prep.txid, funding_vout: prep.vout || 0, reclaim_spk: reclaimSpk, adaptor_sig: signed.adaptor_sig, repay_spk: repaySpk, status: "funded" };
   rememberLoan(rec);
-  return { ftxid, rec, repaySpk };
+  return { ftxid, rec, repaySpk, take_id: take.take_id };
+}
+
+/** Poll the relay until the lender disburses the principal (after the collateral
+ *  confirms). Returns the disbursement txid, or null on timeout. */
+export async function awaitDisbursement(ui, take_id, tries = 60, gap = 5000) {
+  for (let i = 0; i < tries; i++) {
+    const t = await ui.api("v1/btc/take/" + take_id).catch(() => null);
+    if (t && t.status === "disbursed") return t.disbursement_txid || "";
+    await new Promise(r => setTimeout(r, gap));
+  }
+  return null;
 }
 export async function reclaim(wallet, rec, tHex) {
   const loan = rec.loan;

@@ -782,11 +782,30 @@ async function runBtcBorrow(offer) {
   if (needWallet()) return;
   try {
     const out = await btcborrow.borrow(state.wallet, offer,
-      { busy, api, post, esc, units, ticker: (a) => meta(a).ticker });
-    note("<b>Collateral funded.</b> <span class=\"mono\">" + esc(out.ftxid) + "</span><br>Repay " +
-      units(out.rec.loan.debt, out.rec.loan.debt_asset) + " " + esc(meta(out.rec.loan.debt_asset).ticker) +
-      " to <span class=\"mono\">" + esc(out.repaySpk) + "</span>, then reclaim your Bitcoin.", "ok");
-  } catch (e) { note(esc(e.message), "bad"); }
+      { busy, api, post, esc, units, ticker: (a) => meta(a).ticker,
+        seqSpk: state.payout?.spk });
+    const t = offer.loan;
+    const principal = BigInt(t.principal || t.debt);
+    note("<b>Collateral funded.</b> <span class=\"mono\">" + esc(out.ftxid) + "</span><br>" +
+      "Waiting for the lender to disburse " + units(principal, t.debt_asset) + " " +
+      esc(meta(t.debt_asset).ticker) + " once your collateral confirms…", "ok");
+    busy(true, "waiting for the principal to arrive…");
+    const dtxid = await btcborrow.awaitDisbursement({ api }, out.take_id).catch(() => null);
+    busy(false);
+    if (dtxid !== null) {
+      await loadWallet(); renderWallet();
+      note("<b>Loan open.</b> You received " + units(principal, t.debt_asset) + " " +
+        esc(meta(t.debt_asset).ticker) +
+        (dtxid ? " (<a href=\"/tx/" + esc(dtxid) + "\" class=\"mono\">disbursement</a>)" : "") +
+        ". Repay " + units(t.debt, t.debt_asset) + " to <span class=\"mono\">" +
+        esc(out.repaySpk) + "</span> before block " + Number(t.repay_deadline).toLocaleString() +
+        ", then reclaim your Bitcoin.", "ok");
+    } else {
+      note("<b>Collateral funded, principal pending.</b> The lender has not " +
+        "disbursed yet; it arrives once your collateral confirms and their " +
+        "responder is online. Your loan is saved in this browser.", "warn");
+    }
+  } catch (e) { busy(false); note(esc(e.message), "bad"); }
 }
 async function checkBtc(ev) {
   ev.preventDefault();
