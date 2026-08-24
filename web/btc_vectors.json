@@ -30,5 +30,6 @@
   "seize_sighash": "ba4ca3dac701cb8321e768faecd59c5c27e137cff8dadbe09e71be26011bfdd6",
   "nums": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
   "leaf_version": 192,
-  "repayment_spk": "512080d373b92c3f1172125c89fd6a9a494eb60ba61e48ab44ec8439429563d419a8"
+  "repayment_spk": "512080d373b92c3f1172125c89fd6a9a494eb60ba61e48ab44ec8439429563d419a8",
+  "funding_address_tb": "tb1phyh9qda9npjrx3tghkj3ajtscsk3mqg7dcm5k545n2mmvdeyhq9q3jj3sg"
 }

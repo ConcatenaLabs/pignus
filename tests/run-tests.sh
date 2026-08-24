@@ -49,6 +49,7 @@ run "browser: offers vs vectors"      node tests/test_offer_web.mjs
 run "browser: repurchase vs vectors"  node tests/test_repurchase_web.mjs
 run "browser: BTC taproot vs vectors" node tests/test_btc_web.mjs
 run "browser: adaptor vs vectors"     node tests/test_adaptor_web.mjs
+run "BTC relay + lender responder"     python3 tests/test_btc_relay.py
 # test_platform runs on the node's functional-test framework, which wants the
 # config.ini that `configure` generates. A worktree does not have one, so look
 # for it in the obvious places rather than assuming SEQUENTIA_SRC has been

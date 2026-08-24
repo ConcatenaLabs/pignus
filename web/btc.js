@@ -229,6 +229,50 @@ export function completeReclaimTx(loan, fundingTxid, vout, destSpk, fee,
   return tx;
 }
 
+// --------------------------------------------------------------- bech32m
+
+const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+function polymod(values) {
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const b = chk >> 25; chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) chk ^= ((b >> i) & 1) ? GEN[i] : 0;
+  }
+  return chk >>> 0;
+}
+function hrpExpand(hrp) {
+  const o = [];
+  for (const c of hrp) o.push(c.charCodeAt(0) >> 5);
+  o.push(0);
+  for (const c of hrp) o.push(c.charCodeAt(0) & 31);
+  return o;
+}
+function convertBits(data, from, to) {
+  let acc = 0, bits = 0; const ret = []; const maxv = (1 << to) - 1;
+  for (const b of data) {
+    acc = (acc << from) | b; bits += from;
+    while (bits >= to) { bits -= to; ret.push((acc >> bits) & maxv); }
+  }
+  if (bits) ret.push((acc << (to - bits)) & maxv);
+  return ret;
+}
+/** bech32m-encode a segwit output. hrp "tb" is Bitcoin testnet (testnet4). */
+export function segwitAddress(witver, witprog, hrp = "tb") {
+  const data = [witver].concat(convertBits(Array.from(witprog), 8, 5));
+  const values = hrpExpand(hrp).concat(data);
+  const mod = polymod(values.concat([0, 0, 0, 0, 0, 0])) ^ 0x2bc830a3;  // bech32m
+  const chk = [];
+  for (let i = 0; i < 6; i++) chk.push((mod >> (5 * (5 - i))) & 31);
+  return hrp + "1" + data.concat(chk).map(d => CHARSET[d]).join("");
+}
+/** The Bitcoin address a borrower funds the collateral to. */
+export function fundingAddress(loan, hrp = "tb") {
+  const spk = fundingSpk(loan);
+  const witver = spk[0] === 0x51 ? 1 : spk[0] - 0x50;
+  return segwitAddress(witver, spk.slice(2), hrp);
+}
+
 // -------------------------------------------------------------------- pin
 
 export function selfTest(v) {
@@ -253,6 +297,8 @@ export function selfTest(v) {
      v.seize_sighash);
   if (v.repayment_spk)
     eq("repayment_spk", bytesToHex(repaymentSpk(loan)), v.repayment_spk);
+  if (v.funding_address_tb)
+    eq("funding_address", fundingAddress(loan, "tb"), v.funding_address_tb);
   return 3;   // leaves proven
 }
 

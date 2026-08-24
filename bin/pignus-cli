@@ -1115,6 +1115,79 @@ def cmd_btc_refund(args):
     return 0
 
 
+def cmd_btc_offer_publish(args):
+    """LENDER: publish a BTC-collateral offer to a relay (pignusd). Picks the
+    secret t, publishes T and h; the secret is stored beside the key so
+    btc-respond and btc-claim can find it."""
+    from pignus import adaptor as A
+    from pignus.btc_collateral import BtcLoan, sha256, loan_to_dict
+    lender = _read_key(args.lender_key)
+    t = A.new_secret()
+    _write_key(args.lender_key + ".t", t)
+    loan = BtcLoan(
+        btc_amount=args.btc_amount, borrower_x="00" * 32,
+        lender_x=A.xonly_pubkey(lender).hex(), oracle_x=args.oracle_x,
+        recover_after=args.recover_after, debt_asset=args.debt_asset,
+        debt=args.debt, repay_deadline=args.repay_deadline,
+        adaptor_point=A.point(t).hex(), payment_hash=sha256(t).hex())
+    d = loan_to_dict(loan)
+    d.pop("borrower_x", None)          # no borrower yet
+    body = {"loan": {k: v for k, v in d.items()}, "market": args.market or "",
+            "note": args.note or ""}
+    # keep borrower_x out of the published loan; it is filled by each taker
+    body["loan"]["borrower_x"] = ""
+    code, rec = book_post(args.book, "/v1/btc/offers", body)
+    if code != 200:
+        raise SystemExit(f"relay refused the offer: {rec.get('error')}")
+    print(json.dumps({"btc_offer_id": rec["btc_offer_id"],
+                      "note": "keep this node's key online and run btc-respond"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_respond(args):
+    """LENDER responder: adaptor-sign the reclaim of every pending take on this
+    lender's offers. Non-custodial: the lender's key never leaves this machine;
+    only the adaptor signature is posted. Run it in a loop (--watch)."""
+    from pignus import adaptor as A
+    from pignus.btc_collateral import BtcLoan, reclaim_tx, lender_release_adaptor
+    lender = _read_key(args.lender_key)
+    lender_x = A.xonly_pubkey(lender).hex()
+
+    def one_pass():
+        n = 0
+        takes = book_get(args.book, "/v1/btc/takes?status=pending")["takes"]
+        for tk in takes:
+            loan = BtcLoan.__new__(BtcLoan) if False else None
+            ld = dict(tk["loan"])
+            if ld.get("lender_x") != lender_x:
+                continue                      # not our offer
+            from pignus.btc_collateral import loan_from_dict
+            loan = loan_from_dict(ld)
+            rtx = reclaim_tx(loan, tk["funding_txid"], int(tk["funding_vout"]),
+                             bytes.fromhex(tk["reclaim_dest"]),
+                             int(tk.get("reclaim_fee", 3000)))
+            asig = lender_release_adaptor(loan, lender, rtx)
+            code, r = book_post(args.book, "/v1/btc/adaptor",
+                                {"take_id": tk["take_id"], "adaptor_sig": asig.hex()})
+            if code == 200:
+                print(f"signed take {tk['take_id']}", file=sys.stderr); n += 1
+            else:
+                print(f"take {tk['take_id']}: {r.get('error')}", file=sys.stderr)
+        return n
+
+    if not args.watch:
+        print(json.dumps({"signed": one_pass()}))
+        return 0
+    print(f"responder for {lender_x[:16]} watching {args.book}", file=sys.stderr)
+    while True:
+        try:
+            one_pass()
+        except Exception as e:                      # noqa: BLE001
+            print(f"pass error: {type(e).__name__}: {e}", file=sys.stderr)
+        time.sleep(args.interval)
+
+
 def add_btc_commands(sub):
     p = sub.add_parser("btc-keygen", help="a party keypair for a BTC loan")
     p.add_argument("--out", required=True, help="keyfile path (0600)")
@@ -1216,6 +1289,28 @@ def add_btc_commands(sub):
     p.add_argument("--out")
     add_node_args(p)
     p.set_defaults(fn=cmd_btc_refund)
+
+    p = sub.add_parser("btc-offer-publish",
+                       help="LENDER: publish a BTC-collateral offer to a relay")
+    p.add_argument("--lender-key", required=True)
+    p.add_argument("--oracle-x", required=True)
+    p.add_argument("--btc-amount", type=int, required=True)
+    p.add_argument("--debt-asset", required=True)
+    p.add_argument("--debt", type=int, required=True)
+    p.add_argument("--recover-after", type=int, required=True)
+    p.add_argument("--repay-deadline", type=int, required=True)
+    p.add_argument("--market", default="")
+    p.add_argument("--note", default="")
+    add_book_arg(p)
+    p.set_defaults(fn=cmd_btc_offer_publish)
+
+    p = sub.add_parser("btc-respond",
+                       help="LENDER responder: adaptor-sign pending takes")
+    p.add_argument("--lender-key", required=True)
+    p.add_argument("--watch", action="store_true")
+    p.add_argument("--interval", type=float, default=5.0)
+    add_book_arg(p)
+    p.set_defaults(fn=cmd_btc_respond)
 
 def main():
     ap = argparse.ArgumentParser(
