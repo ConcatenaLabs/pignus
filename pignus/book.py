@@ -43,6 +43,8 @@ class Book:
         self._lock = threading.Lock()
         self.offers = {}
         self.loans = {}
+        self.btc_offers = {}     # cross-chain BTC-collateral offers (lender T+h)
+        self.btc_takes = {}      # a borrower's take + the lender's adaptor reply
         self._load()
 
     # ----------------------------------------------------------- persistence
@@ -55,11 +57,14 @@ class Book:
             return
         self.offers = d.get("offers", {})
         self.loans = d.get("loans", {})
+        self.btc_offers = d.get("btc_offers", {})
+        self.btc_takes = d.get("btc_takes", {})
 
     def _save(self):
         """Write via a temporary file and rename, so a crash mid-write leaves
         the previous book intact rather than a truncated one."""
         d = {"offers": self.offers, "loans": self.loans,
+             "btc_offers": self.btc_offers, "btc_takes": self.btc_takes,
              "updated": int(time.time())}
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".book-")
@@ -202,6 +207,52 @@ class Book:
         if market:
             out = [x for x in out if x.get("market", "").upper() == market.upper()]
         return sorted(out, key=lambda x: x.get("updated", 0), reverse=True)
+
+    # ------------------------------------------------------- BTC collateral
+
+    def put_btc_offer(self, rec):
+        rec["btc_offer_id"] = rec.get("btc_offer_id") or secrets.token_hex(12)
+        rec["created"] = rec.get("created") or int(time.time())
+        rec["status"] = rec.get("status") or "open"
+        with self._lock:
+            self.btc_offers[rec["btc_offer_id"]] = rec
+            self._save()
+        return rec
+
+    def list_btc_offers(self, status="open"):
+        with self._lock:
+            out = list(self.btc_offers.values())
+        if status and status != "all":
+            out = [o for o in out if o.get("status", "open") == status]
+        return sorted(out, key=lambda o: o.get("created", 0), reverse=True)
+
+    def put_btc_take(self, rec):
+        rec["take_id"] = rec.get("take_id") or secrets.token_hex(12)
+        rec["created"] = rec.get("created") or int(time.time())
+        rec["status"] = rec.get("status") or "pending"
+        with self._lock:
+            self.btc_takes[rec["take_id"]] = rec
+            self._save()
+        return rec
+
+    def update_btc_take(self, take_id, **fields):
+        with self._lock:
+            rec = self.btc_takes.get(take_id)
+            if rec is None:
+                return None
+            rec.update(fields)
+            rec["updated"] = int(time.time())
+            self._save()
+            return rec
+
+    def list_btc_takes(self, offer_id=None, status=None):
+        with self._lock:
+            out = list(self.btc_takes.values())
+        if offer_id:
+            out = [t for t in out if t.get("btc_offer_id") == offer_id]
+        if status:
+            out = [t for t in out if t.get("status") == status]
+        return sorted(out, key=lambda t: t.get("created", 0), reverse=True)
 
     def stats(self, prices=None):
         """A summary a page can render. Health figures need prices, and are

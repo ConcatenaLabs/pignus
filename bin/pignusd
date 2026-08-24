@@ -547,6 +547,19 @@ class Service:
             out["surplus_if_liquidated"] = t.surplus_at(price)
         return out
 
+    # ------------------------------------------------------- BTC collateral
+
+    def btc_reclaim_sighash(self, loan_dict, funding_txid, funding_vout,
+                            reclaim_dest_hex, fee):
+        """Recompute the reclaim sighash the lender's adaptor signature must
+        commit to, so the relay never passes on a request to sign something
+        other than the loan it claims to be."""
+        from pignus import btc_collateral as BC
+        loan = BC.loan_from_dict(loan_dict)
+        tx = BC.reclaim_tx(loan, funding_txid, int(funding_vout),
+                           bytes.fromhex(reclaim_dest_hex), int(fee))
+        return BC.sighash_for(loan, tx, "reclaim").hex()
+
     def health(self):
         return {
             "ok": self.node_error is None and self.oracle_error is None,
@@ -717,6 +730,18 @@ class Handler(BaseHTTPRequestHandler):
             if att is None:
                 return self._send(404, {"error": f"no attestation for {market}"})
             return self._send(200, att.to_dict())
+        if path == "/v1/btc/offers":
+            return self._send(200, {"offers": s.book.list_btc_offers(
+                status=q.get("status", ["open"])[0])})
+        if path == "/v1/btc/takes":
+            return self._send(200, {"takes": s.book.list_btc_takes(
+                offer_id=q.get("offer_id", [None])[0],
+                status=q.get("status", [None])[0])})
+        if path.startswith("/v1/btc/take/"):
+            rec = s.book.btc_takes.get(path[len("/v1/btc/take/"):])
+            if not rec:
+                return self._send(404, {"error": "no such take"})
+            return self._send(200, rec)
         if path == "/v1/stats":
             return self._send(200, s.book.stats(s.prices))
         return self._send(404, {"error": "no such endpoint", "path": path})
@@ -750,6 +775,70 @@ class Handler(BaseHTTPRequestHandler):
                 view = s.offer_view(s.book.offers.get(rec["offer_id"], rec))
                 view["manage_token"] = rec.get("manage_token")
                 return self._send(200, view)
+            if path == "/v1/btc/offers":
+                # A lender publishes a BTC-collateral offer: the loan terms with
+                # T and h, no borrower yet. Minimal sanity only -- the borrower
+                # verifies every address themselves before funding.
+                loan = body.get("loan") or {}
+                for k in ("btc_amount", "lender_x", "oracle_x", "recover_after",
+                          "debt_asset", "debt", "repay_deadline",
+                          "adaptor_point", "payment_hash"):
+                    if loan.get(k) in (None, ""):
+                        raise ValueError(f"the offer's loan is missing {k}")
+                rec = s.book.put_btc_offer({
+                    "loan": loan, "market": body.get("market", ""),
+                    "responder": body.get("responder", ""),
+                    "note": body.get("note", "")})
+                return self._send(200, rec)
+            if path == "/v1/btc/take":
+                # A borrower asks a lender to adaptor-sign their reclaim. The
+                # relay recomputes the reclaim sighash and refuses a request
+                # whose sighash does not match the loan + funding it names, so a
+                # lender is never asked to sign a mystery transaction.
+                offer = s.book.btc_offers.get(body.get("btc_offer_id"))
+                if not offer:
+                    return self._send(404, {"error": "no such BTC offer"})
+                loan = dict(offer["loan"])
+                loan["borrower_x"] = body["borrower_x"]
+                want = s.btc_reclaim_sighash(
+                    loan, body["funding_txid"], body["funding_vout"],
+                    body["reclaim_dest"], body.get("reclaim_fee", 3000))
+                if want != str(body.get("reclaim_sighash", "")).lower():
+                    raise ValueError(
+                        "the reclaim sighash does not match the loan and funding "
+                        "named; refusing to relay a request to sign something else")
+                rec = s.book.put_btc_take({
+                    "btc_offer_id": offer["btc_offer_id"], "loan": loan,
+                    "borrower_x": body["borrower_x"],
+                    "funding_txid": body["funding_txid"],
+                    "funding_vout": int(body["funding_vout"]),
+                    "reclaim_dest": body["reclaim_dest"],
+                    "reclaim_fee": int(body.get("reclaim_fee", 3000)),
+                    "reclaim_sighash": want})
+                return self._send(200, rec)
+            if path == "/v1/btc/adaptor":
+                # The lender's responder returns its adaptor signature. The relay
+                # VERIFIES it against the loan's lender key, the adaptor point and
+                # the reclaim sighash before storing, so a borrower never acts on
+                # a release that would not complete.
+                take = s.book.btc_takes.get(body.get("take_id"))
+                if not take:
+                    return self._send(404, {"error": "no such take"})
+                from pignus import btc_collateral as BC
+                loan = BC.loan_from_dict(take["loan"])
+                asig = bytes.fromhex(body["adaptor_sig"])
+                from pignus import adaptor as A
+                ok = A.encrypt_verify(
+                    bytes.fromhex(loan.lender_x),
+                    bytes.fromhex(take["reclaim_sighash"]),
+                    bytes.fromhex(loan.adaptor_point), asig)
+                if not ok:
+                    raise ValueError("that adaptor signature does not verify "
+                                     "against the loan; refusing to store it")
+                s.book.update_btc_take(take["take_id"],
+                                       adaptor_sig=body["adaptor_sig"],
+                                       status="signed")
+                return self._send(200, {"ok": True, "take_id": take["take_id"]})
             if path == "/v1/loans":
                 if len(s.book.loans) >= MAX_LOANS:
                     return self._send(429, {"error": "the book is full"})
