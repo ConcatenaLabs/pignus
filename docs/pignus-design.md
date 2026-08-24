@@ -2,7 +2,7 @@
 
 Status (2026-08-22): the loan-vault covenant (section 2) is implemented in the
 node repository's
-[`test/functional/pignus_covenant.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/test/functional/pignus_covenant.py)
+[`test/functional/pignus_covenant.py`](https://github.com/ConcatenaLabs/Sequentia/blob/master/test/functional/pignus_covenant.py)
 and proven against the node by `feature_pignus_vault.py`, which is in the test
 runner, with the oracle set (6.1), funded offers (3) and the attack suite proven
 by `feature_pignus_oracle_set.py`, `feature_pignus_offer.py` and
@@ -19,13 +19,13 @@ redeems the pledge. That is exactly the shape of the thing, and it is a working
 name -- renaming costs one identifier.
 
 Companion documents, all in other repositories:
-[`openamp-design.md`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/doc/sequentia/openamp-design.md) and
-[`opendamp-design.md`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/doc/sequentia/opendamp-design.md) in the node
+[`openamp-design.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/openamp-design.md) and
+[`opendamp-design.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/opendamp-design.md) in the node
 repository (the two restricted-asset models this coexists with, section 8),
-[`simplicity-dex-covenant-offers-design.md`](https://github.com/GracedEternalKingCabbageMan/seqdex/blob/main/docs/simplicity-dex-covenant-offers-design.md)
+[`simplicity-dex-covenant-offers-design.md`](https://github.com/ConcatenaLabs/seqdex/blob/main/docs/simplicity-dex-covenant-offers-design.md)
 in the `seqdex` repository (the covenant-offer design this borrows its
 output-map and self-replication techniques from), and
-[`03-bitcoin-anchoring.md`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/doc/sequentia/03-bitcoin-anchoring.md) in
+[`03-bitcoin-anchoring.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/03-bitcoin-anchoring.md) in
 the node repository (why section 6.4 exists at all).
 
 ## 1. What is being claimed
@@ -59,7 +59,7 @@ it is much less than "can take the money".
 
 A taproot output, internal key = the BIP341 NUMS point, tapleaf version 0xc4
 (Elements tapscript), four leaves. Reference implementation:
-[`test/functional/pignus_covenant.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/test/functional/pignus_covenant.py)
+[`test/functional/pignus_covenant.py`](https://github.com/ConcatenaLabs/Sequentia/blob/master/test/functional/pignus_covenant.py)
 in the node repository.
 
 Notation: `C` is the collateral asset, `D` the debt asset, `L` the collateral
@@ -237,7 +237,7 @@ no funds and cannot alter terms, because the terms are inside the address the
 borrower reconstructs. A *funded* resting offer, where the lender's principal
 sits in its own covenant that anyone may take by locking a correctly-shaped
 vault in the same transaction, is implemented in the node repository's
-[`test/functional/pignus_offer.py`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/test/functional/pignus_offer.py)
+[`test/functional/pignus_offer.py`](https://github.com/ConcatenaLabs/Sequentia/blob/master/test/functional/pignus_offer.py)
 and proven by `feature_pignus_offer.py`; `pignus/offers.py` and `web/offer.js`
 drive it. The offer covenant recomputes the vault's taproot address from a
 witness-supplied borrower key with `OP_TWEAKVERIFY` plus the tagged hashes, the

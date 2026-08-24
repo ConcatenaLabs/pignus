@@ -27,7 +27,7 @@ so.
 ```bash
 ssh seq
 cd /root/sequentia
-git clone https://github.com/GracedEternalKingCabbageMan/pignus.git
+git clone https://github.com/ConcatenaLabs/pignus.git
 mkdir -p /root/sequentia/pignus-data
 
 # the node source the covenant is imported from (NOT the committee run
