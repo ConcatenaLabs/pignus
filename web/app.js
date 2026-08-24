@@ -19,6 +19,7 @@ import * as flows from "./flows.js";
 import * as repo from "./repurchase.js";
 import * as btc from "./btc.js";
 import * as badaptor from "./adaptor.js";
+import * as btcborrow from "./btcborrow.js";
 import { Wallet, payoutProgram, WalletError } from "./wallet.js";
 
 const $ = (s) => document.querySelector(s);
@@ -218,6 +219,7 @@ async function refresh() {
   state.loans = l.loans;
   state.oracleX = or.oracle_x;
   state.oracles = ors.oracles || [];
+  try { state.btcOffers = (await api("v1/btc/offers")).offers || []; } catch { state.btcOffers = []; }
   state.reference = m.reference_ticker || "USDX";
   if (m.block_seconds) state.blockSeconds = m.block_seconds;
   $("#chain").textContent = `block ${Number(state.height).toLocaleString()}`;
@@ -227,6 +229,7 @@ async function refresh() {
   $("#daemon").className = "tag " + (hz.ok ? "ok" : "bad");
   renderMarkets();
   renderOffers();
+  renderBtcOffers();
   renderLoans();
   renderLendForm();
   renderWallet();
@@ -768,6 +771,23 @@ async function lend(ev) {
 
 // ------------------------------------------------------------ repurchase
 
+function renderBtcOffers() {
+  const box = document.querySelector("#btcoffers"); if (!box) return;
+  btcborrow.renderOffers(box, state.btcOffers || [], {
+    esc, units, ticker: (a) => meta(a).ticker,
+    atomsToBtc: (n) => (Number(BigInt(n)) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 }),
+  }, (offer) => runBtcBorrow(offer));
+}
+async function runBtcBorrow(offer) {
+  if (needWallet()) return;
+  try {
+    const out = await btcborrow.borrow(state.wallet, offer,
+      { busy, api, post, esc, units, ticker: (a) => meta(a).ticker });
+    note("<b>Collateral funded.</b> <span class=\"mono\">" + esc(out.ftxid) + "</span><br>Repay " +
+      units(out.rec.loan.debt, out.rec.loan.debt_asset) + " " + esc(meta(out.rec.loan.debt_asset).ticker) +
+      " to <span class=\"mono\">" + esc(out.repaySpk) + "</span>, then reclaim your Bitcoin.", "ok");
+  } catch (e) { note(esc(e.message), "bad"); }
+}
 async function checkBtc(ev) {
   ev.preventDefault();
   const out = $("#btcout");
