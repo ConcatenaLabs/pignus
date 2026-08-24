@@ -810,6 +810,7 @@ class Handler(BaseHTTPRequestHandler):
                 rec = s.book.put_btc_take({
                     "btc_offer_id": offer["btc_offer_id"], "loan": loan,
                     "borrower_x": body["borrower_x"],
+                    "borrower_seq_spk": body.get("borrower_seq_spk", ""),
                     "funding_txid": body["funding_txid"],
                     "funding_vout": int(body["funding_vout"]),
                     "reclaim_dest": body["reclaim_dest"],
@@ -838,6 +839,16 @@ class Handler(BaseHTTPRequestHandler):
                 s.book.update_btc_take(take["take_id"],
                                        adaptor_sig=body["adaptor_sig"],
                                        status="signed")
+                return self._send(200, {"ok": True, "take_id": take["take_id"]})
+            if path == "/v1/btc/disbursed":
+                # The lender's responder reports that it has sent the principal
+                # to the borrower on Sequentia -- the other half of the loan.
+                take = s.book.btc_takes.get(body.get("take_id"))
+                if not take:
+                    return self._send(404, {"error": "no such take"})
+                s.book.update_btc_take(
+                    take["take_id"], status="disbursed",
+                    disbursement_txid=str(body.get("disbursement_txid", "")))
                 return self._send(200, {"ok": True, "take_id": take["take_id"]})
             if path == "/v1/loans":
                 if len(s.book.loans) >= MAX_LOANS:

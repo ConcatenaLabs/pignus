@@ -89,6 +89,11 @@ class BtcLoan:
     repay_deadline: int         # Sequentia absolute locktime for REFUND
     adaptor_point: str = ""     # T, x-only hex; set once the lender picks t
     payment_hash: str = ""      # SHA256(t)
+    # The principal disbursed to the borrower at origination, in debt-asset
+    # atoms (debt = principal + interest). Economic metadata ONLY: it is not in
+    # any taproot script, so it never changes the funding or repayment address.
+    # 0 means "same as debt" (a zero-interest demo loan).
+    principal: int = 0
 
     # ------------------------------------------------------------- Bitcoin
 
@@ -465,3 +470,32 @@ def fund_bitcoin(btc_node, loan, feerate=5, broadcast=True):
     if broadcast:
         btc_node.sendrawtransaction(signed["hex"])
     return dec["txid"], vout, signed["hex"]
+
+
+# ------------------------------------------------------- principal disbursement
+
+def disburse_principal(seq_node, loan, borrower_seq_spk_hex, fee_asset="bitcoin"):
+    """The lender sends the PRINCIPAL to the borrower, on Sequentia, once the
+    Bitcoin collateral is committed. This is the other half of a loan -- without
+    it the borrower has locked collateral and received nothing -- and it is a
+    plain payment, enforced by nothing but the lender's own interest in keeping
+    a borrower who will repay. `principal` is debt-asset atoms; 0 means the whole
+    debt (a zero-interest loan). Returns the disbursement txid.
+    """
+    principal = int(loan.principal) or int(loan.debt)
+    desc = seq_node.getdescriptorinfo(f"raw({borrower_seq_spk_hex})")["descriptor"]
+    addr = seq_node.deriveaddresses(desc)[0]
+    return seq_node.sendtoaddress(address=addr, amount=f"{principal / COIN:.8f}",
+                                  assetlabel=loan.debt_asset,
+                                  fee_asset_label=fee_asset)
+
+
+def funding_confirmed(btc_node, funding_txid, funding_vout, min_conf=1):
+    """Is the borrower's collateral committed on Bitcoin deeply enough for the
+    lender to disburse against it? A lender who disburses before the collateral
+    is buried has given away the principal for nothing."""
+    try:
+        out = btc_node.gettxout(funding_txid, int(funding_vout), False)
+    except Exception:                                   # noqa: BLE001
+        return False
+    return out is not None and int(out.get("confirmations", 0) or 0) >= min_conf
