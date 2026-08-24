@@ -1,6 +1,6 @@
 [Unit]
 Description=Pignus loan book and watcher (Sequentia testnet)
-Documentation=https://github.com/GracedEternalKingCabbageMan/pignus
+Documentation=https://github.com/ConcatenaLabs/pignus
 After=network-online.target pignus-oracle.service
 Wants=network-online.target
 

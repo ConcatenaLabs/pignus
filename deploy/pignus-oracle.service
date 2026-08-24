@@ -1,6 +1,6 @@
 [Unit]
 Description=Pignus price oracle (Sequentia testnet)
-Documentation=https://github.com/GracedEternalKingCabbageMan/pignus
+Documentation=https://github.com/ConcatenaLabs/pignus
 After=network-online.target
 Wants=network-online.target
 
