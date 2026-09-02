@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 The Sequentia developers
 # Distributed under the MIT software license.
-"""The OTHER half of a BTC-collateral loan: the lender disburses the principal.
+"""A whole cross-chain loan through the relay and an unattended responder.
 
-Origination (test_btc_relay.py) is only half a loan -- the borrower locks
-collateral and, until this, receives nothing. Here the responder, given a
-Sequentia wallet and a Bitcoin node, watches for the collateral to confirm and
-then SENDS the principal to the borrower's Sequentia address. Proven on a real
-bitcoind + sequentiad:
+test_btc_relay.py proves the message-passing with no chain; this drives the same
+protocol with real money on both chains, through the process a lender actually
+leaves running. It is the one that would catch a responder that pays a
+principal twice, or one that can be made to pay out a stranger's offer.
 
-  the lender publishes an offer with a principal
-  the borrower funds the collateral on Bitcoin and posts a take with their
-    Sequentia address
-  the responder adaptor-signs, then -- once the collateral confirms -- disburses
-  the borrower's Sequentia address actually receives the principal
+  the lender publishes a SIGNED offer with a principal
+  the borrower funds the pre-vault and posts a take, with their own payout
+    program and their advance signature
+  the responder checks the offer is really its own, signs a release with a
+    secret drawn for THAT take, and pays the principal once the collateral is
+    committed -- and never pays it twice
+  the borrower claims the principal, publishing their secret
+  the responder reads it off the chain and starts the loan
+  a forged offer naming the lender's key is refused by the relay, and a
+    responder that somehow saw one would not act on it
 """
 
 import json
@@ -37,6 +41,25 @@ BIN = os.path.join(HERE, "..", "bin")
 COIN = 100_000_000
 USDX = None
 PASS = FAIL = 0
+
+
+def post(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+def post_code(url, body):
+    """The status a POST comes back with, for the cases that must be refused."""
+    import urllib.error
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
 
 
 def check(name, cond, detail=""):
@@ -119,60 +142,124 @@ def main():
 
             btch = rig.btc.getblockcount()
             seqh = n.getblockcount()
+            lender_prog = b_spk[4:] if b_spk.startswith("0014") else b_spk
             off = cli("btc-offer-publish", "--lender-key", lkey,
                       "--oracle-x", oracle["pubkey_x"], "--btc-amount", "100000",
                       "--debt-asset", usdx, "--debt", "10500000000",
                       "--principal", "10000000000",           # 100 USDX principal
-                      "--recover-after", str(btch + 50),
-                      "--repay-deadline", str(seqh + 400), "--book", base)
+                      "--recover-after", str(btch + 600),
+                      "--repay-deadline", str(seqh + 2000),
+                      "--abort-after", str(btch + 400),
+                      "--d-refund", str(seqh + 1000),
+                      "--lender-prog", lender_prog,
+                      "--market", "BTC/USDX", "--book", base)
             check("the lender publishes an offer carrying a principal",
                   bool(off.get("btc_offer_id")))
             offer = get(base + "/v1/btc/offers")["offers"][0]
 
-            # borrower builds their side and funds the collateral on Bitcoin
+            # A forged offer in the lender's name is what the whole scheme has
+            # to refuse: the lender's own responder would otherwise pay it out.
+            forged = dict(offer["loan"]); forged["principal"] = "99000000000"
+            fake = post_code(base + "/v1/btc/offers",
+                             {"loan": forged, "lots": 1, "market": "BTC/USDX",
+                              "offer_sig": "aa" * 64})
+            check("a forged offer naming the lender is refused", fake == 403,
+                  f"got {fake}")
+
+            # The borrower's side: their own secret, their own payout program,
+            # the pre-vault funded but nothing lent yet.
             borrower = A.new_secret()
-            loan_d = dict(offer["loan"]); loan_d["borrower_x"] = A.xonly_pubkey(borrower).hex()
+            w = A.new_secret()
+            loan_d = dict(offer["loan"])
+            loan_d.update(borrower_x=A.xonly_pubkey(borrower).hex(),
+                          h_w=B.sha256(w).hex(),
+                          borrower_prog=b_spk[4:], borrower_ver=0)
             loan = B.loan_from_dict(loan_d)
-            ftxid, fvout, _ = B.fund_bitcoin(rig.btc, loan)
+            ptxid, pvout, _ = B.fund_bitcoin(rig.btc, loan)
             rig.btc_mine(1)
+            vault_txid = B.upgrade_tx(loan, ptxid, pvout).txid()
             dest = bytes.fromhex("0014" + "55" * 20)
-            rtx = B.reclaim_tx(loan, ftxid, fvout, dest, 3000)
-            sighash = B.sighash_for(loan, rtx, "reclaim").hex()
-            req = urllib.request.Request(
-                base + "/v1/btc/take",
-                data=json.dumps({"btc_offer_id": offer["btc_offer_id"],
-                                 "borrower_x": loan.borrower_x,
-                                 "borrower_seq_spk": b_spk,
-                                 "funding_txid": ftxid, "funding_vout": fvout,
-                                 "reclaim_dest": dest.hex(), "reclaim_fee": 3000,
-                                 "reclaim_sighash": sighash}).encode(),
-                headers={"Content-Type": "application/json"})
-            take = json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
-            check("the take carries the borrower's Sequentia address",
+            sighash = B.sighash_for(
+                loan, B.reclaim_tx(loan, vault_txid, 0, dest, 3000),
+                "reclaim").hex()
+            take = post(base + "/v1/btc/take", {
+                "btc_offer_id": offer["btc_offer_id"],
+                "borrower_x": loan.borrower_x,
+                "borrower_seq_spk": b_spk,
+                "borrower_prog": loan.borrower_prog, "borrower_ver": 0,
+                "h_w": loan.h_w, "w_seq": 0,
+                "prevault_txid": ptxid, "prevault_vout": pvout,
+                "prevault_value": str(loan.prevault_value()),
+                "upgrade_presig": B.presign_upgrade(loan, ptxid, pvout,
+                                                    borrower).hex(),
+                "reclaim_dest": dest.hex(), "reclaim_fee": 3000,
+                "reclaim_sighash": sighash})
+            check("the take carries the borrower's own payout program",
                   bool(take.get("take_id")))
 
+            def respond():
+                r = subprocess.run(
+                    [sys.executable, os.path.join(BIN, "pignus-cli"),
+                     "btc-respond", "--lender-key", lkey, "--book", base,
+                     "--claim-depth", "1",
+                     "--rpc", f"http://127.0.0.1:{rig.seq_rpcport}",
+                     "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS,
+                     "--rpc-wallet", "pignus",
+                     "--btc-rpc", f"http://127.0.0.1:{rig.btc_rpcport}",
+                     "--btc-rpc-user", RPC_USER, "--btc-rpc-password", RPC_PASS,
+                     "--btc-rpc-wallet", "pignus"],
+                    capture_output=True, text=True)
+                if r.stderr.strip():
+                    print("    responder: " + r.stderr.strip()[-600:])
+                if r.returncode:
+                    print(r.stdout)
+                return r
+
             before = bw.getbalances()["mine"]["trusted"].get(usdx, 0)
-            # the responder signs AND disburses (one pass, --watch off)
-            r = subprocess.run(
-                [sys.executable, os.path.join(BIN, "pignus-cli"), "btc-respond",
-                 "--lender-key", lkey, "--book", base,
-                 "--rpc", f"http://127.0.0.1:{rig.seq_rpcport}",
-                 "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS,
-                 "--rpc-wallet", "pignus",
-                 "--btc-rpc", f"http://127.0.0.1:{rig.btc_rpcport}",
-                 "--btc-rpc-user", RPC_USER, "--btc-rpc-password", RPC_PASS,
-                 "--btc-rpc-wallet", "pignus"],
-                capture_output=True, text=True)
-            print(r.stderr[-500:] if r.returncode else "", end="")
+            respond()                       # signs the release, pays the principal
             rig.seq_mine(1)
-            tk = wait_for(lambda: get(base + f"/v1/btc/take/{take['take_id']}")["status"]
-                          == "disbursed" and get(base + f"/v1/btc/take/{take['take_id']}"))
-            check("the responder disburses once the collateral confirms",
-                  bool(tk) and tk.get("disbursement_txid"), json.dumps(tk)[:160] if tk else "")
+            tk = wait_for(lambda: get(base + f"/v1/btc/take/{take['take_id']}")
+                          .get("status") == "disbursed"
+                          and get(base + f"/v1/btc/take/{take['take_id']}"))
+            check("the responder signs and disburses once the collateral is "
+                  "committed", bool(tk) and tk.get("disbursement_txid"),
+                  json.dumps(tk)[:200] if tk else "")
+            signed_loan = B.loan_from_dict(tk["loan"])
+            check("with a secret drawn for this take, not for the offer",
+                  bool(tk.get("adaptor_point")) and bool(tk.get("payment_hash")))
+
+            # The principal is not the borrower's until they claim it, and the
+            # claim is what starts the loan.
+            paid = n.gettxout(tk["disbursement_txid"],
+                              int(tk.get("disbursement_vout", 0)), True)
+            check("the principal waits in the hashlocked output",
+                  paid is not None
+                  and paid["scriptPubKey"]["hex"]
+                  == signed_loan.disbursement_spk().hex())
+
+            after_disburse = bw.getbalances()["mine"]["trusted"].get(usdx, 0)
+            respond()                       # a second pass must NOT pay again
+            rig.seq_mine(1)
+            check("a second pass does not pay the principal twice",
+                  float(bw.getbalances()["mine"]["trusted"].get(usdx, 0))
+                  == float(after_disburse))
+
+            B.claim_disbursement(n, signed_loan, tk["disbursement_txid"],
+                                 int(tk.get("disbursement_vout", 0)), w)
+            rig.seq_mine(2)
             after = bw.getbalances()["mine"]["trusted"].get(usdx, 0)
-            check("the borrower's Sequentia address received the principal",
+            check("the borrower's own address received the principal",
                   float(after) - float(before) >= 99.9,
                   f"before {before} after {after}")
+
+            respond()                       # reads w off the chain, upgrades
+            rig.btc_mine(1)
+            live = get(base + f"/v1/btc/take/{take['take_id']}")
+            check("the responder started the loan with the published secret",
+                  live.get("status") == "live" and bool(live.get("upgrade_txid")),
+                  json.dumps(live)[:200])
+            check("and the collateral is in the vault the release names",
+                  rig.btc.gettxout(live["upgrade_txid"], 0) is not None)
         finally:
             for p in procs:
                 p.terminate()

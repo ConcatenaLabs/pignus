@@ -742,17 +742,23 @@ What runs where:
 
 - **the browser**, at `/lending/` -- composes every transaction, derives every
   address, and sends only a signature request to the wallet extension. It is
-  the only place a second implementation of the covenant exists (`web/pignus.js`
-  and `web/offer.js`), because a browser cannot import the Python one; both are
-  pinned byte for byte to the golden vectors and the page refuses to run at all
-  if that pinning fails.
+  the only place a second implementation exists (`web/pignus.js`, `web/offer.js`
+  and, for the parent chain, `web/btc.js` and `web/adaptor.js`), because a
+  browser cannot import the Python; all of them are pinned byte for byte to
+  golden vectors the proven Python emits, and the page refuses to run at all if
+  that pinning fails. Both legs of a cross-chain loan are settled here too,
+  which is only possible because neither of them needs a signature.
 - **the CLI**, on the downloads page -- the same operations against your own
-  node, for anyone who would rather not use a website.
+  node, for anyone who would rather not use a website, plus the lender's side of
+  a cross-chain loan, which is a process rather than a page: the lender draws
+  the secrets, and drawing a secret in a browser means storing it in one.
 - **the oracle and the loan book** -- services on the testnet server. Neither
   can move anything: the book is discovery, and the oracle asserts a number.
 
-Two things were found only by building the browser client, and both are worth
-recording because neither was visible from the library side: payouts that could
-only be taproot (section 2.6), and exits that required a signature the extension
-cannot make (section 2.5). A design that is only ever exercised by its own test
+Three things were found only by building the browser client, and all are worth
+recording because none was visible from the library side: payouts that could
+only be taproot (section 2.6), exits that required a signature the extension
+cannot make (section 2.5), and the same problem again on the cross-chain legs,
+where the fix was to pay both of them through a pinned hashlock rather than a
+key (section 7.1). A design that is only ever exercised by its own test
 suite hides exactly this class of defect.

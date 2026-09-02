@@ -4,7 +4,7 @@
 
 from decimal import Decimal
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 #: Atoms in one whole unit of any asset.
 COIN = 100_000_000

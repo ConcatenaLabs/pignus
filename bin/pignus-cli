@@ -31,9 +31,11 @@ With a node wallet, everything the page does:
 
 Native BTC collateral (Tier B), a two-party handshake carrying a ticket JSON:
 
-    btc-keygen, btc-propose, btc-prepare, btc-adaptor, btc-originate, btc-repay,
-    btc-claim, btc-reclaim, btc-seize-sighash, btc-seize, btc-timeout,
-    btc-refund; through a relay: btc-offer-publish, btc-respond
+    btc-keygen, btc-propose, btc-prepare, btc-adaptor, btc-originate,
+    btc-disburse, btc-claim-principal, btc-upgrade, btc-repay, btc-claim,
+    btc-reclaim, and the endings btc-abort, btc-refund, btc-refund-principal,
+    btc-seize-sighash, btc-seize, btc-timeout; btc-check says whose move it is.
+    Through a relay: btc-offer-publish, btc-offer-withdraw, btc-respond
 
 Pledged collateral at an OpenAMP issuer (Tier C), where a signature rather than
 a key travels between the parties:
@@ -1353,110 +1355,432 @@ def cmd_btc_keygen(args):
     return 0
 
 
+def _btc_cfg(args):
+    """Load a responder configuration file, if one was given.
+
+    Credentials belong in a file, not on a command line: every user on the
+    machine can read `ps`. The flags still work for a one-off run, and anything
+    a flag sets wins over the file.
+    """
+    path = getattr(args, "config", None)
+    if not path:
+        return {}
+    with open(path) as f:
+        cfg = json.load(f)
+    for key, dest in (("book", "book"), ("lender_key", "lender_key"),
+                      ("interval", "interval"), ("fee_asset", "fee_asset"),
+                      ("disburse_conf", "disburse_conf"),
+                      ("claim_depth", "claim_depth"), ("state", "state")):
+        if cfg.get(key) not in (None, "") and not getattr(args, dest, None):
+            setattr(args, dest, cfg[key])
+    for prefix, block in (("rpc", cfg.get("rpc") or {}),
+                          ("btc_rpc", cfg.get("btc_rpc") or {})):
+        for field in ("url", "user", "password", "cookie", "wallet"):
+            if not block.get(field):
+                continue
+            dest = f"{prefix}" if field == "url" else f"{prefix}_{field}"
+            dest = dest.replace("rpc_cookie", "rpc_cookie")
+            if not getattr(args, dest, None) or field == "url":
+                setattr(args, dest, block[field])
+    return cfg
+
+
+class _ResponderState:
+    """What the responder has already done, on disk, before it does it again.
+
+    A principal paid twice is a principal given away, and the gap between
+    sending a payment and recording that it was sent is exactly where a crash
+    lands. So the intent is written BEFORE the send and the result after, and a
+    take whose intent was written but never completed is never retried blind:
+    it is reported, for a person to resolve.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.data = {}
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    self.data = json.load(f)
+            except (OSError, ValueError):
+                self.data = {}
+
+    def get(self, take_id):
+        return self.data.get(take_id, {})
+
+    def set(self, take_id, **fields):
+        rec = dict(self.data.get(take_id, {}))
+        rec.update(fields)
+        self.data[take_id] = rec
+        self._save()
+        return rec
+
+    def _save(self):
+        if not self.path:
+            return
+        tmp = self.path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(self.data, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+
+
+def _loan_from_take(tk):
+    from pignus.btc_collateral import loan_from_dict
+    return loan_from_dict(dict(tk["loan"]))
+
+
 def cmd_btc_propose(args):
-    """LENDER: pick the secret t, publish T and h, and write the ticket. The
-    secret is written beside the key as {keyfile}.t so `btc-adaptor`/`btc-claim`
-    can find it; it never enters the ticket."""
+    """LENDER: write the terms of a loan and send them to a borrower.
+
+    No secret is drawn here. The lender's secret belongs to a particular
+    borrower's loan, and there is no borrower yet -- one secret shared between
+    two loans would let either borrower's repayment release the other's
+    collateral.
+    """
     from pignus import adaptor as A
-    from pignus.btc_collateral import BtcLoan, sha256, loan_to_dict
+    from pignus.btc_collateral import BtcLoan, loan_to_dict
+    from pignus import btc_relay as R
     lender = _read_key(args.lender_key)
-    t = A.new_secret()
-    _write_key(args.lender_key + ".t", t)
     loan = BtcLoan(
-        btc_amount=args.btc_amount, borrower_x=args.borrower_x,
+        btc_amount=args.btc_amount, borrower_x="", 
         lender_x=A.xonly_pubkey(lender).hex(), oracle_x=args.oracle_x,
         recover_after=args.recover_after, debt_asset=args.debt_asset,
-        debt=args.debt, repay_deadline=args.repay_deadline,
-        adaptor_point=A.point(t).hex(), payment_hash=sha256(t).hex())
+        debt=args.debt, principal=args.principal or args.debt,
+        repay_deadline=args.repay_deadline,
+        abort_after=args.abort_after, d_refund=args.d_refund,
+        upgrade_fee=args.upgrade_fee,
+        lender_prog=R.check_program(args.lender_prog, args.lender_ver),
+        lender_ver=args.lender_ver,
+        market=args.market or "", strike=args.strike or 0)
+    if args.oracle_x == loan.lender_x:
+        raise SystemExit("the lender cannot be their own oracle: that is a "
+                         "loan whose holder decides on their own when to seize "
+                         "it")
     tk = loan_to_dict(loan)
     tk["_stage"] = "proposed"
     _save_ticket(args, tk)
-    print(json.dumps({"funding_address": None, "stage": "proposed",
-                      "note": "send this ticket to the borrower"}, indent=2))
+    print(json.dumps({"stage": "proposed",
+                      "note": "send this ticket to the borrower; they choose "
+                              "their own origination secret"}, indent=2))
     return 0
 
 
 def cmd_btc_prepare(args):
-    """BORROWER: build the Bitcoin funding UNBROADCAST (so its txid is known
-    before any collateral is committed) and the reclaim transaction, and add
-    both to the ticket. The funding hex is kept locally to broadcast only after
-    the lender's adaptor signature has verified."""
-    from pignus.btc_collateral import fund_bitcoin, reclaim_tx
+    """BORROWER: choose the origination secret, fund the PRE-VAULT without
+    broadcasting it, and sign in advance the one transaction that can move the
+    collateral into the loan.
+
+    Nothing is committed by this command. The funding stays local until the
+    lender's release has been verified, and the collateral can be taken back
+    from the pre-vault whatever the lender does next.
+    """
+    from pignus import adaptor as A
+    from pignus.btc_collateral import (fund_bitcoin, reclaim_tx, sha256,
+                                       presign_upgrade, upgrade_tx,
+                                       timelocks_sane, loan_from_dict)
+    from pignus import btc_relay as R
     btc = btc_node_from(args)
+    borrower = _read_key(args.borrower_key)
     tk = _ticket(args)
-    loan = _loan(tk)
+    w = A.new_secret()
+    _write_key(args.borrower_key + ".w", w)
+    tk["borrower_x"] = A.xonly_pubkey(borrower).hex()
+    tk["h_w"] = sha256(w).hex()
+    tk["borrower_prog"] = R.check_program(args.borrower_prog, args.borrower_ver)
+    tk["borrower_ver"] = args.borrower_ver
+    loan = loan_from_dict(tk)
+
+    seq_height = args.seq_height
+    if seq_height is None and (args.rpc_user or args.rpc_password or args.rpc_cookie):
+        seq_height = node_from(args).getblockcount()
+    if seq_height is not None:
+        problems = timelocks_sane(loan, btc.getblockcount(), int(seq_height))
+        if problems and not args.force:
+            raise SystemExit("these terms are not safe to enter:\n  - "
+                             + "\n  - ".join(problems)
+                             + "\nRe-run with --force only if you understand "
+                               "exactly what you are accepting.")
+
     txid, vout, fhex = fund_bitcoin(btc, loan, feerate=args.feerate,
                                     broadcast=False)
+    presig = presign_upgrade(loan, txid, vout, borrower)
     if args.reclaim_address:
-        info = btc.getaddressinfo(args.reclaim_address)
-        dest = bytes.fromhex(info["scriptPubKey"])
+        dest = bytes.fromhex(btc.getaddressinfo(args.reclaim_address)["scriptPubKey"])
     else:
         dest = bytes.fromhex(btc.getaddressinfo(
             btc.getnewaddress())["scriptPubKey"])
-    rtx = reclaim_tx(loan, txid, vout, dest, args.btc_fee)
-    tk.update(funding_txid=txid, funding_vout=vout, funding_hex=fhex,
-              reclaim_dest=dest.hex(), reclaim_hex=rtx.hex(), _stage="prepared")
+    vault_txid = upgrade_tx(loan, txid, vout).txid()
+    rtx = reclaim_tx(loan, vault_txid, 0, dest, args.btc_fee)
+    tk.update(prevault_txid=txid, prevault_vout=vout, prevault_hex=fhex,
+              prevault_value=loan.prevault_value(),
+              upgrade_presig=presig.hex(), vault_txid=vault_txid, vault_vout=0,
+              reclaim_dest=dest.hex(), reclaim_hex=rtx.hex(),
+              reclaim_fee=args.btc_fee, _stage="prepared")
     _save_ticket(args, tk)
-    print(json.dumps({"funding_txid": txid, "vout": vout, "stage": "prepared",
-                      "note": "send this ticket to the lender for the adaptor "
-                              "signature; do NOT broadcast the funding yet"},
-                     indent=2))
+    print(json.dumps({
+        "prevault_txid": txid, "vout": vout,
+        "prevault_address": loan.prevault_address(btc),
+        "vault_txid": vault_txid, "stage": "prepared",
+        "note": "send this ticket to the lender for the release; do NOT "
+                "broadcast the funding yet. Your secret is in "
+                f"{args.borrower_key}.w -- back it up, it is what claims the "
+                "principal."}, indent=2))
     return 0
 
 
 def cmd_btc_adaptor(args):
-    """LENDER: adaptor-sign the borrower's reclaim transaction under T, so the
-    borrower holds a release only `t` can complete."""
-    from pignus.btc_collateral import lender_release_adaptor
-    from pignus.btcscript import Tx
+    """LENDER: draw this loan's secret and hand the borrower a release only
+    that secret can complete."""
+    from pignus import adaptor as A
+    from pignus.btc_collateral import (lender_release_adaptor, reclaim_tx,
+                                       sha256, check_upgrade_presig,
+                                       loan_from_dict)
     lender = _read_key(args.lender_key)
     tk = _ticket(args)
-    loan = _loan(tk)
-    rtx = Tx.from_hex(tk["reclaim_hex"]) if hasattr(Tx, "from_hex") else None
-    if rtx is None:
-        # rebuild the reclaim tx from the ticket's fields
-        from pignus.btc_collateral import reclaim_tx
-        rtx = reclaim_tx(loan, tk["funding_txid"], tk["funding_vout"],
-                         bytes.fromhex(tk["reclaim_dest"]), args.btc_fee)
+    t = A.new_secret()
+    tk["adaptor_point"] = A.point(t).hex()
+    tk["payment_hash"] = sha256(t).hex()
+    loan = loan_from_dict(tk)
+    if not check_upgrade_presig(loan, tk["prevault_txid"],
+                                int(tk["prevault_vout"]),
+                                bytes.fromhex(tk["upgrade_presig"])):
+        raise SystemExit("the borrower's advance signature does not move that "
+                         "collateral into this loan's vault. Refusing to sign "
+                         "a release for it.")
+    _write_key(f"{args.lender_key}.t.{tk['h_w'][:16]}", t)
+    rtx = reclaim_tx(loan, tk["vault_txid"], int(tk.get("vault_vout", 0)),
+                     bytes.fromhex(tk["reclaim_dest"]),
+                     int(tk.get("reclaim_fee", args.btc_fee)))
     asig = lender_release_adaptor(loan, lender, rtx)
-    tk["adaptor_sig"] = asig.hex()
-    tk["_stage"] = "adaptor-signed"
+    tk.update(adaptor_sig=asig.hex(), _stage="signed")
     _save_ticket(args, tk)
-    print(json.dumps({"adaptor_sig": asig.hex()[:24] + "...",
-                      "stage": "adaptor-signed"}, indent=2))
+    print(json.dumps({"stage": "signed", "adaptor_point": tk["adaptor_point"],
+                      "note": "send the ticket back; the secret stays here"},
+                     indent=2))
     return 0
 
 
 def cmd_btc_originate(args):
-    """BORROWER: verify the lender's adaptor signature, and only then broadcast
-    the funding. This is the check that makes the loan safe to enter."""
-    from pignus.btc_collateral import reclaim_tx, check_release_adaptor
+    """BORROWER: check the lender's release, then commit the collateral.
+
+    This is the one irreversible step on the borrower's side, and everything it
+    checks is checked before the broadcast rather than after.
+    """
+    from pignus.btc_collateral import (check_release_adaptor, reclaim_tx,
+                                       upgrade_tx, loan_from_dict)
     btc = btc_node_from(args)
     tk = _ticket(args)
-    loan = _loan(tk)
-    rtx = reclaim_tx(loan, tk["funding_txid"], tk["funding_vout"],
-                     bytes.fromhex(tk["reclaim_dest"]), args.btc_fee)
-    asig = bytes.fromhex(tk["adaptor_sig"])
-    if not check_release_adaptor(loan, rtx, asig):
-        raise SystemExit("REFUSED: the lender's release signature does not "
-                         "verify. Do NOT fund; the release could be worthless.")
-    txid = btc.sendrawtransaction(tk["funding_hex"])
+    loan = loan_from_dict(tk)
+    if upgrade_tx(loan, tk["prevault_txid"],
+                  int(tk["prevault_vout"])).txid() != tk["vault_txid"]:
+        raise SystemExit("the ticket's vault does not follow from its own "
+                         "funding: the terms have been altered since you "
+                         "prepared it")
+    rtx = reclaim_tx(loan, tk["vault_txid"], int(tk.get("vault_vout", 0)),
+                     bytes.fromhex(tk["reclaim_dest"]),
+                     int(tk.get("reclaim_fee", args.btc_fee)))
+    if not check_release_adaptor(loan, rtx, bytes.fromhex(tk["adaptor_sig"])):
+        raise SystemExit("the lender's release does NOT verify against these "
+                         "terms. Nothing has been broadcast.")
+    txid = btc.sendrawtransaction(tk["prevault_hex"])
     tk["_stage"] = "funded"
     _save_ticket(args, tk)
-    print(json.dumps({"funded_txid": txid, "stage": "funded",
-                      "note": "collateral is committed; the adaptor release "
-                              "verified first"}, indent=2))
+    print(json.dumps({"funding_txid": txid, "stage": "funded",
+                      "note": "the collateral is committed but not yet lent "
+                              "against: you can take it back after Bitcoin "
+                              f"block {loan.abort_after} if no principal "
+                              "arrives"}, indent=2))
+    return 0
+
+
+def cmd_btc_disburse(args):
+    """LENDER: pay the principal, once the collateral is really there.
+
+    The check is not that something confirmed: it is that THIS loan's
+    collateral, at the agreed amount, is in the outpoint the borrower named.
+    """
+    from pignus.btc_collateral import (collateral_committed, pay_disbursement,
+                                       loan_from_dict)
+    btc = btc_node_from(args)
+    seq = node_from(args)
+    tk = _ticket(args)
+    loan = loan_from_dict(tk)
+    ok, why = collateral_committed(btc, loan, tk["prevault_txid"],
+                                   int(tk["prevault_vout"]),
+                                   min_conf=args.disburse_conf)
+    if not ok:
+        raise SystemExit(f"not disbursing: {why}")
+    txid, vout = pay_disbursement(seq, loan, fee_asset=args.fee_asset)
+    tk.update(disbursement_txid=txid, disbursement_vout=vout,
+              _stage="disbursed")
+    _save_ticket(args, tk)
+    print(json.dumps({"disbursement_txid": txid, "vout": vout,
+                      "stage": "disbursed",
+                      "note": "the borrower claims this to start the loan"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_claim_principal(args):
+    """BORROWER: take the principal. This publishes your secret, which is what
+    starts the loan -- taking the money and starting the loan are one act."""
+    from pignus.btc_collateral import claim_disbursement, loan_from_dict
+    seq = node_from(args)
+    tk = _ticket(args)
+    loan = loan_from_dict(tk)
+    w = _read_key(args.borrower_key + ".w")
+    txid = claim_disbursement(seq, loan, tk["disbursement_txid"],
+                              int(tk["disbursement_vout"]), w,
+                              fee_asset=args.fee_asset)
+    tk.update(principal_claim_txid=txid, _stage="claimed-principal")
+    _save_ticket(args, tk)
+    print(json.dumps({"claim_txid": txid, "stage": "claimed-principal"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_upgrade(args):
+    """LENDER: start the loan, using the secret the borrower published.
+
+    The secret is read off the Sequentia chain rather than taken from anyone,
+    and only acted on once the transaction that published it is buried: a
+    Bitcoin reorg can undo a Sequentia transaction, and a lender who upgrades on
+    a claim that is then undone has moved collateral for a principal nobody
+    took.
+    """
+    from pignus.btc_collateral import (preimage_from_spend, complete_upgrade,
+                                       anchor_safe, loan_from_dict)
+    seq = node_from(args)
+    btc = btc_node_from(args)
+    tk = _ticket(args)
+    loan = loan_from_dict(tk)
+    w, spend_txid, conf = preimage_from_spend(
+        seq, tk["disbursement_txid"], int(tk["disbursement_vout"]),
+        expect_hash=loan.h_w)
+    ok, depth = anchor_safe(seq, spend_txid, min_depth=args.min_depth)
+    if not ok and not args.force:
+        raise SystemExit(f"the claim that published the secret has {depth} "
+                         f"confirmation(s), below the {args.min_depth} this "
+                         "asks for. Sequentia reorgs when Bitcoin reorgs; "
+                         "re-run with --force to accept that risk.")
+    tx = complete_upgrade(loan, tk["prevault_txid"], int(tk["prevault_vout"]),
+                          bytes.fromhex(tk["upgrade_presig"]), w)
+    txid = btc.sendrawtransaction(tx.hex())
+    tk.update(upgrade_txid=txid, _stage="live")
+    _save_ticket(args, tk)
+    print(json.dumps({"upgrade_txid": txid, "stage": "live",
+                      "note": "the collateral is in the vault; the loan runs"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_abort(args):
+    """BORROWER: take the collateral back because no principal ever came."""
+    from pignus.btc_collateral import abort_tx, loan_from_dict
+    btc = btc_node_from(args)
+    borrower = _read_key(args.borrower_key)
+    tk = _ticket(args)
+    loan = loan_from_dict(tk)
+    height = btc.getblockcount()
+    if height < loan.abort_after and not args.force:
+        raise SystemExit(f"the collateral becomes abortable at Bitcoin block "
+                         f"{loan.abort_after}; the chain is at {height}")
+    dest = (bytes.fromhex(btc.getaddressinfo(args.dest)["scriptPubKey"])
+            if args.dest else bytes.fromhex(tk["reclaim_dest"]))
+    tx = abort_tx(loan, tk["prevault_txid"], int(tk["prevault_vout"]), dest,
+                  args.btc_fee, borrower)
+    txid = btc.sendrawtransaction(tx.hex())
+    tk["_stage"] = "aborted"
+    _save_ticket(args, tk)
+    print(json.dumps({"abort_txid": txid, "stage": "aborted"}, indent=2))
+    return 0
+
+
+def cmd_btc_refund_principal(args):
+    """LENDER: take back a principal the borrower never claimed."""
+    from pignus.btc_collateral import refund_disbursement, loan_from_dict
+    seq = node_from(args)
+    tk = _ticket(args)
+    loan = loan_from_dict(tk)
+    txid = refund_disbursement(seq, loan, tk["disbursement_txid"],
+                               int(tk["disbursement_vout"]),
+                               fee_asset=args.fee_asset)
+    tk["_stage"] = "principal-refunded"
+    _save_ticket(args, tk)
+    print(json.dumps({"refund_txid": txid, "stage": "principal-refunded"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_check(args):
+    """Where a loan stands, on both chains, and what each party can do next.
+
+    A cross-chain loan has two halves that can disagree, and reading two block
+    explorers to work out which is a good way to act on the wrong one.
+    """
+    from pignus.btc_collateral import (loan_from_dict, collateral_committed,
+                                       tx_confirmations, timelocks_sane)
+    tk = _ticket(args)
+    loan = loan_from_dict(tk)
+    out = {"stage": tk.get("_stage", "?"),
+           "market": loan.market, "btc_amount": loan.btc_amount,
+           "debt": loan.debt, "principal": int(loan.principal) or loan.debt}
+    btc = seq = None
+    try:
+        btc = btc_node_from(args)
+        out["btc_height"] = btc.getblockcount()
+    except Exception as e:                              # noqa: BLE001
+        out["btc_error"] = str(e)
+    try:
+        seq = node_from(args)
+        out["seq_height"] = seq.getblockcount()
+    except Exception as e:                              # noqa: BLE001
+        out["seq_error"] = str(e)
+    if btc and tk.get("prevault_txid"):
+        ok, why = collateral_committed(btc, loan, tk["prevault_txid"],
+                                       int(tk["prevault_vout"]), min_conf=1)
+        out["prevault"] = {"outpoint": f"{tk['prevault_txid']}:{tk['prevault_vout']}",
+                           "committed": ok, "detail": why}
+    if btc and tk.get("upgrade_txid"):
+        out["vault"] = {"txid": tk["upgrade_txid"],
+                        "confirmations": tx_confirmations(btc, tk["upgrade_txid"])}
+    if seq and tk.get("disbursement_txid"):
+        out["principal"] = {
+            "outpoint": f"{tk['disbursement_txid']}:{tk.get('disbursement_vout', 0)}",
+            "still_unclaimed": bool(seq.gettxout(tk["disbursement_txid"],
+                                                 int(tk.get("disbursement_vout", 0)),
+                                                 True))}
+    if btc and seq:
+        out["timelocks"] = timelocks_sane(loan, out.get("btc_height", 0),
+                                          out.get("seq_height", 0)) or "sane"
+    out["next"] = {
+        "proposed": "borrower: btc-prepare",
+        "prepared": "lender: btc-adaptor",
+        "signed": "borrower: btc-originate",
+        "funded": "lender: btc-disburse (or borrower: btc-abort, after "
+                  f"Bitcoin block {loan.abort_after})",
+        "disbursed": "borrower: btc-claim-principal (or lender: "
+                     f"btc-refund-principal, after Sequentia block {loan.d_refund})",
+        "claimed-principal": "lender: btc-upgrade",
+        "live": f"borrower: btc-repay, before Sequentia block {loan.repay_deadline}",
+        "repaid": "lender: btc-claim",
+        "claimed": "borrower: btc-reclaim",
+    }.get(tk.get("_stage"), "nothing further")
+    print(json.dumps(out, indent=2))
     return 0
 
 
 def cmd_btc_repay(args):
-    """BORROWER: pay the debt into the Sequentia hashlock. The lender can only
-    take it by publishing t."""
-    from pignus.btc_collateral import pay_repayment
+    """BORROWER: pay the debt into the output the lender can only open by
+    publishing the secret that releases your collateral."""
+    from pignus.btc_collateral import pay_repayment, loan_from_dict
     node = node_from(args)
     tk = _ticket(args)
-    loan = _loan(tk)
-    txid, vout = pay_repayment(node, loan)
+    loan = loan_from_dict(tk)
+    txid, vout = pay_repayment(node, loan, fee_asset=args.fee_asset)
     tk.update(repay_txid=txid, repay_vout=vout, _stage="repaid")
     _save_ticket(args, tk)
     print(json.dumps({"repay_txid": txid, "vout": vout, "stage": "repaid"},
@@ -1465,44 +1789,48 @@ def cmd_btc_repay(args):
 
 
 def cmd_btc_claim(args):
-    """LENDER: take the repayment, which forces t onto the Sequentia chain."""
-    from pignus.btc_collateral import claim_repayment
+    """LENDER: take the repayment, which publishes the secret that releases the
+    borrower's collateral."""
+    from pignus.btc_collateral import claim_repayment, loan_from_dict
     node = node_from(args)
-    lender = _read_key(args.lender_key)
-    t = _read_key(args.lender_key + ".t")
     tk = _ticket(args)
-    loan = _loan(tk)
-    txid = claim_repayment(node, loan, tk["repay_txid"], tk["repay_vout"],
-                           lender, t)
+    loan = loan_from_dict(tk)
+    t = _read_key(args.secret_file or f"{args.lender_key}.t.{tk['h_w'][:16]}")
+    txid = claim_repayment(node, loan, tk["repay_txid"], int(tk["repay_vout"]),
+                           t, fee_asset=args.fee_asset)
     tk.update(claim_txid=txid, _stage="claimed")
     _save_ticket(args, tk)
     print(json.dumps({"claim_txid": txid, "stage": "claimed",
-                      "note": "t is now public on the Sequentia chain"},
+                      "note": "the secret is now public on the Sequentia chain"},
                      indent=2))
     return 0
 
 
 def cmd_btc_reclaim(args):
-    """BORROWER: read t off the chain, check the claim is anchor-safe, and take
-    the collateral back on Bitcoin."""
-    from pignus.btc_collateral import (
-        reclaim_tx, complete_reclaim, preimage_from_claim, anchor_safe)
+    """BORROWER: read the secret off the chain, check it is buried, and take
+    the collateral back."""
+    from pignus.btc_collateral import (reclaim_tx, complete_reclaim,
+                                       preimage_from_spend, anchor_safe,
+                                       loan_from_dict)
     node = node_from(args)
     btc = btc_node_from(args)
     borrower = _read_key(args.borrower_key)
     tk = _ticket(args)
-    loan = _loan(tk)
-    ok, conf = anchor_safe(node, tk["claim_txid"], min_depth=args.min_depth)
+    loan = loan_from_dict(tk)
+    t, spend_txid, _conf = preimage_from_spend(
+        node, tk["repay_txid"], int(tk["repay_vout"]),
+        expect_hash=loan.payment_hash)
+    ok, conf = anchor_safe(node, spend_txid, min_depth=args.min_depth)
     if not ok and not args.force:
         raise SystemExit(f"the claim has {conf} confirmations, below the "
                          f"{args.min_depth} this asks for; a Bitcoin-driven "
                          "reorg could still undo it. Re-run with --force to "
                          "accept that risk.")
-    t = preimage_from_claim(node, tk["claim_txid"])
-    rtx = reclaim_tx(loan, tk["funding_txid"], tk["funding_vout"],
-                     bytes.fromhex(tk["reclaim_dest"]), args.btc_fee)
-    asig = bytes.fromhex(tk["adaptor_sig"])
-    tx = complete_reclaim(loan, rtx, asig, t, borrower)
+    rtx = reclaim_tx(loan, tk["vault_txid"], int(tk.get("vault_vout", 0)),
+                     bytes.fromhex(tk["reclaim_dest"]),
+                     int(tk.get("reclaim_fee", args.btc_fee)))
+    tx = complete_reclaim(loan, rtx, bytes.fromhex(tk["adaptor_sig"]), t,
+                          borrower)
     txid = btc.sendrawtransaction(tx.hex())
     tk["_stage"] = "reclaimed"
     _save_ticket(args, tk)
@@ -1511,210 +1839,549 @@ def cmd_btc_reclaim(args):
 
 
 def cmd_btc_seize_sighash(args):
-    """LENDER: print the exact sighash the ORACLE co-signs for a seizure."""
-    from pignus.btc_collateral import seize_sighash
+    """LENDER: print the seizure request an ORACLE co-signs.
+
+    The request carries the loan, not just a number: an oracle handed a bare
+    sighash has no way to tell whether it is seizing an under-water loan or a
+    healthy one, and signing what it cannot read is the whole of the risk this
+    tier carries.
+    """
+    from pignus.btc_collateral import seize_request, loan_from_dict
     btc = btc_node_from(args)
     tk = _ticket(args)
-    loan = _loan(tk)
+    loan = loan_from_dict(tk)
     dest = (bytes.fromhex(btc.getaddressinfo(args.dest)["scriptPubKey"])
             if args.dest else
             bytes.fromhex(btc.getaddressinfo(btc.getnewaddress())["scriptPubKey"]))
-    sh = seize_sighash(loan, tk["funding_txid"], tk["funding_vout"], dest,
-                       args.btc_fee)
-    print(json.dumps({"seize_sighash": sh.hex(), "dest": dest.hex(),
-                      "note": "the oracle signs this with BIP340; pass its "
-                              "signature and the SAME --dest to btc-seize"},
-                     indent=2))
+    req = seize_request(loan, tk["vault_txid"], int(tk.get("vault_vout", 0)),
+                        dest, args.btc_fee)
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(req, f, indent=2, sort_keys=True)
+        print(f"wrote {args.out}", file=sys.stderr)
+    tk.update(seize_dest=dest.hex(), seize_fee=args.btc_fee)
+    _save_ticket(args, tk)
+    print(json.dumps(req, indent=2))
     return 0
 
 
 def cmd_btc_seize(args):
-    """LENDER: with the oracle's signature over the seize sighash, take the
-    collateral jointly."""
-    from pignus.btc_collateral import seize_tx
+    """LENDER + oracle: seize the collateral, with the oracle's signature over
+    the identical transaction."""
+    from pignus.btc_collateral import seize_tx, loan_from_dict
     btc = btc_node_from(args)
     lender = _read_key(args.lender_key)
     tk = _ticket(args)
-    loan = _loan(tk)
-    dest = bytes.fromhex(btc.getaddressinfo(args.dest)["scriptPubKey"])
-    tx = seize_tx(loan, tk["funding_txid"], tk["funding_vout"], dest,
-                  args.btc_fee, lender, bytes.fromhex(args.oracle_sig))
+    loan = loan_from_dict(tk)
+    dest = bytes.fromhex(args.dest_spk or tk["seize_dest"])
+    tx = seize_tx(loan, tk["vault_txid"], int(tk.get("vault_vout", 0)), dest,
+                  int(tk.get("seize_fee", args.btc_fee)), lender,
+                  bytes.fromhex(args.oracle_sig))
     txid = btc.sendrawtransaction(tx.hex())
+    tk["_stage"] = "seized"
+    _save_ticket(args, tk)
     print(json.dumps({"seize_txid": txid, "stage": "seized"}, indent=2))
     return 0
 
 
 def cmd_btc_timeout(args):
-    """LENDER: sweep the collateral after the term, if the borrower never
-    repaid."""
-    from pignus.btc_collateral import timeout_tx
+    """LENDER: sweep the collateral after the term, when nobody repaid."""
+    from pignus.btc_collateral import timeout_tx, loan_from_dict
     btc = btc_node_from(args)
     lender = _read_key(args.lender_key)
     tk = _ticket(args)
-    loan = _loan(tk)
+    loan = loan_from_dict(tk)
     dest = (bytes.fromhex(btc.getaddressinfo(args.dest)["scriptPubKey"])
             if args.dest else
             bytes.fromhex(btc.getaddressinfo(btc.getnewaddress())["scriptPubKey"]))
-    tx = timeout_tx(loan, tk["funding_txid"], tk["funding_vout"], dest,
-                    args.btc_fee, lender, locktime=btc.getblockcount())
+    tx = timeout_tx(loan, tk["vault_txid"], int(tk.get("vault_vout", 0)), dest,
+                    args.btc_fee, lender)
     txid = btc.sendrawtransaction(tx.hex())
+    tk["_stage"] = "timed-out"
+    _save_ticket(args, tk)
     print(json.dumps({"timeout_txid": txid, "stage": "timed-out"}, indent=2))
     return 0
 
 
 def cmd_btc_refund(args):
-    """BORROWER: recover the repayment on Sequentia after the deadline, if the
-    lender stalled."""
-    from pignus.btc_collateral import refund_repayment
+    """BORROWER: take the repayment back after the deadline, if the lender
+    never claimed it."""
+    from pignus.btc_collateral import refund_repayment, loan_from_dict
     node = node_from(args)
-    borrower = _read_key(args.borrower_key)
     tk = _ticket(args)
-    loan = _loan(tk)
-    txid = refund_repayment(node, loan, tk["repay_txid"], tk["repay_vout"],
-                            borrower, loan.repay_deadline)
+    loan = loan_from_dict(tk)
+    txid = refund_repayment(node, loan, tk["repay_txid"], int(tk["repay_vout"]),
+                            fee_asset=args.fee_asset)
+    tk["_stage"] = "refunded"
+    _save_ticket(args, tk)
     print(json.dumps({"refund_txid": txid, "stage": "refunded"}, indent=2))
     return 0
 
 
 def cmd_btc_offer_publish(args):
-    """LENDER: publish a BTC-collateral offer to a relay (pignusd). Picks the
-    secret t, publishes T and h; the secret is stored beside the key so
-    btc-respond and btc-claim can find it."""
+    """LENDER: publish a cross-chain offer to a relay.
+
+    The offer is signed by the key it names. A relay that accepted an unsigned
+    one would let anyone publish in a lender's name, and that lender's own
+    responder would pay it out.
+    """
     from pignus import adaptor as A
-    from pignus.btc_collateral import BtcLoan, sha256, loan_to_dict
+    from pignus import btc_relay as R
+    _btc_cfg(args)
     lender = _read_key(args.lender_key)
-    t = A.new_secret()
-    _write_key(args.lender_key + ".t", t)
-    loan = BtcLoan(
-        btc_amount=args.btc_amount, borrower_x="00" * 32,
-        lender_x=A.xonly_pubkey(lender).hex(), oracle_x=args.oracle_x,
-        recover_after=args.recover_after, debt_asset=args.debt_asset,
-        debt=args.debt, principal=args.principal or args.debt,
-        repay_deadline=args.repay_deadline,
-        adaptor_point=A.point(t).hex(), payment_hash=sha256(t).hex())
-    d = loan_to_dict(loan)
-    d.pop("borrower_x", None)          # no borrower yet
-    body = {"loan": {k: v for k, v in d.items()}, "market": args.market or "",
-            "note": args.note or ""}
-    # keep borrower_x out of the published loan; it is filled by each taker
-    body["loan"]["borrower_x"] = ""
+    lender_x = A.xonly_pubkey(lender).hex()
+    if args.oracle_x == lender_x:
+        raise SystemExit("the lender cannot be their own oracle")
+    loan = {
+        "btc_amount": args.btc_amount, "lender_x": lender_x,
+        "oracle_x": args.oracle_x, "recover_after": args.recover_after,
+        "debt_asset": args.debt_asset, "debt": args.debt,
+        "principal": args.principal or args.debt,
+        "repay_deadline": args.repay_deadline, "abort_after": args.abort_after,
+        "upgrade_fee": args.upgrade_fee, "d_refund": args.d_refund,
+        "lender_prog": R.check_program(args.lender_prog, args.lender_ver),
+        "lender_ver": args.lender_ver, "market": args.market or "",
+        "strike": args.strike or 0, "price_scale": args.price_scale,
+    }
+    lots = max(1, int(args.lots))
+    body = {"loan": loan, "market": args.market or "", "lots": lots,
+            "note": args.note or "",
+            "offer_sig": R.sign_offer(lender, loan, args.market or "", lots)}
     code, rec = book_post(args.book, "/v1/btc/offers", body)
     if code != 200:
         raise SystemExit(f"relay refused the offer: {rec.get('error')}")
-    print(json.dumps({"btc_offer_id": rec["btc_offer_id"],
-                      "note": "keep this node's key online and run btc-respond"},
+    print(json.dumps({"btc_offer_id": rec["btc_offer_id"], "lots": lots,
+                      "note": "keep the responder running while this rests"},
+                     indent=2))
+    return 0
+
+
+def cmd_btc_offer_withdraw(args):
+    """LENDER: take an offer down. The coin is untouched -- there is no coin;
+    this stops the relay offering terms nobody is answering."""
+    from pignus import btc_relay as R
+    _btc_cfg(args)
+    lender = _read_key(args.lender_key)
+    code, r = book_post(args.book,
+                        f"/v1/btc/offers/{args.offer}/withdraw",
+                        {"sig": R.sign_report(lender, R.WITHDRAW_TAG,
+                                              args.offer)})
+    if code != 200:
+        raise SystemExit(f"relay refused: {r.get('error')}")
+    print(json.dumps({"btc_offer_id": args.offer, "status": "withdrawn"},
                      indent=2))
     return 0
 
 
 def cmd_btc_respond(args):
-    """LENDER responder: adaptor-sign the reclaim of every pending take on this
-    lender's offers. Non-custodial: the lender's key never leaves this machine;
-    only the adaptor signature is posted. Run it in a loop (--watch)."""
+    """LENDER responder: the lender's whole side of every open cross-chain loan.
+
+    Non-custodial in the only sense that matters here: the key never leaves this
+    machine and the relay is never trusted for anything -- every offer it serves
+    is checked against the lender's own signature before a single move is made
+    on it.
+    """
     from pignus import adaptor as A
-    from pignus.btc_collateral import BtcLoan, reclaim_tx, lender_release_adaptor
+    from pignus import btc_relay as R
+    from pignus.btc_collateral import (loan_from_dict, reclaim_tx,
+                                       lender_release_adaptor,
+                                       check_upgrade_presig,
+                                       collateral_committed, pay_disbursement,
+                                       preimage_from_spend, complete_upgrade,
+                                       anchor_safe, claim_repayment,
+                                       refund_disbursement, upgrade_tx)
+    _btc_cfg(args)
+    if not args.lender_key:
+        raise SystemExit("--lender-key, or a config file naming one, is required")
     lender = _read_key(args.lender_key)
     lender_x = A.xonly_pubkey(lender).hex()
+    state = _ResponderState(args.state or (args.lender_key + ".state.json"))
 
-    from pignus.btc_collateral import (loan_from_dict, disburse_principal,
-                                        funding_confirmed)
-    seq_node = node_from(args) if args.rpc_user or args.rpc_password or args.rpc_cookie else None
-    btc_node = btc_node_from(args) if args.btc_rpc_user or args.btc_rpc_password or args.btc_rpc_cookie else None
+    seq_node = (node_from(args)
+                if (args.rpc_user or args.rpc_password or args.rpc_cookie)
+                else None)
+    btc_node = (btc_node_from(args)
+                if (args.btc_rpc_user or args.btc_rpc_password
+                    or args.btc_rpc_cookie) else None)
 
-    def sign_pass():
+    def ours(offer):
+        """An offer is this responder's only if this key signed it. The relay
+        is a message carrier, not an authority."""
+        loan = offer.get("loan") or {}
+        return (loan.get("lender_x") == lender_x
+                and R.verify_offer(loan, offer.get("market", ""),
+                                   int(offer.get("lots", 1)),
+                                   offer.get("offer_sig", "")))
+
+    def offers_by_id():
+        out = {}
+        for o in book_get(args.book, "/v1/btc/offers?status=all")["offers"]:
+            out[o["btc_offer_id"]] = o
+        return out
+
+    # What each report calls its fields on the wire, against the canonical names
+    # the signature covers. The two differ because the wire names say which
+    # transaction is meant and the signed names say what is being asserted;
+    # keeping one mapping here is what stops them drifting apart.
+    REPORT_BODY = {
+        "/v1/btc/disbursed": {"txid": "disbursement_txid",
+                              "vout": "disbursement_vout"},
+        "/v1/btc/upgraded": {"txid": "upgrade_txid"},
+        "/v1/btc/claimed": {"txid": "claim_txid", "secret": "secret_t"},
+        "/v1/btc/refunded": {"txid": "refund_txid"},
+        # The release carries its own names on the wire already.
+        "/v1/btc/adaptor": {"adaptor_point": "adaptor_point",
+                            "payment_hash": "payment_hash",
+                            "adaptor_sig": "adaptor_sig"},
+    }
+
+    def report(tag, take_id, path, **fields):
+        names = REPORT_BODY[path]
+        body = {names[k]: v for k, v in fields.items()}
+        body["take_id"] = take_id
+        body["auth"] = R.sign_report(lender, tag, take_id, **fields)
+        code, r = book_post(args.book, path, body)
+        if code != 200:
+            print(f"take {take_id}: the relay refused a {path.rsplit('/', 1)[1]} "
+                  f"report: {r.get('error')}", file=sys.stderr)
+        return code, r
+
+    def sign_pass(offers):
         n = 0
         for tk in book_get(args.book, "/v1/btc/takes?status=pending")["takes"]:
-            if dict(tk["loan"]).get("lender_x") != lender_x:
-                continue                      # not our offer
+            offer = offers.get(tk.get("btc_offer_id"))
+            if not offer or not ours(offer):
+                continue
             loan = loan_from_dict(dict(tk["loan"]))
-            rtx = reclaim_tx(loan, tk["funding_txid"], int(tk["funding_vout"]),
+            if not check_upgrade_presig(loan, tk["prevault_txid"],
+                                        int(tk["prevault_vout"]),
+                                        bytes.fromhex(tk["upgrade_presig"])):
+                print(f"take {tk['take_id']}: the advance signature does not "
+                      "move that collateral into this loan; not signing",
+                      file=sys.stderr)
+                continue
+            # One secret per LOAN. Sharing one across an offer's takes would let
+            # any borrower's repayment release every other borrower's collateral.
+            have = state.get(tk["take_id"])
+            t = (bytes.fromhex(have["t"]) if have.get("t") else A.new_secret())
+            state.set(tk["take_id"], t=t.hex())
+            rtx = reclaim_tx(loan, tk["vault_txid"],
+                             int(tk.get("vault_vout", 0)),
                              bytes.fromhex(tk["reclaim_dest"]),
                              int(tk.get("reclaim_fee", 3000)))
-            asig = lender_release_adaptor(loan, lender, rtx)
-            code, r = book_post(args.book, "/v1/btc/adaptor",
-                                {"take_id": tk["take_id"], "adaptor_sig": asig.hex()})
+            loan_with_t = loan_from_dict({**dict(tk["loan"]),
+                                          "adaptor_point": A.point(t).hex(),
+                                          "payment_hash": _sha256(t)})
+            asig = lender_release_adaptor(loan_with_t, lender, rtx)
+            code, r = report(R.ADAPTOR_TAG, tk["take_id"], "/v1/btc/adaptor",
+                             adaptor_point=A.point(t).hex(),
+                             payment_hash=_sha256(t), adaptor_sig=asig.hex())
             if code == 200:
                 print(f"signed take {tk['take_id']}", file=sys.stderr); n += 1
             else:
                 print(f"take {tk['take_id']}: {r.get('error')}", file=sys.stderr)
         return n
 
-    def disburse_pass():
-        """The other half of a loan: once a borrower's collateral is confirmed on
-        Bitcoin, send them the principal on Sequentia. Without a Sequentia wallet
-        (--rpc*) and a Bitcoin node (--btc-rpc*) this is skipped, and the
-        responder only does origination."""
+    def disburse_pass(offers):
         if not (seq_node and btc_node):
             return 0
         n = 0
         for tk in book_get(args.book, "/v1/btc/takes?status=signed")["takes"]:
-            loan_d = dict(tk["loan"])
-            if loan_d.get("lender_x") != lender_x or not tk.get("borrower_seq_spk"):
+            offer = offers.get(tk.get("btc_offer_id"))
+            if not offer:
+                print(f"take {tk['take_id']}: the relay no longer serves the "
+                      "offer it was taken from", file=sys.stderr)
                 continue
-            loan = loan_from_dict(loan_d)
-            if not funding_confirmed(btc_node, tk["funding_txid"],
-                                     int(tk["funding_vout"]),
-                                     min_conf=args.disburse_conf):
-                continue                      # collateral not buried yet
+            if not ours(offer):
+                print(f"take {tk['take_id']}: offer "
+                      f"{tk.get('btc_offer_id')} is not signed by this key; "
+                      "ignoring it", file=sys.stderr)
+                continue
+            have = state.get(tk["take_id"])
+            if have.get("disbursement_txid"):
+                continue                       # already paid; never pay twice
+            if have.get("disbursing"):
+                print(f"take {tk['take_id']}: a disbursement was started and "
+                      "not recorded. Check the wallet for a payment of "
+                      f"{have.get('disbursing')} and clear it in the state "
+                      "file before this take can move.", file=sys.stderr)
+                continue
+            loan = loan_from_dict(dict(tk["loan"]))
+            ok, why = collateral_committed(btc_node, loan, tk["prevault_txid"],
+                                           int(tk["prevault_vout"]),
+                                           min_conf=args.disburse_conf)
+            if not ok:
+                # Say why, once, rather than skipping in silence: an operator
+                # watching a loan that will not move needs to know whether they
+                # are waiting for a confirmation or looking at a bad take.
+                if have.get("waiting") != why:
+                    state.set(tk["take_id"], waiting=why)
+                    print(f"take {tk['take_id']}: {why}", file=sys.stderr)
+                continue
+            if have.get("waiting"):
+                state.set(tk["take_id"], waiting=None)
+            # Written BEFORE the send: the gap between paying and recording is
+            # where a crash would otherwise cost a second principal.
+            state.set(tk["take_id"], disbursing=loan.disbursement_spk().hex())
             try:
-                txid = disburse_principal(seq_node, loan, tk["borrower_seq_spk"],
-                                          fee_asset=args.fee_asset or "bitcoin")
-            except Exception as e:            # noqa: BLE001
+                txid, vout = pay_disbursement(seq_node, loan,
+                                              fee_asset=args.fee_asset or None)
+            except Exception as e:                      # noqa: BLE001
+                state.set(tk["take_id"], disbursing=None,
+                          last_error=f"{type(e).__name__}: {e}")
                 print(f"disburse {tk['take_id']}: {type(e).__name__}: {e}",
                       file=sys.stderr)
                 continue
-            book_post(args.book, "/v1/btc/disbursed",
-                      {"take_id": tk["take_id"], "disbursement_txid": txid})
-            print(f"disbursed {int(loan.principal) or int(loan.debt)} to "
-                  f"{tk['take_id']}: {txid}", file=sys.stderr); n += 1
+            state.set(tk["take_id"], disbursing=None, disbursement_txid=txid,
+                      disbursement_vout=vout)
+            report(R.DISBURSED_TAG, tk["take_id"], "/v1/btc/disbursed",
+                   txid=txid, vout=vout)
+            print(f"disbursed to {tk['take_id']}: {txid}", file=sys.stderr)
+            n += 1
+        return n
+
+    def upgrade_pass(offers):
+        """Start every loan whose borrower has taken the principal."""
+        if not (seq_node and btc_node):
+            return 0
+        n = 0
+        for status in ("disbursed", "claimed-principal"):
+            for tk in book_get(args.book,
+                               f"/v1/btc/takes?status={status}")["takes"]:
+                offer = offers.get(tk.get("btc_offer_id"))
+                if not offer or not ours(offer):
+                    continue
+                have = state.get(tk["take_id"])
+                if have.get("upgrade_txid"):
+                    continue
+                d = have.get("disbursement_txid") or tk.get("disbursement_txid")
+                if not d:
+                    continue
+                loan = loan_from_dict(dict(tk["loan"]))
+                try:
+                    w, spend_txid, _c = preimage_from_spend(
+                        seq_node, d,
+                        int(have.get("disbursement_vout",
+                                     tk.get("disbursement_vout", 0))),
+                        expect_hash=loan.h_w)
+                except ValueError:
+                    continue                   # not claimed yet
+                ok, depth = anchor_safe(seq_node, spend_txid,
+                                        min_depth=args.claim_depth)
+                if not ok:
+                    continue                   # not buried enough to act on
+                try:
+                    tx = complete_upgrade(loan, tk["prevault_txid"],
+                                          int(tk["prevault_vout"]),
+                                          bytes.fromhex(tk["upgrade_presig"]), w)
+                    txid = btc_node.sendrawtransaction(tx.hex())
+                except Exception as e:                  # noqa: BLE001
+                    print(f"upgrade {tk['take_id']}: {type(e).__name__}: {e}",
+                          file=sys.stderr)
+                    continue
+                state.set(tk["take_id"], upgrade_txid=txid)
+                report(R.UPGRADED_TAG, tk["take_id"], "/v1/btc/upgraded",
+                       txid=txid)
+                print(f"started loan {tk['take_id']}: {txid}", file=sys.stderr)
+                n += 1
+        return n
+
+    def refund_pass(offers):
+        """Take back a principal nobody claimed, once its deadline has passed."""
+        if not seq_node:
+            return 0
+        n = 0
+        height = seq_node.getblockcount()
+        for tk in book_get(args.book, "/v1/btc/takes?status=disbursed")["takes"]:
+            offer = offers.get(tk.get("btc_offer_id"))
+            if not offer or not ours(offer):
+                continue
+            have = state.get(tk["take_id"])
+            loan = loan_from_dict(dict(tk["loan"]))
+            if height < loan.d_refund or have.get("principal_refunded"):
+                continue
+            d = have.get("disbursement_txid") or tk.get("disbursement_txid")
+            vout = int(have.get("disbursement_vout",
+                                tk.get("disbursement_vout", 0)))
+            if not d or seq_node.gettxout(d, vout, True) is None:
+                continue                       # already spent: claimed or gone
+            try:
+                txid = refund_disbursement(seq_node, loan, d, vout,
+                                           fee_asset=args.fee_asset or None)
+            except Exception as e:                      # noqa: BLE001
+                print(f"refund {tk['take_id']}: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+                continue
+            state.set(tk["take_id"], principal_refunded=txid)
+            report(R.REFUNDED_TAG, tk["take_id"], "/v1/btc/refunded", txid=txid)
+            print(f"took back the principal of {tk['take_id']}: {txid}",
+                  file=sys.stderr)
+            n += 1
+        return n
+
+    def claim_pass(offers):
+        """Take every repayment that has arrived, which publishes the secret
+        that releases the borrower's collateral. A lender who sits on this is
+        holding a borrower's collateral hostage, so it is not optional."""
+        if not seq_node:
+            return 0
+        n = 0
+        for status in ("live", "repaid"):
+            for tk in book_get(args.book,
+                               f"/v1/btc/takes?status={status}")["takes"]:
+                offer = offers.get(tk.get("btc_offer_id"))
+                if not offer or not ours(offer):
+                    continue
+                have = state.get(tk["take_id"])
+                if have.get("claim_txid") or not have.get("t"):
+                    continue
+                loan = loan_from_dict(dict(tk["loan"]))
+                found = _find_repayment(seq_node, loan, tk, have)
+                if not found:
+                    continue
+                rtxid, rvout = found
+                try:
+                    txid = claim_repayment(seq_node, loan, rtxid, rvout,
+                                           bytes.fromhex(have["t"]),
+                                           fee_asset=args.fee_asset or None)
+                except Exception as e:                  # noqa: BLE001
+                    print(f"claim {tk['take_id']}: {type(e).__name__}: {e}",
+                          file=sys.stderr)
+                    continue
+                state.set(tk["take_id"], claim_txid=txid)
+                report(R.CLAIMED_TAG, tk["take_id"], "/v1/btc/claimed",
+                       txid=txid, secret=have["t"])
+                print(f"claimed the repayment of {tk['take_id']}: {txid}",
+                      file=sys.stderr)
+                n += 1
         return n
 
     def one_pass():
-        return sign_pass() + disburse_pass()
+        offers = offers_by_id()
+        return (sign_pass(offers) + disburse_pass(offers)
+                + upgrade_pass(offers) + claim_pass(offers)
+                + refund_pass(offers))
 
     if not args.watch:
-        print(json.dumps({"signed": one_pass()}))
+        print(json.dumps({"moves": one_pass()}))
         return 0
     print(f"responder for {lender_x[:16]} watching {args.book}", file=sys.stderr)
     while True:
         try:
             one_pass()
-        except Exception as e:                      # noqa: BLE001
-            print(f"pass error: {type(e).__name__}: {e}", file=sys.stderr)
+        except KeyboardInterrupt:
+            return 0
+        except Exception as e:                          # noqa: BLE001
+            print(f"pass failed: {type(e).__name__}: {e}", file=sys.stderr)
         time.sleep(args.interval)
 
 
+def _sha256(b):
+    import hashlib
+    return hashlib.sha256(b).hexdigest()
+
+
+def _find_repayment(seq_node, loan, take, have):
+    """Where the borrower paid the debt, if they have.
+
+    The responder is told by the borrower, but it does not have to be believed:
+    the repayment address follows from the terms, so a scan of what the wallet
+    can see settles it. Returns (txid, vout) or None.
+    """
+    if have.get("repay_txid"):
+        return have["repay_txid"], int(have.get("repay_vout", 0))
+    if take.get("repay_txid"):
+        return take["repay_txid"], int(take.get("repay_vout", 0))
+    spk = loan.repayment_spk().hex()
+    try:
+        desc = seq_node.getdescriptorinfo(f"raw({spk})")["descriptor"]
+        addr = seq_node.deriveaddresses(desc)[0]
+    except Exception:                                   # noqa: BLE001
+        return None
+    try:
+        for u in seq_node.listunspent(0, 9999999, [addr]):
+            return u["txid"], int(u["vout"])
+    except Exception:                                   # noqa: BLE001
+        return None
+    return None
+
+
 def add_btc_commands(sub):
+    def party_terms(p):
+        """The terms a cross-chain loan is made of, on both chains."""
+        p.add_argument("--oracle-x", required=True,
+                       help="the oracle both sides accept for a seizure. It "
+                            "must not be the lender's own key")
+        p.add_argument("--btc-amount", type=int, required=True,
+                       help="collateral, in satoshis")
+        p.add_argument("--debt-asset", required=True)
+        p.add_argument("--debt", type=int, required=True,
+                       help="atoms the borrower repays, principal plus interest")
+        p.add_argument("--principal", type=int, default=0,
+                       help="atoms the borrower receives (default: the debt, "
+                            "an interest-free loan)")
+        p.add_argument("--recover-after", type=int, required=True,
+                       help="Bitcoin height the lender's TIMEOUT sweep opens at")
+        p.add_argument("--repay-deadline", type=int, required=True,
+                       help="Sequentia height the borrower's repayment refund "
+                            "opens at")
+        p.add_argument("--abort-after", type=int, required=True,
+                       help="Bitcoin height the borrower may take unlent "
+                            "collateral back at")
+        p.add_argument("--d-refund", type=int, required=True,
+                       help="Sequentia height the lender may take an unclaimed "
+                            "principal back at")
+        p.add_argument("--upgrade-fee", type=int, default=3000,
+                       help="satoshis the pre-vault carries to pay for moving "
+                            "the collateral into the loan")
+        p.add_argument("--lender-prog", required=True,
+                       help="the lender's Sequentia payout program, hex: 20 "
+                            "bytes at witness version 0, 32 at version 1")
+        p.add_argument("--lender-ver", type=int, default=0)
+        p.add_argument("--market", default="",
+                       help="the oracle feed a seizure is judged against")
+        p.add_argument("--strike", type=int, default=0,
+                       help="the price a seizure is justified below, so it can "
+                            "be checked afterwards")
+
     p = sub.add_parser("btc-keygen", help="a party keypair for a BTC loan")
     p.add_argument("--out", required=True, help="keyfile path (0600)")
     p.set_defaults(fn=cmd_btc_keygen)
 
-    p = sub.add_parser("btc-propose", help="LENDER: propose a BTC-collateral loan")
+    p = sub.add_parser("btc-propose",
+                       help="LENDER: write the terms and send them to a borrower")
     p.add_argument("--lender-key", required=True)
-    p.add_argument("--borrower-x", required=True)
-    p.add_argument("--oracle-x", required=True)
-    p.add_argument("--btc-amount", type=int, required=True, help="collateral, sats")
-    p.add_argument("--debt-asset", required=True)
-    p.add_argument("--debt", type=int, required=True, help="atoms to repay")
-    p.add_argument("--recover-after", type=int, required=True,
-                   help="Bitcoin height the TIMEOUT sweep opens at")
-    p.add_argument("--repay-deadline", type=int, required=True,
-                   help="Sequentia height the REFUND opens at")
-    p.add_argument("--out", required=True)
-    p.set_defaults(fn=cmd_btc_propose)
+    party_terms(p)
+    p.add_argument("--out", required=True, help="where to write the ticket")
+    p.set_defaults(fn=cmd_btc_propose, ticket=None)
 
     p = sub.add_parser("btc-prepare",
-                       help="BORROWER: build the funding (unbroadcast) + reclaim")
+                       help="BORROWER: fund the pre-vault, unbroadcast, and "
+                            "sign the move into the loan in advance")
     p.add_argument("ticket")
-    p.add_argument("--reclaim-address", help="where the collateral returns")
-    p.add_argument("--feerate", type=float, default=5.0, help="sat/vB")
-    p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--borrower-key", required=True)
+    p.add_argument("--borrower-prog", required=True,
+                   help="your Sequentia payout program, hex")
+    p.add_argument("--borrower-ver", type=int, default=0)
+    p.add_argument("--reclaim-address", help="where the collateral comes back "
+                                             "to (default: a new address)")
+    p.add_argument("--feerate", type=float, default=5.0,
+                   help="sat/vB for the funding transaction")
+    p.add_argument("--btc-fee", type=int, default=3000,
+                   help="satoshis the reclaim transaction pays")
+    p.add_argument("--seq-height", type=int,
+                   help="the Sequentia height to judge the deadlines against, "
+                        "if no Sequentia node is configured")
+    p.add_argument("--force", action="store_true",
+                   help="accept terms this refuses as unsafe")
     p.add_argument("--out")
+    add_node_args(p)
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_prepare)
 
     p = sub.add_parser("btc-adaptor",
-                       help="LENDER: adaptor-sign the borrower's reclaim")
+                       help="LENDER: draw this loan's secret and hand over the "
+                            "release")
     p.add_argument("ticket")
     p.add_argument("--lender-key", required=True)
     p.add_argument("--btc-fee", type=int, default=3000)
@@ -1722,28 +2389,100 @@ def add_btc_commands(sub):
     p.set_defaults(fn=cmd_btc_adaptor)
 
     p = sub.add_parser("btc-originate",
-                       help="BORROWER: verify the release, then fund Bitcoin")
+                       help="BORROWER: verify the release, then commit the "
+                            "collateral")
     p.add_argument("ticket")
     p.add_argument("--btc-fee", type=int, default=3000)
     p.add_argument("--out")
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_originate)
 
+    p = sub.add_parser("btc-disburse",
+                       help="LENDER: pay the principal into the output the "
+                            "borrower opens to start the loan")
+    p.add_argument("ticket")
+    p.add_argument("--disburse-conf", type=int, default=1,
+                   help="Bitcoin confirmations required on the collateral first")
+    p.add_argument("--fee-asset", help="the asset this pays its fee in "
+                                       "(default: the debt asset)")
+    p.add_argument("--out")
+    add_node_args(p)
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_disburse)
+
+    p = sub.add_parser("btc-claim-principal",
+                       help="BORROWER: take the principal, which starts the loan")
+    p.add_argument("ticket")
+    p.add_argument("--borrower-key", required=True)
+    p.add_argument("--fee-asset")
+    p.add_argument("--out")
+    add_node_args(p)
+    p.set_defaults(fn=cmd_btc_claim_principal)
+
+    p = sub.add_parser("btc-upgrade",
+                       help="LENDER: start the loan with the secret the "
+                            "borrower published")
+    p.add_argument("ticket")
+    p.add_argument("--min-depth", type=int, default=6,
+                   help="confirmations required on the borrower's claim before "
+                        "acting on it")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--out")
+    add_node_args(p)
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_upgrade)
+
+    p = sub.add_parser("btc-abort",
+                       help="BORROWER: take back collateral no principal ever "
+                            "came for")
+    p.add_argument("ticket")
+    p.add_argument("--borrower-key", required=True)
+    p.add_argument("--dest", help="a Bitcoin address (default: the reclaim "
+                                  "address in the ticket)")
+    p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--out")
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_abort)
+
+    p = sub.add_parser("btc-refund-principal",
+                       help="LENDER: take back a principal nobody claimed")
+    p.add_argument("ticket")
+    p.add_argument("--fee-asset")
+    p.add_argument("--out")
+    add_node_args(p)
+    p.set_defaults(fn=cmd_btc_refund_principal)
+
+    p = sub.add_parser("btc-check",
+                       help="where a loan stands on both chains, and whose "
+                            "move it is")
+    p.add_argument("ticket")
+    add_node_args(p)
+    add_btc_node_args(p)
+    p.set_defaults(fn=cmd_btc_check)
+
     p = sub.add_parser("btc-repay", help="BORROWER: pay the debt into the hashlock")
     p.add_argument("ticket")
+    p.add_argument("--fee-asset")
     p.add_argument("--out")
     add_node_args(p)
     p.set_defaults(fn=cmd_btc_repay)
 
-    p = sub.add_parser("btc-claim", help="LENDER: take the repayment, revealing t")
+    p = sub.add_parser("btc-claim",
+                       help="LENDER: take the repayment, publishing the secret "
+                            "that releases the collateral")
     p.add_argument("ticket")
     p.add_argument("--lender-key", required=True)
+    p.add_argument("--secret-file", help="the secret for this loan (default: "
+                                         "beside the key)")
+    p.add_argument("--fee-asset")
     p.add_argument("--out")
     add_node_args(p)
     p.set_defaults(fn=cmd_btc_claim)
 
     p = sub.add_parser("btc-reclaim",
-                       help="BORROWER: read t, check anchor-safety, take the BTC")
+                       help="BORROWER: take the collateral back once the "
+                            "secret is public")
     p.add_argument("ticket")
     p.add_argument("--borrower-key", required=True)
     p.add_argument("--btc-fee", type=int, default=3000)
@@ -1755,10 +2494,12 @@ def add_btc_commands(sub):
     p.set_defaults(fn=cmd_btc_reclaim)
 
     p = sub.add_parser("btc-seize-sighash",
-                       help="LENDER: the sighash the oracle co-signs to seize")
+                       help="LENDER: print the seizure request an oracle "
+                            "co-signs")
     p.add_argument("ticket")
-    p.add_argument("--dest")
+    p.add_argument("--dest", help="a Bitcoin address for the seized collateral")
     p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--out", help="write the request here, for the oracle")
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_seize_sighash)
 
@@ -1766,8 +2507,9 @@ def add_btc_commands(sub):
     p.add_argument("ticket")
     p.add_argument("--lender-key", required=True)
     p.add_argument("--oracle-sig", required=True)
-    p.add_argument("--dest", required=True)
+    p.add_argument("--dest-spk", help="the script the request named")
     p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--out")
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_seize)
 
@@ -1776,46 +2518,63 @@ def add_btc_commands(sub):
     p.add_argument("--lender-key", required=True)
     p.add_argument("--dest")
     p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--out")
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_timeout)
 
-    p = sub.add_parser("btc-refund", help="BORROWER: recover the repayment")
+    p = sub.add_parser("btc-refund",
+                       help="BORROWER: take the repayment back if the lender "
+                            "never claimed it")
     p.add_argument("ticket")
-    p.add_argument("--borrower-key", required=True)
+    p.add_argument("--fee-asset")
     p.add_argument("--out")
     add_node_args(p)
     p.set_defaults(fn=cmd_btc_refund)
 
     p = sub.add_parser("btc-offer-publish",
-                       help="LENDER: publish a BTC-collateral offer to a relay")
-    p.add_argument("--lender-key", required=True)
-    p.add_argument("--oracle-x", required=True)
-    p.add_argument("--btc-amount", type=int, required=True)
-    p.add_argument("--debt-asset", required=True)
-    p.add_argument("--debt", type=int, required=True)
-    p.add_argument("--principal", type=int, default=0,
-                   help="atoms disbursed to the borrower (default: = debt, "
-                   "a zero-interest loan)")
-    p.add_argument("--recover-after", type=int, required=True)
-    p.add_argument("--repay-deadline", type=int, required=True)
-    p.add_argument("--market", default="")
+                       help="LENDER: publish a cross-chain offer to a relay")
+    p.add_argument("--config", help="a responder config file; keeps "
+                                    "credentials off the command line")
+    p.add_argument("--lender-key")
+    party_terms(p)
+    p.add_argument("--lots", type=int, default=1,
+                   help="how many loans of these terms are on offer")
+    p.add_argument("--price-scale", type=int, default=100000)
     p.add_argument("--note", default="")
     add_book_arg(p)
     p.set_defaults(fn=cmd_btc_offer_publish)
 
+    p = sub.add_parser("btc-offer-withdraw",
+                       help="LENDER: take one of your offers down")
+    p.add_argument("--offer", required=True)
+    p.add_argument("--config")
+    p.add_argument("--lender-key")
+    add_book_arg(p)
+    p.set_defaults(fn=cmd_btc_offer_withdraw)
+
     p = sub.add_parser("btc-respond",
-                       help="LENDER responder: adaptor-sign takes and disburse "
-                       "the principal once collateral confirms")
-    p.add_argument("--lender-key", required=True)
+                       help="LENDER responder: sign releases, pay principals, "
+                            "start loans, claim repayments")
+    p.add_argument("--config", help="a JSON file with the key, the node "
+                                    "credentials and the state file; nothing "
+                                    "secret then appears in `ps`")
+    p.add_argument("--lender-key")
+    p.add_argument("--state", help="where this responder records what it has "
+                                   "already done (default: beside the key)")
     p.add_argument("--watch", action="store_true")
     p.add_argument("--interval", type=float, default=5.0)
     p.add_argument("--disburse-conf", type=int, default=1,
                    help="Bitcoin confirmations required before disbursing")
-    p.add_argument("--fee-asset", help="fee asset for the disbursement send")
+    p.add_argument("--claim-depth", type=int, default=6,
+                   help="confirmations required on a borrower's claim before "
+                        "moving their collateral into the loan")
+    p.add_argument("--fee-asset", help="fee asset for the Sequentia legs "
+                                       "(default: the debt asset)")
     add_book_arg(p)
-    add_node_args(p)           # --rpc*: the lender's Sequentia wallet (disburse)
-    add_btc_node_args(p)       # --btc-rpc*: to see the collateral confirm
+    add_node_args(p)           # the lender's Sequentia wallet
+    add_btc_node_args(p)       # to see the collateral, and to broadcast
     p.set_defaults(fn=cmd_btc_respond)
+
 
 def main():
     ap = argparse.ArgumentParser(

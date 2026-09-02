@@ -49,6 +49,7 @@ run "browser: offers vs vectors"      node tests/test_offer_web.mjs
 run "browser: repurchase vs vectors"  node tests/test_repurchase_web.mjs
 run "browser: BTC taproot vs vectors" node tests/test_btc_web.mjs
 run "browser: adaptor vs vectors"     node tests/test_adaptor_web.mjs
+run "BTC relay: what it may be believed about" python3 tests/test_btc_relay_auth.py
 run "BTC relay + lender responder"     python3 tests/test_btc_relay.py
 run "BTC principal disbursement"       python3 tests/test_btc_disburse.py
 # test_platform runs on the node's functional-test framework, which wants the
@@ -75,6 +76,8 @@ run "threshold oracles end to end"     python3 tests/test_threshold.py
 run "BTC collateral: the covenant + crypto" python3 tests/test_btc_collateral.py
 run "BTC collateral: the library legs"  python3 tests/test_btc_cli.py
 run "BTC collateral: the CLI handshake" python3 tests/test_btc_cli_flow.py
+run "BTC origination on Bitcoin"       python3 tests/test_prevault.py
+run "BTC origination across both chains" python3 tests/test_btc_origination.py
 
 echo
 if [ "$fails" -eq 0 ]; then

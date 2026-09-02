@@ -55,7 +55,10 @@ pignus/watcher.py        reconcile loans AND offers to the chain; name each exit
                          discover loans from take witnesses; catch ghosts
 pignus/book.py           the loan book: discovery, nothing else
 pignus/offers.py         funded resting offers (the node repo's pignus_offer.py)
-pignus/btc_collateral.py native BTC collateral (Tier B): the Bitcoin-side leaves
+pignus/btc_collateral.py native BTC collateral (Tier B): the pre-vault, the
+                         vault, and both chains' legs of a cross-chain loan
+pignus/btc_relay.py      what a relay may and may not be believed about: the
+                         signatures on every offer and every lender's report
 pignus/adaptor.py        Schnorr adaptor signatures, the cross-chain link
 pignus/dlc.py            the DLC that settles BTC collateral at maturity
 pignus/btcscript.py      the Bitcoin script and taproot primitives Tier B needs
@@ -67,11 +70,13 @@ bin/pignusd              the loan book, the watcher, and the page at /lending/
 bin/pignus-cli           selftest, quote, propose, show, address, verify, status,
                          check-attestation; with a node wallet: offer-fund,
                          offer-take, offer-withdraw, repay, liquidate, default,
-                         recover; pledge-* (Tier C); repo-* (repurchase)
+                         recover; btc-* (Tier B, both chains); pledge-* (Tier C);
+                         repo-* (repurchase)
 bin/pignus-liquidator    one liquidator among however many people run one
 web/                     the browser client pignusd serves: pignus.js, offer.js,
-                         repurchase.js, pset.js, flows.js, wallet.js, app.js
-deploy/                  the two systemd units, example configs, DEPLOY.md
+                         repurchase.js, pset.js, flows.js, wallet.js, app.js,
+                         and for Tier B btc.js, adaptor.js, btcborrow.js
+deploy/                  the systemd units, example configs, DEPLOY.md
 docs/pignus-design.md    the design and security analysis
 ```
 
@@ -276,6 +281,9 @@ Two collateral types are weaker on purpose and are labelled as such:
 test/functional/feature_pignus_vault.py      the covenant: 4 exits, 12 refusals
 test/functional/feature_pignus_oracle_set.py the on-chain oracle set
 test/functional/feature_pignus_offer.py      funded offers
+test/functional/feature_pignus_hashlock.py   the signature-free hashlock sweep
+                                             both cross-chain legs are paid
+                                             through
 test/functional/feature_pignus_attack.py     the attack suite
 tests/test_platform.py                       this library, end to end
 tests/test_btc_collateral.py                 Tier B, on a bitcoind + sequentiad rig
@@ -286,9 +294,20 @@ tests/test_threshold.py                      a 2-of-3 oracle loan, end to end
 tests/test_openamp.py                        the Tier C pledge message, pinned
 tests/test_btc_cli.py                        the BTC-collateral library legs
 tests/test_btc_cli_flow.py                   the BTC-collateral CLI handshake
+tests/test_prevault.py                       origination on the Bitcoin side:
+                                             the pre-vault, the upgrade, the
+                                             abort, against a real bitcoind
+tests/test_btc_origination.py                a whole cross-chain loan, both
+                                             chains, nobody trusting anybody
+tests/test_btc_relay_auth.py                 what the relay may be believed
+                                             about, with no daemon at all
 tests/run-tests.sh                           everything here, fastest first
 tests/cli_drill.sh            the commands, offline
 ```
 
-The four `feature_pignus_*.py` tests live in the node repository and are in its
+The `feature_pignus_*.py` tests live in the node repository and are in its
 `test_runner.py`.
+
+`tests/gen_web_vectors.py` regenerates the golden vectors the browser's Bitcoin
+and adaptor code pins itself to. Run it only when the Python it mirrors changes,
+in the same commit, and re-run `test_btc_web.mjs` and `test_adaptor_web.mjs`.
