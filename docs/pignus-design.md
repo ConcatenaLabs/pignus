@@ -9,9 +9,9 @@ drives it -- the oracle, the loan book, the watcher, the browser client and the
 Bitcoin-collateral construction (section 7) -- lives in the `pignus` repository,
 and runs on the testnet at
 [sequentiatestnet.com/lending/](https://sequentiatestnet.com/lending/). The
-OpenDAMP repurchase (8.1) is there in part: its bond vault, the verification of
-both legs and the forfeit path are built, while composing a settlement against a
-live OpenDAMP asset is not.
+OpenDAMP repurchase (8.1) is there too: the bond vault, the verification of both
+legs, the forfeit path, and the four-input settlement `pignus-cli repo-settle`
+composes and then attaches the covenant witness to.
 
 *Pignus* is the Roman-law term for property pledged as security for a debt: the
 creditor holds the pledge, the debt is owed separately, and redeeming the debt
@@ -369,12 +369,12 @@ exactly the `m` lowest attestations they hold, which makes the effective price
 the m-th lowest of the set -- a robust quantile rather than any one oracle's
 number.
 
-Two properties fall out and are worth stating. A single compromised oracle can
-no longer trigger a liquidation, because it cannot reach the threshold alone --
-and a signature from one key replayed into another key's slot fails, since every
-slot pins its own key. A single dead oracle can no longer block one either, so
-the set improves both halves of the trust problem rather than trading one for
-the other. An abstaining slot carries an EMPTY signature, which
+Two properties fall out and are worth stating. A single compromised oracle
+cannot trigger a liquidation, because it cannot reach the threshold alone -- and
+a signature from one key replayed into another key's slot fails, since every
+slot pins its own key. A single dead oracle cannot block one either, so the set
+improves both halves of the trust problem rather than trading one for the
+other. An abstaining slot carries an EMPTY signature, which
 `OP_CHECKSIGFROMSTACK` treats as false; a non-empty invalid signature aborts the
 script instead, so a slot cannot be stuffed with rubbish to fake an abstention.
 
@@ -439,23 +439,27 @@ chains' scripts:
 
 1. The lender picks a secret `t` and publishes `h = SHA256(t)`.
 2. At origination the lender hands the borrower their half of the RECLAIM
-   signature on the transaction that returns the BTC. RECLAIM also demands `t`,
-   so the borrower holds a release they cannot yet use.
-
-The hash is what makes this checkable, and that is the whole reason it is a hash.
-An earlier version of this design used an adaptor signature under a point
-`T = t·G` and asked the borrower to believe that the `h` baked into their
-repayment output came from the same secret. Nothing can check that -- proving
-`SHA256(t) = h` and `t·G = T` together needs a proof this protocol has no way to
-carry -- and a lender who published an unrelated `h` took the repayment AND the
-collateral, with no collusion and no race. With one hash in both scripts there
-is nothing left to assert.
+   signature on the transaction that returns the BTC -- an ordinary BIP340
+   signature the borrower verifies on the spot. RECLAIM also demands `t`, so
+   the borrower holds a release they cannot yet use.
 3. The borrower repays on Sequentia into a hashlocked output whose CLAIM leaf
    pays the lender against `t` and whose REFUND leaf returns the money to the
    borrower after `repay_deadline`.
 4. The lender claims the repayment, which publishes `t` on the Sequentia chain.
 5. The borrower reads `t` off the chain and spends RECLAIM with it, the
    lender's release and their own signature.
+
+**The link is a hash rather than an adaptor signature, and that is the point.**
+An adaptor signature under a point `T = t·G` would make step 2 a signature the
+borrower cannot complete until `t` is public, which sounds like the same thing.
+It is not, because it asks the borrower to believe that the `h` baked into their
+repayment output and the `T` their release is encrypted under came from one
+secret. Nothing available here checks that: proving `SHA256(t) = h` and
+`t·G = T` together needs a proof this protocol has no way to carry, and a lender
+who published an unrelated `h` would take the repayment AND keep the collateral,
+with no collusion and no race. With one hash in both scripts there is nothing
+left to assert and nothing left to take on trust -- the borrower compiles both
+scripts and reads the same 32 bytes out of each.
 
 If the lender never claims, the borrower recovers the repayment after the CLTV
 and the lender takes the BTC via TIMEOUT: the loan unwinds and neither side is
@@ -510,19 +514,31 @@ Origination therefore runs:
 | # | who | what | if it stops here |
 |---|---|---|---|
 | 1 | borrower | prepares the pre-vault funding, unbroadcast, and asks for a loan | nothing has happened |
-| 2 | lender | draws this loan's secret and publishes `h`; the borrower can now derive the vault, and pre-signs UPGRADE | nothing has happened |
-| 2b | lender | verifies the pre-signature and signs RECLAIM | nothing has happened |
-| 3 | borrower | verifies the release, broadcasts the pre-vault funding | borrower ABORTs at `abort_after`, out only a fee |
-| 4 | lender | sees the collateral confirmed, pays the principal into the hashlock | lender REFUNDs at `d_refund`; borrower ABORTs |
-| 5 | borrower | claims the principal, publishing `w` | lender REFUNDs at `d_refund`; borrower ABORTs |
-| 6 | lender | reads `w`, waits for the claim to be anchor-safe, broadcasts UPGRADE | **the lender loses**: the borrower has the principal and, at `abort_after`, the collateral |
+| 2 | lender | draws this loan's secret and publishes `h` | nothing has happened |
+| 3 | borrower | can now derive the vault, and pre-signs UPGRADE | nothing has happened |
+| 4 | lender | verifies that pre-signature and signs RECLAIM | nothing has happened |
+| 5 | borrower | verifies the release, broadcasts the pre-vault funding | borrower ABORTs at `abort_after`, out only a fee |
+| 6 | lender | sees the collateral confirmed, pays the principal into the hashlock | lender REFUNDs at `d_refund`; borrower ABORTs |
+| 7 | borrower | claims the principal, publishing `w` | lender REFUNDs at `d_refund`; borrower ABORTs |
+| 8 | lender | reads `w`, waits for the claim to be anchor-safe, broadcasts UPGRADE | **the lender loses**: the borrower has the principal and, at `abort_after`, the collateral |
 
-Only step 6 exposes anyone to a loss rather than to a delay, and only the lender,
-who controls whether they are online. The margin between `d_refund` and
+Only the last step exposes anyone to a loss rather than to a delay, and only the
+lender, who controls whether they are online. The margin between `d_refund` and
 `abort_after` is what makes that exposure a choice rather than a race, which is
 why `timelocks_sane()` refuses a loan whose deadlines do not leave it: at least a
 day, in wall-clock seconds, converting each chain's heights at its own block
-time. The same function refuses a loan whose `recover_after` does not sit a day
+time.
+
+The fee on that last step is the other half of the same exposure, and it is
+worth stating rather than leaving to be discovered. The borrower signs the move
+into the vault at origination, so its fee is fixed before anyone knows what the
+parent chain will cost. It cannot be replaced -- the signature commits to the
+whole transaction -- and its only output is the vault, which nobody can spend
+to pay for it, so it cannot be bumped from either end either. A fee too low to
+confirm before `abort_after` is a loan the lender has paid for and cannot
+start. That is why the pre-vault carries a deliberately generous fee, why the
+relay refuses an offer whose fee could not plausibly confirm, and why the
+margin above is measured in days rather than hours. The same function refuses a loan whose `recover_after` does not sit a day
 past `repay_deadline`, because a lender who could claim a repayment after the
 Bitcoin timeout had opened would be racing the borrower for the collateral with
 the repayment already in hand.
@@ -617,7 +633,12 @@ messages between the parties: `/v1/btc/offers` (the lender's offers),
 drawing this loan's secret), `/v1/btc/presig` (the borrower signing the move
 into the vault that hash implies), `/v1/btc/adaptor` (the release
 coming back) and the lender's reports that the principal is paid, the loan is
-started, the repayment is claimed or an unclaimed principal is taken back.
+started, the repayment is claimed or an unclaimed principal is taken back. The
+borrower reports two things of their own -- where they took the principal and
+where they paid the debt -- and those are signed by the borrower's key for the
+same reason the lender's are signed by theirs: everything either of them says is
+on a chain anyway, but an unauthenticated hint that moved a take out of the
+status a responder scans would stop a principal being paid, for good.
 `docs/api.md` documents each of them.
 
 The relay holds no key and can move nothing, and it is never believed. Every
@@ -699,10 +720,9 @@ promise, not a script. A policy server that is dishonest or compromised can
 release a pledge without repayment, and no amount of checking on the lender's
 side would reveal it beforehand. A Tier C loan is labelled issuer-permissioned
 wherever a user can see it, because presenting it quietly beside a Tier A loan
-would be a lie. Today that means the `pledge-*` commands of `pignus-cli`, which
-print the sentence `openamp.describe()` builds: there is no pledge tab on the
-page and the book carries no pledges, so the CLI is the whole of Tier C's
-surface.
+would be a lie. That is the `pledge-*` commands of `pignus-cli`, which print the
+sentence `openamp.describe()` builds: there is no pledge tab on the page and the
+book carries no pledges, so the CLI is the whole of Tier C's surface.
 
 **Tier D** admits no seizure-backed loan, and the answer is structural rather
 than a matter of effort. Three independent reasons, any one of which is
@@ -858,6 +878,25 @@ address cannot pin the money terms -- and leg one with `verify_leg_one`, and
 re-verifies after the depth its risk appetite justifies: a bond whose funding an
 anchor-driven reorg has undone (section 6.4) secures nothing, and there is no
 watcher here to notice.
+
+Because both halves matter, `repo-verify` reports a **state** and never an
+"ok": `not-funded`, `bond-only`, `funded-unburied`, `live`, `forfeitable`,
+`settled`. `bond-only` is what a bond checked on its own earns, and it is the
+answer to guard against -- a bond nobody has matched against the transfer it
+secures is a number, not a claim. `--min-confirmations` is where each side's
+tolerance for a reorg goes; below it the state is `funded-unburied` however
+correct both halves are.
+
+The settlement itself is composed in two steps, because it needs signatures from
+both parties and the covenant's witness must go on last. `repo-settle
+--skeleton` builds the transaction above from the terms and the four outpoints
+it is given -- refusing a verifier coin carrying the repurchase's own asset, a
+blinded coin, a `C_U` holding the wrong asset or the wrong amount, and a fee in
+anything but the debt asset -- and `repo-settle --attach` puts the RETURN
+witness on the version everybody has signed. The vault always lands at input 1,
+for the reason above; the composer places it there and that is not something a
+caller can choose. A borrower whose debt coin needs no change leaves five
+outputs rather than six, which the narrower OpenDAMP shape also accepts.
 
 ## 9. Where the code lives
 

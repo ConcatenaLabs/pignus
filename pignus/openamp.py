@@ -206,12 +206,15 @@ class PledgeClient:
         return p
 
     def release(self, pledge_id, lender_sec=None, repaid_txid="",
-                force=False, reason=""):
+                force=False, reason="", lender_sig=None):
         """The debt is settled; unlock the collateral.
 
-        Pass `lender_sec` to sign as the lender. `force=True` is the issuer's
-        override for a lender who cannot sign at all, and it requires a written
-        reason because it goes into the public transparency log.
+        Sign with `lender_sec`, or pass a `lender_sig` somebody else produced --
+        the lender's key does not have to be on the machine that talks to the
+        issuer, and on any machine that is not the lender's own it should not
+        be. `force=True` is the issuer's override for a lender who cannot sign
+        at all, and it requires a written reason because it goes into the
+        public transparency log.
         """
         body = {"repaid_txid": repaid_txid}
         if force:
@@ -220,26 +223,40 @@ class PledgeClient:
                                  "part of the public transparency log")
             body["force"] = True
             body["reason"] = reason
+        elif lender_sig:
+            body["lender_sig"] = lender_sig
+        elif lender_sec is not None:
+            body["lender_sig"] = sign_pledge(lender_sec, "release", pledge_id,
+                                             repaid_txid)
         else:
-            if lender_sec is None:
-                raise ValueError("release needs the lender's key, or force with a reason")
-            body["lender_sig"] = sign_pledge(lender_sec, "release", pledge_id, repaid_txid)
+            raise ValueError("a release needs the lender's signature: their "
+                             "key, a signature they made with it, or the "
+                             "issuer's forced override with a reason")
         return self._call("POST", f"/v1/issuer/pledges/{pledge_id}/release", body)
 
-    def seize(self, pledge_id, reason, lender_sec, borrower_sec=None):
+    def seize(self, pledge_id, reason, lender_sec=None, lender_sig=None,
+              holder_sig=None):
         """Deliver the collateral to the lender.
 
-        `borrower_sec` is only needed before maturity, where the borrower is not
-        in default and their countersignature is what makes an early seizure a
-        surrender rather than a taking. Passing it after maturity is harmless.
+        `holder_sig` is the borrower's countersignature, needed before maturity,
+        where the borrower is not in default and their consent is what makes an
+        early seizure a surrender rather than a taking. It is a SIGNATURE and
+        never a key: a lender holding the borrower's key could spend every
+        enclave output that key controls, which is not what surrendering one
+        pledge means. The lender's own half may likewise be a signature rather
+        than a key.
         """
         if not reason:
             raise ValueError("a seizure needs a reason; it becomes part of the "
                              "public transparency log")
+        if not (lender_sig or lender_sec is not None):
+            raise ValueError("a seizure needs the lender's signature: their "
+                             "key, or a signature they made with it")
         body = {"reason": reason,
-                "lender_sig": sign_pledge(lender_sec, "seize", pledge_id, reason)}
-        if borrower_sec is not None:
-            body["holder_sig"] = sign_pledge(borrower_sec, "seize", pledge_id, reason)
+                "lender_sig": lender_sig or sign_pledge(lender_sec, "seize",
+                                                        pledge_id, reason)}
+        if holder_sig:
+            body["holder_sig"] = holder_sig
         return self._call("POST", f"/v1/issuer/pledges/{pledge_id}/seize", body)
 
 

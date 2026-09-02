@@ -6,8 +6,8 @@ Sequentia uses NATIVE Bitcoin on the parent chain, not a pegged representation,
 so BTC collateral is a real Bitcoin UTXO -- and Bitcoin has no introspection, no
 OP_CAT and no OP_CHECKSIGFROMSTACK. None of the loan covenant runs there. The
 collateral therefore sits on Bitcoin, the debt sits on Sequentia, and the two are
-bound together by an adaptor signature so that repaying and getting the
-collateral back are one act rather than two hopes.
+bound together by ONE HASH that appears in both chains' scripts, so that
+repaying and getting the collateral back are one act rather than two hopes.
 
 The Bitcoin side
 ----------------
@@ -116,7 +116,9 @@ class BtcLoan:
     h_w: str = ""               # SHA256(w), the borrower's origination secret
     abort_after: int = 0        # Bitcoin locktime: the borrower takes the
                                 # pre-vault back if no principal ever arrives
-    upgrade_fee: int = 3000     # satoshis the pre-vault carries for the move
+    upgrade_fee: int = 10_000   # satoshis the pre-vault carries for the move,
+                                # generous on purpose: the move is signed at
+                                # origination and cannot be fee-bumped
     d_refund: int = 0           # Sequentia locktime: the lender takes the
                                 # principal back if the borrower never claims
 
@@ -290,8 +292,9 @@ def _spend_tx(funding_txid, vout, value, dest_spk, fee, locktime=0):
 
 def reclaim_tx(loan, funding_txid, vout, dest_spk, fee):
     """The transaction that returns the collateral to the borrower. Built at
-    origination, BEFORE the funding is broadcast, because the lender's adaptor
-    signature has to commit to it."""
+    origination, BEFORE any collateral is committed, because the lender's
+    release has to commit to it -- and because a borrower who funds first and
+    asks for the release afterwards has handed the lender a free option."""
     return _spend_tx(funding_txid, vout, loan.btc_amount, dest_spk, fee)
 
 
@@ -352,7 +355,7 @@ def complete_reclaim(loan, tx, release_sig, secret, borrower_sec):
 def upgrade_tx(loan, prevault_txid, vout):
     """The one transaction that moves the collateral out of the pre-vault and
     into the vault. Fixed at origination: the borrower signs exactly this, so
-    the vault's outpoint -- and therefore the reclaim the lender adaptor-signs
+    the vault's outpoint -- and therefore the reclaim the lender signs
     -- is known before any Bitcoin is committed."""
     tx = B.Tx()
     tx.vin.append(B.TxIn(prevault_txid, vout))
@@ -433,6 +436,9 @@ SEQ_BLOCK_SECONDS = 60
 UPGRADE_MARGIN_SECONDS = 24 * 3600
 REPAY_MARGIN_SECONDS = 24 * 3600
 CLAIM_MARGIN_SECONDS = 2 * 3600
+# The shortest term worth calling one: the gap between the last moment a loan
+# can start and the moment its repayment window shuts.
+TERM_MINIMUM_SECONDS = 24 * 3600
 
 
 def timelocks_sane(loan, btc_height, seq_height, *,
@@ -479,6 +485,21 @@ def timelocks_sane(loan, btc_height, seq_height, *,
             "the lender can sweep the collateral too soon after the repayment "
             "deadline: a borrower who repays on time could still lose it. "
             "Move recover_after later.")
+    # A loan cannot start until the borrower claims the principal, and they may
+    # do that as late as d_refund. Without this, a set of deadlines that passes
+    # every other check can leave a borrower with a repayment window that is
+    # already over by the time their loan begins.
+    if loan.d_refund and seq_s(loan.repay_deadline) - seq_s(loan.d_refund) \
+            < TERM_MINIMUM_SECONDS:
+        problems.append(
+            "the repayment deadline is too close to the last moment the loan "
+            "can start: the term could be over before it begins. Move "
+            "repay_deadline later.")
+    if loan.abort_after and btc_s(loan.recover_after) <= btc_s(loan.abort_after):
+        problems.append(
+            "the lender's sweep opens before the collateral stops being "
+            "abortable, which is not a loan in between. Move recover_after "
+            "past abort_after.")
     return problems
 
 
@@ -617,9 +638,6 @@ def loan_from_json(s) -> "BtcLoan":
 # second copy. Every function here takes a Sequentia node (pignus.node.Node or a
 # test proxy) and the caller's own secret; no key is derived or stored here.
 
-SEQ_FEE = 5000
-
-
 def _seq_tf():
     load_covenant()
     from test_framework import messages as m
@@ -703,7 +721,7 @@ def _find_vout(node, raw_hex, spk):
 
 
 def _pay_into(node, spk, asset, amount, *, change_spk=None, fee_asset=None,
-              fee=None, flow="repay4"):
+              fee=None, flow="btcrepay"):
     """Pay `amount` atoms of `asset` into `spk`, explicitly, from a node wallet.
 
     A covenant reads the values it checks, so every input must be explicit and
@@ -781,6 +799,29 @@ def _payee_spk(prog_hex, ver):
     return (b"\x00\x14" if int(ver) == 0 else b"\x51\x20") + prog
 
 
+def _outpoint_value(node, txid, vout, asset, want):
+    """What that outpoint actually holds, checked against what it should.
+
+    The covenant pays out the whole INPUT, so a spender that sized its output
+    from the loan document would build a transaction the covenant refuses --
+    and every one of these addresses is public, so a coin that is an atom heavy
+    is something anyone can arrange. Reading the chain is the only way to be
+    right about it.
+    """
+    out = node.gettxout(txid, int(vout), True)
+    if out is None:
+        raise ValueError(f"{txid}:{vout} holds nothing: it is spent or unknown")
+    got_asset = out.get("asset")
+    if got_asset not in (None, asset):
+        raise ValueError(f"{txid}:{vout} holds {got_asset}, not the asset this "
+                         "loan is denominated in")
+    held = int(round(float(out.get("value", 0)) * COIN))
+    if held < int(want):
+        raise ValueError(f"{txid}:{vout} holds {held}, less than the {want} "
+                         "these terms name")
+    return held
+
+
 def _spend_hashlock(node, tap, leaves, txid, vout, leaf, *, value, asset,
                     payee_spk, secret=None, locktime=0, fee=None,
                     fee_asset=None, change_spk=None):
@@ -793,8 +834,9 @@ def _spend_hashlock(node, tap, leaves, txid, vout, leaf, *, value, asset,
     """
     m, _ = _seq_tf()
     from test_framework.messages import tx_from_hex
+    value = _outpoint_value(node, txid, vout, asset, value)
     if fee_asset is None or fee is None:
-        chosen, atoms = seq_fee_choice(node, prefer=(asset,), flow="repay4")
+        chosen, atoms = seq_fee_choice(node, prefer=(asset,), flow="btcclaim")
         fee_asset = fee_asset or chosen
         fee = int(fee if fee is not None else atoms)
     fee_coins = _seq_explicit_many(node, {fee_asset: int(fee)})
@@ -1024,7 +1066,7 @@ def fund_bitcoin(btc_node, loan, feerate=5, broadcast=True, prevault=None):
 
     Funds the PRE-VAULT when the loan has one, which is what an abortable
     origination needs, and the vault directly otherwise. Built without
-    broadcasting when the caller wants the txid first: the lender's adaptor
+    broadcasting when the caller wants the txid first: the lender's release
     signature commits to a reclaim that spends the vault outpoint, so both
     parties must know the ids BEFORE any collateral is committed.
     Returns (txid, vout, hex).
@@ -1112,7 +1154,7 @@ def disburse_principal(seq_node, loan, borrower_seq_spk_hex, fee_asset=None):
     addr = seq_node.deriveaddresses(desc)[0]
     if fee_asset is None:
         fee_asset, _ = seq_fee_choice(seq_node, prefer=(loan.debt_asset,),
-                                      flow="repay4")
+                                      flow="btcrepay")
     return seq_node.sendtoaddress(address=addr,
                                   amount=f"{principal / COIN:.8f}",
                                   assetlabel=loan.debt_asset,

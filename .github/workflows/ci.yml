@@ -103,6 +103,22 @@ jobs:
             node "tests/$f.mjs"
           done
 
+      # The page, in a real browser. It needs a headless Chromium, and skips
+      # with a message rather than failing when the runner has none -- so this
+      # step is honest about what it checked either way.
+      - name: install a headless browser
+        run: npx --yes playwright@1.49.0 install --with-deps chromium
+        continue-on-error: true
+
+      - name: the page, in a real browser
+        working-directory: pignus
+        env:
+          SEQUENTIA_SRC: ${{ github.workspace }}/Sequentia
+        run: |
+          CHROME=$(find "$HOME/.cache/ms-playwright" -name chrome -type f 2>/dev/null | head -1)
+          if [ -n "$CHROME" ]; then export PIGNUS_CHROME="$CHROME"; fi
+          bash tests/page_check.sh
+
       - name: the BTC relay's authorisation rules
         working-directory: pignus
         env:

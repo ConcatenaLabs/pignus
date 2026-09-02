@@ -22,6 +22,8 @@
   "min_depth": 2,
   "rescan_depth": 1500,
   "back_scan_cap": 200,
+  "_prune_note": "How long a FINISHED record is kept: a spent offer, a closed vault, an ended cross-chain take. The chain is the record and this book is an index of it, so nothing pruned is lost -- but every list is rendered end to end on every read, and a record nothing can happen to any more pays that for ever. Anything still open is kept whatever its age; 0 keeps everything.",
+  "prune_after": 2592000,
   "_proxies_note": "Peers whose X-Forwarded-For this daemon believes, which is how the write rate limit is keyed per client behind Caddy. pignusd must not be reachable except through the proxy.",
   "trusted_proxies": ["127.0.0.1", "::1"],
   "_rpc_note": "Optional. Without it the book still serves offers and whatever it last knew, and says so in /healthz rather than presenting stale states as fresh. Fill in ONE of cookie or user/password.",
@@ -31,6 +33,13 @@
     "user": "",
     "password": "",
     "wallet": ""
+  },
+  "_btc_rpc_note": "Optional, and only for cross-chain loans. The book reads the parent chain's tip through it so a Bitcoin-side deadline is checked against a height this daemon read itself rather than one a client sent. It never spends: no wallet is needed.",
+  "btc_rpc": {
+    "url": "http://127.0.0.1:48332",
+    "cookie": "",
+    "user": "",
+    "password": ""
   },
   "registry": "http://127.0.0.1:3005"
 }

@@ -147,12 +147,13 @@ def main():
                       "--oracle-x", oracle["pubkey_x"], "--btc-amount", "100000",
                       "--debt-asset", usdx, "--debt", "10500000000",
                       "--principal", "10000000000",           # 100 USDX principal
-                      "--recover-after", str(btch + 600),
-                      "--repay-deadline", str(seqh + 2000),
+                      "--recover-after", str(btch + 4_600),
+                      "--repay-deadline", str(seqh + 43_200),
                       "--abort-after", str(btch + 400),
-                      "--d-refund", str(seqh + 1000),
+                      "--d-refund", str(seqh + 1_440),
                       "--lender-prog", lender_prog, "--lots", "2",
-                      "--market", "BTC/USDX", "--book", base)
+                      "--market", "BTC/USDX", "--strike", "4200000000",
+                      "--book", base)
             check("the lender publishes an offer carrying a principal",
                   bool(off.get("btc_offer_id")))
             offer = get(base + "/v1/btc/offers")["offers"][0]

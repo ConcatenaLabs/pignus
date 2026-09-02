@@ -116,10 +116,12 @@
 <p class="crumb"><a href="/" id="crumb">&larr; Sequentia testnet</a></p>
 <h1>Pignus <span class="t">lending</span></h1>
 <p class="sub"><span id="intro_markets">Borrow one Sequentia asset against
-another, or against native Bitcoin.</span> Every term of a loan
-is compiled into a covenant the network enforces: nobody holds the collateral,
-nobody can change the deal once it is struck, and repaying needs no one's
-permission.</p>
+another.</span> Every term of the loan is compiled into a covenant the network
+enforces: nobody holds the collateral, nobody can change the deal once it is
+struck, and repaying needs no one's permission. Native Bitcoin can be the
+collateral too, on the parent chain, where there is no covenant to enforce
+anything &mdash; that tier is bound by a secret the two chains share, and needs
+a lender who is online.</p>
 <div class="status">
   <span class="tag dim" id="pinned">checking the covenant&hellip;</span>
   <span class="tag dim" id="chain">chain&hellip;</span>
@@ -233,10 +235,11 @@ permission.</p>
   default nobody could ever reach the collateral. What can be built is a
   <strong>repurchase</strong>: you sell the asset to the lender, and their
   obligation to sell it back is secured by a bond in a covenant here. Settling
-  one is a single OpenDAMP transfer that also spends the bond vault, and Pignus
-  does not compose that transaction yet; this page does the half that protects
-  you: it rebuilds the bond vault's address from the terms and checks it against
-  the funded coin, its asset and its amount.</p>
+  one is a single OpenDAMP transfer that also spends the bond vault;
+  <code>pignus-cli repo-settle</code> composes it, because it needs a verifier
+  input this page cannot select. What this page does is the half that protects
+  you beforehand: it rebuilds the bond vault's address from the terms and checks
+  it against the funded coin, its asset and its amount.</p>
   <form class="lend card" id="repoform">
     <div class="full"><label for="repoterms">Repurchase terms (JSON)</label>
       <textarea name="terms" id="repoterms" rows="8"
@@ -252,18 +255,20 @@ permission.</p>
 <section data-panel="btc" id="panel-btc" role="tabpanel" aria-labelledby="tab-btc" hidden>
   <h2>Native Bitcoin collateral <span class="tag">cross-chain</span></h2>
   <p class="hint">Borrow a Sequentia asset against <strong>real Bitcoin</strong>,
-  not a pegged token. The collateral is a Bitcoin output on the parent chain, the
-  debt is on Sequentia, and the two are bound by an adaptor signature, so
-  repaying and getting the collateral back are one act rather than two hopes.
-  Everything on this page runs through your wallet: the page rebuilds every
-  address from the terms, checks the lender's release against them, and only
-  then asks you to commit anything.</p>
+  not a pegged token. The collateral is a Bitcoin output on the parent chain and
+  the debt is on Sequentia, and one hash binds the two: the same hash locks the
+  Bitcoin vault's reclaim leaf and the Sequentia output you repay into, so the
+  secret that pays the lender their money is the secret that hands your Bitcoin
+  back. Repaying and getting the collateral back are one act rather than two
+  hopes. Everything on this page runs through your wallet: the page rebuilds
+  every address from the terms, checks the lender's release against them, and
+  only then asks you to commit anything.</p>
   <p class="hint">Your collateral does not go straight into the loan. It waits
-  where you alone can take it back, and the loan begins only when you claim the
-  principal &mdash; which is the same act, so you can never be left having paid
-  in and received nothing. Because Bitcoin has no covenants, this is the one
-  tier where the lender has to be online, and where a liquidation needs the
-  oracle to co-sign rather than a script to compute it.</p>
+  in a pre-vault you alone can take back, and the loan begins only when you
+  claim the principal &mdash; which is the same act, so you can never be left
+  having paid in and received nothing. Because Bitcoin has no covenants, this is
+  the one tier where the lender has to be online, and where a liquidation needs
+  the oracle to co-sign rather than a script to compute it.</p>
   <h3 style="margin-top:14px">Open BTC-collateral offers</h3>
   <div class="card tbl" id="btcoffers"><div class="empty">loading&hellip;</div></div>
   <h3 style="margin-top:18px">Your BTC-collateral loans</h3>
@@ -272,7 +277,7 @@ permission.</p>
   <form class="lend card" id="btcform">
     <div class="full"><label for="btcticket">Loan ticket (JSON)</label>
       <textarea name="ticket" id="btcticket" rows="9"
-        placeholder='paste the loan ticket the lender sent: btc_amount, lender_x, borrower_x, oracle_x, recover_after, debt_asset, debt, repay_deadline, adaptor_point, payment_hash — and, once you have prepared funding, funding_txid, reclaim_dest, adaptor_sig'></textarea></div>
+        placeholder='paste the loan ticket the lender sent: btc_amount, lender_x, borrower_x, oracle_x, recover_after, debt_asset, debt, repay_deadline, payment_hash, lender_prog, borrower_prog — and, once you have prepared funding, prevault_txid, reclaim_dest, release_sig'></textarea></div>
     <div class="full"><button type="submit">Check it</button>
       <span class="hint" style="display:inline;margin-left:8px">Keyless: this form
       derives addresses and verifies the release; it signs nothing. Only the

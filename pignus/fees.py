@@ -30,11 +30,34 @@ DUST_OUTPUT_VSIZE = 145
 # Conservative vsize estimates per flow. A single-leaf (offer-born) vault
 # reveals its whole ~1 kB leaf on every exit and the offer's TAKE leaf carries
 # that leaf as constants; witness bytes are discounted, but these round up.
+#
+# `btcrepay` and `btcclaim` are the two steps of a Bitcoin-collateral loan that
+# happen on THIS chain: paying the debt into the hashlocked repayment output,
+# and opening a hashlocked output -- the principal, or a repayment the lender
+# never claimed. Neither touches a vault leaf or carries oracle evidence, so
+# both are ordinary explicit payments; the claim is the larger of the two
+# because it reveals the hashlock leaf and its control block.
 VSIZE = {
     "fund": 400, "withdraw": 600, "take": 3000,
     "repay": 2000, "liquidate": 2200, "default": 2200, "recover": 1900,
     "repay4": 600, "liquidate4": 800, "default4": 800, "recover4": 500,
+    "btcrepay": 600, "btcclaim": 800,
 }
+
+
+def _policy():
+    """The node's fee policy, as every composer needs to see it.
+
+    The browser prices a fee and folds change to dust from exactly these
+    numbers, so they are published beside the rates rather than written down a
+    second time in JavaScript: two copies of the node's arithmetic drift apart
+    the day its policy changes, and neither side would notice.
+    """
+    return {"rate_scale": RATE_SCALE,
+            "feerate_rfa_per_kvb": DEFAULT_FEERATE_RFA_PER_KVB,
+            "dust_relay_rfa_per_kvb": DUST_RELAY_RFA_PER_KVB,
+            "dust_output_vsize": DUST_OUTPUT_VSIZE,
+            "vsize": dict(VSIZE)}
 
 
 def fee_table(node):
@@ -67,9 +90,7 @@ def fee_table(node):
         floor = atoms(node.getnetworkinfo()["relayfee"])
     except Exception:                                   # noqa: BLE001
         pass
-    return {"rates": out, "relay_floor_rfa_per_kvb": floor,
-            "feerate_rfa_per_kvb": DEFAULT_FEERATE_RFA_PER_KVB,
-            "vsize": dict(VSIZE)}
+    return {"rates": out, "relay_floor_rfa_per_kvb": floor, **_policy()}
 
 
 def empty_table():
@@ -78,9 +99,7 @@ def empty_table():
     Same shape as `fee_table`, so nothing downstream has to know whether the
     node has been reached yet, and the constants live in one place.
     """
-    return {"rates": {}, "relay_floor_rfa_per_kvb": None,
-            "feerate_rfa_per_kvb": DEFAULT_FEERATE_RFA_PER_KVB,
-            "vsize": dict(VSIZE)}
+    return {"rates": {}, "relay_floor_rfa_per_kvb": None, **_policy()}
 
 
 def dust_atoms(rate):

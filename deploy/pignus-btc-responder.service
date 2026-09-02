@@ -18,13 +18,30 @@ ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignus-cli btc-respond \
     --config /root/sequentia/pignus-responder.json --watch
 Restart=always
 RestartSec=10
-# The lender's adaptor key IS the lender's side of every open loan: keep what
-# this service writes unreadable to anyone else, and keep the process away from
-# what it does not need.
+# The lender's key IS the lender's side of every open loan: keep what this
+# service writes unreadable to anyone else, and keep the process away from what
+# it does not need.
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+# ProtectSystem=full leaves /root untouched, and /root is where all of this
+# lives, so on its own it protects nothing this service reaches for. /root is
+# mounted read-only instead and the one directory that has to stay WRITABLE is
+# handed back: /root/sequentia/pignus-data, which holds lender.key and the
+# responder's state file -- the record of what has already been sent, written
+# before each send.
+#
+# Do not reach for ProtectHome=yes or ProtectSystem=strict without extending
+# ReadWritePaths to match. The responder would then refuse every step it is
+# meant to take, in the middle of open loans.
 ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/root/sequentia/pignus-data
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
 
 [Install]
 WantedBy=multi-user.target

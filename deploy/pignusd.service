@@ -16,7 +16,24 @@ RestartSec=5
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+# ProtectSystem=full leaves /root untouched, and /root is where every part of
+# this lives -- the checkout, the node source, the config, the book -- so on its
+# own it protects nothing this service reaches for. /root is therefore mounted
+# read-only and the one directory that has to stay WRITABLE is handed back:
+# /root/sequentia/pignus-data, which holds book.json and the temporary file the
+# book is atomically renamed from.
+#
+# Do not reach for ProtectHome=yes or ProtectSystem=strict without extending
+# ReadWritePaths to match. pignusd would still start cleanly and then die at its
+# first book write, hours later, which reads as a bug rather than as a mount.
 ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/root/sequentia/pignus-data
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
 
 [Install]
 WantedBy=multi-user.target

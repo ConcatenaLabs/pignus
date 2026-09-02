@@ -19,7 +19,23 @@ RestartSec=5
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+# ProtectSystem=full leaves /root untouched, and /root is where all of this
+# lives, so on its own it protects nothing this service reaches for. /root is
+# mounted read-only instead and the one directory that has to stay WRITABLE is
+# handed back: /root/sequentia/pignus-data, which holds oracle.key, the
+# attestation log, its rotated files and their .chain, and the seizure log.
+#
+# Do not reach for ProtectHome=yes or ProtectSystem=strict without extending
+# ReadWritePaths to match. The oracle then fails at start on a key it can
+# neither read nor create, which looks like a lost key and is not.
 ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/root/sequentia/pignus-data
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
 
 [Install]
 WantedBy=multi-user.target

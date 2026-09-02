@@ -147,15 +147,24 @@ holds:
 {
   "rates": {"<asset id>": 100000000},
   "relay_floor_rfa_per_kvb": 100,
-  "feerate_rfa_per_kvb": 1100,
-  "vsize": {"repay": 350, "…": 0}
+  "feerate_rfa_per_kvb": 2000,
+  "vsize": {"repay": 2000, "repay4": 600, "take": 3000, "…": 0}
 }
 ```
 
 `rates` is keyed by asset id and is empty when no node is configured.
 `relay_floor_rfa_per_kvb` is `null` when the node did not report one, rather
 than a guess presented as the node's number. Any asset with a rate can pay the
-fee; none is privileged.
+fee; none is privileged, and a fee is committed in the asset it is paid in —
+`atoms = ceil(rfa × 1e8 / rate)`, so a more valuable asset pays fewer atoms.
+
+`feerate_rfa_per_kvb` is what a composer should charge, well above the relay
+floor on purpose: a fee at exactly the floor stops relaying the moment its
+asset's rate drifts down between composition and inclusion. `vsize` is a
+conservative size estimate per flow, keyed by the name the composer asks under;
+the table is `VSIZE` in `pignus/fees.py`, and a flow it does not name has no
+estimate to price against. A rate is reference units per whole asset unit,
+scaled by `1e8`, which is what makes the formula above dimensionally sound.
 
 ### `GET /v1/vectors`
 
@@ -386,8 +395,11 @@ long as the take is within the watcher's scan depth.
 States: `UNCONFIRMED` (funding seen, not yet in a block), `LIVE` (funded to at
 least `min_depth` and unspent), `REPAID`, `LIQUIDATED`, `DEFAULTED`, `RECOVERED`
 (closed by that leaf), `SPENT_UNKNOWN` (spent by a witness this watcher could
-not name) and `GHOST` (the funding was undone by a Bitcoin-driven reorg). A
-misspelled state returns an empty list rather than an error.
+not name) and `GHOST` (the funding was undone by a Bitcoin-driven reorg).
+
+A misspelled `state` is a 400 whose body lists all eight. An empty list would
+read as "you have no loans" rather than "that is not a state", which is the one
+answer a caller cannot tell from the truth.
 
 ### `GET /v1/loans/{id}`
 
@@ -411,12 +423,14 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
   "maturity": 119000, "recover_after": 162200,
   "lender_prog": "…", "lender_ver": 1,
   "borrower_prog": "…", "borrower_ver": 0,
-  "oracle": "2-of-3",
+  "oracle": "2-of-3", "oracle_x": "…",
+  "oracle_keys": ["…", "…", "…"],
   "height": 118432, "past_maturity": false, "recover_open": false,
   "price": 300000000, "health": 1.6667, "ltv": 0.525,
   "liquidatable": false,
   "seizure_if_liquidated": 3675000, "surplus_if_liquidated": 6662991666,
   "spent_by": "", "spent_height": 0, "closed_confirmations": 0, "note": "",
+  "min_depth": 2,
  "funding_height": 118289, "funding_block": "…"
 }
 ```
@@ -426,7 +440,9 @@ a spend the watcher could not reach, and they are persisted with the record so a
 restart does not lose the distinction. `closed_confirmations` is how deep the
 CLOSE is, which is a different question from how deep the funding was: a
 repayment or a liquidation one block old can still be reorged out, and zero
-means either not closed at all or closed only in the mempool.
+means either not closed at all or closed only in the mempool. `min_depth` is the
+number both are counted towards, repeated on the loan so a reader is not made to
+fetch `/v1/markets` to learn what it is.
 
 `single_leaf` says which vault layout this loan lives in: a loan originated
 through a funded offer is in the single-leaf vault, a directly originated one is
@@ -498,7 +514,16 @@ say that price buys.
 `problems` is empty when everything the covenant enforces is visible and agrees;
 a non-empty entry names what could not be checked or did not add up. A borrower
 who was liquidated has no other way to see the price it happened at.
-`pignus-cli explain --loan <id>` prints exactly this.
+`pignus-cli explain --loan <id>` prints exactly this, and works from a terms
+file and a txid with no book involved.
+
+Two cases answer 200 with a short body rather than the whole account: the
+closing transaction is in neither the block this book recorded nor the mempool,
+and the transaction found there does not spend this vault. Both carry `loan_id`,
+`spent_by`, `height`, `exit` and a one-line `problems`, and nothing else. They
+are answers rather than errors — what the book knows, and why it cannot say
+more — so a reader that checks `problems` before the numbers handles them
+alongside a complete account.
 
 - 404 if there is no such loan, or it is still open, or this book never saw it
   close.
@@ -519,18 +544,33 @@ verifies again before acting. What is left for the relay to be wrong about is
 availability, which is the one thing a relay is allowed to be wrong about.
 
 The relay also recomputes rather than believes: it rebuilds the vault outpoint
-from the offer's own terms, rebuilds the reclaim sighash, and verifies the
-borrower's advance signature and the lender's adaptor signature before storing
-either.
+from the offer's own terms, rebuilds the reclaim sighash, and verifies both the
+borrower's advance signature and the lender's release against them before
+storing either.
 
-**Take statuses**, in order: `pending` (waiting for the lender's release),
-`signed` (the release is stored), `disbursed` (the principal is paid into the
-hashlock), `claimed-principal` (the borrower has opened it, publishing `w`),
-`live` (the collateral is in the vault), `claimed` (the lender has taken the
-repayment, publishing `t`), `refunded` (the lender took an unclaimed principal
-back). A `pending` take that nobody signs within half an hour stops holding its
-lot on the offer; one that has been signed holds its lot for good, because the
-lender has committed to it.
+**The handshake**, in order: `POST /v1/btc/take` (a borrower asks),
+`POST /v1/btc/hash` (the lender draws this loan's secret and publishes its
+hash), `POST /v1/btc/presig` (the borrower signs the one transaction that can
+move their collateral into the vault that hash implies) and
+`POST /v1/btc/adaptor` (the lender returns the release). Only after checking
+that release does the borrower broadcast anything. Everything past that point is
+a report of something already on a chain: `/disbursed`, `/claimed-principal`,
+`/upgraded`, `/repaid`, `/claimed`, `/refunded`.
+
+**Take statuses**, in order: `requested` (the borrower has asked; the lender has
+not drawn this loan's secret yet, so there is no vault), `reserved` (the hash is
+published and the vault is derivable), `pending` (the borrower's advance
+signature is stored, and the lender's release is what is waited on), `signed`
+(the release is stored), `disbursed` (the principal is paid into the hashlock),
+`claimed-principal` (the borrower has opened it, publishing `w`), `live` (the
+collateral is in the vault), `claimed` (the lender has taken the repayment,
+publishing `t`), `refunded` (the lender took an unclaimed principal back).
+
+`lots_left` on an offer is what a take holds against it. A take still `pending`
+after half an hour releases its lot, and a `signed` one whose collateral never
+appeared releases its lot after six hours: a borrower who asks and walks away
+must not hold a lender's offer shut. Every status past that holds its lot for
+good, because money is in flight by then.
 
 ### `GET /v1/btc/offers`
 
@@ -624,9 +664,11 @@ every other borrower's collateral.
 The relay stores it and serves it back, so a borrower can check that the hash
 their repayment will commit to came from the lender rather than from the relay.
 
-`200` moves the take to `status: "reserved"` and serves the `vault_txid` and
-`repayment_spk` that hash implies. `403` the signature is not the lender's.
-`409` the take already has a different hash.
+`200` is `{"ok": true, "take_id": "…"}` and moves the take to
+`status: "reserved"`, recording the `vault_txid` and the `repayment_spk` that
+hash implies — read them back from `GET /v1/btc/take/{id}`. `403` the signature
+is not the lender's. `409` the take already has a different hash. `400` the hash
+is not 32 bytes.
 
 ### `POST /v1/btc/presig`
 
@@ -655,19 +697,32 @@ lender.
 
 ### `POST /v1/btc/adaptor`
 
-The lender's responder returns the release. Body: `take_id`, `adaptor_point`,
-`payment_hash`, `adaptor_sig`, `auth`.
+The lender's release: an ordinary BIP340 signature over the transaction that
+returns the collateral to the borrower, which the borrower can check for
+themselves before committing anything.
 
-`auth` is the lender's signature over all three. The relay then verifies the
-adaptor signature itself against this loan's reclaim sighash before storing it,
-so a release that could never be completed is never handed to a borrower. The
-point and hash are drawn **per take**: one loan, one secret, so no borrower's
-release is completed by another borrower's repayment.
+```json
+{"take_id": "…", "release_sig": "<64-byte hex>",
+ "adaptor_point": "<32-byte hex>", "payment_hash": "<32-byte hex>",
+ "auth": "<64-byte hex>"}
+```
 
-Sets the take to `signed` and fills in its `repayment_spk`. 403 if `auth` is not
-the loan's lender, 409 if the take already holds a different release (a release
-cannot be replaced), 400 if the adaptor signature does not verify, 404 for an
-unknown take.
+The field is served back as both `release_sig` and `adaptor_sig`, and either is
+accepted on the way in. The second name is what the wire has always called it,
+from when this really was an adaptor signature; what it carries now is a plain
+release, and the older name is kept only so a client and a relay of different
+vintages still understand each other.
+
+`auth` is a BIP340 signature by the offer's `lender_x` over
+`tagged("pignus/btc-adaptor/1", canonical({take_id, adaptor_point,
+payment_hash, adaptor_sig}))`.
+
+The relay derives the vault from the take's own pre-vault outpoint and payment
+hash, rebuilds the reclaim transaction, and refuses a signature that does not
+verify against it. `200` moves the take to `status: "signed"` and serves the
+`vault_txid` it derived. `403` the reply is not the lender's. `409` the take has
+no advance signature yet, the release is for a different payment hash, or one is
+already stored. `400` the signature does not verify.
 
 ### `POST /v1/btc/disbursed`, `/upgraded`, `/claimed`, `/refunded`
 
@@ -705,6 +760,16 @@ the key the take names.
 canonical({take_id, txid, vout}))`.
 
 `200` on either. `403` the signature is not the borrower's. `404` no such take.
+
+# `pignus-oracle`
+
+Everything the oracle serves is a read. The ones that go to disk for it —
+`/v1/log/raw`, `/v1/seizures`, `/v1/seizure/{sighash}`,
+`/v1/attestation/{market}/at/{ts}`, and `/v1/log` whenever `since`, `until` or
+`cursor` sends it to the archive — are limited to one request a second per
+address with a burst of ten, and answer 429 over that. An auditor's query is
+cheap once and expensive in a loop, and this process has signing to do.
+Everything else comes out of memory and is not limited.
 
 ## Endpoints
 

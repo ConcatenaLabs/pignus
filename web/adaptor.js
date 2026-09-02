@@ -131,6 +131,14 @@ function concat(...parts) {
 }
 
 export function selfTest(v) {
+  // The plain verifier first: it is what a borrower checks the lender's
+  // release with before committing any Bitcoin.
+  if (v.plain) {
+    if (!verifySchnorr(v.plain.pubkey_x, v.plain.msg, v.plain.sig))
+      throw new Error("adaptor.js cannot verify the golden BIP340 signature");
+    if (verifySchnorr(v.plain.pubkey_x, v.plain.other_msg, v.plain.sig))
+      throw new Error("adaptor.js accepts a signature over the wrong message");
+  }
   if (!verifyAdaptor(v.lender_x, v.msg, v.adaptor_point_x, v.adaptor_sig))
     throw new Error("adaptor.js failed to verify the golden adaptor signature");
   if (verifyAdaptor(v.lender_x, v.bad_msg, v.adaptor_point_x, v.adaptor_sig))

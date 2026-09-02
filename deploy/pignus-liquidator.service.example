@@ -30,9 +30,12 @@ Environment=PYTHONUNBUFFERED=1
 # the command line: `ps` is readable by every user on the box, and this process
 # runs for the life of the book.
 # The url is the one pignusd already talks to; the cookie is the .cookie file
-# in the node's own data directory.
+# in the node's own data directory -- replace the path below with it. A
+# placeholder with a space in it is not one: systemd splits an Environment=
+# value on whitespace and drops the line with a warning, and the bot then looks
+# for the node's cookie in the wrong place.
 Environment=PIGNUS_RPC_URL=http://127.0.0.1:18200
-Environment=PIGNUS_RPC_COOKIE=<node datadir>/.cookie
+Environment=PIGNUS_RPC_COOKIE=/path/to/the/node/datadir/.cookie
 #
 # --book is where the live loans come from, re-read every round, so a loan taken
 #   while this runs is watched too.
@@ -65,7 +68,19 @@ RestartSec=30
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+# ProtectSystem=full leaves /root untouched, and /root is where the checkout,
+# the node source and the node's cookie file live, so on its own it protects
+# nothing this bot reaches for. /root is mounted read-only instead, and NO
+# directory has to stay writable: the bot keeps no state of its own, holds no
+# key, and every coin it moves is signed by the node wallet over RPC. So there
+# is no ReadWritePaths here, and adding one would only widen it.
 ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
 
 [Install]
 WantedBy=multi-user.target

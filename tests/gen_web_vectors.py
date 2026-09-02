@@ -147,6 +147,15 @@ def adaptor_vectors():
         "adaptor_sig": asig.hex(),
         "completed_sig": A.decrypt(asig, t).hex(),
         "bad_msg": _fixed("pignus/web-vectors/other-message").hex(),
+        # A plain BIP340 signature, because that is what a borrower checks a
+        # release with now. Without a case here, the one function standing
+        # between them and their collateral is pinned to nothing.
+        "plain": {
+            "pubkey_x": A.xonly_pubkey(lender_sec).hex(),
+            "msg": msg.hex(),
+            "sig": A.sign(lender_sec, msg).hex(),
+            "other_msg": _fixed("pignus/web-vectors/other-message").hex(),
+        },
     }
 
 

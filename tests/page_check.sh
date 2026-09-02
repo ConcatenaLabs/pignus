@@ -15,15 +15,27 @@
 # is where Playwright puts one, and the check SKIPS rather than fails when there
 # is none, because a browser is not something a checkout can be assumed to have.
 #
+# A skip that exits 0 is a check that reports success without checking anything,
+# so it says so in as many words -- and anywhere a browser IS guaranteed, set
+# PIGNUS_REQUIRE_CHROME=1 and a missing one is a failure instead. A runner that
+# is meant to cover the page should set it; otherwise the day the browser stops
+# being installed is the day this stops testing and nothing says so.
+#
 #   tests/page_check.sh
+#   PIGNUS_REQUIRE_CHROME=1 tests/page_check.sh
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
 CHROME="${PIGNUS_CHROME:-$HOME/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome}"
 if [ ! -x "$CHROME" ]; then
-    echo "no headless browser at $CHROME; skipping the page check"
+    echo "no headless browser at $CHROME"
     echo "(set PIGNUS_CHROME to one, or install Playwright's chromium)"
+    if [ -n "${PIGNUS_REQUIRE_CHROME:-}" ]; then
+        echo "PIGNUS_REQUIRE_CHROME is set, so this is a FAILURE"
+        exit 1
+    fi
+    echo "SKIPPED: the page was not checked in a browser at all"
     exit 0
 fi
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily Pignus backup
+Documentation=https://github.com/ConcatenaLabs/pignus
+
+[Timer]
+OnCalendar=daily
+# A box that was off at midnight still gets its backup when it comes up, rather
+# than skipping the day silently.
+Persistent=true
+# Nothing here is urgent to the minute, and an hour of slack lets systemd batch
+# this with whatever else the box wakes for.
+AccuracySec=1h
+
+[Install]
+WantedBy=timers.target

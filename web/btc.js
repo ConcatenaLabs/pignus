@@ -138,9 +138,18 @@ export function twoOfTwo(aX, bX) {
                 Uint8Array.of(OP.CHECKSIG));
 }
 export function timelockedSingle(locktime, keyX) {
-  const n = scriptNum(locktime);
-  return concat(concat(Uint8Array.of(n.length), n),
-                Uint8Array.of(OP.CLTV, OP.DROP), push(keyX), Uint8Array.of(OP.CHECKSIG));
+  // 1..16 are the small-integer opcodes, not one-byte pushes. Every realistic
+  // locktime is far above 16, so this branch is unreachable in practice -- and
+  // that is exactly why it is here: an encoding that differs from the Python
+  // only for values nobody uses is a divergence nothing would ever catch, in
+  // code whose whole job is to agree byte for byte.
+  const push0to16 = (v) => Uint8Array.of(v === 0 ? 0x00 : 0x50 + v);
+  const head = (Number.isInteger(locktime) && locktime >= 0 && locktime <= 16)
+    ? push0to16(locktime)
+    : (() => { const n = scriptNum(locktime);
+               return concat(Uint8Array.of(n.length), n); })();
+  return concat(head, Uint8Array.of(OP.CLTV, OP.DROP), push(keyX),
+                Uint8Array.of(OP.CHECKSIG));
 }
 
 // ---------------------------------------------------------------- the loan

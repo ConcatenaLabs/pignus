@@ -200,8 +200,17 @@ branch left on one laptop is invisible to every other machine and to the box.
 Tier B (borrow a Sequentia asset against real Bitcoin) is NOT a covenant loan
 and does not behave like one. Bitcoin has no introspection, so none of the loan
 covenant runs there: the collateral is a plain Bitcoin taproot UTXO, the debt is
-on Sequentia, and the two are bound by a BIP340 adaptor signature. Consequences
-worth keeping straight:
+on Sequentia, and the two are bound by **one hash carried in both chains'
+scripts**. The Bitcoin vault's RECLAIM leaf is `SHA256 <h> EQUALVERIFY
+<borrower> CHECKSIGVERIFY <lender> CHECKSIG`, and `h` is the same hash the
+Sequentia repayment output uses, so the lender can only take the repayment by
+publishing the secret that also releases the collateral. That hash IS the
+binding, and it is deliberately not an adaptor signature: nothing a borrower can
+run proves that `SHA256(t) = h` and `t·G = T` are about the same `t`, so a
+lender who published an unrelated `h` would take the repayment and keep the
+collateral. The lender's half of RECLAIM is handed over at origination as an
+ordinary signature the borrower verifies; do not turn it back into an adaptor
+one. Consequences worth keeping straight:
 
 - **The lender cannot be offline.** A funded covenant offer lets the lender walk
   away because the script reconstructs everything; the Bitcoin side cannot, so
@@ -210,22 +219,33 @@ worth keeping straight:
   (`pignus-cli btc-respond`, `deploy/pignus-btc-responder.service`); the
   borrower's half is the page.
 - **A borrower does all of it in the browser.** `web/btc.js` (Bitcoin taproot:
-  address, BIP341 sighash, witness, the pre-vault) and `web/adaptor.js` (adaptor
-  verify + decrypt) are faithful ports of `pignus/btcscript.py` and
-  `pignus/adaptor.py`, pinned byte-for-byte to `web/btc_vectors.json` /
-  `web/adaptor_vectors.json` before they derive anything. Regenerate those with
-  `tests/gen_web_vectors.py`, only when the Python changes, in the same commit,
-  and re-run `test_btc_web.mjs` / `test_adaptor_web.mjs`.
+  address, BIP341 sighash, witness, the pre-vault) and `web/adaptor.js` (BIP340
+  verification, which is what the borrow flow uses, plus the adaptor verify and
+  decrypt that mirror the Python) are faithful ports of `pignus/btcscript.py`
+  and `pignus/adaptor.py`, pinned
+  byte-for-byte to `web/btc_vectors.json` / `web/adaptor_vectors.json` before
+  they derive anything. Regenerate those with `tests/gen_web_vectors.py`, only
+  when the Python changes, in the same commit, and re-run `test_btc_web.mjs` /
+  `test_adaptor_web.mjs`.
 - **Both Sequentia legs are signature-free**, and that is load-bearing rather
   than elegant. The principal and the repayment are paid into
   `build_hashlock_leaf` outputs: a pinned payee, opened by publishing a secret.
   The wallet extension can sign its own inputs and a Bitcoin sighash, but no
   covenant leaf -- so a leg that needed one could not be settled from a browser
   at all. Keep it that way.
-- **The SWK wasm's `adaptorSign` is a DIFFERENT scheme** (the DEX swap spec),
-  not interoperable with `pignus/adaptor.py`. Do not wire it into the Pignus
-  flow. A browser LENDER would still need the CLI: the lender draws the secrets,
-  and drawing a secret in a page means storing it in a browser.
+- **Adaptor signatures live in `pignus/dlc.py` only**, the maturity-settlement
+  path, which funds its own two-leaf output and is wired into no command and no
+  page. The loan path has none. The SWK wasm's `adaptorSign` is a DIFFERENT
+  scheme again (the DEX swap spec), not interoperable with `pignus/adaptor.py`;
+  do not wire it into anything here. A browser LENDER would still need the CLI:
+  the lender draws the secrets, and drawing a secret in a page means storing it
+  in a browser.
+- **The handshake is ask, hash, pre-sign, release, fund, and that order is
+  forced.** The vault's address commits to `h`, so the borrower cannot sign the
+  move out of the pre-vault until the lender has drawn the secret, and the
+  lender will not release until that signature exists. Anything that derives a
+  vault address before the hash is known is wrong -- there is no vault yet, and
+  the builders refuse rather than guess.
 - **Origination is atomic, and the order is the whole argument.** The collateral
   goes into a pre-vault the borrower can abort; the lender pays the principal
   into an output only the borrower can open; opening it publishes `w`, which is

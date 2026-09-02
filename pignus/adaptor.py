@@ -1,19 +1,22 @@
 # Copyright (c) 2026 The Sequentia developers
 # Distributed under the MIT software license.
-"""Schnorr adaptor signatures: the link that makes two chains settle together.
+"""BIP340 signing, and Schnorr adaptor signatures for the DLC.
 
-A BTC-collateralised loan has its collateral on Bitcoin and its debt on
-Sequentia, and the two have to move as one act. An adaptor signature is what
-makes that possible without trusting anyone: the lender hands the borrower a
-signature on the BTC-release transaction that is INCOMPLETE, missing exactly one
-scalar `t`. The borrower cannot use it. When the lender later claims the
-repayment on Sequentia -- which they can only do by revealing `t` -- the borrower
-reads `t` off the chain, completes the signature, and takes the collateral back.
+Two different things live here, and only one of them is used by a loan.
 
-So repaying and getting the collateral back are the same event. If the lender
-never claims, the borrower's repayment refunds on a timelock and the lender takes
-the collateral on theirs: the loan unwinds, and neither side can strand the
-other. The lender is strictly worse off for stalling, which is why they do not.
+The plain half -- `new_secret`, `point`, `xonly_pubkey`, `sign`, `verify` -- is
+the BIP340 the whole cross-chain tier runs on: the lender's release, the
+borrower's advance signature, and every signed message the relay carries.
+
+The adaptor half is used ONLY by `dlc.py`, the maturity-settlement path. It was
+once the loan's cross-chain link too, and that was wrong: an adaptor binds a
+signature to a POINT `T = t*G`, while the Sequentia side of a loan opens against
+a HASH, and nothing can check that a point and a hash came from one secret. A
+lender could publish an unrelated hash and take the repayment and the
+collateral both. A loan is now bound by one hash in both chains' scripts, where
+there is nothing left to assert. In a DLC there is no second commitment to
+disagree with -- each contract transaction is encrypted to the oracle's own
+attestation point -- so the adaptor is exactly right there.
 
 The construction, and where the parity traps are
 -----------------------------------------------

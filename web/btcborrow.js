@@ -5,7 +5,8 @@
 //
 // Bitcoin has no covenants, so none of the loan covenant runs on the parent
 // chain: the collateral is a plain taproot output there, the debt lives on
-// Sequentia, and the two are bound by an adaptor signature. What that costs is
+// Sequentia, and the two are bound by one hash in both chains' scripts. The
+// cost is
 // an interactive lender -- the two-party handshake here -- and what it buys is
 // collateral that is real Bitcoin rather than a token standing in for it.
 //
@@ -100,6 +101,11 @@ export function offerProblems(loan) {
     problems.push("this offer lends nothing.");
   if (loan.principal && BigInt(loan.principal) > BigInt(loan.debt))
     problems.push("this offer would pay out more than it asks back.");
+  if (!BigInt(loan.strike || 0))
+    problems.push("this offer names no price for a seizure, so there would be " +
+      "nothing to hold the lender and the oracle to if they took the " +
+      "collateral. A seizure here is the two of them signing together, not a " +
+      "script computing anything.");
   return problems;
 }
 
@@ -198,8 +204,21 @@ export async function borrow(wallet, offer, ui) {
     throw new Error("your wallet gave no Sequentia address to be paid at, so " +
       "there is nowhere for the principal to go. Reconnect and try again.");
 
-  const w_seq = Number(offer.w_seq || 0);
+  // A nonce per TAKE, not per offer. Two loans against one offer with the same
+  // secret would mean the lender, holding the secret the first loan published,
+  // could move the second borrower's collateral into a vault they had not paid
+  // for. It is posted with the take and served back, so the wallet can derive
+  // the same secret again on another machine.
+  const w_seq = Math.floor(Math.random() * 0x7fffffff);
   const secret = await deriveSecret(wallet, offer.btc_offer_id, borrower_x, w_seq);
+  // The whole recovery story rests on this signature being the same every
+  // time. Check it here, once, rather than discovering on the day that a
+  // borrower cannot open their own principal.
+  const again = await deriveSecret(wallet, offer.btc_offer_id, borrower_x, w_seq);
+  if (hex(again) !== hex(secret))
+    throw new Error("this wallet signs differently every time, so the secret " +
+      "that opens your principal could not be derived again. Do not start a " +
+      "loan from it: use pignus-cli, which keeps the secret in a file.");
   const loan = {
     ...offer.loan,
     borrower_x,
@@ -288,7 +307,8 @@ export async function borrow(wallet, offer, ui) {
   // here would still pass because it would be checking the relay's own numbers.
   const reclaimSighash = hex(btc.reclaimSighash(
     live, vaultTxid, 0, toBytes(reclaimSpk), reclaimFee));
-  if (!badaptor.verifySchnorr(live.lender_x, reclaimSighash, signed.adaptor_sig))
+  const releaseSig = signed.release_sig || signed.adaptor_sig;
+  if (!badaptor.verifySchnorr(live.lender_x, reclaimSighash, releaseSig))
     throw new Error("the lender's release does not verify against this loan. " +
       "Refusing to commit any Bitcoin.");
 
@@ -306,7 +326,7 @@ export async function borrow(wallet, offer, ui) {
     upgrade_presig: presig,
     reclaim_spk: reclaimSpk,
     reclaim_fee: reclaimFee,
-    release_sig: signed.adaptor_sig,
+    release_sig: releaseSig,
     status: "funded",
   };
   rememberLoan(rec);
@@ -411,8 +431,8 @@ export async function repay(wallet, rec, ui) {
  * Take the collateral back once the lender has claimed the repayment.
  *
  * The claim publishes `t` on Sequentia; `t` completes the release the lender
- * signed at origination. It is checked against the loan's own adaptor point
- * before use, and the claim must be buried first: Sequentia reorgs when Bitcoin
+ * signed at origination. The secret is checked against the hash this loan's
+ * own scripts commit to, and the claim that published it must be buried first: Sequentia reorgs when Bitcoin
  * reorgs, and spending Bitcoin on a secret a reorg could undo is how a borrower
  * loses both sides.
  */
@@ -538,8 +558,12 @@ export async function recoverLoans(wallet, ui) {
       vault_txid: t.vault_txid ?? was.vault_txid,
       // The relay calls the lender's release `adaptor_sig` on the wire; it is
       // an ordinary signature, and the record here calls it what it is.
-      release_sig: t.adaptor_sig ?? was.release_sig,
-      status: t.status || was.status || "funded",
+      release_sig: t.release_sig ?? t.adaptor_sig ?? was.release_sig,
+      // The relay's status never moves a loan BACKWARDS. It does not know
+      // what this borrower has done -- a repayment it has not been told about,
+      // a principal just claimed -- and letting it overwrite that would offer
+      // somebody the Repay button twice.
+      status: laterOf(was.status, t.status),
     };
     local.set(t.take_id, rec);
     rememberLoan(rec);
@@ -548,15 +572,41 @@ export async function recoverLoans(wallet, ui) {
 }
 
 /** What the borrower can do with a loan right now, and what it is waiting for. */
+// How far along a loan is, so two views of it can be compared. The relay knows
+// the lender's steps; this browser knows the borrower's; neither knows both.
+const ORDER = ["requested", "reserved", "pending", "signed", "funded",
+               "disbursed", "claimed-principal", "claimed", "live", "repaid",
+               "reclaimed", "refunded", "aborted"];
+
+function laterOf(a, b) {
+  const ia = ORDER.indexOf(a || ""), ib = ORDER.indexOf(b || "");
+  if (ia < 0) return b || a || "funded";
+  if (ib < 0) return a;
+  return ia >= ib ? a : b;
+}
+
 export function nextStep(rec, heights) {
   const l = rec.loan || {};
   switch (rec.status) {
+    case "requested":
+    case "reserved":
+    case "pending":
+      return { action: null, label: "",
+               note: "Waiting for the lender to finish opening this loan. " +
+                     "Nothing of yours is committed yet." };
     case "funded":
-      return { action: "claim", label: "Claim the principal",
-               note: "Your collateral is committed. Taking the principal is " +
-                     "what starts the loan." };
     case "signed":
-      return { action: "claim", label: "Claim the principal", note: "" };
+      return { action: null, label: "",
+               note: "Your collateral is committed. The lender pays the " +
+                     "principal next; you claim it, and claiming it is what " +
+                     "starts the loan. If it never comes you can take the " +
+                     "collateral back after Bitcoin block " +
+                     Number(l.abort_after).toLocaleString() + "." };
+    case "disbursed":
+      return { action: "claim", label: "Claim the principal",
+               note: "The principal is waiting in an output only you can " +
+                     "open. Taking it is what starts the loan." };
+    case "claimed-principal":
     case "claimed":
       // The principal has been taken but the collateral has not moved into the
       // vault yet. Repaying now would pay for a loan that has not started, and
@@ -565,6 +615,12 @@ export function nextStep(rec, heights) {
                note: "You have the principal. The lender starts the loan by " +
                      "moving your collateral into its vault, which is theirs " +
                      "to do and takes a confirmation or two." };
+    case "refunded":
+      return { action: "abort", label: "Take the collateral back",
+               note: "The principal went back to the lender unclaimed, so " +
+                     "there is no loan. Your collateral is abortable from " +
+                     "Bitcoin block " +
+                     Number(l.abort_after).toLocaleString() + "." };
     case "live":
       return { action: "repay", label: "Repay",
                note: "Repay before Sequentia block " +

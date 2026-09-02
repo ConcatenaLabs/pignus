@@ -606,9 +606,10 @@ function renderIntro() {
   const cols = uniq(lendable.map(m => m.collateral_ticker));
   const list = (xs) => xs.length === 1 ? esc(xs[0])
     : esc(xs.slice(0, -1).join(", ")) + " or " + esc(xs[xs.length - 1]);
-  const cross = state.markets.some(m => m.cross_chain);
-  el.innerHTML = `Borrow ${list(debts)} against ${list(cols)}` +
-    (cross ? ", or against native Bitcoin." : ".");
+  // Only the covenant tiers belong in this sentence: the one after it says
+  // what the network enforces, and that claim is false on the parent chain.
+  // Native Bitcoin has its own sentence, which stays put.
+  el.innerHTML = `Borrow ${list(debts)} against ${list(cols)}.`;
 }
 
 /** How old a market's newest verified attestation is, in plain words. */
@@ -852,7 +853,7 @@ function wireExits(box, rows) {
     const l = rows.find(r => (r.loan_id || r.txid) === id);
     if (!l) { el.innerHTML = ""; return; }   // the list moved under the fetch
     try {
-      const html = exitBlock(await api(`v1/loan/${encodeURIComponent(id)}/exit`),
+      const html = exitBlock(await api(`v1/loans/${encodeURIComponent(id)}/exit`),
                              JSON.parse(l.terms));
       _exits.set(id, html);
       el.innerHTML = html;
@@ -1658,7 +1659,12 @@ async function seize(l, atMaturity) {
         throw new Error("none of this loan's oracles have a verifiable " +
                         "attestation right now; the covenant would refuse it.");
     } else {
-      single = await api(`v1/attestation/${market}`);
+      // Ask for THIS LOAN'S oracle by name. Unqualified, the book serves
+      // whichever key it currently calls primary, and a loan baked to an
+      // older key -- which is every loan taken before a rotation -- would be
+      // handed an attestation its own covenant will not accept.
+      single = await api(`v1/attestation/${market}` +
+        (t.oracle_x ? `?oracle=${encodeURIComponent(t.oracle_x)}` : ""));
       // Verify the SIGNATURE against the key THIS LOAN bakes in, and the price
       // SCALE against the one it computes at. The oracle is trusted for a
       // number and never for the transport that carried it, a loan only
@@ -1781,6 +1787,30 @@ async function lend(ev) {
 // the book, the heights both chains are at, and a fee this user chose.
 
 /**
+ * How deep a Sequentia transaction is, read off the chain.
+ *
+ * The relay says which transaction published the secret; it must not also be
+ * the one that says how buried it is. The whole reason for waiting is that a
+ * Bitcoin reorg can undo it, and a relay that could report the depth could
+ * report six.
+ *
+ * The book's node keeps no transaction index, so a transaction is found
+ * through an output it still holds: `v1/outpoint` answers for any unspent one,
+ * mempool included, and every output of one transaction is the same depth. A
+ * transaction whose outputs have all been spent again answers nothing and
+ * reads as zero, which keeps a borrower waiting rather than spending Bitcoin
+ * on a secret that could still be undone.
+ */
+async function confirmations(txid, maxVout = 4) {
+  if (!/^[0-9a-f]{64}$/i.test(String(txid || ""))) return 0;
+  for (let vout = 0; vout < maxVout; vout++) {
+    const got = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
+    if (got) return Number(got.confirmations || 0);
+  }
+  return 0;
+}
+
+/**
  * What btcborrow.js needs from the page.
  *
  * `flow` picks the fee estimate, and `prefer`/`committed` keep the choice
@@ -1805,13 +1835,19 @@ function btcUi({ flow = "btcrepay", prefer = [], committed = {} } = {}) {
     },
     payoutProgram: async () => state.payout,
     heights: async () => ({ btc: state.btcHeight, seq: state.height }),
+    confirmations,
     btcHrp: btcHrp(),
     addressToSpk: async (addr) => programFromAddress(addr).spk,
     utxos: async () => state.utxos,
     changeSpk: async () => state.payout.spk,
     feeRates: async () => {
       const f = feeFor(flow, prefer, committed);
-      return { asset: f.asset, atoms: f.atoms, dust: dustFor(f.asset) };
+      // `estimated` says the book publishes no size for this flow and the fee
+      // was priced at the largest size it does publish, so a screen that draws
+      // its own confirmation can say so rather than charging for a guess in
+      // silence.
+      return { asset: f.asset, atoms: f.atoms, dust: dustFor(f.asset),
+               estimated: !!feeVsize(flow)?.estimated };
     },
   };
 }
@@ -1837,6 +1873,17 @@ function needBtcHeight() {
 
 async function runBtcBorrow(off) {
   if (needWallet() || needBtcHeight()) return;
+  // The Bitcoin code derives the address real collateral is sent to. If it
+  // could not reproduce the golden vectors, it does not get to say where.
+  if (!state.btcPinned) {
+    note("This page could not check its own Bitcoin code against the vectors "
+         + "the node's builders emit"
+         + (state.btcWhy ? ` (${esc(state.btcWhy)})` : "")
+         + ", so it will not tell your wallet where to send collateral. "
+         + "Reload; if it persists, this deployment is broken and "
+         + "<code>pignus-cli btc-offer-take</code> is the way in.", "bad");
+    return;
+  }
   try {
     const l = off.loan;
     const principal = BigInt(l.principal || 0) || BigInt(l.debt);
@@ -2042,34 +2089,78 @@ async function checkBtc(ev) {
   catch (e) { say("bad", "That ticket is not valid JSON: " + esc(e.message)); return; }
   try {
     let filled = "";
-    if (loan.borrower_x === undefined && state.wallet
+    if (!loan.borrower_x && state.wallet
         && await btcborrow.walletCanBtc(state.wallet)) {
       loan.borrower_x = (await state.wallet.request("getBtcPublicKey", {})).pubkey_x;
       filled = "<p class=\"hint\">The ticket carried no <code>borrower_x</code>, so " +
                "this used your wallet's own Bitcoin key.</p>";
     }
+    // `payment_hash` is the whole of the cross-chain binding: the same hash
+    // stands in the Bitcoin vault's RECLAIM leaf and in the Sequentia
+    // repayment output, so the secret that pays the lender here is the secret
+    // that releases the collateral there. A ticket without it describes
+    // nothing that can be checked.
     const need = ["btc_amount", "lender_x", "oracle_x", "recover_after",
-                  "debt_asset", "debt", "repay_deadline", "adaptor_point",
-                  "payment_hash", "borrower_x"];
-    const missing = need.filter(k => loan[k] === undefined);
+                  "debt_asset", "debt", "repay_deadline", "payment_hash",
+                  "borrower_x", "lender_prog", "borrower_prog"];
+    // An empty string counts as missing: a ticket at the proposed stage
+    // carries the borrower's fields as blanks, and a blank program would
+    // derive an address rather than fail, which is the worse outcome.
+    const missing = need.filter(k => loan[k] === undefined || loan[k] === null
+                                     || loan[k] === "");
     if (missing.length)
       throw new Error("the ticket is missing: " + missing.join(", ") +
                       (missing.includes("borrower_x")
                         ? " — paste a prepared ticket (from pignus-cli " +
                           "btc-prepare), or connect your wallet and this page " +
-                          "reads your Bitcoin key itself" : ""));
+                          "reads your Bitcoin key itself" : "") +
+                      (missing.includes("payment_hash")
+                        ? " — the hash both chains commit to only exists once " +
+                          "the lender has drawn this loan's secret, so a ticket " +
+                          "that has not been back to them yet cannot be checked "
+                          + "here" : ""));
     const fundingSpk = pig._internals.bytesToHex(btc.fundingSpk(loan));
     const repaySpk = pig._internals.bytesToHex(btc.repaymentSpk(loan));
     const fundingAddr = btc.fundingAddress(loan, btcHrp());
     const repayAddr = btc.segwitAddress(1, pig._internals.hexToBytes(repaySpk.slice(4)),
                                         seqHrp());
     const rdOk = state.height == null || Number(loan.repay_deadline) > state.height;
+    // Collateral is never paid into the vault by hand. It goes into the
+    // PRE-VAULT, which the borrower alone can take back after `abort_after`,
+    // and it moves on only when claiming the principal publishes `w`. A ticket
+    // that describes that origination gets both addresses, in the order they
+    // are used, so nobody funds the second one.
+    let preAddr = "", preSpk = "", preValue = 0n, principalAddr = "";
+    try {
+      preSpk = pig._internals.bytesToHex(btc.prevaultSpk(loan));
+      preAddr = btc.prevaultAddress(loan, btcHrp());
+      preValue = btc.prevaultValue(loan);
+    } catch { /* an older ticket with no abortable origination */ }
+    try {
+      if (loan.h_w && loan.d_refund)
+        principalAddr = btc.segwitAddress(1, btc.disbursementSpk(loan).slice(2),
+                                          seqHrp());
+    } catch { /* the principal's own address needs the abort deadlines too */ }
+    // The vault's outpoint is not a fact to be taken from the ticket: it
+    // follows from the pre-vault the collateral goes into and from the terms
+    // themselves. Derive it, and if the ticket also states one, they must
+    // agree -- a ticket that names some other vault is one the lender's
+    // release does not cover.
+    let vaultTxid = "";
+    if (loan.prevault_txid)
+      try { vaultTxid = btc.upgradeTx(loan, loan.prevault_txid,
+                                      Number(loan.prevault_vout || 0)).txid(); }
+      catch { /* not enough of a ticket to name the vault */ }
     // The same checks the automated path makes before it commits any Bitcoin:
     // what the offer says on its face, and whether its two chains' deadlines
     // leave everybody the time they need.
     const problems = btcborrow.offerProblems(loan).concat(
       state.btcHeight != null && state.height != null
         ? btcborrow.timelockProblems(loan, state.btcHeight, state.height) : []);
+    if (vaultTxid && loan.vault_txid && loan.vault_txid !== vaultTxid)
+      problems.push("this ticket's vault does not follow from its own " +
+                    "pre-vault and terms, so something in it has been altered " +
+                    "since it was prepared.");
     let lines = filled;
     if (problems.length)
       lines += `<p class="tag bad">Do not fund this.</p><ul>` +
@@ -2079,31 +2170,47 @@ async function checkBtc(ev) {
         deadlines below could not be checked against the Bitcoin chain; compare
         them yourself in a Bitcoin explorer.</p>`;
     lines += `<p><strong>These terms compile to:</strong></p><div class="kv">
-      <span class="k">Bitcoin funding address</span><span>${esc(fundingAddr)}<br><span class="mono">${fundingSpk}</span></span>
+      ${preAddr ? `<span class="k">Bitcoin pre-vault — pay this one</span><span>${esc(preAddr)}<br><span class="mono">${preSpk}</span><br><span class="small">exactly ${(Number(preValue)/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC: the collateral plus the fee for the one transaction that moves it on. Yours alone to take back after Bitcoin block ${Number(loan.abort_after).toLocaleString()}.</span></span>` : ""}
+      <span class="k">Bitcoin loan vault</span><span>${esc(fundingAddr)}<br><span class="mono">${fundingSpk}</span>${preAddr
+        ? '<br><span class="small">Do NOT pay this address. The collateral reaches it only through the pre-vault, when claiming the principal publishes the secret that releases it.</span>' : ""}</span>
+      ${principalAddr ? `<span class="k">Where the principal waits</span><span>${esc(principalAddr)}<br><span class="small">claiming it is what starts the loan; until you do, nothing is lent and nothing is locked.</span></span>` : ""}
       <span class="k">Sequentia repayment address</span><span>${esc(repayAddr)}<br><span class="mono">${repaySpk}</span></span>
       <span class="k">Collateral</span><span>${(Number(BigInt(loan.btc_amount))/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC</span>
       <span class="k">Debt</span><span>${units(loan.debt, loan.debt_asset)} ${esc(meta(loan.debt_asset).ticker)}</span>
+      <span class="k">Both chains' shared secret</span><span class="mono">${esc(loan.payment_hash)}</span>
       <span class="k">Repay deadline</span><span>Sequentia block ${Number(loan.repay_deadline).toLocaleString()}${state.height == null ? ""
         : rdOk ? ` — in the future (now block ${Number(state.height).toLocaleString()})`
         : ` — <b>ALREADY PAST</b> (now block ${Number(state.height).toLocaleString()}): the lender's Sequentia refund is open, so do not fund`}</span>
       <span class="k">Lender sweep</span><span>Bitcoin block ${Number(loan.recover_after).toLocaleString()} — this page cannot see the Bitcoin height; confirm in a Bitcoin explorer that it is well after your repayment deadline</span>
-      </div>`;
-    // If the ticket has a funding outpoint + reclaim dest + the lender's
-    // adaptor sig, check the release the borrower would rely on.
-    if (loan.funding_txid && loan.reclaim_dest && loan.adaptor_sig) {
+      </div>
+      <p class="hint">That one hash stands in the Bitcoin vault's reclaim leaf and
+      in the Sequentia repayment output above. It is the whole of the binding
+      between the two chains: the secret that pays the lender their money is the
+      secret that hands your Bitcoin back.</p>`;
+    // The release the lender hands over at origination is an ordinary
+    // signature now, so it can be checked outright rather than taken on trust.
+    // It commits to one exact reclaim transaction spending the VAULT, whose
+    // outpoint is fixed before any Bitcoin moves. The DERIVED vault is checked
+    // against first: a release that only verifies against the ticket's own
+    // claim about where the collateral will sit verifies nothing.
+    const release = loan.release_sig || loan.adaptor_sig;
+    const against = vaultTxid || loan.vault_txid || loan.funding_txid || "";
+    if (against && loan.reclaim_dest && release) {
       const sh = pig._internals.bytesToHex(btc.reclaimSighash(loan,
-        loan.funding_txid, loan.funding_vout || 0,
+        against, vaultTxid ? 0 : (loan.vault_vout ?? loan.funding_vout ?? 0),
         pig._internals.hexToBytes(loan.reclaim_dest), loan.reclaim_fee || 3000));
-      const ok = state.adaptorPinned && badaptor.verifyAdaptor(
-        loan.lender_x, sh, loan.adaptor_point, loan.adaptor_sig);
+      const ok = state.adaptorPinned
+        && badaptor.verifySchnorr(loan.lender_x, sh, release);
       lines += ok
-        ? `<p class="tag ${rdOk ? "ok" : "bad"}" style="margin-top:10px">The lender's release signature verifies for this reclaim: once you learn the secret you can reclaim the collateral to the address in <code>reclaim_dest</code>.</p>` +
+        ? `<p class="tag ${rdOk ? "ok" : "bad"}" style="margin-top:10px">The lender's release signature verifies for this reclaim: once the lender takes your repayment, the secret they publish completes it and the collateral comes back to the address in <code>reclaim_dest</code>.</p>` +
           (rdOk
-            ? `<p class="hint">This page cannot see Bitcoin. Before funding, confirm in a Bitcoin explorer that the funding transaction pays exactly ${(Number(BigInt(loan.btc_amount))/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC to the funding address above at <code>${esc(loan.funding_txid)}:${Number(loan.funding_vout || 0)}</code>, and that the lender's sweep height is well after your repayment deadline. The lender pays the principal only after your collateral confirms.</p>`
+            ? `<p class="hint">This page cannot see Bitcoin. Before funding, confirm in a Bitcoin explorer that your funding transaction pays ${preAddr
+                ? `exactly ${(Number(preValue)/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC to the pre-vault address above`
+                : `exactly ${(Number(BigInt(loan.btc_amount))/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC to the vault address above`}, and that the lender's sweep height is well after your repayment deadline. The lender pays the principal only after your collateral confirms.</p>`
             : `<p class="hint">The repayment deadline has already passed, so do not fund this whatever else checks out.</p>`)
         : `<p class="tag bad" style="margin-top:10px">The lender's release signature does NOT verify. Do not fund — the release could be worthless.</p>`;
     } else {
-      lines += `<p class="hint" style="margin-top:10px">Add <code>funding_txid</code>, <code>reclaim_dest</code> and the lender's <code>adaptor_sig</code> to also check the release before you fund.</p>`;
+      lines += `<p class="hint" style="margin-top:10px">Add <code>prevault_txid</code> (or <code>vault_txid</code>), <code>reclaim_dest</code> and the lender's <code>release_sig</code> to also check the release before you fund.</p>`;
     }
     say(rdOk && !problems.length ? "ok" : "bad", lines);
   } catch (e) { say("bad", "<strong>Cannot verify.</strong> " + esc(e.message)); }

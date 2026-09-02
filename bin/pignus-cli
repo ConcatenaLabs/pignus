@@ -2384,7 +2384,8 @@ def cmd_btc_offer_take(args):
                          "when their responder is back online.")
     if not check_release(loan, reclaim_tx(loan, vault_txid, 0, dest,
                                           args.btc_fee),
-                         bytes.fromhex(signed["adaptor_sig"])):
+                         bytes.fromhex(signed.get("release_sig")
+                                       or signed["adaptor_sig"])):
         raise SystemExit("the lender's release does NOT verify against these "
                          "terms. Nothing has been broadcast.")
     txid = btc.sendrawtransaction(phex)
@@ -2393,7 +2394,9 @@ def cmd_btc_offer_take(args):
     tk.update(prevault_txid=ptxid, prevault_vout=pvout, prevault_hex=phex,
               prevault_value=loan.prevault_value(), upgrade_presig=presig.hex(),
               vault_txid=vault_txid, vault_vout=0, reclaim_dest=dest.hex(),
-              reclaim_fee=args.btc_fee, release_sig=signed["adaptor_sig"],
+              reclaim_fee=args.btc_fee,
+              release_sig=(signed.get("release_sig")
+                           or signed["adaptor_sig"]),
               take_id=take["take_id"], btc_offer_id=args.offer,
               _stage="funded")
     _save_ticket(args, tk)
@@ -2561,6 +2564,10 @@ def cmd_btc_respond(args):
         "/v1/btc/claimed": {"txid": "claim_txid", "secret": "secret_t"},
         "/v1/btc/refunded": {"txid": "refund_txid"},
         # The release carries its own names on the wire already.
+        # `adaptor_sig` is what the wire has always called this field; what it
+        # carries is an ordinary release signature. Both names are sent so a
+        # relay of either vintage understands it, and the signature covers the
+        # canonical name.
         "/v1/btc/adaptor": {"adaptor_point": "adaptor_point",
                             "payment_hash": "payment_hash",
                             "adaptor_sig": "adaptor_sig"},
@@ -2679,7 +2686,9 @@ def cmd_btc_respond(args):
             if have.get("disbursement_txid"):
                 continue                       # already paid; never pay twice
             if have.get("disbursing"):
-                found = _find_output(seq_node, have["disbursing"])
+                found = _find_output(seq_node, have["disbursing"],
+                                     asset=loan.debt_asset,
+                                     amount=int(loan.principal) or int(loan.debt))
                 if found:
                     state.set(tk["take_id"], disbursing=None,
                               disbursement_txid=found[0],
@@ -2700,6 +2709,18 @@ def cmd_btc_respond(args):
                 loan = loan_for(offer, tk, have)
             except ValueError as e:
                 print(f"take {tk['take_id']}: {e}", file=sys.stderr)
+                continue
+            # The borrower chooses when to fund, and nothing makes them do it
+            # promptly. Deadlines that were safe when this take was signed can
+            # be behind us by the time the collateral appears, and disbursing
+            # into a window that has already closed is how a lender pays for a
+            # loan that can never start.
+            late = timelocks_sane(loan, btc_height(), seq_height())
+            if late:
+                if have.get("waiting") != "; ".join(late):
+                    state.set(tk["take_id"], waiting="; ".join(late))
+                    print(f"take {tk['take_id']}: not disbursing -- "
+                          + "; ".join(late), file=sys.stderr)
                 continue
             ok, why = collateral_committed(btc_node, loan, tk["prevault_txid"],
                                            int(tk["prevault_vout"]),
@@ -2730,7 +2751,9 @@ def cmd_btc_respond(args):
                 print(f"disburse {tk['take_id']}: {type(e).__name__}: {e}; "
                       "checking whether the payment went out anyway",
                       file=sys.stderr)
-                found = _find_output(seq_node, loan.disbursement_spk().hex())
+                found = _find_output(seq_node, loan.disbursement_spk().hex(),
+                                     asset=loan.debt_asset,
+                                     amount=int(loan.principal) or int(loan.debt))
                 if found:
                     state.set(tk["take_id"], disbursing=None,
                               disbursement_txid=found[0],
@@ -2809,13 +2832,55 @@ def cmd_btc_respond(args):
                 n += 1
         return n
 
+    def publish_pass(offers):
+        """Hand the borrower the secret, once the claim that published it on
+        chain is buried.
+
+        The secret is what releases their collateral. A lender who claims a
+        repayment and then sits on it holds the collateral hostage until the
+        timeout sweeps it -- so this is not a courtesy, it is the other half of
+        being paid. It waits for depth because a borrower who spent Bitcoin on
+        a secret a reorg then undid would lose both.
+        """
+        if not seq_node:
+            return 0
+        n = 0
+        for tk in book_get(args.book, "/v1/btc/takes?status=claimed")["takes"]:
+            offer = offers.get(tk.get("btc_offer_id"))
+            if not offer or not ours(offer):
+                continue
+            have = state.get(tk["take_id"])
+            if have.get("secret_published") or not have.get("t"):
+                continue
+            claim_txid = have.get("claim_txid") or tk.get("claim_txid")
+            if not claim_txid:
+                continue
+            ok, depth = anchor_safe(seq_node, claim_txid,
+                                    min_depth=args.claim_depth)
+            if not ok:
+                continue
+            code, _r = report(R.CLAIMED_TAG, tk["take_id"], "/v1/btc/claimed",
+                              txid=claim_txid, secret=have["t"])
+            if code == 200:
+                state.set(tk["take_id"], secret_published=True)
+                print(f"published the secret for {tk['take_id']}: the borrower "
+                      "can take their collateral back", file=sys.stderr)
+                n += 1
+        return n
+
     def refund_pass(offers):
         """Take back a principal nobody claimed, once its deadline has passed."""
         if not seq_node:
             return 0
         n = 0
         height = seq_node.getblockcount()
-        for tk in book_get(args.book, "/v1/btc/takes?status=disbursed")["takes"]:
+        # Every take this responder has paid a principal into, whatever the
+        # relay currently says about it. A borrower can move a take out of any
+        # status the relay tracks -- they report their own steps -- so a
+        # principal nobody claimed must be found by looking at the coin.
+        mine = [tk for tk in book_get(args.book, "/v1/btc/takes")["takes"]
+                if state.get(tk["take_id"]).get("disbursement_txid")]
+        for tk in mine:
             offer = offers.get(tk.get("btc_offer_id"))
             if not offer or not ours(offer):
                 continue
@@ -2897,6 +2962,9 @@ def cmd_btc_respond(args):
                 state.set(tk["take_id"], claim_txid=txid)
                 report(R.CLAIMED_TAG, tk["take_id"], "/v1/btc/claimed",
                        txid=txid, secret="")
+                # The secret itself follows once the claim is buried. Publishing
+                # it with the claim still in the mempool would let a borrower
+                # take the collateral back off a transaction a reorg could undo.
                 print(f"claimed the repayment of {tk['take_id']}: {txid}",
                       file=sys.stderr)
                 n += 1
@@ -2906,7 +2974,7 @@ def cmd_btc_respond(args):
         offers = offers_by_id()
         return (hash_pass(offers) + sign_pass(offers) + disburse_pass(offers)
                 + upgrade_pass(offers) + claim_pass(offers)
-                + refund_pass(offers))
+                + publish_pass(offers) + refund_pass(offers))
 
     if not args.watch:
         print(json.dumps({"moves": one_pass()}))
@@ -2954,9 +3022,12 @@ def _find_output(node, spk_hex, asset=None, amount=None, since_height=None):
                 continue
         if since_height is not None and int(u.get("height", 0)) < int(since_height):
             continue
-        # Take the deepest: a griefer can pay dust to a known address, and the
-        # one that matters is the one that has been there longest.
-        if best is None or int(u.get("height", 0)) < int(best.get("height", 0)):
+        # Take the most RECENT match. Every one of these addresses is public,
+        # and a coin that is not this loan's payment is something anyone can
+        # arrange in advance -- so preferring the oldest match would prefer
+        # theirs. With the asset and the exact amount checked above, the newest
+        # is the one this responder just sent.
+        if best is None or int(u.get("height", 0)) > int(best.get("height", 0)):
             best = u
     if best is None:
         return None
@@ -2987,7 +3058,11 @@ def _find_repayment(seq_node, loan, take, have, scan=True):
             return False
         if out.get("asset") not in (None, loan.debt_asset):
             return False
-        return int(round(float(out.get("value", 0)) * COIN)) >= int(loan.debt)
+        # Exactly the debt, not at least it. The covenant pays out the whole
+        # input, and every spender here sizes its output from the terms, so a
+        # coin an atom heavy is one no tool in this repository can spend --
+        # and accepting it here would stop the scan that finds the real one.
+        return int(round(float(out.get("value", 0)) * COIN)) == int(loan.debt)
 
     for src in (have, take):
         txid = (src or {}).get("repay_txid")
@@ -3026,9 +3101,13 @@ def add_btc_commands(sub):
         p.add_argument("--d-refund", type=int, required=True,
                        help="Sequentia height the lender may take an unclaimed "
                             "principal back at")
-        p.add_argument("--upgrade-fee", type=int, default=3000,
+        p.add_argument("--upgrade-fee", type=int, default=10_000,
                        help="satoshis the pre-vault carries to pay for moving "
-                            "the collateral into the loan")
+                            "the collateral into the loan. That transaction is "
+                            "signed in advance and cannot be replaced or "
+                            "fee-bumped, so this is deliberately generous: a "
+                            "fee too low to confirm is a loan that cannot "
+                            "start")
         p.add_argument("--lender-prog", required=True,
                        help="the lender's Sequentia payout program, hex: 20 "
                             "bytes at witness version 0, 32 at version 1")

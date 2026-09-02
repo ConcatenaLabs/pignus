@@ -94,7 +94,7 @@ def main():
             "recover_after": 204600, "debt_asset": "11" * 32,
             "debt": 5000000000, "principal": 4800000000,
             "repay_deadline": 143200, "abort_after": 200300,
-            "upgrade_fee": 3000, "d_refund": 100720,
+            "upgrade_fee": 10000, "d_refund": 100720,
             "lender_prog": "cc" * 20, "lender_ver": 0,
             "market": "BTC/USDX", "strike": 4200000000, "price_scale": 100000}
     try:
@@ -112,6 +112,25 @@ def main():
             "loan": loan, "lots": 2, "market": "BTC/USDX",
             "offer_sig": R.sign_offer(stranger, loan, "BTC/USDX", 2)})
         check("an offer signed by somebody else is refused", code == 403)
+        no_strike = dict(loan, strike=0)
+        check("an offer that names no strike is refused -- a seizure nobody "
+              "can judge afterwards is not one to advertise",
+              post(base + "/v1/btc/offers", {
+                  "loan": no_strike, "lots": 2, "market": "BTC/USDX",
+                  "offer_sig": R.sign_offer(lsec, no_strike, "BTC/USDX",
+                                            2)})[0] == 400)
+        own_oracle = dict(loan, oracle_x=lender_x)
+        check("and one whose lender is its own oracle",
+              post(base + "/v1/btc/offers", {
+                  "loan": own_oracle, "lots": 2, "market": "BTC/USDX",
+                  "offer_sig": R.sign_offer(lsec, own_oracle, "BTC/USDX",
+                                            2)})[0] == 400)
+        cheap = dict(loan, upgrade_fee=100)
+        check("and one whose upgrade could never confirm",
+              post(base + "/v1/btc/offers", {
+                  "loan": cheap, "lots": 2, "market": "BTC/USDX",
+                  "offer_sig": R.sign_offer(lsec, cheap, "BTC/USDX",
+                                            2)})[0] == 400)
         code, offer = post(base + "/v1/btc/offers", {
             "loan": loan, "lots": 2, "market": "BTC/USDX", "note": "demo",
             "offer_sig": R.sign_offer(lsec, loan, "BTC/USDX", 2)})
@@ -245,6 +264,9 @@ def main():
         full2 = dict(loan, borrower_x=borrower_x, h_w=B.sha256(w2).hex(),
                      borrower_prog="dd" * 20, borrower_ver=0)
         ln2_0 = B.loan_from_dict(full2)
+        check("a take reusing another's origination commitment is refused",
+              post(base + "/v1/btc/take", take_body(
+                  prevault_txid=p2, prevault_vout=0))[0] == 400)
         code, take2 = post(base + "/v1/btc/take", take_body(
             h_w=full2["h_w"], prevault_txid=p2, prevault_vout=0,
             prevault_value=str(ln2_0.prevault_value())))

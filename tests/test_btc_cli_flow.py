@@ -89,10 +89,10 @@ def main():
                  # Deadlines that leave both sides the margin timelocks_sane
                  # insists on, converted at each chain's own block time: a
                  # Bitcoin block is ten minutes, a Sequentia block one.
-                 "--recover-after": str(btc_tip + 600),
-                 "--repay-deadline": str(seq_tip + 2000),
+                 "--recover-after": str(btc_tip + 4_600),
+                 "--repay-deadline": str(seq_tip + 43_200),
                  "--abort-after": str(btc_tip + 400),
-                 "--d-refund": str(seq_tip + 1000),
+                 "--d-refund": str(seq_tip + 1_440),
                  "--lender-prog": lender_prog, "--market": "BTC/USDX",
                  "--strike": "4200000000"}
             d.update(over)

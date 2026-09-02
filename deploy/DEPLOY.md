@@ -24,6 +24,12 @@ key that signs releases and the wallet that pays principals. It is listed here
 because the testnet runs one, and because a cross-chain offer nobody responds to
 is an offer nobody can take.
 
+Two systemd timers run beside those processes: `pignus-backup.timer` archives
+daily everything that is not on a chain, and `pignus-check.timer` runs
+`deploy/pignus-check.sh` every five minutes to ask whether the oracle is still
+signing and the book is still being told. Neither serves anything; both are
+described below.
+
 All of it is pure Python and needs no build step. It does need a Sequentia
 **source** checkout, because the loan covenant lives in the node repository and
 Pignus imports the proven builder rather than carrying a copy — see `CLAUDE.md`.
@@ -40,7 +46,7 @@ fee rates and no chain state, and `/healthz` says so.
 ssh root@<the testnet box>
 cd /root/sequentia
 git clone https://github.com/ConcatenaLabs/pignus.git
-mkdir -p /root/sequentia/pignus-data
+mkdir -p /root/sequentia/pignus-data /root/backups
 
 # the node source the covenant is imported from (NOT the committee run
 # directory; nothing here needs the running nodes)
@@ -48,6 +54,7 @@ cd /root/sequentia/Sequentia && git fetch origin && git checkout master \
   && git pull --ff-only
 
 cp /root/sequentia/pignus/deploy/*.service /etc/systemd/system/
+cp /root/sequentia/pignus/deploy/*.timer   /etc/systemd/system/
 cp /root/sequentia/pignus/deploy/oracle.example.json    /root/sequentia/pignus-oracle.json
 cp /root/sequentia/pignus/deploy/pignusd.example.json   /root/sequentia/pignusd.json
 cp /root/sequentia/pignus/deploy/responder.example.json /root/sequentia/pignus-responder.json
@@ -60,7 +67,21 @@ chmod 600 /root/sequentia/pignusd.json /root/sequentia/pignus-responder.json
 
 systemctl daemon-reload
 systemctl enable --now pignus-oracle pignusd pignus-btc-responder
+systemctl enable --now pignus-backup.timer pignus-check.timer
 ```
+
+Every unit runs as root with its state under `/root`, which is exactly where
+`ProtectSystem=` does not reach — so each one mounts `/root` read-only instead
+and hands back the single directory it has to write: `/root/sequentia/pignus-data`
+for the three services, `/root/backups` for the backup. **Move one of those
+paths and the matching `ReadWritePaths=` moves with it.** Otherwise the service
+starts cleanly and fails at its first write, which for `pignusd` is hours later
+and reads as a bug rather than as a mount.
+
+Both directories have to exist before the units start, which is what the `mkdir`
+above is for: the mount namespace is built before the unit's first command runs,
+so a `ReadWritePaths=` naming a directory that is not there fails the unit
+outright and nothing inside it can create one.
 
 The oracle key is created 0600 on first start at the `keyfile` path and is never
 logged or served. **Back it up.** Losing it does not lose anyone's money — a
@@ -77,17 +98,29 @@ Publish the key so borrowers and lenders can pin it:
 
 ## Backups
 
-Everything Pignus keeps is under `/root/sequentia/pignus-data`, plus the three
-config files. All of it holds secrets, so keep the archive 0600 and copy it off
-the box:
+Everything Pignus keeps is under `/root/sequentia/pignus-data`, plus the config
+files beside it. All of it holds secrets, so keep the archive 0600 and copy it
+off the box:
 
 ```bash
+mkdir -p /root/backups
 tar czf /root/backups/pignus-$(date +%F).tgz \
     /root/sequentia/pignus-data \
     /root/sequentia/pignusd.json \
     /root/sequentia/pignus-oracle*.json \
     /root/sequentia/pignus-responder.json
 ```
+
+`pignus-backup.service` is that command as a unit, at `UMask=0077` so the
+archive is 0600, and `pignus-backup.timer` runs it daily and catches up a day
+the box was switched off for. `systemctl start pignus-backup` takes one now and
+`journalctl -u pignus-backup` says how the last one went. The unit counts tar's
+exit 1 as success: the oracle appends to its attestation log while the archive
+is being written, and a prefix of an append-only log is what a backup of a live
+one can be. A fatal error is exit 2 and still fails the unit.
+
+The `pignus-oracle*.json` glob covers every threshold oracle's config as well as
+the primary's. **An archive still on the box is not a backup** — copy it off.
 
 What each piece costs to lose:
 
@@ -193,8 +226,14 @@ curl -s localhost:8741/healthz | jq -r .git_rev; git rev-parse --short HEAD
 
 Every Pignus process runs from this one checkout, so every one of them is
 restarted; a unit left on the old code keeps the old relay protocol and the old
-covenant pin. The last line must print the same short hash twice. Restart the
-extra oracles too if any are running.
+covenant pin. The last line must print the same short hash twice. Threshold
+oracles are restarted with the rest — `systemctl restart pignus-oracle@2
+pignus-oracle@3`, naming the instances that are enabled.
+
+A unit file that changed in the checkout is not the one systemd is running: the
+copies under `/etc/systemd/system` are what it reads, so copy them over again
+and `systemctl daemon-reload` before restarting. `pignus-check.sh` is the
+exception — it is executed out of the checkout, so a pull is all it needs.
 
 If the node repository's covenant changed, pull that too and re-run the drills
 **before** restarting. `pignusd` loads the covenant and checks it against
@@ -204,6 +243,7 @@ rather than deriving addresses from a builder that has drifted.
 ## Checking it
 
 ```bash
+/root/sequentia/pignus/deploy/pignus-check.sh   # the whole answer, yes or no
 curl -s localhost:8740/healthz          # 503 if the oracle is not signing
 curl -s localhost:8741/healthz | jq '{ok, error, git_rev, covenant_vectors}'
 curl -s localhost:8741/v1/markets | head -40
@@ -212,6 +252,27 @@ journalctl -u pignus-btc-responder -f
 SEQUENTIA_SRC=/root/sequentia/Sequentia \
   /root/sequentia/pignus/tests/cli_drill.sh
 ```
+
+`pignus-check.sh` is the three `curl` lines under it as one command that answers
+yes or no: every oracle's `/healthz` and the book's must say `ok`, and every
+market that is not cross-chain must have a price signed within
+`PIGNUS_MAX_PRICE_AGE` seconds, with no market disagreeing with the registry
+about how many decimals its assets have. `pignus-check.timer` runs it every
+five minutes and `pignus-check.service` carries the endpoints and that age as
+environment: add each threshold oracle's port to `PIGNUS_ORACLES` there, and
+keep `PIGNUS_MAX_PRICE_AGE` equal to `max_price_age` in `pignusd.json`, since a
+check looser than the book's own limit reports healthy while the book is already
+withholding prices. A failed run shows in `systemctl list-units --failed` and in
+the journal, and nowhere else until an alerting unit is named in the commented
+`OnFailure=` at the top of `pignus-check.service`.
+
+Cross-chain rows are left out of the *age* half deliberately. A native-BTC
+seizure is co-signed by an operator running a command, and the oracle refuses on
+the spot against a stale price, so the person acting sees it. On a covenant
+market nobody is looking: every liquidator in the race stops, and nothing says
+so. The decimals are checked on every row, cross-chain included, because a
+market whose oracle and registry disagree about them is priced out by a power of
+ten and no signature check anywhere can see it.
 
 The oracle's `/healthz` answers **503**, not 200, when it has not completed a
 signing round within two intervals, with `stale`, `errors` and `round_error`
@@ -255,6 +316,7 @@ places it is checked anywhere.
 | `min_depth` | 2 | how deep a funding must be before a loan reads as LIVE. Depth is the lender's risk appetite, so it is configuration; the page shows the number in use |
 | `rescan_depth` | 1500 | how far back a poll may walk to find a spend it missed |
 | `back_scan_cap` | 200 | how many blocks one poll may fetch for those backward walks. The walk is the expensive half of a poll, so it is rationed and a search that runs out of budget resumes on the next one |
+| `prune_after` | 2592000 | how long a *finished* record is kept: a spent offer, a closed vault, an ended cross-chain take. Nothing pruned is lost — the chain is the record and this book is an index of it — but every list is rendered end to end on every read. Anything still open is kept whatever its age; 0 keeps everything |
 | `trusted_proxies` | `["127.0.0.1", "::1"]` | the peers whose `X-Forwarded-For` this daemon believes |
 | `rpc` | — | the node. Optional: without one the book still serves offers and whatever it last knew, and says so in `/healthz` |
 
@@ -280,13 +342,28 @@ Run more than one `pignus-oracle` and list the extra ones in `pignusd.json`:
 attestation per oracle; a lender opens a 2-of-3 with `offer-fund --oracles book
 --oracle-threshold 2`.
 
-Each extra oracle needs its own config — `cp deploy/oracle.example.json
-/root/sequentia/pignus-oracle-2.json`, then give it a distinct `keyfile`,
-`logfile` and `listen` — and its own unit, a copy of `pignus-oracle.service`
-whose `ExecStart` names that config. **Distinct keyfiles are what makes them
-independent**: three instances sharing one key are a 1-of-1 wearing a 2-of-3
-label. Print each key with `--print-pubkey`, add all of them to the backup, and
-confirm `/v1/oracles` on the book lists them all.
+`pignus-oracle@.service` is the unit for every instance after the first, and
+First install has already put it in `/etc/systemd/system` — it is one of the
+`deploy/*.service` files. It reads `/root/sequentia/pignus-oracle-<n>.json`, so
+a second and a third oracle are two configs and one command:
+
+```bash
+cp /root/sequentia/pignus/deploy/oracle2.example.json /root/sequentia/pignus-oracle-2.json
+cp /root/sequentia/pignus/deploy/oracle3.example.json /root/sequentia/pignus-oracle-3.json
+systemctl enable --now pignus-oracle@2 pignus-oracle@3
+```
+
+Those two files are `oracle.example.json` with a different `keyfile`, `logfile`
+and `listen` and nothing else changed; `diff` them to see it. The primary keeps
+its own unit, `pignus-oracle.service`, because its key is the one the book hands
+lenders — it is named rather than numbered.
+
+**Distinct keyfiles are what makes the set independent**: three instances
+sharing one key are a 1-of-1 wearing a 2-of-3 label. Print each key with
+`--print-pubkey`, add the new ports to `PIGNUS_ORACLES` in
+`pignus-check.service`, and confirm `/v1/oracles` on the book lists them all.
+The backup already covers the extra keys and configs, which are under
+`pignus-data` and match the `pignus-oracle*.json` glob.
 
 Independence here is of **keys**, not of prices. Every oracle in the example
 configuration reads the same price server, so a stale or manipulated feed
@@ -299,8 +376,8 @@ pointing at genuinely different upstreams.
 A vault bakes the key it was originated against, so a rotation is never a swap:
 the old key must keep signing until the last vault that names it has matured.
 
-1. Run the new key as a second instance, on its own port with its own keyfile
-   and logfile.
+1. Run the new key as another `pignus-oracle@<n>` instance, on its own port with
+   its own keyfile and logfile.
 2. Add it to `pignusd.json` and make it the primary; the old instance stays in
    `oracles` and goes on signing.
 3. List what still depends on the old key with
@@ -322,15 +399,42 @@ borrower does the whole of their side in the page; the lender's side is a
 process that has to be running.
 
 `pignus-btc-responder` runs `pignus-cli btc-respond --watch` from
-`/root/sequentia/pignus-responder.json`. It signs releases, pays principals once
-the collateral is confirmed, starts loans as borrowers claim their principal,
-and takes back what nobody claimed. Nothing secret goes on its command line —
+`/root/sequentia/pignus-responder.json`. It draws each loan's secret and
+publishes the hash both chains commit to, signs the release the borrower checks
+before committing any collateral, pays the principal once that collateral is
+confirmed, starts the loan once the borrower has claimed the principal, and
+takes back a principal nobody claimed. Nothing secret goes on its command line —
 `ps` is readable by every user on the box — so the key path and both nodes'
 credentials live in that file, at mode 600.
 
 It keeps its state in one file beside the key (`state` in the config). That file
 is what stops a principal being paid twice after a crash: back it up with the
 key, and never delete it while a loan is open.
+
+`deploy/responder.example.json` is the starting point. The keys:
+
+| key | default | what it does |
+|---|---|---|
+| `lender_key` | — | the key that signs every release, report and claim. This is the lender's whole side of every open loan |
+| `state` | beside the key | what this responder has already done, written *before* each send |
+| `book` | — | the relay it reads takes from and reports to |
+| `interval` | 5 | seconds between passes over the queue |
+| `disburse_conf` | 1 | Bitcoin confirmations on the borrower's collateral before the principal is paid |
+| `claim_depth` | 6 | confirmations on the borrower's claim of that principal before their collateral is moved into the loan |
+| `scan_interval` | 300 | seconds between chain scans for a repayment whose borrower never said where it landed |
+| `fee_asset` | the debt asset | which asset pays the Sequentia-side fees. Any asset the node publishes a rate for; there is no privileged fee coin |
+| `rpc` | — | the Sequentia node: `url`, one of `cookie` or `user`/`password`, and `wallet` |
+| `btc_rpc` | — | the Bitcoin node, the same four fields |
+
+`disburse_conf` and `claim_depth` are the lender's exposure to a reorg on the
+other chain, which is why they are configuration rather than constants.
+
+Where a loan stands, on both chains at once and from either side, from the
+ticket file that names it:
+
+```bash
+pignus-cli btc-check loan.json
+```
 
 **Back up the lender key AND the state file.** Losing the key loses the ability
 to claim repayments — borrowers can still take their collateral back once the
@@ -416,3 +520,22 @@ No liquidator bot runs here. Liquidation is a permissionless race and anyone may
 enter it; a platform whose liquidations depend on the operator's bot has an
 operator. `pignus-liquidator` ships for anyone who wants to run one — the README
 has the flags — and it is deliberately not part of the service.
+
+`deploy/pignus-liquidator.service.example` is the unit for anyone who does want
+one. Copy it to `/etc/systemd/system/pignus-liquidator.service` and edit the
+paths, the taker address and the oracles; it is an `.example` rather than a
+`.service` precisely so that the `cp deploy/*.service` in First install does not
+install it. Run it by hand with `--dry-run --once` first:
+
+```bash
+/root/sequentia/pignus/bin/pignus-liquidator --book http://127.0.0.1:8741 \
+    --oracle http://127.0.0.1:8740 --taker-address <your address> \
+    --rpc-wallet liquidator --once --dry-run
+```
+
+It prints every loan it would close and the profit each one leaves, and moves
+nothing. Its node credentials come from `PIGNUS_RPC_URL` and `PIGNUS_RPC_COOKIE`
+in the unit rather than from the command line, because `ps` is readable by every
+user on the box and this process runs for the life of the book. `--oracle` may
+be repeated, and must be: a loan is judged against the key it bakes, so a loan
+naming an oracle this bot does not watch is skipped.

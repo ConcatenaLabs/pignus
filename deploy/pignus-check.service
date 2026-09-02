@@ -1,0 +1,42 @@
+[Unit]
+# Runs deploy/pignus-check.sh: not "are the processes up", which systemd already
+# knows, but "is the oracle still signing and is the book still being told". A
+# dead signing thread leaves a process happily serving its last attestation, and
+# nothing else on the box notices until a liquidation cannot be made.
+Description=Pignus service check
+Documentation=https://github.com/ConcatenaLabs/pignus
+After=network-online.target pignus-oracle.service pignusd.service
+#
+# A failed check is only in the journal until something is wired here. OnFailure=
+# names a unit systemd starts when this one fails, so make that unit send the
+# mail, the page or the chat message, and give it the failed unit's name with
+# %i by templating it. Uncomment once that unit exists -- an OnFailure= naming a
+# unit that is not installed makes every failure a second, confusing failure.
+# OnFailure=pignus-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+# Two of the three services are on a different port for each extra oracle, so
+# the set to check is configuration rather than something the script guesses.
+# Match it to what is enabled: the primary plus every pignus-oracle@N.
+Environment=PIGNUS_ORACLES=http://127.0.0.1:8740
+Environment=PIGNUS_BOOK=http://127.0.0.1:8741
+# Keep this equal to max_price_age in pignusd.json.
+Environment=PIGNUS_MAX_PRICE_AGE=600
+ExecStart=/root/sequentia/pignus/deploy/pignus-check.sh
+NoNewPrivileges=true
+PrivateTmp=true
+# This one reads two HTTP endpoints and writes NOTHING, so no directory has to
+# stay writable and there is no ReadWritePaths. /root is read-only rather than
+# hidden only because the script itself lives under it.
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

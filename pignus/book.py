@@ -40,11 +40,67 @@ import time
 from contextlib import contextmanager
 
 from .terms import LoanTerms
+from .watcher import CLOSED
+
+# The states a vault is closed in, by name. Taken from the watcher rather than
+# written out again: a loan the book calls finished and the watcher calls open
+# would be dropped from the index while the chain still had something to say
+# about it.
+CLOSED_STATES = frozenset(s.value for s in CLOSED)
+# An offer in one of these is spent, cancelled or unfindable: its coin cannot
+# be taken again, whatever happens next.
+DEAD_OFFERS = frozenset(("taken", "withdrawn", "gone", "ghost"))
+# Take statuses that hold no lot of a lender's offer: the loan they were for
+# ended without the principal ever going out, or was undone.
+LOT_FREE = frozenset(("aborted", "refunded", "expired"))
+# The steps of the handshake before the lender has signed anything: the ask,
+# the hash the lender draws for it, and the borrower's advance signature. A
+# borrower can walk away from any of them, so each expires.
+UNSIGNED = frozenset(("requested", "reserved", "pending"))
+# A cross-chain take nothing further can happen to: one that ran to an end, and
+# one that never got past the ask -- a borrower who requests a loan and walks
+# away leaves a record no step of the handshake will ever touch again. Every
+# status in between is money in flight (a signature given, collateral funded, a
+# principal paid) and is kept whatever its age.
+FINISHED_TAKES = frozenset(("claimed", "refunded", "aborted", "expired",
+                            "requested", "reserved"))
 
 
 class OfferExists(ValueError):
     """That coin is already listed, and the request did not prove it owns the
     listing."""
+
+
+def _holds_lot(rec, now, take_ttl=1800, signed_ttl=6 * 3600):
+    """Whether a take is still holding one lot of its offer's principal.
+
+    A take that ended without the principal going out holds nothing, and nor
+    does a handshake the borrower walked away from: asking for a loan is free
+    and anonymous, so an offer that stayed shut because somebody once asked
+    about it could be closed by anyone, for nothing. A SIGNED take does hold
+    its lot -- the lender has committed to that one -- but not for ever against
+    a taker who never funded anything. Everything past that point is money in
+    flight and holds its lot until the record is done with.
+    """
+    status = rec.get("status", "pending")
+    if status in LOT_FREE:
+        return False
+    age = int(now) - int(rec.get("created", now))
+    if status in UNSIGNED:
+        return not (take_ttl and age > take_ttl)
+    if status == "signed":
+        return not (signed_ttl and age > signed_ttl)
+    return True
+
+
+def _last_touched(rec):
+    """When a record last changed, or 0 when it does not say.
+
+    Every writer here stamps `updated` on a change and `created` on the first
+    write. A record carrying neither is not datable, and something undatable is
+    not something to delete: it reads as 1970 and would be pruned on sight.
+    """
+    return int(rec.get("updated") or rec.get("created") or 0)
 
 
 class Book:
@@ -367,31 +423,24 @@ class Book:
                             signed_ttl=6 * 3600):
         """How many loans of this offer are still on the table.
 
-        A take that was never signed expires, because a borrower who walks away
-        after asking must not hold a lender's offer shut for ever; one that WAS
-        signed holds its lot for good, because the lender has committed to it.
+        A take the lender never signed expires, because a borrower who walks
+        away after asking must not hold a lender's offer shut for ever; one
+        that WAS signed keeps its lot much longer, because the lender has
+        committed to it. `_holds_lot` is where that is decided.
+
+        `lots_taken` counts the takes this book no longer keeps: forgetting an
+        old record must not hand a lender's principal back out a second time,
+        so a pruned take's lot is credited to the offer as it goes.
         """
         rec = self.btc_offers.get(btc_offer_id)
         if rec is None:
             return 0
         now = int(time.time())
-        held = 0
-        for t in self.btc_takes.values():
-            if t.get("btc_offer_id") != btc_offer_id:
-                continue
-            status = t.get("status", "pending")
-            if status in ("aborted", "refunded", "expired"):
-                continue
-            age = now - int(t.get("created", now))
-            if status == "pending" and age > take_ttl:
-                continue
-            # A signed take whose collateral never appeared frees its lot too,
-            # eventually: a taker who funds nothing must not be able to hold a
-            # lender's whole offer shut.
-            if status == "signed" and signed_ttl and age > signed_ttl:
-                continue
-            held += 1
-        return max(0, int(rec.get("lots") or 1) - held)
+        held = sum(1 for t in self.btc_takes.values()
+                   if t.get("btc_offer_id") == btc_offer_id
+                   and _holds_lot(t, now, take_ttl, signed_ttl))
+        return max(0, int(rec.get("lots") or 1)
+                   - int(rec.get("lots_taken") or 0) - held)
 
     def list_btc_offers(self, status="open"):
         with self._lock:
@@ -439,6 +488,62 @@ class Book:
         if status:
             out = [t for t in out if t.get("status") == status]
         return sorted(out, key=lambda t: t.get("created", 0), reverse=True)
+
+    # --------------------------------------------------------------- pruning
+
+    def prune(self, max_age):
+        """Forget records that have been finished for `max_age` seconds.
+
+        The chain is the record and this file is an index of it, so nothing is
+        lost here that cannot be read back off the chain. What an index costs
+        is work on every read: each list is rendered end to end for every open
+        page and every liquidator poll, and a record nothing can happen to any
+        more pays that for ever.
+
+        So only the finished go, and only long after the fact -- a borrower
+        reading back how their loan ended does it in the days afterwards, not
+        the months. An open offer, a live or unconfirmed vault, and a take with
+        money in flight are kept at any age, and so is anything the book cannot
+        date. `max_age` of zero or less prunes nothing.
+
+        Returns {"offers": [...], "loans": [...], "btc_takes": [...]}: the ids
+        dropped, so a caller that was watching those records can stop.
+        """
+        out = {"offers": [], "loans": [], "btc_takes": []}
+        if int(max_age) <= 0:
+            return out
+        now = int(time.time())
+        cutoff = now - int(max_age)
+        with self._lock:
+            for oid, rec in list(self.offers.items()):
+                ts = _last_touched(rec)
+                if rec.get("status", "open") in DEAD_OFFERS \
+                        and ts and ts < cutoff:
+                    del self.offers[oid]
+                    out["offers"].append(oid)
+            for lid, rec in list(self.loans.items()):
+                ts = _last_touched(rec)
+                if rec.get("state") in CLOSED_STATES and ts and ts < cutoff:
+                    del self.loans[lid]
+                    out["loans"].append(lid)
+            for tid, rec in list(self.btc_takes.items()):
+                ts = _last_touched(rec)
+                if rec.get("status", "pending") not in FINISHED_TAKES \
+                        or not ts or ts >= cutoff:
+                    continue
+                # The lot goes with it. A take that is still holding one of a
+                # lender's lots must keep holding it once the record is gone,
+                # or pruning would re-advertise principal that was paid out.
+                # A handshake nobody finished is holding nothing by now, and is
+                # credited nothing.
+                offer = self.btc_offers.get(rec.get("btc_offer_id"))
+                if offer is not None and _holds_lot(rec, now):
+                    offer["lots_taken"] = int(offer.get("lots_taken") or 0) + 1
+                del self.btc_takes[tid]
+                out["btc_takes"].append(tid)
+            if any(out.values()):
+                self._save()
+        return out
 
     def stats(self, prices=None):
         """A summary a page can render. Health figures need prices, and are

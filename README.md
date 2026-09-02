@@ -75,9 +75,10 @@ pignus/btc_collateral.py native BTC collateral (Tier B): the pre-vault, the
                          vault, and both chains' legs of a cross-chain loan
 pignus/btc_relay.py      what a relay may and may not be believed about: the
                          signatures on every offer and every lender's report
-pignus/adaptor.py        Schnorr adaptor signatures, the cross-chain link
+pignus/adaptor.py        BIP340 signing and verification, and the Schnorr
+                         adaptor signatures the DLC settlement uses
 pignus/dlc.py            DLC primitives for settling BTC collateral at maturity;
-                         a library, wired into nothing yet
+                         a library, used by nothing else here
 pignus/btcscript.py      the Bitcoin script and taproot primitives Tier B needs
 pignus/openamp.py        Tier C pledges at an OpenAMP policy server
 pignus/repurchase.py     Tier D: the OpenDAMP repurchase, labelled as one, never a loan
@@ -140,6 +141,21 @@ pignus-cli repay | liquidate | default | recover --loan <id> --rpc-wallet me
 pignus-cli offer-withdraw --offer <id> --rpc-wallet me
 ```
 
+`pignus-cli <command> --help` is the complete list of options for any command.
+What shapes an offer is worth having here:
+
+| flag | what it sets |
+|---|---|
+| `--principal` / `--lots` | lent per loan, and how many loans the one coin holds |
+| `--interest` | percent over the whole term (default 3) |
+| `--open-ltv` / `--liq-ltv` | the loan-to-value a loan opens at and the one it liquidates at (default 50 and 75) |
+| `--term-days` / `--offer-days` | the term, and how long the offer stays open (default: the term) |
+| `--bonus` | the liquidation bonus, percent (default 5) |
+| `--borrower-ver` | the witness version borrowers are paid out at: 0 for a bech32 extension wallet, 1 for taproot. It is part of the offer's address, so it cannot be changed afterwards |
+| `--oracles` / `--oracle-threshold` | an m-of-n oracle set, below |
+| `--memo` | a note kept in the terms |
+| `--no-publish` | fund the offer without listing it on the book |
+
 `--book` names the pignusd to read markets and offers from (default
 `http://127.0.0.1:8741`, or `PIGNUS_BOOK`). The node wallet that signs is named
 by `--rpc` (default `http://127.0.0.1:18776`, the RPC port of the binary's
@@ -147,6 +163,30 @@ default chain; `PIGNUS_RPC_URL`), `--rpc-wallet`, and either `--rpc-cookie` or
 `--rpc-user`/`--rpc-password`. Every one of them also reads a `PIGNUS_RPC_*`
 environment variable, which is where credentials belong: a command line is
 readable by every process on the machine.
+
+Every command that composes a covenant transaction takes the same three fee
+options. `--fee-asset` and `--fee-amount` name the asset and the atoms; the
+default is the asset already being spent, and failing that anything held with a
+published rate. Nothing falls back to a privileged asset, because there is not
+one. `--prep-fee-asset` names the asset for the preparing sends -- the ones that
+give the wallet explicit coins, since a covenant cannot spend a blinded input
+and a node wallet's change is blinded -- and defaults to `--fee-asset`. The
+cross-chain `btc-*` commands take `--fee-asset` on its own, their Sequentia legs
+being one plain payment each. `--dry-run` composes and prints without
+broadcasting anything, preparing sends included.
+
+`liquidate` and `default` take their price from the book, or from
+`--attestation`, `--attestations` (for an m-of-n loan) or `--oracle`. It is
+verified locally against the key the **vault** bakes in either way, and refused
+if it was signed more than `--max-attestation-age` seconds ago -- 600 by
+default, `--allow-stale` to build against an older one anyway. Tapscript can
+tell that an attestation is newer than the loan but not that it is recent, so
+this is the only place recency is checked at all.
+
+`pignus-cli --version` prints the version and `--debug` re-raises with the
+traceback instead of a one-line message. A command exits 1 for an error, 2 when
+an issuer refused a Tier C request outright, and 3 when the covenant builder
+could not be loaded or has drifted from the golden vectors.
 
 A loan does not need the book at all. `--loan <id>` is a convenience that looks
 the terms up; with the terms file in hand, `pignus-cli repay --terms loan.json
@@ -216,16 +256,20 @@ asset with a published exchange rate to pay the fee.
 ### Native BTC collateral (Tier B, cross-chain)
 
 Borrow a Sequentia asset against real Bitcoin. The collateral sits on Bitcoin,
-the debt on Sequentia, bound by an adaptor signature so repaying and reclaiming
-are one act.
+the debt on Sequentia, and **one hash appears in both chains' scripts**: the
+Bitcoin vault's `RECLAIM` leaf demands the secret behind it alongside both
+parties' signatures, and the Sequentia repayment can only be taken by publishing
+that same secret. So repaying and reclaiming are one act, and the borrower can
+check that for themselves rather than being asked to believe it -- the hash they
+repay against is the hash their release is built on.
 
 Origination is atomic, because otherwise it is a gift: the collateral waits in a
 pre-vault the borrower can take back, the principal is paid into an output only
 the borrower can open, and opening it publishes the secret that moves the
 collateral into the vault. Neither side ever holds both, and the only party
 exposed to a loss rather than a delay is a lender who goes offline in the middle
-of it. `pignus-cli btc-check` prints where a loan stands and what each party can
-do next.
+of it. `pignus-cli btc-check` prints where a loan stands on both chains and
+whose move it is next.
 
 A borrower does all of this in the browser at `/lending/`. From the command
 line, it is a two-party handshake, one command per move, with a `ticket` JSON
@@ -238,19 +282,50 @@ pignus-cli btc-propose --lender-key lender.key --oracle-x <x> \
     --principal 5000000000 --lender-prog <hex> --market BTC/USDX \
     --recover-after <btc-height> --abort-after <btc-height> \
     --repay-deadline <seq-height> --d-refund <seq-height> --out loan.json
-pignus-cli btc-prepare  loan.json --btc-rpc ...   # borrower: fund unbroadcast
-pignus-cli btc-adaptor  loan.json --lender-key lender.key
-pignus-cli btc-originate loan.json --btc-rpc ...  # borrower: verify, then fund
+pignus-cli btc-prepare  loan.json --borrower-key borrower.key \
+    --borrower-prog <hex> --btc-rpc ...   # fund the pre-vault, unbroadcast
+pignus-cli btc-adaptor  loan.json --lender-key lender.key   # draw the secret,
+                                                            # publish its hash,
+                                                            # sign the release
+pignus-cli btc-originate loan.json --borrower-key borrower.key --btc-rpc ...
+pignus-cli btc-disburse loan.json --rpc ...       # lender: pay the principal
+pignus-cli btc-claim-principal loan.json --borrower-key borrower.key --rpc ...
+pignus-cli btc-upgrade  loan.json --lender-key lender.key --btc-rpc ...
 pignus-cli btc-repay    loan.json --rpc ...       # borrower: pay the hashlock
 pignus-cli btc-claim    loan.json --lender-key lender.key --rpc ...   # reveals t
 pignus-cli btc-reclaim  loan.json --borrower-key borrower.key --rpc ... --btc-rpc ...
 ```
 
-and the other endings: `btc-seize-sighash` / `btc-seize` (lender + oracle),
+The order matters and is not a matter of taste. The vault's address commits to
+the lender's hash, so the borrower cannot sign the move into it until the lender
+has drawn the secret; and the lender cannot start the loan until the borrower
+has opened the principal, which is what publishes the secret `btc-upgrade`
+needs. Every step before `btc-originate` commits nothing at all. `btc-check`
+names the next move at each stage, so the sequence need not be memorised.
+
+`--borrower-prog` and `--borrower-ver` are the borrower's Sequentia payout
+program -- where the principal is paid and where a repayment refunds to -- and
+`--lender-prog` and `--lender-ver` the lender's; both are 20 bytes at witness
+version 0 and 32 at version 1, and both are baked into addresses, so neither can
+be changed afterwards. `--reclaim-address` is the Bitcoin address the collateral
+comes back to, a fresh one from the wallet by default. `--feerate` prices the
+Bitcoin funding in sat/vB. `--btc-fee` is the flat satoshi fee the transactions
+spending the vault carry, and `--upgrade-fee` is what the pre-vault holds on top
+of the collateral so the move into the vault can pay for itself even if the
+borrower has gone by then.
+
+Several of these commands refuse before they act -- terms whose deadlines leave
+no margin, a claim too shallow to spend against, a timelock that has not opened
+-- and take `--force` to proceed anyway. Read what the refusal said before using
+it: those checks are most of what stands between an over-collateralised loan and
+a stall that pays the other side.
+
+The other endings: `btc-seize-sighash` / `btc-seize` (lender + oracle),
 `btc-timeout` (lender, after the term), `btc-refund` (borrower, if the lender
-stalls), `btc-abort` (borrower, if the principal never came). The trust model,
-the exposure at each step and why liquidation needs the oracle to co-sign on the
-Bitcoin side are in the design doc, section 7.
+never claims the repayment), `btc-abort` (borrower, if the principal never
+came), `btc-refund-principal` (lender, if the borrower never claimed it). The
+trust model, the exposure at each step and why liquidation needs the oracle to
+co-sign on the Bitcoin side are in the design doc, section 7.
 
 A seizure is the one move that needs a third party while a loan is live: there
 is no covenant on the Bitcoin side, so the oracle's signature *is* the decision.
@@ -286,6 +361,16 @@ can read it. `deploy/responder.example.json` is the starting point and
 is what stops a principal being paid twice after a crash: back it up with the
 key.
 
+| flag | what it does |
+|---|---|
+| `--config` | the JSON holding the key, both nodes' credentials and the state file |
+| `--watch` / `--interval` | keep running, and how many seconds between passes (default 5) |
+| `--disburse-conf` | Bitcoin confirmations required on the collateral before a principal is paid (default 1) |
+| `--claim-depth` | confirmations required on a borrower's claim before their collateral is moved into the vault (default 6) -- the claim is a Sequentia transaction, and Sequentia reorgs when Bitcoin does |
+| `--scan-interval` | seconds between chain scans for a repayment whose borrower never said where it landed (default 300) |
+| `--fee-asset` | what the Sequentia legs pay their fee in (default: the debt asset) |
+| `--state` | where it records what it has already done (default: beside the key) |
+
 Every offer is signed by the key it names as the lender, and the relay verifies
 that before storing it -- otherwise anyone could publish in a lender's name and
 have that lender's own responder pay it out. The same goes the other way: every
@@ -298,9 +383,73 @@ pignus-cli btc-offer-take --offer <id> --borrower-key borrower.key \
     --borrower-prog <hex> --out loan.json --btc-rpc ... --rpc ...
 ```
 
+That is the whole borrower's half of the handshake in one command: it checks
+the offer's own signature, refuses an offer whose oracle is the lender's key,
+funds the pre-vault without broadcasting it, waits for the lender's hash, signs
+the move into the vault that hash implies, waits for the release, verifies it
+locally, and only then broadcasts. Every refusal along the way leaves the
+Bitcoin untouched. `--wait` bounds how long it will sit waiting for a lender.
+It writes the same ticket file the two-party commands use, so `btc-check` and
+the rest work on the loan afterwards.
+
 The relay itself is never trusted: it holds no key, moves nothing, and rebuilds
 every address, outpoint and sighash from the offer's own terms rather than
 believing what it is told. [`docs/api.md`](docs/api.md) documents each endpoint.
+
+### Restricted assets (Tiers C and D)
+
+Two asset models on Sequentia cannot use the covenant vault, and each gets a
+different answer rather than a pretence. The loan book carries neither. Tier C
+is command-line only; Tier D has a *Check a repurchase* tab on the page that
+reads a terms document and its bond back, while everything that moves money is
+a command.
+
+**OpenAMP (Tier C)** collateral never moves. The issuer's policy server records
+a **pledge** against part of the borrower's balance and refuses transfers that
+would spend it, so `pledge-create`, `pledge-list`, `pledge-release` and
+`pledge-seize` speak to that server rather than to a node. `pledge-sign` is what
+lets a party authorise a release or a seizure on their own machine, so a
+signature travels instead of a key: pass the result as `--lender-sig` or, for
+the borrower's countersignature on an early seizure, `--holder-sig`. Every one
+of these prints the sentence that says the collateral is issuer-permissioned,
+because presenting it quietly beside a Tier A loan would be a lie. `--issuer`
+names the `openampd` (default `http://127.0.0.1:8722`, or `PIGNUS_ISSUER`) and
+`--token` authenticates the caller to it and nothing more (`PIGNUS_ISSUER_TOKEN`
+is where it belongs).
+
+**OpenDAMP (Tier D)** assets cannot be collateral at all, so what Pignus offers
+is a **repurchase**: the borrower sells the asset and holds a claim, secured by
+a bond in a two-leaf covenant vault. `repo-propose` writes the terms,
+`repo-fund` pays the bond in, and `repo-forfeit` sweeps it back to the borrower
+once the deadline passes.
+
+```
+pignus-cli repo-verify terms.json --txid <bond funding> \
+    --leg-txid <the transfer to the lender> --lender-cu <hex>
+```
+
+`repo-verify` is the check that matters, and it reports a **state** rather than
+an "ok": `not-funded`, `bond-only` (the bond is there and nobody has looked at
+the half it secures), `funded-unburied`, `live`, `forfeitable`, or `settled`. A
+bond alone is worth nothing, which is why the leg-one arguments are what move it
+past `bond-only` and why `--min-confirmations` decides when either half stops
+being reorgable.
+
+Settling is one atomic transaction of four inputs and at most six outputs --
+exactly what OpenDAMP allows, with no spare slot in either direction -- so it is
+composed in two steps and signed in between:
+
+```
+pignus-cli repo-settle terms.json --txid <bond> --verifier <txid:vout> \
+    --verifier-spk <hex> --cu-lender <txid:vout> --debt-utxo <txid:vout> \
+    --skeleton settle.json
+pignus-cli repo-settle terms.json --txid <bond> --attach settle.json --broadcast
+```
+
+`--skeleton` writes the unsigned settlement for the other party to sign;
+`--attach` puts the covenant's `RETURN` witness on last, which is the only order
+that works. The borrower's debt-asset side must be a single coin and the fee
+comes out of it, because there is no room for another input.
 
 ## Running it
 
@@ -326,6 +475,12 @@ browser client, and on the testnet it is what `/lending/` is.
 `deploy/DEPLOY.md` covers running it and the oracle as systemd units behind
 Caddy, with `deploy/pignusd.example.json` as the starting configuration, and
 [`docs/api.md`](docs/api.md) documents every endpoint it serves.
+
+`pignusd --config <file> --once` refreshes once and prints the markets, the
+stats and the health, without serving, which is the way to check a
+configuration before it is a unit. It refuses to start at all if the covenant
+builder cannot be loaded or has drifted from the golden vectors, because every
+vault address it would show is derived from that builder.
 
 ### The oracle
 
@@ -362,12 +517,17 @@ pignus-oracle --config oracle.json
 | `previous_keys` | x-only keys this oracle used to sign with, published at `/v1/pubkey` so a borrower can tell a rotation from a stranger |
 | `seizures` | where Tier B co-signatures are logged (default: `<logfile>.seizures`) |
 | `source.type` | `static` (fixed prices, for drills), `http` (one request per market) or `http_bulk` (one snapshot per round, which is what keeps a round's prices consistent) |
+| `source.prices` | with `static`, the fixed price per market |
 | `source.url`, `.field` | where the prices are, and which field of each row holds one |
 | `source.timeout`, `.max_age` | seconds to wait, and how long a fetched snapshot may be reused |
 | `source.feed_max_age` | how old the feed's own `_meta.updated` may be before this oracle refuses to re-sign its numbers |
 
 8730 is the built-in listen default; the testnet box runs the oracle on 8740
 and `pignusd` on 8741, see `deploy/DEPLOY.md`.
+
+`--once` signs one round, prints it and exits, without serving; `--print-pubkey`
+prints the x-only key and exits, and is the one path that will not create a key
+file, because asking what the key is must never answer with a new one.
 
 The key is created 0600 on first run and its mode is re-checked on every start.
 It is never logged and never served. Prices come from the price feed that
@@ -395,7 +555,10 @@ pignus-oracle --config oracle.json --sign-seize --request seizure.json
 
 `seizure.json` is what `pignus-cli btc-seize-sighash --out` writes: it carries
 the loan, so the oracle rebuilds the sighash from the terms rather than signing
-a number somebody else computed.
+a number somebody else computed. `--sighash`, `--market` and `--strike` are the
+hand-fed alternative, and they are worse for exactly that reason. `--max-age`
+(600 seconds by default) is how recent the justifying price must be, and
+`--allow-stale` co-signs against an older one.
 
 ### Verifying a liquidation
 
@@ -455,12 +618,12 @@ read-only, and the liquidator bot is just whoever noticed first.
 Three collateral types are weaker on purpose and are labelled as such:
 
 - **Native BTC** (design doc section 7) is cross-chain. Repayment and release
-  are bound by an adaptor signature, so neither can happen without the other --
-  but a lender who simply declines to claim the repayment keeps the collateral,
-  which on an over-collateralised loan is worth more. Liquidation needs the
-  oracle to co-sign, because Bitcoin has no introspection. Section 7.2 explains
-  why that is not a DLC, and 7.1's exposure table says exactly what each party
-  can lose.
+  are bound by one hash carried in both chains' scripts, so neither can happen
+  without the other -- but a lender who simply declines to claim the repayment
+  keeps the collateral, which on an over-collateralised loan is worth more.
+  Liquidation needs the oracle to co-sign, because Bitcoin has no introspection.
+  Section 7.2 explains why that is not a DLC, and 7.1's exposure table says
+  exactly what each party can lose.
 - **OpenAMP restricted assets** never enter a vault at all: the issuer's policy
   server records a pledge and refuses transfers that would spend it. A release
   needs the lender's signature; a seizure needs the lender's signature plus
@@ -481,35 +644,42 @@ Three collateral types are weaker on purpose and are labelled as such:
 in seconds rather than after a two-chain rig has finished starting. Each file's
 docstring says what it proves.
 
-Offline, no node:
+Offline, no node. This half also runs in CI on every push:
 
 ```
 tests/cli_drill.sh                 every CLI command, refusals included
 tests/service_drill.sh             the oracle and pignusd together
 tests/test_units.py                the covenant vectors + an oracle round trip
 tests/test_openamp.py              the Tier C pledge message, pinned
+tests/test_watcher.py              reorgs, and reading an exit back
+tests/test_oracle_service.py       what the oracle will not sign
+tests/test_liquidator.py           what the liquidation bot refuses
+tests/test_btc_relay.py            the relay and the lender's responder
 tests/test_btc_relay_auth.py       what the relay may be believed about
 tests/test_web.mjs                 web/pignus.js against the golden vectors
 tests/test_offer_web.mjs           web/offer.js against them
 tests/test_repurchase_web.mjs      web/repurchase.js against them
 tests/test_btc_web.mjs             web/btc.js against web/btc_vectors.json
 tests/test_adaptor_web.mjs         web/adaptor.js against adaptor_vectors.json
+tests/test_btcborrow_web.mjs       what the browser's BTC borrow flow refuses
+tests/page_check.sh                the page, in a real browser; it skips
+                                   itself where there is no headless Chromium
 ```
 
 Against a running chain (a `sequentiad`, and for the BTC ones a `bitcoind` too):
 
 ```
+tests/test_btc_disburse.py         paying the principal
 tests/test_platform.py             this library, end to end
 tests/test_pset.py                 the browser's PSETs, accepted by a node
 tests/test_flows.py                the browser's flows through a whole loan
 tests/test_book.py                 the book and the watcher against a chain
+tests/test_watcher_reorg.py        the watcher against a real reorg
 tests/test_tiers.py                Tiers C and D
 tests/test_lifecycle.py            the CLI through fund, take, repay,
                                    liquidate, withdraw, default, with the
                                    daemon discovering every step
 tests/test_threshold.py            a 2-of-3 oracle loan, end to end
-tests/test_btc_relay.py            the relay and the lender's responder
-tests/test_btc_disburse.py         paying the principal
 tests/test_btc_collateral.py       Tier B's covenant and crypto
 tests/test_btc_cli.py              the BTC-collateral library legs
 tests/test_btc_cli_flow.py         the BTC-collateral CLI handshake
@@ -519,15 +689,19 @@ tests/test_btc_origination.py      a whole cross-chain loan, both chains,
                                    nobody trusting anybody
 ```
 
+`tests/test_pset.mjs` and `tests/test_flows.mjs` are the browser halves of
+`test_pset.py` and `test_flows.py` and are driven by them, because both need a
+node behind them. `run-tests.sh` fails if a file in `tests/` is run by nothing
+at all: a test nobody runs is a test nobody notices going red.
+
 In the node repository, and in its `test_runner.py`:
 
 ```
 test/functional/feature_pignus_vault.py      the covenant's exits and refusals
 test/functional/feature_pignus_oracle_set.py the on-chain oracle set
 test/functional/feature_pignus_offer.py      funded offers
-test/functional/feature_pignus_hashlock.py   the signature-free hashlock sweep
-                                             both cross-chain legs are paid
-                                             through
+test/functional/feature_pignus_hashlock.py   the signature-free hashlock both
+                                             cross-chain legs are paid through
 test/functional/feature_pignus_attack.py     the attack suite
 ```
 
