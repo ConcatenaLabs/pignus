@@ -174,6 +174,36 @@ const offer = {
      JSON.stringify(r.calls.map(c => c.method)));
 }
 
+// The one number a borrower can hold a lender and an oracle to: this tier's
+// seizure is the two of them signing together, with no price test in any
+// script, so an offer list that does not show the strike shows nothing about
+// when the collateral can be taken.
+{
+  const rows = [];
+  const box = { set innerHTML(v) { rows.push(v); },
+                querySelectorAll: () => [] };
+  const ui = { esc: (x) => String(x), ticker: () => "USDX",
+               units: (a) => (Number(a) / 1e8).toString(),
+               atomsToBtc: (a) => (Number(a) / 1e8).toString(),
+               blockTime: (h) => "block " + h };
+  bb.renderOffers(box, [{ btc_offer_id: "x", status: "open", loan: {
+    btc_amount: 100000, debt: 3914000000, principal: 3800000000,
+    debt_asset: "11".repeat(32), repay_deadline: 1, recover_after: 2,
+    strike: 5218666667, price_scale: 100000 } }], ui, () => {});
+  const html = rows.join("");
+  ok("the offer list shows the price a seizure is judged against",
+     html.includes("seized below") && html.includes("52186.66667"),
+     html.slice(0, 200));
+  const bare = [];
+  bb.renderOffers({ set innerHTML(v) { bare.push(v); },
+                    querySelectorAll: () => [] },
+    [{ btc_offer_id: "y", status: "open", loan: {
+      btc_amount: 1, debt: 1, debt_asset: "11".repeat(32),
+      repay_deadline: 1, recover_after: 2 } }], ui, () => {});
+  ok("and says so plainly when an offer names none",
+     bare.join("").includes("not stated"));
+}
+
 // The borrow flow names a transaction by its id to bind the reclaim signature
 // to the vault the pre-signed upgrade creates. If the transaction object
 // cannot name itself, that binding cannot be computed at all.
