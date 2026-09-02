@@ -108,6 +108,7 @@ latest verified price.
     }
   ],
   "height": 118432,
+  "btc_height": 155377,
   "reference_ticker": "USDX",
   "block_seconds": 60,
   "min_depth": 2,
@@ -195,11 +196,18 @@ with `_` for the slash: `/v1/attestation/GOLD_USDX`. `?oracle=<x-only hex>`
 returns that particular signer's instead, which is how a loan baked to a key
 this book no longer calls primary is still priced.
 
-The signed fields — `market`, `feed_id`, `timestamp`, `price`, `price_scale`,
-`signature` — are untouched. `oracle_x`, `age` (seconds) and `stale` (older than
-`max_price_age`) are added beside them: age is not a signed property and cannot
-be, but a reader acting on a price needs it. Verify against the key the **vault**
-bakes in, not against whichever oracle served it. 404 when the book holds none.
+The attestation's own fields — `market`, `feed_id`, `timestamp`, `price`,
+`price_scale`, `signature` — are passed through untouched. Only `feed_id`,
+`timestamp` and `price` are inside the signature. `price_scale` is not: it is
+baked into the vault's leaf instead, which is why a price quoted at one scale
+and read at another is a hundredfold error the covenant cannot notice, and why
+every consumer here compares the scale to the loan's own before using a price.
+
+`oracle_x`, `age` (seconds) and `stale` (older than `max_price_age`) are added
+beside them. Age is not a signed property and cannot be, but a reader acting on
+a price needs it: a signature stays valid however old the number under it is.
+Verify against the key the **vault** bakes in, not against whichever oracle
+served it. 404 when the book holds none.
 
 ### `GET /v1/attestations/{market}`
 
@@ -238,6 +246,29 @@ transaction index is needed:
 - 404 if the output is unspent nowhere — it may already be spent.
 - 503 if this book has no node.
 
+### `GET /v1/spend/{txid}/{vout}`
+
+Who spent an outpoint, and what their witness published. This is how a borrower
+recovers the secret that releases their Bitcoin collateral without depending on
+anybody telling them: a lender who claims a repayment publishes the preimage
+whether they mean to or not, because the covenant leaf forces it into the
+witness.
+
+```json
+{"txid": "…", "vout": 0, "spend_txid": "…",
+ "confirmations": 12,
+ "preimages": {"<sha256 of the item>": "<32-byte item, hex>"}}
+```
+
+`preimages` is every 32-byte witness item keyed by its SHA-256, so a caller
+picks by the hash its own loan commits to and this book needs to know nothing
+about that loan. The mempool is searched first, then blocks backwards from the
+tip as far as `back_scan_cap`.
+
+- 400 if the txid is not 64 hex or the vout is not a number.
+- 404 if the output is still unspent, or its spend is outside the scan window.
+- 503 if this book has no node.
+
 ### `GET /healthz`
 
 ```json
@@ -252,15 +283,29 @@ transaction index is needed:
  "offers": 7, "loans": 52, "unrenderable": 0,
  "assets": 41, "fee_rates": 6,
  "block_seconds": 60, "reference_ticker": "USDX",
- "oracles": 3, "oracle_errors": [], "node": true}
+ "oracles": 3, "oracle_errors": [],
+ "event_errors": [], "event_backlog": 0,
+ "node": true, "btc_node": true, "btc_height": 155377}
 ```
 
 `ok` is false when there is no node, when the node or the **primary** oracle is
 unreachable, while the first sync is still running, when the poll thread has not
-finished within `max(120s, 3 × poll)`, or when any market's newest verified
-attestation is older than `max_price_age`. `error` says which; `stale_markets`
-and `oracle_errors` name them individually. The status code is always 200 —
-read `ok`, not the code.
+finished within `max(120s, 3 × poll)`, when any market's newest verified
+attestation is older than `max_price_age`, or when offer events are queued up
+unapplied. `error` says which; `stale_markets`, `oracle_errors` and
+`event_errors` name them individually. The status code is always 200 — read
+`ok`, not the code.
+
+`btc_node` says whether this book can see the parent chain, and `btc_height` is
+that chain's tip. Without them a cross-chain loan's Bitcoin-side deadlines are
+not checked here at all, and every take this book accepts says so in its
+warnings — so a page refuses to originate one, because it could not tell a
+borrower when their collateral becomes abortable.
+
+`event_backlog` is how many offer events are waiting to be applied, and
+`event_errors` the last few this book dropped because it could never apply
+them. A backlog that only grows means loans an offer opened are not being
+registered.
 
 `covenant_vectors` counts the golden vector cases the covenant tripwire checked
 in this process. Zero would mean the builder was never loaded; a non-zero count
@@ -562,9 +607,25 @@ not drawn this loan's secret yet, so there is no vault), `reserved` (the hash is
 published and the vault is derivable), `pending` (the borrower's advance
 signature is stored, and the lender's release is what is waited on), `signed`
 (the release is stored), `disbursed` (the principal is paid into the hashlock),
-`claimed-principal` (the borrower has opened it, publishing `w`), `live` (the
-collateral is in the vault), `claimed` (the lender has taken the repayment,
-publishing `t`), `refunded` (the lender took an unclaimed principal back).
+`live` (the collateral is in the vault), `claimed` (the lender has taken the
+repayment, publishing `t`), `refunded` (the lender took an unclaimed principal
+back).
+
+Every one of those is set by the LENDER's own signed report, or by the
+handshake. A borrower's reports set no status at all: they record where a
+payment landed and nothing else. That is deliberate, and it is the reason a
+lender's responder decides what to do from its own records and the two chains
+rather than from a status here. A status a borrower could set is a status they
+could use, to move a take out from under the step the lender was about to take
+-- leaving a principal paid and collateral never vaulted -- and to pin a
+lender's lot in a state nothing would ever clear.
+
+So a client watching a loan should read the FIELDS, not the status word:
+`disbursement_txid` says the principal was paid, `principal_claim_txid` that
+the borrower took it, `upgrade_txid` that the loan started, `repay_txid` that
+the debt was paid, `claim_txid` with `secret_t` that the lender took it, and
+`refund_txid` that an unclaimed principal went home. Each only ever becomes
+true. The page derives everything it shows from them.
 
 `lots_left` on an offer is what a take holds against it. A take still `pending`
 after half an hour releases its lot, and a `signed` one whose collateral never
@@ -738,7 +799,9 @@ asserts. All take `take_id` and `auth`; each takes one or two more:
 
 `/v1/btc/claimed` publishes the secret that completes the borrower's release, so
 the relay checks it: a `secret_t` whose SHA-256 is not the loan's `payment_hash`
-is refused with 400 rather than published.
+is refused with 400 rather than published. It is reported twice -- once when the
+claim is made, again with the secret once that claim is buried -- and the empty
+first form never overwrites a secret already published.
 
 `{"ok": true, "take_id": "…"}` on success. 403 if the report is not signed by
 this loan's lender, 404 for an unknown take.
@@ -746,10 +809,12 @@ this loan's lender, 404 for an unknown take.
 ### `POST /v1/btc/claimed-principal`, `/v1/btc/repaid`
 
 The borrower's own reports: where they took the principal, and where they paid
-the debt. Both are hints -- everything they say is on chain -- but a hint that
-moved a take out of the status a lender's responder scans for would stop a
-principal being paid or an unclaimed one being taken back. So both are signed by
-the key the take names.
+the debt. Both are hints -- everything they say is on chain -- and both record
+`txid`/`vout` and change NO status, because a status a borrower can set is one
+they can use to move a take out from under the step their lender was about to
+take. They are signed by the key the take names all the same: an unsigned hint
+is a way to write into somebody else's loan, and a lender's responder saves a
+whole-UTXO-set scan by believing one that checks out.
 
 ```json
 {"take_id": "…", "txid": "…", "vout": 0, "auth": "<64-byte hex>"}

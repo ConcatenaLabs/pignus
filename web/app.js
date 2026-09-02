@@ -373,6 +373,16 @@ async function pinCovenant() {
     state.repoPinned = 0;
     state.repoWhy = e.message;
   }
+  // The OFFER covenant is a third implementation, and the one a lender funds
+  // directly: the coin goes to whatever address this page computes, and a
+  // builder one byte adrift sends it where no borrower can draw from it and no
+  // refund can reach it. Pinned here so nothing derives one unpinned.
+  try {
+    state.offerPinned = offer.selfTest(vectors);
+  } catch (e) {
+    state.offerPinned = 0;
+    state.offerWhy = e.message;
+  }
   // The BTC-collateral crypto pins SEPARATELY, against its own vectors; a
   // deployment without them can still run the loan page.
   try {
@@ -383,6 +393,7 @@ async function pinCovenant() {
   } catch (e) { state.btcPinned = 0; state.btcWhy = e.message; }
   $("#pinned").textContent =
     `covenant pinned to ${state.pinned} golden vectors` +
+    (state.offerPinned ? `, offers to ${state.offerPinned}` : "") +
     (state.repoPinned ? `, repurchase to ${state.repoPinned}` : "") +
     (state.btcPinned ? `, BTC + adaptor pinned` : "");
   $("#pinned").className = "tag ok";
@@ -424,6 +435,7 @@ async function refresh() {
     if (m.min_depth != null) state.minDepth = m.min_depth;
     state.txUrl = m.explorer_tx_url || DEFAULT_TX_URL;
     state.btcTxUrl = m.btc_explorer_tx_url || DEFAULT_BTC_TX_URL;
+    if (m.btc_height != null) state.btcHeight = m.btc_height;
   }
   if (a) state.assets = a.assets || {};
   if (f) state.fees = f;
@@ -787,6 +799,29 @@ function wireDetails(box) {
  * were closed at, whether it verifies against the key their own vault bakes
  * in, and what that price should have bought against what it did.
  */
+/**
+ * Does this attestation's signature check out, in THIS browser, against a key
+ * this loan actually names?
+ *
+ * null when the page cannot answer -- an attestation with no price, no
+ * timestamp, or from a key the loan does not name. The book has an opinion of
+ * its own, and printing that opinion under the words "checked here" was the
+ * defect: a reader deciding whether to believe a closed loan needs to know
+ * which party did the checking.
+ */
+function localVerdict(t, a) {
+  try {
+    const named = t.oracles && t.oracles.length
+      ? t.oracles.includes(a.oracle_x) : a.oracle_x === t.oracle_x;
+    if (!named || a.price == null || a.timestamp == null || !a.signature)
+      return null;
+    return pig.verifySchnorr(
+      a.oracle_x,
+      pig.attestationMessage(pig.feedId(t.market), a.timestamp, a.price),
+      a.signature);
+  } catch { return null; }
+}
+
 function exitBlock(x, t) {
   const c = t.collateral_asset, d = t.debt_asset;
   const scale = x.price_scale || t.price_scale || 100000;
@@ -808,12 +843,24 @@ function exitBlock(x, t) {
     }
     const when = a.timestamp
       ? new Date(Number(a.timestamp) * 1000).toLocaleString() : "—";
+    // Verified HERE, in this browser, against the key this vault's own address
+    // commits to. The book reports a verdict of its own and the page used to
+    // print it while claiming the check had happened locally -- which made the
+    // one line a reader would rely on the one line that was not true. Where
+    // the two disagree, both are shown: a book that says yes to a signature
+    // this page says no to is the more interesting fact of the two.
+    const mine = localVerdict(t, a);
+    const tag = mine === null
+      ? `<span class="tag dim" title="this page could not rebuild the message for this attestation">not checked here</span>`
+      : mine
+        ? '<span class="tag ok" title="checked in this browser against the key baked into this vault\'s own address">signature verified</span>'
+        : '<span class="tag bad" title="this signature does not check out in this browser against the key baked into this vault\'s address">signature does NOT verify</span>';
+    const argued = (mine !== null && a.verified != null && !!a.verified !== mine)
+      ? ` <span class="tag bad" title="the book and this page disagree about this signature; trust neither until it is explained">the book disagrees</span>`
+      : "";
     rows.push(`<span class="k">Oracle ${shortHex(a.oracle_x, 10)}</span><span>` +
       `${a.price == null ? "—" : px(a.price)} <span class="small">signed ${esc(when)}</span> ` +
-      (a.verified
-        ? '<span class="tag ok" title="checked here against the key baked into this vault\'s own address">signature verified</span>'
-        : '<span class="tag bad" title="this signature does not check out against the key baked into this vault\'s address">signature does NOT verify</span>') +
-      "</span>");
+      tag + argued + "</span>");
   }
   if (x.price_used != null)
     rows.push(`<span class="k">Price it closed at</span><span>${px(x.price_used)}` +
@@ -834,7 +881,8 @@ function exitBlock(x, t) {
   return `<div class="kv">${rows.join("")}</div>${problems}` +
     `<div class="small" style="margin-top:6px">Every line above is read out of ` +
     `<a href="${txLink(x.spent_by)}" class="mono">${shortHex(x.spent_by, 12)}</a>` +
-    `, and each signature is checked against the key this vault's own address commits to.</div>`;
+    `, and each signature is checked in this browser against the key this ` +
+    `vault's own address commits to.</div>`;
 }
 
 // One fetch per closed loan. The tables redraw every half minute and a closing
@@ -986,6 +1034,7 @@ function renderOffers() {
       const st = status !== "open"
         ? `<span class="tag ${status === "ghost" ? "bad" : "dim"}" title="${status === "unlisted"
             ? "funded on chain, but this book has no listing for it yet" : ""}">${esc(status)}</span>` : "";
+      offer.requirePinned();
       const spk = derived(`offer:${o.outpoint}`, () => offer.offerTree({
         terms: t, principal: big(o.principal || t.principal),
         collateral: big(o.collateral || t.collateral_amount),
@@ -1090,7 +1139,8 @@ function renderLoans() {
       const oracle = (t.oracles && t.oracles.length)
         ? `<span class="sub2">${esc(l.oracle || "")} oracles</span>` : "";
       const spk = derived(`vault:${l.txid}:${l.vout}`, () => l.single_leaf
-        ? offer.offerVaultScriptPubKey(t) : pig.vaultScriptPubKey(t));
+        ? (offer.requirePinned(), offer.offerVaultScriptPubKey(t))
+        : pig.vaultScriptPubKey(t));
       return `<tr>
         <td data-label="loan" class="mono"><a href="${txLink(l.txid)}" style="color:inherit;text-decoration:none">${shortHex(l.txid, 10)}</a>${role ? "<br>" + role : ""}</td>
         <td data-label="market">${esc(l.collateral_ticker)} / ${esc(l.debt_ticker)}${oracle}</td>
@@ -1649,15 +1699,31 @@ async function seize(l, atMaturity) {
       // another price scale is dropped with them: the scale is baked into the
       // leaf and signed by nobody, so the same number is a different price.
       const got = await api(`v1/attestations/${market}`);
-      set = (got.attestations || []).filter(a =>
+      const named = (got.attestations || []).filter(a =>
         t.oracles.includes(a.oracle_x) &&
         (a.price_scale == null || big(a.price_scale) === scale) &&
         pig.verifySchnorr(a.oracle_x,
           pig.attestationMessage(pig.feedId(t.market), a.timestamp, a.price),
           a.signature));
-      if (!set.length)
+      // AGE, as well as signature. An oracle's signature stays valid however
+      // old the number under it is, and the covenant cannot tell the
+      // difference -- so a seizure composed from yesterday's prices is a
+      // seizure at yesterday's price, decided against a position that has
+      // moved. The single-oracle path already refuses this; a threshold one
+      // took whatever verified.
+      set = named.filter(a => !a.stale);
+      if (!named.length)
         throw new Error("none of this loan's oracles have a verifiable " +
                         "attestation right now; the covenant would refuse it.");
+      if (set.length < Number(t.oracle_threshold || 1)) {
+        const ages = named.map(a => `${shortHex(a.oracle_x, 8)} ` +
+          (a.age != null ? `${Number(a.age)}s old` : "age unknown"))
+          .join(", ");
+        throw new Error(`this loan needs ${t.oracle_threshold} of its oracles ` +
+          `and only ${set.length} have a current price (${ages}). Closing at a ` +
+          "stale price is closing at a price the market has left behind; wait " +
+          "for the oracles to catch up, or use pignus-cli with --allow-stale.");
+      }
     } else {
       // Ask for THIS LOAN'S oracle by name. Unqualified, the book serves
       // whichever key it currently calls primary, and a loan baked to an
@@ -1866,8 +1932,8 @@ function needBtcHeight() {
   if (state.btcHeight != null) return false;
   note("This book does not publish a Bitcoin height, so the page cannot check " +
        "that the two chains' deadlines leave you enough time to repay and " +
-       "reclaim. Take the offer with <code>pignus-cli btc-take</code>, which " +
-       "reads a Bitcoin node directly.", "warn");
+       "reclaim. Take the offer with <code>pignus-cli btc-offer-take</code>, " +
+       "which reads a Bitcoin node directly.", "warn");
   return true;
 }
 
@@ -1938,7 +2004,10 @@ async function renderBtcLoans() {
         acts.push(`<button data-btcabort="${i}" class="warnbtn sm">Take the collateral back</button>`);
       // The repayment's own REFUND leaf: if the lender never took the money,
       // it comes home after the deadline, and needs no signature from them.
-      if (rec.status === "repaid" && rec.repay_txid && state.height != null
+      // Decided from the facts, not from a word: the repayment went out, no
+      // secret has appeared for it, and its own refund leaf has opened.
+      if (rec.repay_txid && !rec.secret_t && !rec.lender_claim_txid
+          && !rec.terminal && state.height != null
           && state.height >= Number(l.repay_deadline))
         acts.push(`<button data-btcunpay="${i}" class="sm" title="the lender never claimed it, so the repayment's refund leaf is open">Take the repayment back</button>`);
       const funded = rec.prevault_txid || rec.funding_txid;
@@ -2046,7 +2115,12 @@ async function btcRefundRepayment(rec) {
         ] }),
       { flow: "btcclaim", prefer: [l.debt_asset] });
     if (txid) {
-      btcborrow.rememberLoan({ ...rec, status: "refunded", refund_txid: txid });
+      // The BORROWER took their own repayment back. Not the same event as the
+      // lender taking back an unclaimed principal, which the relay also used
+      // to call "refunded" -- and the collision offered an abort button on a
+      // pre-vault that had been spent months earlier.
+      btcborrow.rememberLoan({ ...rec, terminal: "repayment-refunded",
+                               repayment_refund_txid: txid });
       await renderBtcLoans();
     }
   } catch (e) { note(explain(e), "bad"); }

@@ -50,7 +50,9 @@ A repurchase against an OpenDAMP asset (Tier D, not a loan):
 
 `pignus-cli <command> --help` describes each. Exit status: 0 done, 1 the command
 could not run, 2 REFUSED -- a check failed and nothing was built or broadcast,
-3 the covenant is unavailable.
+3 the covenant is unavailable, 4 a CHECK command ran and reported a state that
+is not settled and not safe to act on (`repo-verify` uses this for `bond-only`
+and `funded-unburied`, which look like success and are not).
 """
 
 import argparse
@@ -64,6 +66,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 
 from pignus import __version__ as PIGNUS_VERSION  # noqa: E402
 from pignus import atoms, compat, oracle as O    # noqa: E402
+from pignus import atoms as _atoms              # noqa: E402
 from pignus.node import Node                    # noqa: E402
 from pignus.openamp import PledgeError          # noqa: E402
 from pignus.terms import LoanTerms, feed_id     # noqa: E402
@@ -99,8 +102,7 @@ def _funding_for(args, node, need, exclude=(), fee_asset=None):
               f"preparing fee was paid in {asset[:8]}…: " + ", ".join(txids),
               file=sys.stderr)
 
-    prep = getattr(args, "prep_fee_asset", None)
-    prep_asset = resolve_asset(node, prep) if prep else fee_asset
+    prep_asset = _prep_asset(node, args, fee_asset)
     try:
         return select_funding(node, need, exclude=exclude,
                               prepare=not args.dry_run,
@@ -111,6 +113,18 @@ def _funding_for(args, node, need, exclude=(), fee_asset=None):
         print(f"dry-run: nothing composed. Preparing explicit coins would have "
               f"broadcast a payment: {e}", file=sys.stderr)
         return None
+
+
+def _prep_asset(node, args, fee_asset):
+    """Which asset the PREPARING sends pay their own fee in.
+
+    `--prep-fee-asset` when it is given, and otherwise the asset this command
+    is already paying in. One place, because the offer commands each select
+    their own funding and every one of them used to ignore the flag -- a flag
+    accepted and silently dropped is worse than one that does not exist.
+    """
+    prep = getattr(args, "prep_fee_asset", None)
+    return resolve_asset(node, prep) if prep else fee_asset
 
 
 def terms_doc(path):
@@ -164,8 +178,11 @@ def add_fee_args(p, fee_default="the asset already being spent"):
     p.add_argument("--fee-asset", help="label or 64-hex id; default: "
                    f"{fee_default}, else anything held that the node "
                    "publishes a rate for")
-    p.add_argument("--fee-amount", type=int, help="atoms; default: priced "
-                   "from the node's exchange rates at 20x the relay floor")
+    p.add_argument("--fee-amount", type=int, default=None,
+                   help="atoms; default: priced from the node's exchange rates "
+                        "at 20x the relay floor. 0 is a real answer -- it "
+                        "means this transaction's fee is paid by another "
+                        "input -- and is honoured rather than replaced")
     p.add_argument("--prep-fee-asset", help="label or 64-hex id for the fee on "
                    "the sends that give the wallet explicit coins (default: "
                    "--fee-asset). A covenant cannot spend a blinded input, and "
@@ -540,6 +557,18 @@ def cmd_pledge_seize(args):
     except ValueError as e:
         raise SystemExit(f"error: {e}") from None
     print(json.dumps(out, indent=2))
+    # Say what actually happened. A seizure before maturity is TWO phases --
+    # the request, then the issuer's delivery once the borrower's
+    # countersignature is in -- and reporting the first as "seized" tells a
+    # lender the collateral is theirs while the issuer is still holding it.
+    state = str(out.get("state") or "").lower()
+    if state and state not in ("seized", "delivered", "closed"):
+        print(f"the issuer accepted the request and the pledge is now "
+              f"'{state}': the collateral has NOT been delivered yet. Check "
+              f"`pignus-cli pledge-show --pledge {args.pledge}` before "
+              "treating it as yours.", file=sys.stderr)
+        return 4
+    print("the collateral has been delivered to the lender", file=sys.stderr)
 
 
 # --- Tier D: a repurchase against an OpenDAMP asset --------------------------
@@ -646,6 +675,12 @@ def cmd_repo_verify(args):
               "deep; until they are, either can still be reorged away",
               file=sys.stderr)
     print(t.describe(), file=sys.stderr)
+    # A script has to be able to tell a repurchase that was fully checked from
+    # one where half of it was never looked at. Both printed the same status,
+    # so an unattended caller could not: `bond-only` means the collateral leg
+    # is unexamined, and `funded-unburied` means either half can still be
+    # reorged away. Neither is a repurchase anybody should act on.
+    return 0 if state in ("live", "forfeitable", "settled") else 4
 
 
 def _repo_terms(args):
@@ -679,7 +714,17 @@ def cmd_repo_fund(args):
     try:
         vout = int(t.verify_funding(node, txid)["n"])
     except ValueError as e:
-        refuse(f"the funding at {txid} is not the bond these terms make: {e}")
+        # NOT `refuse`. That means "nothing was built, nothing was sent", and
+        # status 2 is what a script reads it by -- but the money has already
+        # gone out one line above. Saying "REFUSED" here would tell an operator
+        # their bond is still in their wallet when it is on the chain.
+        print(f"the bond was BROADCAST at {txid}, and it is not the bond these "
+              f"terms make: {e}\n"
+              f"The money is on chain. Nothing further has been signed. Read "
+              f"the transaction, and use `pignus-cli repo-verify --txid {txid}` "
+              f"to see what actually landed before doing anything else.",
+              file=sys.stderr)
+        raise SystemExit(1) from None
     print(f"funded the bond ({t.bond()} atoms of {t.debt_asset[:12]}...) at "
           f"{txid}:{vout}  (fee in {fee_asset[:8]}…)", file=sys.stderr)
     print(json.dumps({"txid": txid, "vout": vout}))
@@ -754,7 +799,45 @@ def _coin_from_chain(node, spec, what):
         refuse(f"{what} {spec} is blinded; every coin in a settlement must be "
                "explicit, because the covenant and OpenDAMP's verifier both "
                "compare values they have to be able to read")
-    return Outpoint(txid, int(vout), atoms(got["value"]), got["asset"])
+    coin = Outpoint(txid, int(vout), atoms(got["value"]), got["asset"])
+    # Kept beside it, because a caller sometimes has to prove the script it was
+    # given IS this coin's. `Outpoint` is the shape the covenant code takes and
+    # it carries no script, so this rides alongside rather than inside it.
+    coin_spk[(txid, int(vout))] = got["scriptPubKey"]["hex"]
+    return coin
+
+
+# What each coin `_coin_from_chain` read actually pays to. One dictionary
+# rather than a wider Outpoint: every covenant path takes the dataclass as it
+# is, and widening it would touch code that has golden vectors behind it.
+coin_spk = {}
+
+
+def _check_settlement_vault(raw, terms, args):
+    """The transaction being witnessed really spends the vault named.
+
+    `repo-settle --attach` requires --txid/--vout and used to ignore them. A
+    witness put on the wrong transaction is refused by the node with a script
+    error that names nothing, and a person then looks for a fault in the
+    covenant rather than in the arguments they typed.
+    """
+    from pignus.repurchase import SETTLEMENT_VAULT_INDEX
+    from pignus.vault import _tf
+    m, _ = _tf()
+    try:
+        tx = m.tx_from_hex(raw)
+    except Exception as e:                              # noqa: BLE001
+        refuse(f"--attach is not a transaction this can read: {e}")
+    if SETTLEMENT_VAULT_INDEX >= len(tx.vin):
+        refuse(f"that transaction has {len(tx.vin)} input(s); a settlement's "
+               f"bond vault sits at input {SETTLEMENT_VAULT_INDEX}")
+    vin = tx.vin[SETTLEMENT_VAULT_INDEX]
+    got = (f"{vin.prevout.hash:064x}", int(vin.prevout.n))
+    want = (str(args.txid).lower(), int(args.vout))
+    if got != want:
+        refuse(f"input {SETTLEMENT_VAULT_INDEX} of that transaction spends "
+               f"{got[0]}:{got[1]}, and --txid/--vout name {want[0]}:{want[1]}. "
+               "This witness belongs to a different settlement.")
 
 
 def cmd_repo_settle(args):
@@ -784,6 +867,11 @@ def cmd_repo_settle(args):
         # The fee is already in the transaction being witnessed; the spender is
         # constructed only for the leaf and the control block.
         sp = R.RepurchaseSpender(node, t, t.debt_asset, 0)
+        # ...and the input being witnessed has to be THIS vault. --txid/--vout
+        # were required and then ignored, so a witness could be attached to
+        # somebody else's settlement, where it fails at the node with a script
+        # error that names nothing.
+        _check_settlement_vault(raw, t, args)
         signed = sp.attach_return_witness(raw)
         if args.broadcast:
             txid = node.sendrawtransaction(signed)
@@ -818,6 +906,17 @@ def cmd_repo_settle(args):
     verifier = _coin_from_chain(node, args.verifier, "--verifier")
     cu_lender = _coin_from_chain(node, args.cu_lender, "--cu-lender")
     debt_input = _coin_from_chain(node, args.debt_utxo, "--debt-utxo")
+    # Output 0 returns the verifier's coin to the address it came from, so the
+    # script given has to BE that address. Mistype it and the settlement is
+    # otherwise perfectly valid: it simply sends the issuer's verifier asset
+    # somewhere nothing can ever spend it from, and no other check would say so.
+    on_chain = coin_spk.get((verifier.txid, verifier.vout))
+    if on_chain and on_chain != str(args.verifier_spk).lower():
+        refuse(f"--verifier-spk is {str(args.verifier_spk)[:20]}... and the "
+               f"verifier coin actually pays {on_chain[:20]}.... Output 0 "
+               "returns that coin to itself, so a different script would send "
+               "the issuer's verifier asset somewhere nothing can spend it "
+               "from.")
     if args.change_spk:
         change_spk = bytes.fromhex(args.change_spk)
     else:
@@ -828,7 +927,8 @@ def cmd_repo_settle(args):
     try:
         raw = sp.compose_settlement(vault, verifier,
                                     bytes.fromhex(args.verifier_spk),
-                                    cu_lender, debt_input, change_spk)
+                                    cu_lender, debt_input, change_spk,
+                                    locktime=int(args.locktime or 0))
     except ValueError as e:
         refuse(str(e))
     print(f"composed a settlement: {t.collateral_amount} atoms of "
@@ -885,7 +985,16 @@ def book_post(base, path, body):
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.status, json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode() or "{}")
+        try:
+            return e.code, json.loads(e.read().decode() or "{}")
+        except ValueError:
+            return e.code, {"error": f"HTTP {e.code}"}
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        # A relay that is down must not raise out of a responder pass. The
+        # caller records what it did in its own state file first and reports
+        # afterwards, so a failed report is a message to retry -- not a reason
+        # to abandon the loan, and never a reason to stop the other passes.
+        return 0, {"error": f"{type(e).__name__}: {e}"}
 
 
 def add_book_arg(p):
@@ -904,7 +1013,13 @@ def choose_fee(node, args, flow, prefer=()):
     """
     table = F.fee_table(node)
     rates = table["rates"]
-    if args.fee_amount:
+    # `is not None`, not truthiness. `--fee-amount 0` is a real request -- a
+    # transaction whose fee is already paid by another input, which is how
+    # `repo-settle --attach` works -- and a falsy test silently discarded it
+    # and priced a fee instead, adding an output the caller did not ask for.
+    if args.fee_amount is not None:
+        if int(args.fee_amount) < 0:
+            raise SystemExit("--fee-amount cannot be negative")
         asset = args.fee_asset or next(iter(prefer), None)
         if not asset:
             raise SystemExit("--fee-amount needs --fee-asset")
@@ -927,9 +1042,20 @@ def dust_fold_for(rate):
     return F.dust_atoms(rate) if rate else None
 
 
+_HEX = set("0123456789abcdefABCDEF")
+
+
 def resolve_asset(node, label_or_hex):
-    if len(label_or_hex) == 64:
-        return label_or_hex
+    """An asset id, from a 64-hex id or from a label this node knows.
+
+    HEX, not merely 64 characters. A 64-character label that is not hex used to
+    be handed straight back as an asset id, and it then reaches a covenant
+    builder or an RPC as an asset nothing has: the error that comes back names
+    a byte length or a JSON field, never the argument that was wrong.
+    """
+    label_or_hex = str(label_or_hex)
+    if len(label_or_hex) == 64 and all(c in _HEX for c in label_or_hex):
+        return label_or_hex.lower()
     labels = node.dumpassetlabels()
     if label_or_hex in labels:
         return labels[label_or_hex]
@@ -1161,7 +1287,8 @@ def cmd_offer_fund(args):
         print(terms.to_json())
         return 0
     raw, _spk = fund_offer(node, terms, principal, collateral, expiry, args.lots,
-                           fee_asset, fee, change_spk, fee_rate=rate)
+                           fee_asset, fee, change_spk, fee_rate=rate,
+                           prep_fee_asset=_prep_asset(node, args, fee_asset))
     txid = node.sendrawtransaction(raw)
     print(f"  funded {txid}:0  (fee {fee} atoms of {fee_asset[:8]}…)",
           file=sys.stderr)
@@ -1375,7 +1502,8 @@ def cmd_offer_take(args):
         return 0
     raw, vault_spk = take_offer(node, terms, coin, coin.amount, principal,
                                 collateral, expiry, fee_asset, fee, spk, spk,
-                                fee_rate=rate)
+                                fee_rate=rate,
+                                prep_fee_asset=_prep_asset(node, args, fee_asset))
     if vault_spk != vault:
         # The vault printed above is the address the borrower was shown; a
         # composer that built a different one is not something to broadcast.
@@ -1411,7 +1539,8 @@ def cmd_offer_withdraw(args):
                                      fee_asset=fee_asset) is None:
         return 0
     raw = withdraw_offer(node, terms, coin, coin.amount, principal, collateral,
-                         expiry, fee_asset, fee, spk, fee_rate=rate)
+                         expiry, fee_asset, fee, spk, fee_rate=rate,
+                         prep_fee_asset=_prep_asset(node, args, fee_asset))
     if args.dry_run:
         print(raw)
         return 0
@@ -1640,11 +1769,6 @@ def add_wallet_commands(sub):
 
 
 COIN = 100_000_000
-# How close to the borrower's own refund deadline a lender may still claim a
-# repayment. Claiming publishes the secret that releases the collateral, so
-# doing it as the refund opens would let a borrower take the debt back AND the
-# collateral. Two hours of Sequentia blocks.
-CLAIM_MARGIN_BLOCKS = 120
 
 # --- Tier B: native BTC collateral, the cross-chain loan ----------------------
 #
@@ -1749,15 +1873,43 @@ class _ResponderState:
     it is reported, for a person to resolve.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, exclusive=False):
         self.path = path
         self.data = {}
+        self._lockf = None
+        if path and exclusive:
+            self._take_lock()
         if path and os.path.exists(path):
             try:
                 with open(path) as f:
                     self.data = json.load(f)
             except (OSError, ValueError):
                 self.data = {}
+
+    def _take_lock(self):
+        """One responder per key, enforced by the filesystem.
+
+        Two responders on one lender key each draw their own secret for the
+        same take. Only one wins the relay's race, but the loser's state file
+        now holds a secret that is not that loan's -- and the address a
+        principal is paid into does not depend on it, so the loser pays a
+        SECOND full principal into the same place. The lender pays twice and
+        can claim neither repayment. A lock is cheaper than the arithmetic.
+        """
+        import fcntl
+        lock = self.path + ".lock"
+        try:
+            self._lockf = open(lock, "a+")
+            fcntl.flock(self._lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lockf.seek(0)
+            self._lockf.truncate()
+            self._lockf.write(f"{os.getpid()}\n")
+            self._lockf.flush()
+        except OSError as e:
+            raise SystemExit(
+                f"another responder already holds {lock}: two on one lender "
+                f"key pay two principals for one loan. Stop that one first "
+                f"({type(e).__name__}: {e})") from e
 
     def get(self, take_id):
         return self.data.get(take_id, {})
@@ -2023,7 +2175,8 @@ def cmd_btc_upgrade(args):
     w, spend_txid, conf = preimage_from_spend(
         seq, tk["disbursement_txid"], int(tk["disbursement_vout"]),
         expect_hash=loan.h_w)
-    ok, depth = anchor_safe(seq, spend_txid, min_depth=args.min_depth)
+    ok, depth = anchor_safe(seq, spend_txid, min_depth=args.min_depth,
+                            btc_node=btc)
     if not ok and not args.force:
         raise SystemExit(f"the claim that published the secret has {depth} "
                          f"confirmation(s), below the {args.min_depth} this "
@@ -2184,12 +2337,13 @@ def cmd_btc_reclaim(args):
     t, spend_txid, _conf = preimage_from_spend(
         node, tk["repay_txid"], int(tk["repay_vout"]),
         expect_hash=loan.payment_hash)
-    ok, conf = anchor_safe(node, spend_txid, min_depth=args.min_depth)
+    ok, conf = anchor_safe(node, spend_txid, min_depth=args.min_depth,
+                            btc_node=btc)
     if not ok and not args.force:
-        raise SystemExit(f"the claim has {conf} confirmations, below the "
-                         f"{args.min_depth} this asks for; a Bitcoin-driven "
-                         "reorg could still undo it. Re-run with --force to "
-                         "accept that risk.")
+        raise SystemExit(f"the claim has {conf} confirmations, and the Bitcoin "
+                         f"header its block anchored to is not yet buried; a "
+                         f"Bitcoin-driven reorg could still undo it. Re-run "
+                         "with --force to accept that risk.")
     rtx = reclaim_tx(loan, tk["vault_txid"], int(tk.get("vault_vout", 0)),
                      bytes.fromhex(tk["reclaim_dest"]),
                      int(tk.get("reclaim_fee", args.btc_fee)))
@@ -2480,13 +2634,15 @@ def cmd_btc_respond(args):
                                        collateral_committed, pay_disbursement,
                                        preimage_from_spend, complete_upgrade,
                                        anchor_safe, claim_repayment,
-                                       refund_disbursement, upgrade_tx)
+                                       refund_disbursement, upgrade_tx,
+                                       effective_repay_deadline)
     _btc_cfg(args)
     if not args.lender_key:
         raise SystemExit("--lender-key, or a config file naming one, is required")
     lender = _read_key(args.lender_key)
     lender_x = A.xonly_pubkey(lender).hex()
-    state = _ResponderState(args.state or (args.lender_key + ".state.json"))
+    state = _ResponderState(args.state or (args.lender_key + ".state.json"),
+                            exclusive=True)
 
     seq_node = (node_from(args)
                 if (args.rpc_user or args.rpc_password or args.rpc_cookie)
@@ -2521,6 +2677,17 @@ def cmd_btc_respond(args):
         secret = (have or {}).get("t")
         if secret:
             d["payment_hash"] = _sha256(bytes.fromhex(secret))
+            # ...but if the relay is holding a DIFFERENT hash for this take,
+            # the secret in this state file is not this loan's. That happens
+            # when a second responder on the same key drew its own secret and
+            # lost the race, and acting on it pays a second principal into an
+            # address that does not depend on the secret at all. Stop.
+            theirs = got.get("payment_hash")
+            if theirs and theirs != d["payment_hash"]:
+                raise ValueError(
+                    "the secret recorded for this take does not match the "
+                    "hash the relay holds for it: another responder reserved "
+                    "it. Refusing to act on it.")
         elif got.get("payment_hash"):
             d["payment_hash"] = got["payment_hash"]
         loan = loan_from_dict(d)
@@ -2550,6 +2717,49 @@ def cmd_btc_respond(args):
         for o in book_get(args.book, "/v1/btc/offers?status=all")["offers"]:
             out[o["btc_offer_id"]] = o
         return out
+
+    def our_takes(offers, status=None):
+        """Every take of an offer THIS key signed, with this responder's own
+        record of it.
+
+        The passes below iterate this rather than asking the relay for a
+        status, because a status is a thing the borrower can move: they report
+        their own steps, and a pass that scans by status is a pass a borrower
+        can steer away from their own loan -- leaving the lender's principal
+        paid and the collateral never taken into the vault. What a pass acts on
+        is the state file, which only this responder writes, and the two
+        chains, which nobody rewrites.
+
+        `status` narrows to a step of the HANDSHAKE, where the relay's word is
+        all there is and moving it can only cost the borrower their own loan.
+        """
+        out = []
+        for tk in book_get(args.book, "/v1/btc/takes")["takes"]:
+            if status is not None and tk.get("status") != status:
+                continue
+            offer = offers.get(tk.get("btc_offer_id"))
+            if not offer or not ours(offer):
+                continue
+            out.append((offer, tk, state.get(tk["take_id"])))
+        return out
+
+    def lots_committed(offers, except_take=None):
+        """How many lots of each offer this responder has already put money
+        behind, counted from its OWN state.
+
+        `lots` is the one term that bounds a lender's total exposure, and until
+        now it was enforced only by the relay -- the party this responder is
+        written never to trust. Counted here, an offer for three lots funds
+        three loans however many takes a relay serves back.
+        """
+        used = {}
+        for _o, tk, have in our_takes(offers):
+            if tk["take_id"] == except_take:
+                continue
+            if have.get("disbursement_txid") or have.get("disbursing"):
+                oid = tk.get("btc_offer_id")
+                used[oid] = used.get(oid, 0) + 1
+        return used
 
     # What each report calls its fields on the wire, against the canonical names
     # the signature covers. The two differ because the wire names say which
@@ -2593,11 +2803,7 @@ def cmd_btc_respond(args):
         address commits to the hash.
         """
         n = 0
-        for tk in book_get(args.book, "/v1/btc/takes?status=requested")["takes"]:
-            offer = offers.get(tk.get("btc_offer_id"))
-            if not offer or not ours(offer):
-                continue
-            have = state.get(tk["take_id"])
+        for offer, tk, have in our_takes(offers, status="requested"):
             t = (bytes.fromhex(have["t"]) if have.get("t") else A.new_secret())
             try:
                 loan = loan_for(offer, tk, {"t": t.hex()})
@@ -2619,11 +2825,7 @@ def cmd_btc_respond(args):
 
     def sign_pass(offers):
         n = 0
-        for tk in book_get(args.book, "/v1/btc/takes?status=pending")["takes"]:
-            offer = offers.get(tk.get("btc_offer_id"))
-            if not offer or not ours(offer):
-                continue
-            have = state.get(tk["take_id"])
+        for offer, tk, have in our_takes(offers, status="pending"):
             if not have.get("t"):
                 print(f"take {tk['take_id']}: no secret recorded for it; it "
                       "was reserved by another responder or the state file was "
@@ -2668,23 +2870,32 @@ def cmd_btc_respond(args):
         return n
 
     def disburse_pass(offers):
+        """Pay the principal of every loan whose collateral is committed.
+
+        The only pass that spends without a deadline forcing it, so every
+        refusal here is deliberate: the loan is rebuilt from the offer this key
+        signed, its deadlines are re-checked against both chains' tips as they
+        are NOW rather than as they were when it was signed, the collateral is
+        read off the parent chain, and the offer's own lot count is enforced
+        from this responder's records rather than the relay's.
+        """
         if not (seq_node and btc_node):
             return 0
         n = 0
-        for tk in book_get(args.book, "/v1/btc/takes?status=signed")["takes"]:
-            offer = offers.get(tk.get("btc_offer_id"))
-            if not offer:
-                print(f"take {tk['take_id']}: the relay no longer serves the "
-                      "offer it was taken from", file=sys.stderr)
-                continue
-            if not ours(offer):
-                print(f"take {tk['take_id']}: offer "
-                      f"{tk.get('btc_offer_id')} is not signed by this key; "
-                      "ignoring it", file=sys.stderr)
-                continue
-            have = state.get(tk["take_id"])
+        used = lots_committed(offers)
+        # Every take this responder signed a release for and has not yet paid.
+        # `vault_txid` is written by sign_pass, so it is this key's own record
+        # of having committed to the loan -- not a status a borrower can move.
+        for offer, tk, have in our_takes(offers):
             if have.get("disbursement_txid"):
                 continue                       # already paid; never pay twice
+            if not (have.get("vault_txid") or tk.get("status") == "signed"):
+                continue                       # not signed by this key yet
+            try:
+                loan = loan_for(offer, tk, have)
+            except ValueError as e:
+                print(f"take {tk['take_id']}: {e}", file=sys.stderr)
+                continue
             if have.get("disbursing"):
                 found = _find_output(seq_node, have["disbursing"],
                                      asset=loan.debt_asset,
@@ -2705,10 +2916,17 @@ def cmd_btc_respond(args):
                           f"a payment to {have['disbursing']} and clear "
                           "'disbursing' in the state file.", file=sys.stderr)
                 continue
-            try:
-                loan = loan_for(offer, tk, have)
-            except ValueError as e:
-                print(f"take {tk['take_id']}: {e}", file=sys.stderr)
+            # An offer is for so many lots, and that number is the whole of a
+            # lender's exposure to it. Counting from this responder's own
+            # records is the point: the relay counts too, and the relay is the
+            # party this code is written never to believe.
+            lots = int(offer.get("lots", 1) or 1)
+            if used.get(tk.get("btc_offer_id"), 0) >= lots:
+                if have.get("waiting") != "lots":
+                    state.set(tk["take_id"], waiting="lots")
+                    print(f"take {tk['take_id']}: offer "
+                          f"{tk.get('btc_offer_id')} has already funded all "
+                          f"{lots} of its lots; not disbursing", file=sys.stderr)
                 continue
             # The borrower chooses when to fund, and nothing makes them do it
             # promptly. Deadlines that were safe when this take was signed can
@@ -2738,6 +2956,7 @@ def cmd_btc_respond(args):
             # Written BEFORE the send: the gap between paying and recording is
             # where a crash would otherwise cost a second principal.
             state.set(tk["take_id"], disbursing=loan.disbursement_spk().hex())
+            used[tk.get("btc_offer_id")] = used.get(tk.get("btc_offer_id"), 0) + 1
             try:
                 txid, vout = pay_disbursement(seq_node, loan,
                                               fee_asset=args.fee_asset or None)
@@ -2776,60 +2995,57 @@ def cmd_btc_respond(args):
         if not (seq_node and btc_node):
             return 0
         n = 0
-        for status in ("disbursed", "claimed-principal"):
-            for tk in book_get(args.book,
-                               f"/v1/btc/takes?status={status}")["takes"]:
-                offer = offers.get(tk.get("btc_offer_id"))
-                if not offer or not ours(offer):
-                    continue
-                have = state.get(tk["take_id"])
-                if have.get("upgrade_txid"):
-                    continue
-                d = have.get("disbursement_txid") or tk.get("disbursement_txid")
-                if not d:
-                    continue
-                try:
-                    loan = loan_for(offer, tk, have)
-                except ValueError as e:
-                    print(f"take {tk['take_id']}: {e}", file=sys.stderr)
-                    continue
-                try:
-                    w, spend_txid, _c = preimage_from_spend(
-                        seq_node, d,
-                        int(have.get("disbursement_vout",
-                                     tk.get("disbursement_vout", 0))),
-                        expect_hash=loan.h_w)
-                except ValueError:
-                    continue                   # not claimed yet
-                ok, depth = anchor_safe(seq_node, spend_txid,
-                                        min_depth=args.claim_depth)
-                if not ok:
-                    continue                   # not buried enough to act on
-                try:
-                    tx = complete_upgrade(loan, tk["prevault_txid"],
-                                          int(tk["prevault_vout"]),
-                                          bytes.fromhex(tk["upgrade_presig"]),
-                                          w, lender)
-                except Exception as e:                  # noqa: BLE001
+        # Driven by this responder's OWN record of having paid a principal,
+        # and by the chain that says the borrower took it. A relay status would
+        # do neither: the borrower reports their own steps, so a status is a
+        # thing they can move -- and moving it out from under this pass leaves
+        # the principal theirs and the collateral never taken into the vault.
+        for offer, tk, have in our_takes(offers):
+            if have.get("upgrade_txid"):
+                continue
+            d = have.get("disbursement_txid")
+            if not d:
+                continue
+            try:
+                loan = loan_for(offer, tk, have)
+            except ValueError as e:
+                print(f"take {tk['take_id']}: {e}", file=sys.stderr)
+                continue
+            try:
+                w, spend_txid, _c = preimage_from_spend(
+                    seq_node, d, int(have.get("disbursement_vout", 0)),
+                    expect_hash=loan.h_w)
+            except ValueError:
+                continue                       # not claimed yet
+            ok, depth = anchor_safe(seq_node, spend_txid,
+                                    min_depth=args.claim_depth,
+                                    btc_node=btc_node)
+            if not ok:
+                continue                       # not buried enough to act on
+            try:
+                tx = complete_upgrade(loan, tk["prevault_txid"],
+                                      int(tk["prevault_vout"]),
+                                      bytes.fromhex(tk["upgrade_presig"]),
+                                      w, lender)
+            except Exception as e:                      # noqa: BLE001
+                print(f"upgrade {tk['take_id']}: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+                continue
+            txid = tx.txid()
+            try:
+                btc_node.sendrawtransaction(tx.hex())
+            except Exception as e:                      # noqa: BLE001
+                # A loan that has already started must not be retried for
+                # ever: the node saying so is a success, not a failure.
+                if not any(w_ in str(e).lower() for w_ in
+                           ("already in", "txn-already", "duplicate")):
                     print(f"upgrade {tk['take_id']}: {type(e).__name__}: {e}",
                           file=sys.stderr)
                     continue
-                txid = tx.txid()
-                try:
-                    btc_node.sendrawtransaction(tx.hex())
-                except Exception as e:                  # noqa: BLE001
-                    # A loan that has already started must not be retried for
-                    # ever: the node saying so is a success, not a failure.
-                    if not any(w_ in str(e).lower() for w_ in
-                               ("already in", "txn-already", "duplicate")):
-                        print(f"upgrade {tk['take_id']}: {type(e).__name__}: {e}",
-                              file=sys.stderr)
-                        continue
-                state.set(tk["take_id"], upgrade_txid=txid)
-                report(R.UPGRADED_TAG, tk["take_id"], "/v1/btc/upgraded",
-                       txid=txid)
-                print(f"started loan {tk['take_id']}: {txid}", file=sys.stderr)
-                n += 1
+            state.set(tk["take_id"], upgrade_txid=txid)
+            report(R.UPGRADED_TAG, tk["take_id"], "/v1/btc/upgraded", txid=txid)
+            print(f"started loan {tk['take_id']}: {txid}", file=sys.stderr)
+            n += 1
         return n
 
     def publish_pass(offers):
@@ -2845,22 +3061,38 @@ def cmd_btc_respond(args):
         if not seq_node:
             return 0
         n = 0
-        for tk in book_get(args.book, "/v1/btc/takes?status=claimed")["takes"]:
-            offer = offers.get(tk.get("btc_offer_id"))
-            if not offer or not ours(offer):
-                continue
-            have = state.get(tk["take_id"])
+        # Driven by this responder's own claim record. A relay status cannot
+        # drive it: the report that would have set one is exactly the report
+        # that may have failed, and a secret that is never published costs the
+        # borrower their collateral.
+        for offer, tk, have in our_takes(offers):
             if have.get("secret_published") or not have.get("t"):
                 continue
-            claim_txid = have.get("claim_txid") or tk.get("claim_txid")
-            if not claim_txid:
+            claim_txid = have.get("claim_txid")
+            repay_txid = have.get("claim_of_txid")
+            if not (claim_txid and repay_txid):
                 continue
-            ok, depth = anchor_safe(seq_node, claim_txid,
-                                    min_depth=args.claim_depth)
+            # Depth is measured from the REPAYMENT's spend, not by looking the
+            # claim up by id. The claim's own outputs belong to the lender's
+            # wallet and get spent, after which no indexless node can find it
+            # and a backward scan ages out -- stranding the secret for good.
+            # The spend of the repayment outpoint is a fact about a covenant
+            # output nobody else can touch, and it is where the secret is.
+            try:
+                secret, spend_txid, _conf = preimage_from_spend(
+                    seq_node, repay_txid, int(have.get("claim_of_vout", 0)),
+                    expect_hash=_sha256(bytes.fromhex(have["t"])))
+            except ValueError:
+                # The claim is not on chain any more: a reorg undid it, or it
+                # never confirmed. claim_pass will notice and try again.
+                continue
+            ok, depth = anchor_safe(seq_node, spend_txid,
+                                    min_depth=args.claim_depth,
+                                    btc_node=btc_node)
             if not ok:
                 continue
             code, _r = report(R.CLAIMED_TAG, tk["take_id"], "/v1/btc/claimed",
-                              txid=claim_txid, secret=have["t"])
+                              txid=spend_txid, secret=secret.hex())
             if code == 200:
                 state.set(tk["take_id"], secret_published=True)
                 print(f"published the secret for {tk['take_id']}: the borrower "
@@ -2917,64 +3149,102 @@ def cmd_btc_respond(args):
         if not seq_node:
             return 0
         n = 0
-        for status in ("live", "repaid"):
-            for tk in book_get(args.book,
-                               f"/v1/btc/takes?status={status}")["takes"]:
-                offer = offers.get(tk.get("btc_offer_id"))
-                if not offer or not ours(offer):
+        # Every take this responder started, whatever the relay says about it.
+        # `upgrade_txid` is this key's own record of having moved the
+        # collateral into the vault, which is the moment a debt begins.
+        for offer, tk, have in our_takes(offers):
+            if not have.get("t"):
+                continue
+            if not (have.get("upgrade_txid") or tk.get("upgrade_txid")):
+                continue
+            try:
+                loan = loan_for(offer, tk, have)
+            except ValueError:
+                continue
+            if have.get("claim_txid"):
+                # A claim already made -- but a claim can be UNDONE. Sequentia
+                # reorgs when Bitcoin reorgs, and a claim that vanished leaves
+                # the repayment spendable by its own refund while the secret it
+                # published stays valid for ever: the borrower takes back the
+                # debt and reclaims the collateral. So check the coin, not the
+                # record, and claim again if it is loose.
+                if not _claim_undone(seq_node, loan, have):
                     continue
+                print(f"take {tk['take_id']}: the claim of its repayment is no "
+                      "longer on chain; claiming again", file=sys.stderr)
+                state.set(tk["take_id"], claim_txid=None)
                 have = state.get(tk["take_id"])
-                if have.get("claim_txid") or not have.get("t"):
-                    continue
-                try:
-                    loan = loan_for(offer, tk, have)
-                except ValueError:
-                    continue
-                # Scan the chain at most every few minutes per loan: the
-                # borrower's signed report is the fast path and this is the
-                # safety net behind it.
-                last = float(have.get("scanned_at") or 0)
-                scan = (time.time() - last) > args.scan_interval
-                found = _find_repayment(seq_node, loan, tk, have, scan=scan)
-                if scan:
-                    state.set(tk["take_id"], scanned_at=time.time())
-                if not found:
-                    continue
-                # Claiming publishes the secret. Doing that when the borrower's
-                # own refund is about to open hands them the debt AND the
-                # collateral: they refund the repayment and reclaim with the
-                # secret. So the claim stops before the deadline, not at it.
-                if seq_height() >= int(loan.repay_deadline) - CLAIM_MARGIN_BLOCKS:
+            # Scan the chain at most every few minutes per loan: the
+            # borrower's signed report is the fast path and this is the
+            # safety net behind it.
+            last = float(have.get("scanned_at") or 0)
+            scan = (time.time() - last) > args.scan_interval
+            found = _find_repayment(seq_node, loan, tk, have, scan=scan,
+                                    min_conf=args.claim_depth)
+            if scan:
+                state.set(tk["take_id"], scanned_at=time.time())
+            if not found:
+                continue
+            # Claiming publishes the secret. Doing that when the borrower's
+            # own refund is about to open hands them the debt AND the
+            # collateral: they refund the repayment and reclaim with the
+            # secret. So the claim stops before the deadline, not at it.
+            if seq_height() >= effective_repay_deadline(loan):
+                if have.get("waiting") != "margin":
+                    state.set(tk["take_id"], waiting="margin")
                     print(f"take {tk['take_id']}: the repayment arrived too "
                           f"close to its own refund deadline (Sequentia block "
                           f"{loan.repay_deadline}); not claiming, and not "
                           "publishing the secret", file=sys.stderr)
-                    continue
-                rtxid, rvout = found
-                try:
-                    txid = claim_repayment(seq_node, loan, rtxid, rvout,
-                                           bytes.fromhex(have["t"]),
-                                           fee_asset=args.fee_asset or None)
-                except Exception as e:                  # noqa: BLE001
-                    print(f"claim {tk['take_id']}: {type(e).__name__}: {e}",
-                          file=sys.stderr)
-                    continue
-                state.set(tk["take_id"], claim_txid=txid)
-                report(R.CLAIMED_TAG, tk["take_id"], "/v1/btc/claimed",
-                       txid=txid, secret="")
-                # The secret itself follows once the claim is buried. Publishing
-                # it with the claim still in the mempool would let a borrower
-                # take the collateral back off a transaction a reorg could undo.
-                print(f"claimed the repayment of {tk['take_id']}: {txid}",
+                continue
+            rtxid, rvout = found
+            try:
+                txid = claim_repayment(seq_node, loan, rtxid, rvout,
+                                       bytes.fromhex(have["t"]),
+                                       fee_asset=args.fee_asset or None)
+            except Exception as e:                      # noqa: BLE001
+                print(f"claim {tk['take_id']}: {type(e).__name__}: {e}",
                       file=sys.stderr)
-                n += 1
+                continue
+            # The outpoint that was claimed is recorded with the claim.
+            # Publishing the secret later means finding the claim again, and
+            # the only handle on it that nobody else can spend is the covenant
+            # output it spent.
+            state.set(tk["take_id"], claim_txid=txid, claim_of_txid=rtxid,
+                      claim_of_vout=int(rvout))
+            report(R.CLAIMED_TAG, tk["take_id"], "/v1/btc/claimed",
+                   txid=txid, secret="")
+            # The secret itself follows once the claim is buried. Publishing
+            # it with the claim still in the mempool would let a borrower
+            # take the collateral back off a transaction a reorg could undo.
+            print(f"claimed the repayment of {tk['take_id']}: {txid}",
+                  file=sys.stderr)
+            n += 1
         return n
 
+    PASSES = (("hash", hash_pass), ("sign", sign_pass),
+              ("disburse", disburse_pass), ("upgrade", upgrade_pass),
+              ("claim", claim_pass), ("publish", publish_pass),
+              ("refund", refund_pass))
+
     def one_pass():
+        """Run every pass, and let none of them stop the rest.
+
+        These were one summed expression, which made any single failure -- a
+        take in a state one pass could not read, a node that blinked -- stop
+        every later pass for as long as it lasted. Publishing secrets and
+        claiming repayments are how borrowers get their collateral back, so a
+        responder that stops doing them quietly is worse than one that stops.
+        """
         offers = offers_by_id()
-        return (hash_pass(offers) + sign_pass(offers) + disburse_pass(offers)
-                + upgrade_pass(offers) + claim_pass(offers)
-                + publish_pass(offers) + refund_pass(offers))
+        moves = 0
+        for name, fn in PASSES:
+            try:
+                moves += fn(offers)
+            except Exception as e:                      # noqa: BLE001
+                print(f"{name} pass failed: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+        return moves
 
     if not args.watch:
         print(json.dumps({"moves": one_pass()}))
@@ -2995,7 +3265,8 @@ def _sha256(b):
     return hashlib.sha256(b).hexdigest()
 
 
-def _find_output(node, spk_hex, asset=None, amount=None, since_height=None):
+def _find_output(node, spk_hex, asset=None, amount=None, since_height=None,
+                 min_conf=0):
     """Find an unspent output paying `spk_hex`, without a wallet and without a
     transaction index.
 
@@ -3012,15 +3283,21 @@ def _find_output(node, spk_hex, asset=None, amount=None, since_height=None):
         res = node.scantxoutset("start", [desc])
     except Exception:                                   # noqa: BLE001
         return None
+    tip = int((res or {}).get("height", 0) or 0)
     best = None
     for u in (res or {}).get("unspents", []):
         if asset is not None and u.get("asset") not in (None, asset):
             continue
         if amount is not None:
-            got = int(round(float(u.get("amount", 0)) * COIN))
+            got = _atoms(u.get("amount", 0))
             if got != int(amount):
                 continue
         if since_height is not None and int(u.get("height", 0)) < int(since_height):
+            continue
+        # Depth, where the caller asked for it. The UTXO set holds only
+        # confirmed coins, so this is never zero -- but one confirmation is not
+        # what a claim that publishes a secret should be built on.
+        if min_conf and tip and (tip - int(u.get("height", 0)) + 1) < int(min_conf):
             continue
         # Take the most RECENT match. Every one of these addresses is public,
         # and a coin that is not this loan's payment is something anyone can
@@ -3034,7 +3311,30 @@ def _find_output(node, spk_hex, asset=None, amount=None, since_height=None):
     return best["txid"], int(best["vout"])
 
 
-def _find_repayment(seq_node, loan, take, have, scan=True):
+def _claim_undone(seq_node, loan, have):
+    """Has a claim this responder made stopped being on chain?
+
+    A reorg can undo one -- Sequentia follows Bitcoin, in real time -- and the
+    cost of not noticing is the whole loan: the repayment goes back to being
+    spendable by the borrower's own refund while the secret the claim published
+    stays valid for ever, so they take back the debt AND the collateral.
+
+    Answered from the covenant outpoint that was claimed, because that is the
+    one handle nobody else can spend. Unknown counts as not undone: acting on
+    an unreadable node would claim a second time for no reason.
+    """
+    txid = have.get("claim_of_txid")
+    if not txid:
+        return False
+    try:
+        out = seq_node.gettxout(txid, int(have.get("claim_of_vout", 0)), True)
+    except Exception:                                   # noqa: BLE001
+        return False
+    # Unspent again means the spend that took it is gone.
+    return out is not None
+
+
+def _find_repayment(seq_node, loan, take, have, scan=True, min_conf=1):
     """Where the borrower paid the debt, if they have.
 
     Nothing here is believed: the repayment address follows from the terms, and
@@ -3043,6 +3343,13 @@ def _find_repayment(seq_node, loan, take, have, scan=True):
     out is ignored rather than retried for ever, and the chain is scanned
     instead -- the address is public, so anyone can pay dust to it, and a
     claim built on the wrong coin would fail until the deadline ran out.
+
+    `min_conf` is the reason a zero-confirmation repayment is never claimed.
+    The borrower builds it signalling replacement, so claiming one puts the
+    secret into the mempool over a parent that its own author can still
+    replace: they read the secret out of the witness, replace the repayment,
+    and reclaim the collateral having paid nothing. Depth is what makes that
+    stop being their choice.
     Returns (txid, vout) or None.
     """
     spk = loan.repayment_spk().hex()
@@ -3058,11 +3365,13 @@ def _find_repayment(seq_node, loan, take, have, scan=True):
             return False
         if out.get("asset") not in (None, loan.debt_asset):
             return False
+        if int(out.get("confirmations", 0) or 0) < int(min_conf):
+            return False
         # Exactly the debt, not at least it. The covenant pays out the whole
         # input, and every spender here sizes its output from the terms, so a
         # coin an atom heavy is one no tool in this repository can spend --
         # and accepting it here would stop the scan that finds the real one.
-        return int(round(float(out.get("value", 0)) * COIN)) == int(loan.debt)
+        return _atoms(out.get("value", 0)) == int(loan.debt)
 
     for src in (have, take):
         txid = (src or {}).get("repay_txid")
@@ -3073,7 +3382,8 @@ def _find_repayment(seq_node, loan, take, have, scan=True):
     # report is what usually finds it; this is for when they never sent one.
     if not scan:
         return None
-    return _find_output(seq_node, spk, asset=loan.debt_asset, amount=loan.debt)
+    return _find_output(seq_node, spk, asset=loan.debt_asset, amount=loan.debt,
+                        min_conf=min_conf)
 
 
 def add_btc_commands(sub):
@@ -3554,6 +3864,13 @@ def main():
     p.add_argument("--change-spk", metavar="HEX",
                    help="where the borrower's change goes (default: this "
                         "wallet, which is where a borrower composing it wants it)")
+    p.add_argument("--locktime", type=int, default=0, metavar="HEIGHT",
+                   help="an nLockTime for the settlement. OpenDAMP's rules can "
+                        "bind a transfer to a height window, and a settlement "
+                        "with no locktime cannot satisfy one: it is simply "
+                        "refused, with nothing able to say why. Sequences stay "
+                        "final, so this enforces the locktime without opting "
+                        "into replacement")
     p.add_argument("--skeleton", metavar="FILE",
                    help="write the unsigned settlement here instead of stdout")
     p.add_argument("--attach", metavar="FILE|HEX",
@@ -3666,6 +3983,21 @@ def main():
             print(f"REFUSED: {e}", file=sys.stderr)
             return 2
         print(f"error: {e}", file=sys.stderr)
+        return 1
+    except urllib.error.HTTPError as e:
+        # A service that ANSWERED, and said no. Telling somebody to check
+        # whether the node is running when the node has just replied 403 sends
+        # them to look at the one thing that is working.
+        if args.debug:
+            raise
+        body = ""
+        try:
+            body = json.loads(e.read().decode() or "{}").get("error", "")
+        except Exception:                               # noqa: BLE001
+            pass
+        print(f"error: that service refused the request "
+              f"(HTTP {e.code} {e.reason})" + (f": {body}" if body else ""),
+              file=sys.stderr)
         return 1
     except urllib.error.URLError as e:
         if args.debug:

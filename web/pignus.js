@@ -317,6 +317,7 @@ function checkProg(prog, ver, what) {
   if (prog.length !== want)
     throw new Error(`${what}: a v${ver} payout program must be ${want} bytes, ` +
                     `got ${prog.length}`);
+  return prog;
 }
 
 function requireLenderCredit(s, assetD, lenderProg, debt, lenderVer) {
@@ -520,8 +521,17 @@ function normaliseTerms(terms) {
     // equal and only ever supply the key; the explicit overrides exist because
     // the golden vectors deliberately give them different values, which is what
     // makes them able to catch a builder that conflates the two.
-    lenderProg: hexToBytes(terms._lender_prog ?? terms.lender_prog ?? terms.lender_x),
-    borrowerProg: hexToBytes(terms._borrower_prog ?? terms.borrower_prog ?? terms.borrower_x),
+    // ...and each is checked against its own witness version before it goes
+    // into a leaf. The Python builder refuses a 32-byte v0 program or a
+    // 20-byte v1 one; this file had the same check written and never called
+    // it, so a browser could compile a vault the proven builder would not,
+    // and only find out when the covenant refused every exit from it.
+    lenderProg: checkProg(
+      hexToBytes(terms._lender_prog ?? terms.lender_prog ?? terms.lender_x),
+      terms.lender_ver ?? 1, "lender_prog"),
+    borrowerProg: checkProg(
+      hexToBytes(terms._borrower_prog ?? terms.borrower_prog ?? terms.borrower_x),
+      terms.borrower_ver ?? 1, "borrower_prog"),
     lenderVer: terms.lender_ver ?? 1,
     borrowerVer: terms.borrower_ver ?? 1,
     // `_feed_id` supplies the 32 bytes directly. The golden vectors do, because

@@ -42,6 +42,8 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 
+from . import atoms as _atoms
+
 # Any RPC layer will do -- this module is handed either pignus.node.Node or a
 # test framework proxy, and they raise different exception types for the same
 # "the node said no". The narrow try blocks below catch broadly on purpose; each
@@ -404,11 +406,21 @@ class VaultWatcher:
                 # book on one timeout, which is a worse lie than a late answer.
                 return
         start = min(self.scanned_height, tip)
-        floor = max(0, start - self.rescan_depth)
+        # The descent stops at the lowest height this watcher has a record for,
+        # never below it. `_seen_hashes` holds only what THIS run scanned, so
+        # after a restart it is nearly empty -- and treating "no record here"
+        # as "this height was replaced" would walk the whole rescan depth down
+        # and rewind every loan in the book on the first reorg of a single
+        # block. A height nothing was recorded at says nothing either way.
+        known = min(self._seen_hashes, default=start)
+        floor = max(0, start - self.rescan_depth, known - 1)
         ancestor = start
         while ancestor > floor:
             seen = self._seen_hashes.get(ancestor)
-            if seen is not None and self._hash_at(ancestor) == seen:
+            if seen is None:
+                ancestor -= 1
+                continue                # not scanned this run; no evidence
+            if self._hash_at(ancestor) == seen:
                 break
             ancestor -= 1
         self._undo_above(ancestor, changed)
@@ -416,6 +428,19 @@ class VaultWatcher:
         self.scanned_hash = self._seen_hashes.get(ancestor)
         for h in [h for h in self._seen_hashes if h > ancestor]:
             del self._seen_hashes[h]
+
+    def _replaced(self, height, block_hash):
+        """Is the block this record names provably no longer in the chain?
+
+        Unknown is NOT replaced. The node failing to answer, or a height this
+        run never scanned, is an absence of evidence -- and the action on the
+        other side of this question (ghosting a funded vault, which nothing
+        re-examines) is not one to take on an absence.
+        """
+        if not block_hash:
+            return True                 # nothing recorded to keep
+        got = self._hash_at(int(height))
+        return got is not None and got != block_hash
 
     def _undo_above(self, ancestor, changed):
         for v in self.vaults.values():
@@ -426,12 +451,14 @@ class VaultWatcher:
                 v.note = ("the closing transaction was in a block that is no "
                           "longer in the chain")
                 touched = True
-            if v.funding_height > ancestor:
-                # The block that buried this funding is gone, so the funding is
-                # a ghost -- unless the transaction is in the replacement chain
-                # as well, which _refresh asks the node in this same poll and
-                # reverses. Clearing the pair here rather than keeping it is
-                # what lets that answer record the new block.
+            if v.funding_height > ancestor and self._replaced(v.funding_height,
+                                                               v.funding_block):
+                # The block that buried this funding is PROVABLY gone -- the
+                # node has a different hash at that height. Height alone is not
+                # enough: a funding whose block is still in the chain would be
+                # ghosted on the strength of a neighbour's reorg, and nothing
+                # afterwards looks at a ghost again, so the lie would be
+                # permanent. A node that will not answer keeps the pair.
                 v.funding_height, v.funding_block = 0, ""
                 v.state = State.GHOST
                 v.confirmations = 0
@@ -516,7 +543,12 @@ class VaultWatcher:
         # Where the coin was before this transaction, so a reorg that takes the
         # block away can put the offer back on the shelf it came off.
         o.history.append({"txid": o.txid, "vout": o.vout, "value": o.value,
-                          "status": o.status, "height": height})
+                          "status": o.status, "height": height,
+                          # WHICH transaction moved it. A move read out of the
+                          # mempool is provisional, and undoing it later means
+                          # being able to ask whether that transaction is still
+                          # anywhere at all.
+                          "by": tx.get("txid", "")})
         self._by_offer.pop((o.txid, o.vout), None)
         leaf = witness[-2] if len(witness) >= 2 else None
         outs = tx.get("vout", [])
@@ -530,7 +562,7 @@ class VaultWatcher:
             if rem and rem.get("scriptPubKey", {}).get("hex") == o.spk \
                     and rem.get("asset") == o.terms.debt_asset:
                 o.txid, o.vout = tx["txid"], 2 * k + 1
-                o.value = int(round(float(rem["value"]) * 100_000_000))
+                o.value = _atoms(rem["value"])
                 o.confirmations = 0
                 self._by_offer[(o.txid, o.vout)] = o.offer_id
                 ev["remainder"] = {"txid": o.txid, "vout": o.vout,
@@ -547,6 +579,41 @@ class VaultWatcher:
             o.status = "gone"
         self.events.append(ev)
 
+    def _unwind_provisional(self, o):
+        """Put an offer back where it was, if the move that took it away was
+        only ever in the mempool and is no longer there.
+
+        Returns True when something was undone. Deliberately narrow: the move
+        must be unmined (`height` 0), it must name the transaction that made
+        it, and that transaction must be absent from the mempool now. Anything
+        less certain is left alone, because putting an offer back on the shelf
+        while its take is still live would show a coin two people could take.
+        """
+        if not o.history:
+            return False
+        last = o.history[-1]
+        if int(last.get("height", 0)) != 0 or not last.get("by"):
+            return False
+        try:
+            if last["by"] in self._mempool():
+                return False            # still pending; nothing to undo
+        except Exception:                               # noqa: BLE001
+            return False
+        o.history.pop()
+        self._by_offer.pop((o.txid, o.vout), None)
+        o.txid, o.vout = last["txid"], int(last["vout"])
+        o.value = int(last.get("value") or 0)
+        o.status = last.get("status") or "open"
+        o.confirmations = 0
+        o.scanned_back_to = 0
+        self._by_offer[(o.txid, o.vout)] = o.offer_id
+        self.events.append({
+            "offer_id": o.offer_id, "kind": "open", "txid": "", "height": 0,
+            "input_index": -1, "outpoint": f"{o.txid}:{o.vout}",
+            "funded_value": str(o.value),
+            "note": "the take that moved this offer never confirmed"})
+        return True
+
     def _refresh_offer(self, o, tip):
         if o.status not in ("open", "ghost"):
             return
@@ -554,7 +621,7 @@ class VaultWatcher:
         if not answered:
             return
         if got is not None:
-            o.value = int(round(float(got["value"]) * 100_000_000))
+            o.value = _atoms(got["value"])
             o.confirmations = int(got.get("confirmations", 0) or 0)
             o.last_seen_height = tip
             o.scanned_back_to = 0
@@ -574,6 +641,23 @@ class VaultWatcher:
             # spender to look for. The only move left to it is the funding
             # coming back, and the gettxout above is the whole of that question.
             return
+        # The coin is gone from where this watcher last put it -- but it may
+        # never have been there. A take read out of the MEMPOOL moves the offer
+        # to the remainder that take would create, and a mempool transaction
+        # can simply be dropped: replaced by its author, or evicted. The offer
+        # is then chasing an outpoint that was never mined, finds nothing, and
+        # is called a reorg ghost, which hides a coin that is still on the
+        # shelf and open to anybody. So an unmined move is undone first.
+        if self._unwind_provisional(o):
+            got, answered = self._txout(o.txid, o.vout)
+            if not answered:
+                return
+            if got is not None:
+                o.value = _atoms(got["value"])
+                o.confirmations = int(got.get("confirmations", 0) or 0)
+                o.last_seen_height = tip
+                o.scanned_back_to = 0
+                return
         # Spent, and the forward scan did not see it: look for the spender in
         # the mempool, then a bounded way back, before giving up on it. An offer
         # this watcher saw unburied skips the walk for the same reason a vault
@@ -928,7 +1012,7 @@ class VaultWatcher:
             value = o.get("value")
             if value is None:           # blinded: nothing to read
                 return None
-            return int(round(float(value) * 100_000_000))
+            return _atoms(value)
 
         lender = payout_spk(terms.lender_ver, terms.payout_programs[0])
         borrower = payout_spk(terms.borrower_ver, terms.payout_programs[1])

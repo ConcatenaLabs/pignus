@@ -78,8 +78,19 @@ def verify_pledge_sig(xonly_hex: str, sig_hex: str, action: str,
     """
     from .oracle import verify_schnorr_varlen
     try:
-        return verify_schnorr_varlen(bytes.fromhex(xonly_hex), bytes.fromhex(sig_hex),
-                                     pledge_message(action, pledge_id, extra))
+        msg = pledge_message(action, pledge_id, extra)
+        key, sig = bytes.fromhex(xonly_hex), bytes.fromhex(sig_hex)
+    except (ValueError, TypeError) as e:
+        # A key or a signature that is not hex, or an action nobody can build a
+        # message for. Reporting that as "the signature does not verify" sends
+        # the caller looking for a bad signature when what they have is a
+        # malformed argument, which is the one thing they can actually fix.
+        raise ValueError(
+            f"this cannot be checked at all: {e}. That is not a verdict on the "
+            "signature -- it means the key, the signature or the action given "
+            "is not something a message can be built from.") from None
+    try:
+        return verify_schnorr_varlen(key, sig, msg)
     except ValueError:
         return False
 

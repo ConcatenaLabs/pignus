@@ -38,15 +38,31 @@ a loan.
 from dataclasses import dataclass, asdict, fields
 import json
 
+from . import atoms as _atoms
 from .compat import load_covenant
 from .terms import _internal
 
 PRODUCT = "repurchase"
 TIER = "D"
 
-# OpenDAMP's deployed verifier bounds its scan at these, and the settlement
-# transaction saturates both exactly (design 8.1). They are not advisory: a
-# settlement with one more input or one more output cannot confirm.
+# Where a node stops reading an absolute locktime as a block height and starts
+# reading it as a Unix time. Consensus, not convention: a deadline on the wrong
+# side of it means something entirely different from what was intended.
+LOCKTIME_THRESHOLD = 500_000_000
+# ...and the earliest Unix time anybody would deliberately write, so a number
+# just above the threshold is caught as the height it was meant to be.
+_PLAUSIBLE_TIME = 1_600_000_000
+
+# The OpenDAMP SHAPE this settlement is built for, and it is a choice rather
+# than a limit of the protocol. OpenDAMP compiles its verifier once per shape --
+# a pair (max inputs, max outputs) -- and puts each as a separate leaf of one
+# taptree, because Simplicity's cost bound is static over the whole program and
+# a single program sized for the widest transfer would charge every ordinary
+# one for slots it never touches. The menu is p3x5 (canonical), p3x4, p4x6 and
+# p5x7. This composition saturates `p4x6` exactly, so a settlement one input or
+# one output wider does not merely cost more: it needs the p5x7 leaf, and this
+# code does not build it.
+DAMP_SHAPE = "p4x6"
 DAMP_MAX_INPUTS = 4
 DAMP_MAX_OUTPUTS = 6
 
@@ -172,6 +188,17 @@ class RepurchaseTerms:
             raise ValueError(
                 "forfeit_after is required: without it the borrower has no date "
                 "on which they may stop waiting for the lender")
+        # An absolute locktime is a HEIGHT below 500,000,000 and a Unix TIME at
+        # or above it, and the two are not interchangeable. A repurchase whose
+        # deadline is a Unix timestamp -- typed by somebody thinking in dates --
+        # is a FORFEIT nobody can take for about nine thousand years, and
+        # nothing else here would say so.
+        if LOCKTIME_THRESHOLD <= self.forfeit_after < _PLAUSIBLE_TIME:
+            raise ValueError(
+                f"forfeit_after is {self.forfeit_after}, at or above "
+                f"{LOCKTIME_THRESHOLD}, so a node reads it as a Unix TIME "
+                f"rather than a block height -- and as a time it is in the "
+                f"past. Give a block height, or a real timestamp.")
         cu = bytes.fromhex(self.borrower_cu)
         if len(cu) != 32:
             raise ValueError(
@@ -313,10 +340,13 @@ class RepurchaseTerms:
             raise ValueError(
                 f"the vault at the right address holds {o['asset']}, not the "
                 f"bond asset {self.debt_asset}")
-        atoms = int(round(float(o["value"]) * 100_000_000))
-        if atoms != self.bond():
+        # Through Decimal, never float: above about 90 million units a float
+        # cannot hold a node's amount exactly, and this comparison is the whole
+        # of what says the bond funded is the bond agreed.
+        held = _atoms(o["value"])
+        if held != self.bond():
             raise ValueError(
-                f"the vault holds {atoms} atoms but these terms make the "
+                f"the vault holds {held} atoms but these terms make the "
                 f"bond exactly {self.bond()}; the repurchase you were shown "
                 f"is not the one being funded")
         return o
@@ -362,6 +392,7 @@ def settlement_shape(consolidated_debt_input: bool) -> dict:
         "vault_index": SETTLEMENT_VAULT_INDEX,
         "covenant_outputs": [2 * SETTLEMENT_VAULT_INDEX,
                              2 * SETTLEMENT_VAULT_INDEX + 1],
+        "shape": DAMP_SHAPE,
         "max_inputs": DAMP_MAX_INPUTS,
         "max_outputs": DAMP_MAX_OUTPUTS,
         "fee_asset": "the debt asset -- a separate fee input would not fit",
@@ -372,12 +403,16 @@ def check_settlement(n_inputs: int, n_outputs: int):
     """Refuse a settlement that cannot confirm, before it is signed."""
     if n_inputs > DAMP_MAX_INPUTS:
         raise ValueError(
-            f"{n_inputs} inputs; OpenDAMP's verifier scans at most "
-            f"{DAMP_MAX_INPUTS} and the settlement already uses all of them")
+            f"{n_inputs} inputs; this settlement is built for OpenDAMP's "
+            f"{DAMP_SHAPE} leaf, which scans at most {DAMP_MAX_INPUTS}, and it "
+            f"already uses all of them. A wider transfer needs a wider leaf "
+            f"(p5x7), which this code does not build.")
     if n_outputs > DAMP_MAX_OUTPUTS:
         raise ValueError(
-            f"{n_outputs} outputs; OpenDAMP's verifier scans at most "
-            f"{DAMP_MAX_OUTPUTS} and the settlement already uses all of them")
+            f"{n_outputs} outputs; this settlement is built for OpenDAMP's "
+            f"{DAMP_SHAPE} leaf, which scans at most {DAMP_MAX_OUTPUTS}, and "
+            f"it already uses all of them. A wider transfer needs a wider leaf "
+            f"(p5x7), which this code does not build.")
     return True
 
 
@@ -416,9 +451,19 @@ def verify_leg_one(node, txid, cu_lender_spk_hex, collateral_asset, atoms,
         raise ValueError(
             "the collateral output is blinded, so the platform cannot "
             "confirm the lender received the amount agreed")
-    got = int(round(float(o["value"]) * 100_000_000))
-    if got < atoms:
-        raise ValueError(f"the lender received {got} atoms, not {atoms}")
+    got = _atoms(o["value"])
+    if got != int(atoms):
+        # Exactly, not at least. The settlement returns the collateral by
+        # spending THIS output and pays the borrower an amount the terms fix,
+        # so a leg that overpaid cannot be settled by any transaction this
+        # code composes: the difference has nowhere to go, and the lender's
+        # surplus would simply be lost.
+        raise ValueError(
+            f"the lender received {got} atoms and these terms say {atoms}. "
+            + ("Too few: the collateral leg is short." if got < int(atoms)
+               else "Too many: a settlement returns this whole output, so the "
+                    "excess would have nowhere to go and could not be paid "
+                    "back."))
     return o
 
 
@@ -435,7 +480,11 @@ def repurchase_state(terms, height, bond=None, leg_one=None, bond_spent=False,
     if bond_spent:
         return "settled"
     if bond is None:
-        return "not-funded"
+        # A leg one with no bond is not "nothing has happened". The lender
+        # holds the asset and the borrower has posted no security for its
+        # return, which is the one arrangement neither party should be told
+        # looks like the beginning.
+        return "leg-one-only" if leg_one is not None else "not-funded"
     if leg_one is None:
         return "bond-only"
     if min(int(bond.get("confirmations") or 0),
@@ -457,11 +506,25 @@ class RepurchaseSpender:
     that does not exist here.
     """
 
-    def __init__(self, node, terms: RepurchaseTerms, fee_asset, fee_amount=5000):
+    def __init__(self, node, terms: RepurchaseTerms, fee_asset, fee_amount,
+                 dust_fold=None):
+        """`fee_amount` is in atoms OF THE FEE ASSET and has NO default.
+
+        The same rule `VaultSpender` states and for the same reason: what a fee
+        costs depends entirely on which asset pays it, so a number carried over
+        from another asset is either forty dollars or below the relay minimum.
+        This class had a default of 5,000, which quietly reintroduced exactly
+        the mistake its sibling refuses.
+
+        `dust_fold` is the change below which fee-asset change is given to the
+        fee instead of made into an output nobody can spend economically.
+        """
+        from .vault import DUST_FOLD_FALLBACK
         self.node = node
         self.terms = terms.sanity_check()
         self.fee_asset = fee_asset
-        self.fee_amount = fee_amount
+        self.fee_amount = int(fee_amount)
+        self.dust_fold = int(dust_fold) if dust_fold else DUST_FOLD_FALLBACK
         self.cov = load_covenant()
         self.tap, self.leaves = terms.taptree()
 
@@ -479,6 +542,10 @@ class RepurchaseSpender:
         v = VaultSpender.__new__(VaultSpender)
         v.node, v.terms, v.fee_asset = self.node, self.terms, self.fee_asset
         v.fee_amount, v.cov = self.fee_amount, self.cov
+        # ...including the dust threshold, which was dropped: a borrowed
+        # VaultSpender then folded change at whatever its class attribute said
+        # rather than at the threshold this fee rate makes dust.
+        v.dust_fold = self.dust_fold
         v.tap, v.leaves = self.tap, self.leaves
         return v
 
@@ -544,7 +611,7 @@ class RepurchaseSpender:
     # --- settlement against a real OpenDAMP asset ----------------------------
 
     def compose_settlement(self, vault, verifier, verifier_spk, cu_lender,
-                           debt_input, change_spk):
+                           debt_input, change_spk, locktime=0):
         """The whole settlement, in `settlement_shape()`'s order, unsigned.
 
         Four inputs, in this order and no other: the OpenDAMP verifier output,
@@ -585,6 +652,10 @@ class RepurchaseSpender:
                 "the verifier output carries the repurchase's own asset, so it "
                 "is not a verifier output: OpenDAMP's verifier asset is a "
                 "distinct asset of the issuer's")
+        if not verifier_spk:
+            raise ValueError(
+                "no verifier script: output 0 returns the verifier's coin to "
+                "the address it came from, and there is nowhere to send it")
         if cu_lender.amount != t.collateral_amount:
             raise ValueError(
                 f"C_U(lender) holds {cu_lender.amount} atoms and the repurchase "
@@ -618,8 +689,16 @@ class RepurchaseSpender:
         m, _ = _tf()
         tx = m.CTransaction()
         tx.nVersion = 2
+        # OpenDAMP's rules can bind a transfer to a height window, and a
+        # settlement that cannot set a locktime cannot satisfy one -- it is
+        # simply refused, with nothing here able to say why. Sequences stay
+        # final at 0xfffffffe so the locktime is enforced without opting the
+        # transaction into replacement.
+        tx.nLockTime = int(locktime or 0)
+        seq = 0xfffffffe if locktime else 0xffffffff
         for o in ins:
-            tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout)))
+            tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout),
+                                  nSequence=seq))
         for amount, spk, asset in outs:
             tx.vout.append(m.CTxOut(nValue=m.CTxOutValue(amount), scriptPubKey=spk,
                                     nAsset=m.CTxOutAsset(asset_out(asset))))

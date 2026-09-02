@@ -279,3 +279,81 @@ export function offerVaultWitness(terms, exit, data = []) {
 }
 
 export const _offerInternals = { doubledTag, offerVaultLeaf, SENTINEL_HEX };
+
+// ------------------------------------------------------------ the tripwire
+//
+// A lender funds the address this file derives. Nothing else checks it: the
+// coin goes to whatever scriptPubKey the page computed, and a builder that has
+// drifted from the covenant by one byte sends it somewhere no borrower can
+// draw from and no refund leaf can reach. The offline suite pins these bytes;
+// this is the same pin, at runtime, in the browser that is about to act.
+
+let _pinned = null;
+
+/**
+ * Rebuild every golden offer vector and compare byte for byte. Returns how
+ * many were checked; throws on the first difference, naming it.
+ */
+export function selfTest(vectors) {
+  const cases = (vectors && vectors.offers) || [];
+  if (!cases.length)
+    throw new Error("no offer vectors to pin against: this deployment cannot " +
+      "derive an offer address it can prove is right");
+  const rev = (h) => h.match(/../g).reverse().join("");
+  const same = (what, got, want) => {
+    if (got !== want)
+      throw new Error(`the offer covenant in this page does not match the ` +
+        `golden vectors at ${what}: refusing to derive an address from it`);
+  };
+  for (const o of cases) {
+    const p = o.params;
+    const terms = {
+      collateral_asset: rev(p.asset_c), debt_asset: rev(p.asset_d),
+      debt: p.debt,
+      lender_x: p.lender_prog, _lender_prog: p.lender_prog,
+      borrower_x: o.borrower_prog, _borrower_prog: o.borrower_prog,
+      lender_ver: p.lender_ver ?? 1, borrower_ver: p.borrower_ver ?? 1,
+      market: "", _feed_id: p.feed_id,
+      oracle_x: p.oracle_x || "",
+      oracles: p.oracles || [], oracle_threshold: p.oracle_threshold || 0,
+      strike: p.strike, maturity: p.maturity, recover_after: p.recover_after,
+      not_before: p.not_before,
+      bonus_num: p.bonus_num ?? 105, bonus_den: p.bonus_den ?? 100,
+      price_scale: p.price_scale ?? 100000,
+    };
+    same(`${o.name}: the single-leaf vault`,
+         hex(offerVaultLeaf(terms)), o.vault_leaf);
+    same(`${o.name}: the vault address`,
+         hex(offerVaultScriptPubKey(terms)), o.vault_scriptPubKey);
+    same(`${o.name}: the vault parity`,
+         String(offerVaultParity(terms)), String(o.vault_negflag ? 3 : 2));
+    same(`${o.name}: the TAKE leaf`,
+         hex(takeLeaf({ terms, principal: o.principal,
+                        collateral: o.collateral })), o.take_leaf);
+    const tree = offerTree({
+      terms, principal: o.principal, collateral: o.collateral,
+      expiryLocktime: o.expiry_locktime });
+    same(`${o.name}: the REFUND leaf`, hex(tree.leaves.refund), o.refund_leaf);
+    same(`${o.name}: the offer address`,
+         hex(tree.scriptPubKey), o.scriptPubKey);
+    for (const [name, want] of Object.entries(o.control_blocks || {}))
+      same(`${o.name}: the ${name} control block`,
+           hex(tree.controlBlocks[name]), want);
+  }
+  _pinned = cases.length;
+  return _pinned;
+}
+
+/** Throws unless `selfTest` has passed. Every address this file hands out for
+ *  somebody to fund goes through it. */
+export function requirePinned() {
+  if (_pinned === null)
+    throw new Error("this page has not pinned its offer covenant against the " +
+      "golden vectors, so an address it derives cannot be trusted. Reload; if " +
+      "it keeps happening, do not fund anything.");
+  return _pinned;
+}
+
+function hex(b) {
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}

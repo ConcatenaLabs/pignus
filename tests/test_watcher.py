@@ -251,6 +251,55 @@ def test_restart():
           f"{v2.state.value} {n.calls['gettxout'] - before['gettxout']}")
 
 
+def test_reorg_after_restart():
+    """A reorg of one block, on a watcher that has only just started.
+
+    `_seen_hashes` holds what THIS run scanned, so after a restart it is nearly
+    empty. A descent that reads "no record at this height" as "this height was
+    replaced" walks the whole rescan depth down and rewinds every loan in the
+    book -- turning a one-block reorg into a book that says every funding is a
+    ghost and every settled loan is open again. A liquidator acts on that.
+    """
+    print("a reorg just after start-up rewinds only what was really replaced")
+    # A rescan depth deep enough to reach the old loan, which is the whole
+    # point: the descent must be stopped by what was SCANNED, not by the depth.
+    n = StubNode(height=1000)
+    w = VaultWatcher(n, min_depth=2, rescan_depth=800)
+    # A loan funded and closed long ago, exactly as a book hands it back.
+    v = w.track("old", StubTerms(), "fold", 0, state="REPAID",
+                confirmations=500, spent_by="oldexit", spent_height=600,
+                funding_height=500, funding_block="blk000500")
+    n.mine(2)
+    w.poll()                              # scans the two new blocks
+    scanned = w.scanned_height
+    n.reorg_from(scanned)                 # the tip block is replaced
+    w.poll()
+    check("the loan funded 500 blocks ago is still funded",
+          v.funding_height == 500 and v.funding_block == "blk000500",
+          f"{v.funding_height} {v.funding_block}")
+    check("and still REPAID: nothing about it was in the replaced block",
+          v.state is State.REPAID, v.state.value)
+    check("the rewind stopped at the lowest height this run had scanned",
+          w.scanned_height >= scanned - 3, str(w.scanned_height))
+
+    # ...and a funding that really WAS in the replaced block does become a
+    # ghost, so the narrower rule has not simply stopped noticing reorgs.
+    n2 = StubNode(height=1000)
+    w2 = VaultWatcher(n2, min_depth=2, rescan_depth=800)
+    n2.utxos[("fnew", 0)] = {"value": 1.0, "confirmations": 3}
+    v2 = w2.track("new", StubTerms(), "fnew", 0)
+    n2.mine(3)
+    w2.poll()
+    v2.funding_height, v2.funding_block = n2.height, n2.hashes[n2.height]
+    v2.state = State.LIVE
+    n2.reorg_from(n2.height)
+    del n2.utxos[("fnew", 0)]
+    w2.poll()
+    check("a funding that WAS in the replaced block is a ghost",
+          v2.state in (State.GHOST, State.UNCONFIRMED, State.SPENT_UNKNOWN),
+          v2.state.value)
+
+
 def test_bounded_walk():
     print("an exit beyond the walk is SPENT_UNKNOWN, and the walk is bounded")
     n = StubNode(height=500)
@@ -553,6 +602,7 @@ def test_explain():
 
 def main():
     for fn in (test_ghost, test_provisional_exit, test_restart,
+               test_reorg_after_restart,
                test_bounded_walk, test_failed_block, test_offers,
                test_rescan_from, test_explain):
         fn()

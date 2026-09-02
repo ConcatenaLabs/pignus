@@ -4,10 +4,10 @@
 
 Every spend here places the covenant input at consensus index 0, so the vault
 credits the lender at output 0 and returns collateral to the borrower at output
-1. That ordering is not a convention this module chose and may vary -- it is the
-covenant's input-bound output map, and getting it wrong produces a transaction
-the interpreter rejects, which is the desired failure: loud, immediate, and
-before any money moves.
+1. That ordering is not a convention this module chose and cannot vary -- it is
+the covenant's own input-bound output map, `2k` and `2k+1` for a vault at input
+`k`, and getting it wrong produces a transaction the interpreter rejects, which
+is the desired failure: loud, immediate, and before any money moves.
 
 The caller supplies the inputs. This module does not do coin selection, because
 coin selection belongs to a wallet that knows the user's whole position, and a
@@ -218,6 +218,19 @@ class VaultSpender:
         if int(getattr(att, "price", 0)) < 1:
             raise ValueError("an attested price of zero cannot open any leaf: "
                              "the seizure arithmetic divides by the price")
+        # The MARKET, which nothing else here checks. An attestation's
+        # signature covers its own feed, and verifying it only says the oracle
+        # meant what it said -- about whichever market it was talking about.
+        # Silver's price judging a gold loan is a liquidation decided on the
+        # wrong number, and the spend it composes is one the covenant refuses
+        # anyway, after the preparing send has been broadcast and paid for.
+        feed = getattr(att, "feed_id", "")
+        if feed and bytes.fromhex(feed) != self.terms.feed:
+            said = getattr(att, "market", "") or "another market"
+            raise ValueError(
+                f"this attestation is for {said} and this loan is written "
+                f"against {self.terms.market}; a price from the wrong feed "
+                "opens no leaf of this vault")
 
     def _oracle_evidence(self, evidence, leaf):
         """Normalise what the caller brought into (witness price, witness maker).
@@ -359,6 +372,31 @@ class VaultSpender:
 
     # ------------------------------------------------------------- accounting
 
+    def _check_vault(self, vault: Outpoint):
+        """The coin being spent really is the vault these terms compile to.
+
+        Composing against a coin nobody checked is composing against a vault
+        somebody else chose: the terms decide every payout, so an exit built
+        over the wrong coin pays the wrong parties, and the only thing that
+        would notice is the interpreter -- after the preparing sends have been
+        broadcast and paid for. The CLI checks this; a caller using the library
+        directly had nothing.
+        """
+        want = bytes(self.tap.scriptPubKey).hex()
+        try:
+            got = self.node.gettxout(vault.txid, int(vault.vout), True)
+        except Exception:                               # noqa: BLE001
+            return                      # a node that will not answer is not a verdict
+        if got is None:
+            raise ValueError(
+                f"{vault.txid}:{vault.vout} is not an unspent output: it is "
+                "spent, or this node has not seen it")
+        if got.get("scriptPubKey", {}).get("hex") != want:
+            raise ValueError(
+                f"{vault.txid}:{vault.vout} does not pay the address these "
+                f"terms compile to. Composing an exit against it would pay "
+                f"parties these terms do not name.")
+
     def _held(self, vault: Outpoint) -> int:
         """What the vault coin actually holds, which is what every leaf reads.
 
@@ -369,6 +407,10 @@ class VaultSpender:
         exited by paying out what it holds, so composing from the terms would
         build a transaction the interpreter rejects.
         """
+        # Where every exit passes, so it is where the coin's identity is
+        # checked: an exit composed over a coin that pays a different address
+        # pays parties these terms do not name.
+        self._check_vault(vault)
         held = int(vault.amount)
         if held < self.terms.collateral_amount:
             raise ValueError(
@@ -716,7 +758,7 @@ def _need(*pairs):
 
 
 def fund_offer(node, terms, principal, collateral, expiry_locktime, lots,
-               fee_asset, fee_amount, change_spk, fee_rate=None):
+               fee_asset, fee_amount, change_spk, fee_rate=None, prep_fee_asset=None):
     """Lock `lots` principals in an offer covenant. Returns (txhex, spk).
 
     The offer address is derived HERE from the terms being funded: a lender who
@@ -731,7 +773,8 @@ def fund_offer(node, terms, principal, collateral, expiry_locktime, lots,
     spk = bytes(tap.scriptPubKey)
     total = int(principal) * int(lots)
     need = _need((terms.debt_asset, total), (fee_asset, fee_amount))
-    funding = select_funding(node, need, prep_fee_asset=fee_asset)
+    funding = select_funding(node, need,
+                             prep_fee_asset=prep_fee_asset or fee_asset)
     change = _change_outs(funding, need, change_spk)
     change, fee_amount = _fold_dust(change, fee_asset, fee_amount,
                                     _dust_limit(fee_rate))
@@ -751,7 +794,7 @@ def fund_offer(node, terms, principal, collateral, expiry_locktime, lots,
 
 def take_offer(node, terms, offer, offer_value, principal, collateral,
                expiry_locktime, fee_asset, fee_amount, borrower_spk,
-               change_spk, fee_rate=None):
+               change_spk, fee_rate=None, prep_fee_asset=None):
     """Draw one principal from a funded offer and lock the collateral.
 
     `terms` carries the BORROWER's program already. The offer input sits at
@@ -771,7 +814,7 @@ def take_offer(node, terms, offer, offer_value, principal, collateral,
 
     need = _need((terms.collateral_asset, int(collateral)), (fee_asset, fee_amount))
     funding = select_funding(node, need, exclude=[(offer.txid, offer.vout)],
-                             prep_fee_asset=fee_asset)
+                             prep_fee_asset=prep_fee_asset or fee_asset)
     change = _change_outs(funding, need, change_spk)
     change, fee_amount = _fold_dust(change, fee_asset, fee_amount,
                                     _dust_limit(fee_rate))
@@ -803,7 +846,7 @@ def take_offer(node, terms, offer, offer_value, principal, collateral,
 
 def withdraw_offer(node, terms, offer, offer_value, principal, collateral,
                    expiry_locktime, fee_asset, fee_amount, change_spk,
-                   fee_rate=None):
+                   fee_rate=None, prep_fee_asset=None):
     """Return an expired offer's remaining principal to the lender's pinned
     program. Anyone may build this; it can only pay the lender."""
     from .offers import offer_tree
@@ -811,7 +854,7 @@ def withdraw_offer(node, terms, offer, offer_value, principal, collateral,
     lender_spk = payout_spk(terms.lender_ver, terms.payout_programs[0])
     funding = select_funding(node, {fee_asset: fee_amount},
                              exclude=[(offer.txid, offer.vout)],
-                             prep_fee_asset=fee_asset)
+                             prep_fee_asset=prep_fee_asset or fee_asset)
     change = _change_outs(funding, {fee_asset: fee_amount}, change_spk)
     change, fee_amount = _fold_dust(change, fee_asset, fee_amount,
                                     _dust_limit(fee_rate))

@@ -128,8 +128,11 @@ def main():
                     "from the node's exchange rates")
     ap.add_argument("--min-profit", type=int, default=0, metavar="ATOMS",
                     help="skip a seizure worth less than this much more than "
-                         "the debt it pays, in debt-asset atoms (default 0: "
-                         "never take one at a loss). Negative to allow it")
+                         "the debt it pays AND the fee it costs, in debt-asset "
+                         "atoms (default 0: never take one at a loss). "
+                         "Negative to allow it. A fee in another asset is not "
+                         "subtracted, because there is no rate here to compare "
+                         "the two with")
     ap.add_argument("--max-attestation-age", type=int, default=600, metavar="S",
                     help="ignore a price signed longer ago than this (default "
                          "600 s); the covenant cannot check recency, so this is "
@@ -424,13 +427,40 @@ def main():
             kind, price, evidence = got
             seize = min(t.collateral_amount, t.seizure_at(price))
             surplus = t.surplus_at(price)
-            profit = seize * price // t.price_scale - t.debt
+            # The FEE is part of the arithmetic. It is paid out of this bot's
+            # own coins, so a seizure whose margin is thinner than the fee is a
+            # seizure taken at a loss -- and `--min-profit 0`, whose whole
+            # promise is "never take one at a loss", used to take exactly
+            # those. Priced with the same call the spend will use, so the two
+            # cannot drift.
+            gross = seize * price // t.price_scale - t.debt
+            # The FEE is part of the arithmetic. It is paid out of this bot's
+            # own coins, so a seizure whose margin is thinner than the fee is
+            # one taken at a loss -- and `--min-profit 0`, whose whole promise
+            # is "never take one at a loss", used to take exactly those.
+            #
+            # Priced with the same call the spend will use, so the two cannot
+            # drift; and a wallet that cannot pay a fee at all is not a reason
+            # to stop DECIDING, so an unpriceable fee leaves the gross figure
+            # and says so. The attempt that matters fails later, loudly.
+            fee_atoms, fee_known = 0, False
+            try:
+                _fa, fee_atoms, _r = fee_for(
+                    t, (kind if v.single_leaf else kind + "4"))
+                fee_known = (_fa == t.debt_asset)
+            except Exception:                           # noqa: BLE001
+                pass
+            profit = gross - (fee_atoms if fee_known else 0)
             print(f"{kind}: {t.loan_id()[:16]} {t.market} price={price} "
                   f"health={t.health(price):.3f} seize={seize} surplus={surplus} "
-                  f"profit={profit}", file=sys.stderr)
+                  f"gross={gross} "
+                  + (f"fee={fee_atoms} " if fee_known else "fee=? ")
+                  + f"profit={profit}", file=sys.stderr)
             if profit < args.min_profit:
-                note(v.loan_id, f"{profit} atoms of profit is under "
-                                f"--min-profit {args.min_profit}")
+                note(v.loan_id,
+                     f"{profit} atoms of profit"
+                     + (f" after a {fee_atoms}-atom fee" if fee_known else "")
+                     + f" is under --min-profit {args.min_profit}")
                 continue
             if args.dry_run:
                 continue
@@ -446,8 +476,13 @@ def main():
                     dust_fold=F.dust_atoms(rate) if rate else None)
                 wants = {t.debt_asset: t.debt}
                 wants[fee_asset_] = wants.get(fee_asset_, 0) + fee_amount
+                # The preparing sends pay their fee in the SAME asset the
+                # exit does. Left unset, `pick_fee` chooses for itself from
+                # whatever the wallet holds, so an unattended bot could spend
+                # an asset its operator never meant it to touch.
                 funding = select_funding(node, wants,
-                                         exclude=[(outpoint.txid, outpoint.vout)])
+                                         exclude=[(outpoint.txid, outpoint.vout)],
+                                         prep_fee_asset=fee_asset_)
                 if kind == "liquidate":
                     raw = spender.liquidate(outpoint, funding, evidence, taker_spk)
                 else:

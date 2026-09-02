@@ -115,6 +115,11 @@ class Book:
         self.loans = {}
         self.btc_offers = {}     # cross-chain BTC-collateral offers (lender T+h)
         self.btc_takes = {}      # a borrower's take + the lender's adaptor reply
+        # Every 32-byte commitment this book has ever seen, against the take
+        # that claimed it. Kept apart from the takes because a take is pruned
+        # and a secret is not: reusing one is how two loans come to share a
+        # settlement, and either borrower then releases the other's collateral.
+        self.btc_commitments = {}
         self._load()
         self._sweep_temps()
 
@@ -142,6 +147,15 @@ class Book:
         self.loans = d.get("loans", {})
         self.btc_offers = d.get("btc_offers", {})
         self.btc_takes = d.get("btc_takes", {})
+        self.btc_commitments = d.get("btc_commitments", {})
+        # A book written before this ledger existed still has its takes; read
+        # the commitments back out of them so an upgrade does not free every
+        # commitment in flight.
+        for tid, t in self.btc_takes.items():
+            for h in (str((t.get("loan") or {}).get("h_w", "")).lower(),
+                      str(t.get("payment_hash", "")).lower()):
+                if h:
+                    self.btc_commitments.setdefault(h, tid)
 
     def _sweep_temps(self, older_than=3600):
         """Drop temporary files a killed process left behind. Only old ones: a
@@ -196,6 +210,7 @@ class Book:
         """
         d = {"offers": self.offers, "loans": self.loans,
              "btc_offers": self.btc_offers, "btc_takes": self.btc_takes,
+             "btc_commitments": self.btc_commitments,
              "updated": int(time.time())}
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".book-")
@@ -432,6 +447,16 @@ class Book:
         old record must not hand a lender's principal back out a second time,
         so a pruned take's lot is credited to the offer as it goes.
         """
+        with self._lock:
+            return self._lots_left(btc_offer_id, take_ttl, signed_ttl)
+
+    def _lots_left(self, btc_offer_id, take_ttl=1800, signed_ttl=6 * 3600):
+        """`btc_offer_lots_left` without the lock, for callers that hold it.
+
+        The scan and the write that follows it have to be one step. Two takes
+        arriving together on a threaded server could otherwise both read the
+        last lot as free, and a lender who offered one loan would owe two.
+        """
         rec = self.btc_offers.get(btc_offer_id)
         if rec is None:
             return 0
@@ -455,17 +480,81 @@ class Book:
         """The take that already named this outpoint, if any. One coin funds one
         loan: letting two takes name it would have a lender sign two releases
         for collateral that can only settle one."""
+        with self._lock:
+            return self._take_by_funding(txid, vout)
+
+    def _take_by_funding(self, txid, vout):
         for t in self.btc_takes.values():
             if (t.get("prevault_txid") == txid
                     and int(t.get("prevault_vout", -1)) == int(vout)):
                 return t
         return None
 
-    def put_btc_take(self, rec):
+    def btc_hash_in_use(self, digest, except_take=None):
+        """Is this 32-byte commitment already spoken for by another loan?
+
+        Kept as its own ledger rather than scanned out of the takes, because a
+        take is eventually forgotten and a secret is not: a commitment that
+        became reusable when its record aged out is a commitment two loans can
+        share, and either borrower's settlement then releases the other's
+        collateral. The ledger holds one hex string per loan and is never
+        pruned, which is the point of it.
+        """
+        digest = str(digest or "").lower()
+        if not digest:
+            return None
+        with self._lock:
+            who = self.btc_commitments.get(digest)
+        return None if (who is None or who == except_take) else who
+
+    def claim_btc_hash(self, digest, take_id):
+        """Record a commitment as this take's. Returns False if another loan
+        has it."""
+        digest = str(digest or "").lower()
+        if not digest:
+            return False
+        with self._lock:
+            who = self.btc_commitments.get(digest)
+            if who is not None and who != take_id:
+                return False
+            self.btc_commitments[digest] = take_id
+            self._save()
+            return True
+
+    def put_btc_take(self, rec, lots_of=None, take_ttl=1800,
+                     signed_ttl=6 * 3600):
+        """Record a new take, optionally claiming one lot of an offer.
+
+        `lots_of` makes the last-lot check and the insert ONE step. Read
+        separately they are a race two borrowers can win at once, and the
+        thing they would win is a second loan from a lender who offered one.
+        Raises ValueError when no lot is left, or when the commitment or the
+        funding outpoint is another loan's.
+        """
         rec["take_id"] = rec.get("take_id") or secrets.token_hex(12)
         rec["created"] = rec.get("created") or int(time.time())
         rec["status"] = rec.get("status") or "pending"
+        h_w = str((rec.get("loan") or {}).get("h_w", "")).lower()
         with self._lock:
+            if lots_of is not None and self._lots_left(
+                    lots_of, take_ttl, signed_ttl) < 1:
+                raise ValueError("every lot of that offer is taken")
+            txid = rec.get("prevault_txid")
+            if txid:
+                clash = self._take_by_funding(txid,
+                                              rec.get("prevault_vout", 0))
+                if clash is not None:
+                    raise ValueError(
+                        f"that outpoint already funds take {clash['take_id']}; "
+                        "one coin funds one loan")
+            if h_w:
+                who = self.btc_commitments.get(h_w)
+                if who is not None and who != rec["take_id"]:
+                    raise ValueError(
+                        f"that origination commitment is already in use by "
+                        f"take {who}. Draw a fresh one: two loans sharing a "
+                        "secret are one loan either party can settle twice")
+                self.btc_commitments[h_w] = rec["take_id"]
             self.btc_takes[rec["take_id"]] = rec
             self._save()
         return rec

@@ -295,7 +295,7 @@ def tier_d_chain():
             return select_funding(n, wants, exclude=exclude)
 
         change = bytes.fromhex(n.getaddressinfo(n.getnewaddress())["scriptPubKey"])
-        sp = RepurchaseSpender(n, t, btc)
+        sp = RepurchaseSpender(n, t, btc, 5000)
 
         settled = False
         try:
@@ -337,7 +337,7 @@ def tier_d_chain():
         vout2 = next(o["n"] for o in raw3["vout"]
                      if o["scriptPubKey"]["hex"] == spk2.hex())
         op2 = Outpoint(txid2, vout2, bond, money)
-        sp2 = RepurchaseSpender(n, t2, btc)
+        sp2 = RepurchaseSpender(n, t2, btc, 5000)
 
         def rejected(name, build, want):
             """The NODE must refuse this, for one of the reasons in `want`.
@@ -381,7 +381,7 @@ def tier_d_chain():
         t_wrong = RepurchaseTerms(**{**t2.__dict__, "borrower_prog": wrong_prog,
                                      "borrower_ver": wrong_ver})
         rejected("FORFEIT paying anyone but the borrower is refused",
-                 lambda: RepurchaseSpender(n, t_wrong, btc).forfeit(
+                 lambda: RepurchaseSpender(n, t_wrong, btc, 5000).forfeit(
                      op2, funding_for(btc, 0, exclude=[(op2.txid, op2.vout)]),
                      change, locktime=t2.forfeit_after), BAD_SCRIPT + TOO_EARLY)
 
@@ -390,7 +390,7 @@ def tier_d_chain():
                "borrower_cu": hashlib.sha256(b"somebody else").hexdigest()})
         rejected("RETURN delivering the asset anywhere but the borrower's C_U "
                  "is refused",
-                 lambda: RepurchaseSpender(n, t_bad_cu, btc).settle(
+                 lambda: RepurchaseSpender(n, t_bad_cu, btc, 5000).settle(
                      op2, funding_for(coll, t2.collateral_amount,
                                       exclude=[(op2.txid, op2.vout)]), change),
                  BAD_SCRIPT)

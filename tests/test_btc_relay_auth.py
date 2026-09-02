@@ -41,7 +41,7 @@ def loan_for(lender_x, **over):
     d = dict(btc_amount=20_000, lender_x=lender_x, oracle_x="22" * 32,
              recover_after=104_600, debt_asset="11" * 32, debt=10_500_000_000,
              principal=10_000_000_000, repay_deadline=143_200,
-             abort_after=100_300, upgrade_fee=3000, d_refund=100_720,
+             abort_after=100_300, upgrade_fee=10_000, d_refund=100_720,
              lender_prog="cc" * 20, lender_ver=0, market="BTC/USDX",
              strike=42_000 * 100_000, price_scale=100_000)
     d.update(over)
@@ -152,6 +152,27 @@ def main():
                                    borrower_prog="dd" * 20,
                                    recover_after=100_200)),
         100_000, 100_000)
+    cheap = BC.timelocks_sane(
+        BC.loan_from_dict(loan_for(lender_x, borrower_x="dd" * 32, h_w="ee" * 32,
+                                   borrower_prog="dd" * 20, upgrade_fee=3000)),
+        100_000, 100_000)
+    check("an upgrade fee too small to confirm is refused, because that move "
+          "can never be replaced or bumped",
+          any("upgrade fee" in p for p in cheap))
+    same = BC.timelocks_sane(
+        BC.loan_from_dict(loan_for(lender_x, borrower_x="dd" * 32, h_w="ee" * 32,
+                                   borrower_prog="dd" * 20,
+                                   payment_hash="ee" * 32)),
+        100_000, 100_000)
+    check("one secret opening both the principal and the repayment is refused",
+          any("same secret" in p for p in same))
+    margin = BC.timelocks_sane(
+        BC.loan_from_dict(loan_for(lender_x, borrower_x="dd" * 32, h_w="ee" * 32,
+                                   borrower_prog="dd" * 20,
+                                   repay_deadline=100_800)),
+        100_000, 100_000)
+    check("a repayment window whose last two hours nobody would answer is "
+          "refused", margin != [])
     check("and a sweep that opens before the collateral stops being abortable",
           any("stops being abortable" in p for p in order), str(order))
 

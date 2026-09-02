@@ -184,9 +184,14 @@ tell that an attestation is newer than the loan but not that it is recent, so
 this is the only place recency is checked at all.
 
 `pignus-cli --version` prints the version and `--debug` re-raises with the
-traceback instead of a one-line message. A command exits 1 for an error, 2 when
-an issuer refused a Tier C request outright, and 3 when the covenant builder
-could not be loaded or has drifted from the golden vectors.
+traceback instead of a one-line message. A command exits 0 when it is done, 1
+for an error, 2 for REFUSED -- a check failed, and nothing was built or
+broadcast -- 3 when the covenant builder could not be loaded or has drifted
+from the golden vectors, and 4 when a check command ran and found a state that
+is not safe to act on. Status 2 is the one worth scripting against: it is the
+promise that nothing happened. Status 4 matters for `repo-verify`, where
+`bond-only` and `funded-unburied` both print a full report and neither is a
+repurchase to rely on.
 
 A loan does not need the book at all. `--loan <id>` is a convenience that looks
 the terms up; with the terms file in hand, `pignus-cli repay --terms loan.json
@@ -429,11 +434,13 @@ pignus-cli repo-verify terms.json --txid <bond funding> \
 ```
 
 `repo-verify` is the check that matters, and it reports a **state** rather than
-an "ok": `not-funded`, `bond-only` (the bond is there and nobody has looked at
-the half it secures), `funded-unburied`, `live`, `forfeitable`, or `settled`. A
-bond alone is worth nothing, which is why the leg-one arguments are what move it
-past `bond-only` and why `--min-confirmations` decides when either half stops
-being reorgable.
+an "ok": `not-funded`, `leg-one-only` (the lender has the asset and no bond
+secures its return), `bond-only` (the bond is there and nobody has looked at the
+half it secures), `funded-unburied`, `live`, `forfeitable`, or `settled`. A bond
+alone is worth nothing, which is why the leg-one arguments are what move it past
+`bond-only`, and why `--min-confirmations` decides when either half stops being
+reorgable. Only `live`, `forfeitable` and `settled` exit 0; the rest exit 4, so
+an unattended caller cannot read a half-checked repurchase as a good one.
 
 Settling is one atomic transaction of four inputs and at most six outputs --
 exactly what OpenDAMP allows, with no spare slot in either direction -- so it is
