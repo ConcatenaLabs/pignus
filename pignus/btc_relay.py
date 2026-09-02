@@ -28,11 +28,17 @@ from . import adaptor as A
 
 OFFER_TAG = "pignus/btc-offer/1"
 WITHDRAW_TAG = "pignus/btc-offer-withdraw/1"
+HASH_TAG = "pignus/btc-hash/1"
 ADAPTOR_TAG = "pignus/btc-adaptor/1"
 DISBURSED_TAG = "pignus/btc-disbursed/1"
 UPGRADED_TAG = "pignus/btc-upgraded/1"
 CLAIMED_TAG = "pignus/btc-claimed/1"
 REFUNDED_TAG = "pignus/btc-refunded/1"
+# The borrower's own reports. They carry no authority -- everything they say is
+# on chain -- but they change what a responder scans for, so they are signed by
+# the key the take names, or they are not believed.
+CLAIMED_PRINCIPAL_TAG = "pignus/btc-claimed-principal/1"
+REPAID_TAG = "pignus/btc-repaid/1"
 
 # Every field a lender's signature over an offer must cover. Anything a taker
 # could vary and profit from has to be in here.

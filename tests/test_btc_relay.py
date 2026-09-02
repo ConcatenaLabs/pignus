@@ -129,14 +129,9 @@ def main():
         w = os.urandom(32)
         full = dict(loan, borrower_x=borrower_x, h_w=B.sha256(w).hex(),
                     borrower_prog="dd" * 20, borrower_ver=0)
-        ln = B.loan_from_dict(full)
+        ln0 = B.loan_from_dict(full)
         ptxid, pvout = "cc" * 32, 1
         dest = "0014" + "44" * 20
-        vault_txid = B.upgrade_tx(ln, ptxid, pvout).txid()
-        sighash = B.sighash_for(
-            ln, B.reclaim_tx(ln, vault_txid, 0, bytes.fromhex(dest), 3000),
-            "reclaim").hex()
-        presig = B.presign_upgrade(ln, ptxid, pvout, borrower).hex()
 
         def take_body(**over):
             b = {"btc_offer_id": offer["btc_offer_id"], "borrower_x": borrower_x,
@@ -144,126 +139,139 @@ def main():
                  "borrower_prog": "dd" * 20, "borrower_ver": 0,
                  "h_w": full["h_w"], "w_seq": 0,
                  "prevault_txid": ptxid, "prevault_vout": pvout,
-                 "prevault_value": str(ln.prevault_value()),
-                 "upgrade_presig": presig, "reclaim_dest": dest,
-                 "reclaim_fee": 3000, "reclaim_sighash": sighash}
+                 "prevault_value": str(ln0.prevault_value()),
+                 "reclaim_dest": dest, "reclaim_fee": 3000}
             b.update(over)
             return b
 
-        check("a take with a mismatched reclaim sighash is refused",
-              post(base + "/v1/btc/take",
-                   take_body(reclaim_sighash="00" * 32))[0] == 400)
-        check("a take whose advance signature is somebody else's is refused",
-              post(base + "/v1/btc/take", take_body(
-                  upgrade_presig=B.presign_upgrade(ln, ptxid, pvout,
-                                                   stranger).hex()))[0] == 400)
         check("a take that misstates what the funding holds is refused",
               post(base + "/v1/btc/take",
                    take_body(prevault_value="1"))[0] == 400)
         check("a take with a malformed payout program is refused",
               post(base + "/v1/btc/take",
                    take_body(borrower_prog="dd" * 32))[0] == 400)
+        check("a take naming something that is not an output script is refused",
+              post(base + "/v1/btc/take", take_body(reclaim_dest="zz"))[0] == 400)
 
         code, take = post(base + "/v1/btc/take", take_body())
-        check("the honest take is accepted and pending",
-              code == 200 and take["status"] == "pending", str(take)[:200])
-        check("the relay derived the vault the release will be signed against",
-              take["vault_txid"] == vault_txid)
-        check("and the addresses both parties will fund",
-              take["disbursement_spk"] == ln.disbursement_spk().hex())
-        check("a second take of the same funding outpoint is refused",
+        check("the honest request is accepted", code == 200 and
+              take["status"] == "requested", str(take)[:200])
+        check("and the addresses that do not need the lender's secret are known",
+              take["disbursement_spk"] == ln0.disbursement_spk().hex())
+        check("a second request against the same funding outpoint is refused",
               post(base + "/v1/btc/take", take_body())[0] == 400)
 
-        print("\n== a release is believed only from the lender ==")
+        print("\n== the lender draws this loan's secret ==")
         t = A.new_secret()
-        point, phash = A.point(t).hex(), B.sha256(t).hex()
-        asig = A.encrypt_sign(lsec, bytes.fromhex(take["reclaim_sighash"]),
-                              A.point(t)).hex()
-        auth = R.sign_report(lsec, R.ADAPTOR_TAG, take["take_id"],
-                             adaptor_point=point, payment_hash=phash,
-                             adaptor_sig=asig)
+        phash, point = B.sha256(t).hex(), A.point(t).hex()
+        check("a hash from a stranger is refused",
+              post(base + "/v1/btc/hash", {
+                  "take_id": take["take_id"], "payment_hash": phash,
+                  "adaptor_point": point,
+                  "auth": R.sign_report(stranger, R.HASH_TAG, take["take_id"],
+                                        payment_hash=phash,
+                                        adaptor_point=point)})[0] == 403)
+        code, _ = post(base + "/v1/btc/hash", {
+            "take_id": take["take_id"], "payment_hash": phash,
+            "adaptor_point": point,
+            "auth": R.sign_report(lsec, R.HASH_TAG, take["take_id"],
+                                  payment_hash=phash, adaptor_point=point)})
+        check("the lender's own hash is stored", code == 200)
+        reserved = get(base + f"/v1/btc/take/{take['take_id']}")
+        ln = B.loan_from_dict({**full, "payment_hash": phash,
+                               "adaptor_point": point})
+        vault_txid = B.upgrade_tx(ln, ptxid, pvout).txid()
+        check("and the vault it implies is derived and served",
+              reserved["vault_txid"] == vault_txid
+              and reserved["repayment_spk"] == ln.repayment_spk().hex())
+
+        print("\n== the borrower signs the move into that vault ==")
+        check("a signature that is not the borrower's is refused",
+              post(base + "/v1/btc/presig", {
+                  "take_id": take["take_id"],
+                  "upgrade_presig": B.presign_upgrade(ln, ptxid, pvout,
+                                                      stranger).hex()})[0] == 400)
+        code, _ = post(base + "/v1/btc/presig", {
+            "take_id": take["take_id"],
+            "upgrade_presig": B.presign_upgrade(ln, ptxid, pvout, borrower).hex()})
+        check("the borrower's own advance signature is accepted", code == 200)
+        check("and the take is ready for a release",
+              get(base + f"/v1/btc/take/{take['take_id']}")["status"] == "pending")
+
+        print("\n== a release is believed only from the lender ==")
+        asig = A.sign(lsec, bytes.fromhex(
+            B.sighash_for(ln, B.reclaim_tx(ln, vault_txid, 0,
+                                           bytes.fromhex(dest), 3000),
+                          "reclaim").hex()))
+        def adaptor_body(**over):
+            b = {"take_id": take["take_id"], "adaptor_point": point,
+                 "payment_hash": phash, "adaptor_sig": asig.hex()}
+            b.update(over)
+            return b
+
         check("a release with no signature from the lender is refused",
-              post(base + "/v1/btc/adaptor",
-                   {"take_id": take["take_id"], "adaptor_point": point,
-                    "payment_hash": phash, "adaptor_sig": asig})[0] == 403)
+              post(base + "/v1/btc/adaptor", adaptor_body())[0] == 403)
         check("a release signed by a stranger is refused",
-              post(base + "/v1/btc/adaptor", {
-                  "take_id": take["take_id"], "adaptor_point": point,
-                  "payment_hash": phash, "adaptor_sig": asig,
-                  "auth": R.sign_report(stranger, R.ADAPTOR_TAG,
-                                        take["take_id"], adaptor_point=point,
-                                        payment_hash=phash,
-                                        adaptor_sig=asig)})[0] == 403)
-        bad_sig = "aa" * 65
+              post(base + "/v1/btc/adaptor", adaptor_body(
+                  auth=R.sign_report(stranger, R.ADAPTOR_TAG, take["take_id"],
+                                     adaptor_point=point, payment_hash=phash,
+                                     adaptor_sig=asig.hex())))[0] == 403)
+        bad = "aa" * 64
         check("a release that does not verify is refused even from the lender",
-              post(base + "/v1/btc/adaptor", {
-                  "take_id": take["take_id"], "adaptor_point": point,
-                  "payment_hash": phash, "adaptor_sig": bad_sig,
-                  "auth": R.sign_report(lsec, R.ADAPTOR_TAG, take["take_id"],
-                                        adaptor_point=point,
-                                        payment_hash=phash,
-                                        adaptor_sig=bad_sig)})[0] == 400)
-        code, _ = post(base + "/v1/btc/adaptor",
-                       {"take_id": take["take_id"], "adaptor_point": point,
-                        "payment_hash": phash, "adaptor_sig": asig,
-                        "auth": auth})
+              post(base + "/v1/btc/adaptor", adaptor_body(
+                  adaptor_sig=bad,
+                  auth=R.sign_report(lsec, R.ADAPTOR_TAG, take["take_id"],
+                                     adaptor_point=point, payment_hash=phash,
+                                     adaptor_sig=bad)))[0] == 400)
+        code, _ = post(base + "/v1/btc/adaptor", adaptor_body(
+            auth=R.sign_report(lsec, R.ADAPTOR_TAG, take["take_id"],
+                               adaptor_point=point, payment_hash=phash,
+                               adaptor_sig=asig.hex())))
         check("the lender's own release is stored", code == 200)
         signed = get(base + f"/v1/btc/take/{take['take_id']}")
         check("the take is now signed", signed["status"] == "signed")
-        rtx = B.reclaim_tx(B.loan_from_dict(signed["loan"]), vault_txid, 0,
-                           bytes.fromhex(dest), 3000)
         check("the borrower's release verifies, so funding is safe",
-              B.check_release_adaptor(B.loan_from_dict(signed["loan"]), rtx,
-                                      bytes.fromhex(signed["adaptor_sig"])))
-        check("only the lender's secret completes it",
-              not A.verify(bytes.fromhex(lender_x),
-                           bytes.fromhex(signed["reclaim_sighash"]),
-                           A.decrypt(bytes.fromhex(signed["adaptor_sig"]),
-                                     A.new_secret())))
+              B.check_release(ln, B.reclaim_tx(ln, vault_txid, 0,
+                                               bytes.fromhex(dest), 3000),
+                              bytes.fromhex(signed["adaptor_sig"])))
+        check("and the reply the borrower acts on is signed by the lender",
+              R.verify_report(lender_x, R.HASH_TAG, take["take_id"],
+                              signed["hash_auth"], payment_hash=phash,
+                              adaptor_point=point))
 
         print("\n== every loan gets its OWN secret ==")
         w2 = os.urandom(32)
-        full2 = dict(full, h_w=B.sha256(w2).hex())
-        ln2 = B.loan_from_dict(full2)
-        p2 = ("dd" * 32)[:64]
-        vault2 = B.upgrade_tx(ln2, p2, 0).txid()
-        sighash2 = B.sighash_for(
-            ln2, B.reclaim_tx(ln2, vault2, 0, bytes.fromhex(dest), 3000),
-            "reclaim").hex()
+        p2 = "dd" * 32
+        full2 = dict(loan, borrower_x=borrower_x, h_w=B.sha256(w2).hex(),
+                     borrower_prog="dd" * 20, borrower_ver=0)
+        ln2_0 = B.loan_from_dict(full2)
         code, take2 = post(base + "/v1/btc/take", take_body(
             h_w=full2["h_w"], prevault_txid=p2, prevault_vout=0,
-            upgrade_presig=B.presign_upgrade(ln2, p2, 0, borrower).hex(),
-            reclaim_sighash=sighash2))
+            prevault_value=str(ln2_0.prevault_value())))
         check("a second borrower takes the offer's second lot", code == 200,
               str(take2)[:160])
         t2 = A.new_secret()
-        asig2 = A.encrypt_sign(lsec, bytes.fromhex(take2["reclaim_sighash"]),
-                               A.point(t2)).hex()
-        post(base + "/v1/btc/adaptor", {
-            "take_id": take2["take_id"], "adaptor_point": A.point(t2).hex(),
-            "payment_hash": B.sha256(t2).hex(), "adaptor_sig": asig2,
-            "auth": R.sign_report(lsec, R.ADAPTOR_TAG, take2["take_id"],
-                                  adaptor_point=A.point(t2).hex(),
-                                  payment_hash=B.sha256(t2).hex(),
-                                  adaptor_sig=asig2)})
-        s1 = get(base + f"/v1/btc/take/{take['take_id']}")
+        phash2, point2 = B.sha256(t2).hex(), A.point(t2).hex()
+        post(base + "/v1/btc/hash", {
+            "take_id": take2["take_id"], "payment_hash": phash2,
+            "adaptor_point": point2,
+            "auth": R.sign_report(lsec, R.HASH_TAG, take2["take_id"],
+                                  payment_hash=phash2, adaptor_point=point2)})
         s2 = get(base + f"/v1/btc/take/{take2['take_id']}")
-        check("the two loans carry different adaptor points",
-              s1["adaptor_point"] != s2["adaptor_point"])
+        check("the two loans commit to different secrets",
+              s2["payment_hash"] != signed["payment_hash"])
         check("so one borrower's repayment cannot free another's collateral",
-              not A.verify(bytes.fromhex(lender_x),
-                           bytes.fromhex(s2["reclaim_sighash"]),
-                           A.decrypt(bytes.fromhex(s2["adaptor_sig"]), t)))
+              s2["vault_txid"] != signed["vault_txid"])
 
         print("\n== the offer runs out ==")
-        p3 = ("ee" * 32)[:64]
-        ln3 = B.loan_from_dict(full)
+        p3 = "ee" * 32
+        full3 = dict(loan, borrower_x=borrower_x,
+                     h_w=B.sha256(os.urandom(32)).hex(),
+                     borrower_prog="dd" * 20, borrower_ver=0)
+        ln3 = B.loan_from_dict(full3)
         code, r = post(base + "/v1/btc/take", take_body(
-            prevault_txid=p3, prevault_vout=0,
-            upgrade_presig=B.presign_upgrade(ln3, p3, 0, borrower).hex(),
-            reclaim_sighash=B.sighash_for(
-                ln3, B.reclaim_tx(ln3, B.upgrade_tx(ln3, p3, 0).txid(), 0,
-                                  bytes.fromhex(dest), 3000), "reclaim").hex()))
+            h_w=full3["h_w"], prevault_txid=p3, prevault_vout=0,
+            prevault_value=str(ln3.prevault_value())))
         check("a third take of a two-lot offer is refused", code == 409,
               str(r)[:140])
 

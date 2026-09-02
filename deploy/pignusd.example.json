@@ -2,6 +2,8 @@
   "listen": "127.0.0.1:8741",
   "book": "/root/sequentia/pignus-data/book.json",
   "oracle": "http://127.0.0.1:8740",
+  "_oracles_note": "Further INDEPENDENT oracles, quoted for m-of-n loans, e.g. [\"http://127.0.0.1:8742\", \"http://127.0.0.1:8743\"]. Each must run from its own keyfile, or a 2-of-3 is really a 1-of-1. They never stand in for the primary: a vault verifies against the key baked into it.",
+  "oracles": [],
   "markets": [
     "GOLD/USDX",
     "SILVR/USDX",
@@ -10,7 +12,18 @@
     "EURX/USDX",
     "BTC/USDX"
   ],
+  "reference_ticker": "USDX",
+  "block_seconds": 60,
+  "_poll_note": "Seconds between chain and oracle refreshes; keep it under block_seconds.",
   "poll": 30,
+  "_age_note": "A verified attestation older than max_price_age seconds is not a price: health, LTV and liquidatable are withheld rather than computed from it, and /healthz turns unhealthy.",
+  "max_price_age": 600,
+  "_depth_note": "min_depth is how deep a funding must be before a loan reads as LIVE. rescan_depth is how far back a poll may walk for a spend it missed, and back_scan_cap how many blocks one poll may fetch for those walks; a book down longer than rescan_depth needs one start with --rescan-from <height>.",
+  "min_depth": 2,
+  "rescan_depth": 1500,
+  "back_scan_cap": 200,
+  "_proxies_note": "Peers whose X-Forwarded-For this daemon believes, which is how the write rate limit is keyed per client behind Caddy. pignusd must not be reachable except through the proxy.",
+  "trusted_proxies": ["127.0.0.1", "::1"],
   "_rpc_note": "Optional. Without it the book still serves offers and whatever it last knew, and says so in /healthz rather than presenting stale states as fresh. Fill in ONE of cookie or user/password.",
   "rpc": {
     "url": "http://127.0.0.1:18200",

@@ -80,6 +80,10 @@ def btc_vectors():
         ln, BC.abort_tx(ln, txid, vout, dest, fee, borrower_sec, locktime=None),
         "abort")
     ab = BC.abort_tx(ln, txid, vout, dest, fee, borrower_sec)
+    rtx = BC.reclaim_tx(ln, up.txid(), 0, dest, fee)
+    release = BC.lender_release(ln, lender_sec, rtx)
+    done = BC.complete_reclaim(ln, BC.reclaim_tx(ln, up.txid(), 0, dest, fee),
+                               release, t, borrower_sec)
     return {
         "_comment": "Emitted by tests/gen_web_vectors.py from the proven "
                     "Python. web/btc.js pins itself to these before it derives "
@@ -99,6 +103,16 @@ def btc_vectors():
             ln, BC.reclaim_tx(ln, txid, vout, dest, fee), "reclaim").hex(),
         "seize_sighash": BC.seize_sighash(ln, txid, vout, dest, fee).hex(),
         "repayment_spk": ln.repayment_spk().hex(),
+        "reclaim": {
+            "vault_txid": up.txid(),
+            "vault_vout": 0,
+            "dest_spk": dest.hex(),
+            "fee": fee,
+            "sighash": BC.sighash_for(ln, rtx, "reclaim").hex(),
+            "release_sig": release.hex(),
+            "tx_hex": done.hex(),
+            "witness": [w.hex() for w in done.vin[0].witness],
+        },
         "disbursement_spk": ln.disbursement_spk().hex(),
         "prevault": {
             "spk": pre.scriptPubKey().hex(),

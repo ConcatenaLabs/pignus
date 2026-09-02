@@ -223,24 +223,13 @@ export async function borrow(wallet, offer, ui) {
   // pays this loan's own address the exact amount; refuse anything else.
   const vout = btc.findOutput(prep.hex, btc.prevaultSpk(loan), preValue);
 
-  const upgradeSighash = hex(btc.upgradeSighash(loan, prep.txid, vout));
-  const presig = (await wallet.request("signBtcTaproot", {
-    sighash: upgradeSighash,
-    display: { detail: "Allow this loan to begin: sign the one transaction " +
-                       "that moves your collateral into the loan vault once " +
-                       "you have taken the principal." },
-  })).signature;
-
   // Where the collateral comes back to. An address the wallet owns, so a
   // borrower can actually see and spend what they get back.
   const reclaimAddr = (await wallet.request("getBtcAddress", {})).address;
   const reclaimSpk = await ui.addressToSpk(reclaimAddr);
   const reclaimFee = Number(offer.reclaim_fee || 3000);
-  const sighash = hex(btc.reclaimSighash(
-    loan, btc.upgradeTx(loan, prep.txid, vout).txid(), 0,
-    toBytes(reclaimSpk), reclaimFee));
 
-  ui.busy(true, "asking the lender to sign your release…");
+  ui.busy(true, "asking the lender to open a loan…");
   const take = await ui.post("v1/btc/take", {
     btc_offer_id: offer.btc_offer_id,
     borrower_x,
@@ -252,13 +241,39 @@ export async function borrow(wallet, offer, ui) {
     prevault_txid: prep.txid,
     prevault_vout: vout,
     prevault_value: preValue.toString(),
-    upgrade_presig: presig,
-    upgrade_fee: Number(loan.upgrade_fee || 3000),
+    btc_height: heights.btc,
     reclaim_dest: reclaimSpk,
     reclaim_fee: reclaimFee,
-    reclaim_sighash: sighash,
   });
 
+  // The lender draws this loan's secret. Its hash goes into BOTH chains'
+  // scripts, and that is what binds them: the secret that pays the lender on
+  // Sequentia is the secret that releases this collateral, by construction
+  // rather than by anybody's word. Nothing can be derived until it arrives,
+  // and nothing has been committed while waiting for it.
+  const reserved = await ui.poll("v1/btc/take/" + take.take_id,
+    t => (t.payment_hash ? t : null), { tries: 40, gap: 2000 });
+  if (!reserved)
+    throw new Error("the lender did not answer in time, and nothing was " +
+      "broadcast. Your Bitcoin is untouched.");
+  const paymentHash = String(reserved.payment_hash || "");
+  if (!/^[0-9a-f]{64}$/.test(paymentHash))
+    throw new Error("the lender's answer carries no usable payment hash.");
+  const live = { ...loan, payment_hash: paymentHash };
+
+  // The vault's address depends on that hash, so this is the first moment the
+  // move into it can be signed at all.
+  const vaultTxid = btc.upgradeTx(live, prep.txid, vout).txid();
+  const presig = (await wallet.request("signBtcTaproot", {
+    sighash: hex(btc.upgradeSighash(live, prep.txid, vout)),
+    display: { detail: "Allow this loan to begin: sign the one transaction " +
+                       "that moves your collateral into the loan vault once " +
+                       "you have taken the principal." },
+  })).signature;
+  await ui.post("v1/btc/presig",
+                { take_id: take.take_id, upgrade_presig: presig });
+
+  ui.busy(true, "asking the lender to sign your release…");
   const signed = await ui.poll("v1/btc/take/" + take.take_id,
     t => (t.status === "signed" || t.status === "disbursed") ? t : null,
     { tries: 40, gap: 2000 });
@@ -267,9 +282,13 @@ export async function borrow(wallet, offer, ui) {
       "broadcast. Your Bitcoin is untouched. Try again when their responder " +
       "is back online.");
 
-  const adaptorPoint = signed.adaptor_point || loan.adaptor_point;
-  if (!badaptor.verifyAdaptor(loan.lender_x, sighash, adaptorPoint,
-                              signed.adaptor_sig))
+  // The release is checked against the loan THIS page built, never against the
+  // relay's copy of it: a relay that could hand back its own version could move
+  // where the principal is paid or where the repayment goes, and every check
+  // here would still pass because it would be checking the relay's own numbers.
+  const reclaimSighash = hex(btc.reclaimSighash(
+    live, vaultTxid, 0, toBytes(reclaimSpk), reclaimFee));
+  if (!badaptor.verifySchnorr(live.lender_x, reclaimSighash, signed.adaptor_sig))
     throw new Error("the lender's release does not verify against this loan. " +
       "Refusing to commit any Bitcoin.");
 
@@ -278,8 +297,8 @@ export async function borrow(wallet, offer, ui) {
   const rec = {
     take_id: take.take_id,
     btc_offer_id: offer.btc_offer_id,
-    loan: { ...loan, adaptor_point: adaptorPoint,
-            payment_hash: signed.payment_hash || loan.payment_hash },
+    loan: live,
+    vault_txid: vaultTxid,
     w_seq,
     prevault_txid: prep.txid,
     prevault_vout: vout,
@@ -287,7 +306,7 @@ export async function borrow(wallet, offer, ui) {
     upgrade_presig: presig,
     reclaim_spk: reclaimSpk,
     reclaim_fee: reclaimFee,
-    adaptor_sig: signed.adaptor_sig,
+    release_sig: signed.adaptor_sig,
     status: "funded",
   };
   rememberLoan(rec);
@@ -334,9 +353,31 @@ export async function claimPrincipal(wallet, rec, ui) {
   const signedPset = await wallet.signPset(pset);
   const txid = await wallet.broadcast({ pset: signedPset });
   rec.status = "claimed"; rec.claim_txid = txid; rememberLoan(rec);
-  await ui.post("v1/btc/claimed-principal",
-                { take_id: rec.take_id, claim_txid: txid }).catch(() => {});
+  await report(wallet, ui, rec, "claimed-principal", txid, 0).catch(() => {});
   return txid;
+}
+
+/**
+ * Tell the relay where something the borrower did landed.
+ *
+ * Everything reported here is on chain anyway, so it carries no authority --
+ * but an unsigned report would still be a way to move somebody else's loan out
+ * of the state their lender is watching for, so it is signed with the key the
+ * take already names.
+ */
+async function report(wallet, ui, rec, kind, txid, vout) {
+  const tag = kind === "repaid" ? "pignus/btc-repaid/1"
+                                : "pignus/btc-claimed-principal/1";
+  const payload = P.taggedHash(tag, new TextEncoder().encode(
+    JSON.stringify({ take_id: rec.take_id, txid: String(txid), vout: Number(vout) },
+                   Object.keys({ take_id: 0, txid: 0, vout: 0 }).sort())));
+  const auth = (await wallet.request("signBtcTaproot", {
+    sighash: hex(payload),
+    display: { detail: "Tell the lender where your payment landed. This " +
+                       "signature moves nothing." },
+  })).signature;
+  return ui.post("v1/btc/" + kind,
+                 { take_id: rec.take_id, txid, vout, auth });
 }
 
 function progToSpk(prog, ver) {
@@ -362,8 +403,7 @@ export async function repay(wallet, rec, ui) {
   const signedPset = await wallet.signPset(pset);
   const txid = await wallet.broadcast({ pset: signedPset });
   rec.status = "repaid"; rec.repay_txid = txid; rememberLoan(rec);
-  await ui.post("v1/btc/repaid", { take_id: rec.take_id, repay_txid: txid })
-    .catch(() => {});
+  await report(wallet, ui, rec, "repaid", txid, 0).catch(() => {});
   return txid;
 }
 
@@ -387,21 +427,29 @@ export async function reclaim(wallet, rec, ui, { minDepth = 6, force = false } =
   if (hex(P.sha256(toBytes(t.secret_t))) !== loan.payment_hash)
     throw new Error("the secret published does not match this loan. Do not act " +
       "on it.");
-  const depth = Number(t.claim_confirmations || 0);
+  // How deep the claim is, read from the chain rather than from the relay: the
+  // whole point of waiting is that a reorg could undo it, and a number the
+  // relay made up is no protection against that.
+  const depth = await ui.confirmations(t.claim_txid);
   if (depth < minDepth && !force)
     throw new Error(`the claim that published the secret has ${depth} ` +
       `confirmation(s). Sequentia reorgs when Bitcoin reorgs, so spending your ` +
       `Bitcoin on it now risks losing both. Wait for ${minDepth}.`);
-  const vaultTxid = t.vault_txid || btc.upgradeTx(loan, rec.prevault_txid,
-                                                  rec.prevault_vout).txid();
+  const vaultTxid = rec.vault_txid
+    || btc.upgradeTx(loan, rec.prevault_txid, rec.prevault_vout).txid();
   const sighash = hex(btc.reclaimSighash(loan, vaultTxid, 0,
                                          toBytes(rec.reclaim_spk), rec.reclaim_fee));
+  // The release was checked before the collateral was ever committed; check it
+  // again here rather than discovering a bad one as a node rejection.
+  if (!badaptor.verifySchnorr(loan.lender_x, sighash, rec.release_sig))
+    throw new Error("the release stored for this loan does not verify. Do not " +
+      "broadcast anything; report it.");
   const borrowerSig = (await wallet.request("signBtcTaproot", {
     sighash, display: { detail: "Take your Bitcoin collateral back." },
   })).signature;
-  const lenderSig = badaptor.decryptAdaptor(rec.adaptor_sig, t.secret_t);
   const tx = btc.completeReclaimTx(loan, vaultTxid, 0, toBytes(rec.reclaim_spk),
-                                   rec.reclaim_fee, lenderSig, borrowerSig);
+                                   rec.reclaim_fee, rec.release_sig,
+                                   borrowerSig, t.secret_t);
   const txid = await wallet.request("broadcast", { chain: "bitcoin", hex: tx.hex() });
   rec.status = "reclaimed"; rememberLoan(rec);
   return txid;
@@ -476,14 +524,21 @@ export async function recoverLoans(wallet, ui) {
       ...was,
       take_id: t.take_id,
       btc_offer_id: t.btc_offer_id,
-      loan: t.loan,
+      // What the relay says the loan is, kept only when this browser has no
+      // copy of its own. A recovered loan is checked before it is acted on:
+      // reclaim verifies the release against the terms it rebuilds, and a
+      // relay that changed a payout would fail that check.
+      loan: was.loan || t.loan,
       w_seq: t.w_seq ?? was.w_seq ?? 0,
       prevault_txid: t.prevault_txid ?? was.prevault_txid,
       prevault_vout: t.prevault_vout ?? was.prevault_vout,
       upgrade_presig: t.upgrade_presig ?? was.upgrade_presig,
       reclaim_spk: t.reclaim_dest ?? was.reclaim_spk,
       reclaim_fee: t.reclaim_fee ?? was.reclaim_fee,
-      adaptor_sig: t.adaptor_sig ?? was.adaptor_sig,
+      vault_txid: t.vault_txid ?? was.vault_txid,
+      // The relay calls the lender's release `adaptor_sig` on the wire; it is
+      // an ordinary signature, and the record here calls it what it is.
+      release_sig: t.adaptor_sig ?? was.release_sig,
       status: t.status || was.status || "funded",
     };
     local.set(t.take_id, rec);
@@ -503,6 +558,13 @@ export function nextStep(rec, heights) {
     case "signed":
       return { action: "claim", label: "Claim the principal", note: "" };
     case "claimed":
+      // The principal has been taken but the collateral has not moved into the
+      // vault yet. Repaying now would pay for a loan that has not started, and
+      // the release names a vault that does not exist.
+      return { action: null, label: "",
+               note: "You have the principal. The lender starts the loan by " +
+                     "moving your collateral into its vault, which is theirs " +
+                     "to do and takes a confirmation or two." };
     case "live":
       return { action: "repay", label: "Repay",
                note: "Repay before Sequentia block " +

@@ -39,6 +39,41 @@ function parseCompressed(b) {
 const CHALLENGE = "BIP0340/challenge";
 
 /**
+ * Verify an ordinary BIP340 signature.
+ *
+ * This is what a borrower checks the lender's release with. It used to be an
+ * adaptor signature under a point, and the borrower had to take on trust that
+ * the point and the hash baked into their repayment came from one secret --
+ * which nothing can check, and a lender who lied took the repayment and the
+ * collateral both. The binding is now the hash itself, in both chains'
+ * scripts, so what is left to check here is a plain signature.
+ */
+export function verifySchnorr(pubkeyXHex, msgHex, sigHex) {
+  const sig = hexToBytes(sigHex);
+  if (sig.length !== 64) return false;
+  const px = hexToBytes(pubkeyXHex), m = hexToBytes(msgHex);
+  let P_;
+  try { P_ = liftX(px); } catch { return false; }
+  const r = toBig(sig.slice(0, 32));
+  const sv = toBig(sig.slice(32));
+  if (r >= FIELD || sv >= N) return false;
+  const e = mod(toBig(taggedHash(CHALLENGE,
+    concatBytes(sig.slice(0, 32), px, m))), N);
+  const sG = pointMul([Gx, Gy], sv);
+  const eP = pointMul(P_, N - e);
+  const R = pointAdd(sG, eP);
+  if (R === null) return false;
+  return hasEvenY(R) && R[0] === r;
+}
+
+function concatBytes(...parts) {
+  let n = 0; for (const p of parts) n += p.length;
+  const out = new Uint8Array(n); let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+/**
  * Verify a 65-byte adaptor signature (compressed R || s) without being able to
  * use it. Mirrors pignus.adaptor.encrypt_verify exactly.
  */

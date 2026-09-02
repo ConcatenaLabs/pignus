@@ -100,9 +100,9 @@ def main():
               B.check_upgrade_presig(loan, txid, vout, presig))
         vault_txid = B.upgrade_tx(loan, txid, vout).txid()
         rtx = B.reclaim_tx(loan, vault_txid, 0, btc_dest(rig), BTC_FEE)
-        asig = B.lender_release_adaptor(loan, lender, rtx)
-        check("the borrower's release adaptor verifies before funding",
-              B.check_release_adaptor(loan, rtx, asig))
+        release = B.lender_release(loan, lender, rtx)
+        check("the borrower's release verifies before funding",
+              B.check_release(loan, rtx, release))
         rig.btc.sendrawtransaction(fhex); rig.btc_mine(1)     # now safe to fund
         ok, why = B.collateral_committed(rig.btc, loan, txid, vout, min_conf=1)
         check("the collateral is committed, and is this loan's", ok, why)
@@ -116,7 +116,7 @@ def main():
                                                       expect_hash=loan.h_w)
         check("claiming the principal published the borrower's secret",
               got_w == w)
-        up = B.complete_upgrade(loan, txid, vout, presig, got_w)
+        up = B.complete_upgrade(loan, txid, vout, presig, got_w, lender)
         rig.btc.sendrawtransaction(up.hex()); rig.btc_mine(1)
         check("which is what moves the collateral into the loan",
               rig.btc.gettxout(vault_txid, 0) is not None)
@@ -135,7 +135,7 @@ def main():
               revealed == t)
         ok, conf = B.anchor_safe(n, claim, min_depth=1)
         check("the claim is buried enough to act on (anchor-safe)", ok, str(conf))
-        rec = B.complete_reclaim(loan, rtx, asig, revealed, borrower)
+        rec = B.complete_reclaim(loan, rtx, release, revealed, borrower)
         got = rig.btc.sendrawtransaction(rec.hex()); rig.btc_mine(1)
         check("the collateral is reclaimed on Bitcoin",
               rig.btc.gettxout(got, 0) is not None)
@@ -149,7 +149,7 @@ def main():
         rig.btc_mine(1)
         up2 = B.complete_upgrade(loan2, txid2, vout2,
                                  B.presign_upgrade(loan2, txid2, vout2, borrower),
-                                 w2)
+                                 w2, lender)
         rig.btc.sendrawtransaction(up2.hex())
         rig.btc_mine(4)
         sweep = B.timeout_tx(loan2, up2.txid(), 0, btc_dest(rig), BTC_FEE, lender,
@@ -166,7 +166,7 @@ def main():
         rig.btc_mine(1)
         up3 = B.complete_upgrade(loan3, txid3, vout3,
                                  B.presign_upgrade(loan3, txid3, vout3, borrower),
-                                 w3)
+                                 w3, lender)
         rig.btc.sendrawtransaction(up3.hex()); rig.btc_mine(1)
         dest3 = btc_dest(rig)
         req = B.seize_request(loan3, up3.txid(), 0, dest3, BTC_FEE)

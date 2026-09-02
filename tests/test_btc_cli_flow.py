@@ -112,21 +112,23 @@ def main():
               tk.get("prevault_txid") and tk.get("_stage") == "prepared"
               and rig.btc.gettxout(tk["prevault_txid"], tk["prevault_vout"]) is None,
               "the funding should NOT be on chain yet")
-        check("and signed the move into the loan in advance",
-              bool(tk.get("upgrade_presig")) and bool(tk.get("vault_txid")))
 
         run("btc-adaptor", ticket, "--lender-key", lk)
         tk = json.load(open(ticket))
         check("the lender drew this loan's secret and signed the release",
-              bool(tk.get("adaptor_sig")) and bool(tk.get("adaptor_point")))
+              bool(tk.get("release_sig")) and bool(tk.get("payment_hash")))
+        check("which fixes the vault both chains' scripts now name",
+              bool(tk.get("vault_txid")))
         check("the secret is stored beside the key, per loan",
               os.path.exists(f"{lk}.t.{tk['h_w'][:16]}"))
 
-        run("btc-originate", ticket, *btc)
+        run("btc-originate", ticket, "--borrower-key", bk, *btc)
         rig.btc_mine(1)
         tk = json.load(open(ticket))
         check("the borrower verified the release and committed the collateral",
               rig.btc.gettxout(tk["prevault_txid"], tk["prevault_vout"]) is not None)
+        check("and signed the move into the vault it names",
+              bool(tk.get("upgrade_presig")))
 
         state = run("btc-check", ticket, *seq, *btc)
         check("btc-check says the collateral is committed and whose move it is",
@@ -146,7 +148,8 @@ def main():
         check("the borrower took the principal, publishing their secret",
               bool(tk.get("principal_claim_txid")))
 
-        run("btc-upgrade", ticket, "--min-depth", "1", *seq, *btc)
+        run("btc-upgrade", ticket, "--lender-key", lk, "--min-depth", "1",
+            *seq, *btc)
         rig.btc_mine(1)
         tk = json.load(open(ticket))
         check("the lender read the secret off the chain and started the loan",
@@ -180,7 +183,7 @@ def main():
         run("btc-prepare", t2, "--borrower-key", bk,
             "--borrower-prog", borrower_prog, "--force", *seq, *btc)
         run("btc-adaptor", t2, "--lender-key", lk)
-        run("btc-originate", t2, *btc)
+        run("btc-originate", t2, "--borrower-key", bk, *btc)
         rig.btc_mine(5)
         out = run("btc-abort", t2, "--borrower-key", bk, *btc)
         rig.btc_mine(1)
@@ -197,13 +200,13 @@ def main():
         run("btc-prepare", t3, "--borrower-key", bk,
             "--borrower-prog", borrower_prog, "--force", *seq, *btc)
         run("btc-adaptor", t3, "--lender-key", lk)
-        run("btc-originate", t3, *btc)
+        run("btc-originate", t3, "--borrower-key", bk, *btc)
         rig.btc_mine(1)
         run("btc-disburse", t3, *seq, *btc)
         rig.seq_mine(1)
         run("btc-claim-principal", t3, "--borrower-key", bk, *seq)
         rig.seq_mine(2)
-        run("btc-upgrade", t3, "--min-depth", "1", *seq, *btc)
+        run("btc-upgrade", t3, "--lender-key", lk, "--min-depth", "1", *seq, *btc)
         rig.btc_mine(10)
         out = run("btc-timeout", t3, "--lender-key", lk, *btc)
         rig.btc_mine(1)

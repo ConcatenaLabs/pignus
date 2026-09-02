@@ -19,12 +19,19 @@ const bytes = (h) => new Uint8Array(hexPairs(h));
 const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 
 try {
-  const n = B.selfTest(v);
+  B.selfTest(v);
   ok("web/btc.js pins to the funding address, leaves, control blocks and sighashes",
-     n === 3);
+     true);
 } catch (e) {
   ok("web/btc.js pins to the vectors (" + e.message.split("\n")[0] + ")", false);
 }
+// selfTest returns a constant, so asserting its value proves nothing about the
+// vectors. What has to be true is that the file it checked against carries all
+// three leaves and both sighashes: a vector file missing one would let selfTest
+// pass over the leaf that was dropped.
+ok("the vector file carries every leaf and both sighashes",
+   Object.keys(v.leaves).length === 3 && v.leaves.reclaim && v.leaves.seize &&
+   v.leaves.timeout && v.reclaim_sighash && v.seize_sighash);
 // the pre-vault, the upgrade the borrower signs in advance, and the abort
 const pv = v.prevault;
 ok("the pre-vault address is the one the Python derives",
@@ -37,6 +44,11 @@ for (const n of ["upgrade", "abort"])
      hex(B.prevaultTree(v.loan).controlBlock(n)) === pv.control_blocks[n]);
 ok("the upgrade transaction is byte-identical to the Python's",
    B.upgradeTx(v.loan, v.reclaim_txid, v.reclaim_vout).hex() === pv.upgrade_tx_hex);
+// The vault's outpoint is this id, and the release the lender signs commits to
+// it, so a browser that computed it differently would ask for a signature over
+// a vault that will never exist.
+ok("and names itself the same way, which is what the release commits to",
+   B.upgradeTx(v.loan, v.reclaim_txid, v.reclaim_vout).txid() === pv.upgrade_txid);
 ok("and so is the sighash the borrower signs in advance",
    hex(B.upgradeSighash(v.loan, v.reclaim_txid, v.reclaim_vout)) === pv.upgrade_sighash);
 ok("the abort sighash is the one the Python signs",
@@ -62,13 +74,20 @@ ok("and a completed abort is byte-identical to the Python's",
   ok("and a funding for the wrong amount is refused, not accepted", threw);
 }
 
-// a reclaim witness assembles in the documented order
-const loan = v.loan;
-const tx = B.completeReclaimTx(loan, v.reclaim_txid, v.reclaim_vout,
-  new Uint8Array(hexPairs(v.reclaim_dest_spk)), v.reclaim_fee,
-  "11".repeat(64), "22".repeat(64));
-ok("a completed reclaim carries [lenderSig, borrowerSig, leaf, control]",
-   tx.vin[0].witness.length === 4);
+// the reclaim, byte for byte against the Python that built it
+{
+  const r = v.reclaim;
+  const tx = B.completeReclaimTx(v.loan, r.vault_txid, r.vault_vout,
+    bytes(r.dest_spk), r.fee, r.release_sig, r.witness[1], v.secrets.t);
+  ok("a completed reclaim is byte-identical to the Python's",
+     tx.hex() === r.tx_hex);
+  ok("and carries the release, the borrower's signature and the secret",
+     tx.vin[0].witness.length === 5
+     && hex(tx.vin[0].witness[2]) === v.secrets.t);
+  ok("the reclaim sighash matches too",
+     hex(B.reclaimSighash(v.loan, r.vault_txid, r.vault_vout,
+                          bytes(r.dest_spk), r.fee)) === r.sighash);
+}
 
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

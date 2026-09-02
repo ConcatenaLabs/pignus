@@ -6,6 +6,13 @@
 # the web page depends on. No node and no network: this is the check that the
 # two services agree with each other and that the page has something to render.
 #
+# It also drives the parts of the daemon that are only reachable through HTTP
+# and are therefore easy to leave untested: the write rate limit and who it is
+# charged to behind a reverse proxy, the manage token that stands between a
+# listing and an anonymous delete, and what happens on start-up to a book file
+# that is not valid JSON. Each of those is a refusal, and a refusal that stops
+# working is silent.
+#
 #   tests/service_drill.sh
 set -euo pipefail
 
@@ -30,6 +37,7 @@ cat > "$WORK/oracle.json" <<EOF
   "interval": 5,
   "price_scale": 100000,
   "markets": ["GOLD/USDX", "SILVR/USDX", "OILX/USDX"],
+  "precisions": {"GOLD": 8, "SILVR": 8, "OILX": 8, "USDX": 8},
   "source": {"type": "static",
              "prices": {"GOLD": 3000, "SILVR": 30, "OILX": 70, "USDX": 1}}
 }
@@ -40,9 +48,34 @@ cat > "$WORK/pignusd.json" <<EOF
   "book": "$WORK/book.json",
   "oracle": "http://127.0.0.1:$OPORT",
   "markets": ["GOLD/USDX", "SILVR/USDX", "OILX/USDX"],
-  "poll": 5
+  "poll": 5,
+  "trusted_proxies": ["127.0.0.1"]
 }
 EOF
+
+# A listing this drill can cancel. Everything about an offer except its manage
+# token is checkable from the chain, and there is no chain here -- so the record
+# is written straight into the book, which is what a running daemon would have
+# left behind, and the endpoint under test is the DELETE.
+CANCEL_TOKEN="a-token-only-the-publisher-has"
+CANCEL_ID=$(python3 - "$WORK/book.json" "$CANCEL_TOKEN" <<PY
+import json, sys
+sys.path.insert(0, "$HERE/..")
+from pignus.book import Book
+from pignus.terms import LoanTerms
+terms = LoanTerms(
+    collateral_asset="aa" * 32, debt_asset="bb" * 32,
+    collateral_amount=10 * 10**8, principal=1450 * 10**8, debt=1500 * 10**8,
+    borrower_x="dd" * 32, lender_x="ee" * 32, market="GOLD/USDX",
+    oracle_x="22" * 32, strike=180 * 100000, not_before=1700000000,
+    maturity=100000, recover_after=143200, max_price=10**6 * 100000)
+b = Book(sys.argv[1])
+rec = b.put_offer({"terms": terms.to_json(), "kind": "funded",
+                   "outpoint": "11" * 32 + ":0", "manage_token": sys.argv[2],
+                   "funded_value": str(1450 * 10**8), "confirmations": 6})
+print(rec["offer_id"])
+PY
+)
 
 echo "== starting the oracle on :$OPORT =="
 "$BIN/pignus-oracle" --config "$WORK/oracle.json" > "$WORK/oracle.log" 2>&1 &
@@ -129,10 +162,24 @@ echo "  page served: $page bytes"
 
 echo
 echo "== the page's own modules are served, and nothing else is =="
-for f in app.js pignus.js offer.js flows.js wallet.js pset.js; do
+# Derived from what the page actually imports, rather than a list that goes
+# stale. A module the daemon's allow-list stops serving does not break the page
+# loudly: pinCovenant() catches a failed vector fetch and quietly sets the BTC
+# pin to zero, so the tab refuses every check while the drill stays green.
+MODULES=$(grep -ho 'from "\./[a-z_]*\.js"' "$HERE/../web"/*.js \
+          | tr -d '"' | sed 's#from \./##' | sort -u)
+for f in $MODULES app.js; do
     code=$(curl -s -o /dev/null -w '%{http_code}' "$D/$f")
     test "$code" = "200" || { echo "  $f -> $code" >&2; exit 1; }
     echo "  $f served"
+done
+for f in btc_vectors.json adaptor_vectors.json; do
+    ct=$(curl -s -o "$WORK/$f" -w '%{content_type}' "$D/$f")
+    case "$ct" in application/json*) ;; *)
+        echo "  $f served as '$ct', not JSON" >&2; exit 1;; esac
+    python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$WORK/$f" || {
+        echo "  $f did not parse" >&2; exit 1; }
+    echo "  $f served as JSON, and parses"
 done
 # The browser must be able to pin its covenant implementation before it derives
 # anything; without this endpoint the page refuses to run at all.
@@ -152,6 +199,81 @@ test "$code" = "404" || { echo "expected 404, got $code" >&2; exit 1; }
 echo "  404, as it should be"
 
 echo
+echo "== a listing is cancelled only with the token it was published with =="
+# The coin is the truth and is untouched either way; what the token protects is
+# the LISTING, so that an anonymous flood cannot take a lender's offer off the
+# book. A 403 without one and a 403 with the wrong one are the whole of that.
+del() { curl -s -o "$WORK/del.json" -w '%{http_code}' -X DELETE \
+        "$D/v1/offers/$CANCEL_ID" ${1:+-H "X-Manage-Token: $1"}; }
+code=$(del)
+test "$code" = "403" || { echo "no token -> $code, wanted 403" >&2; exit 1; }
+code=$(del "not-the-token")
+test "$code" = "403" || { echo "wrong token -> $code, wanted 403" >&2; exit 1; }
+curl -fsS "$D/v1/offers" | python3 -c '
+import json,sys
+assert json.load(sys.stdin)["offers"], "a refused cancel removed the listing"'
+echo "  refused twice, and the listing is still there"
+code=$(del "$CANCEL_TOKEN")
+test "$code" = "200" || { echo "right token -> $code, wanted 200" >&2
+    cat "$WORK/del.json" >&2; exit 1; }
+python3 -c '
+import json,sys
+assert json.load(open(sys.argv[1]))["removed"] is True, "removed was not true"' \
+  "$WORK/del.json"
+code=$(del "$CANCEL_TOKEN")
+test "$code" = "404" || { echo "second cancel -> $code, wanted 404" >&2; exit 1; }
+echo "  cancelled with its own token, then gone"
+
+echo
+echo "== the write rate limit is charged to the client, not to the proxy =="
+# Behind Caddy every request arrives from loopback. Keying the limit on the
+# socket peer would give the whole internet one bucket, and one flooder would
+# lock everybody out; keying it on a header anyone can set would let a flooder
+# claim a fresh identity per request. So the header is believed only from a
+# configured proxy, and only its LAST hop.
+burst() {
+    local n=$1; shift
+    local limited=0 other=0
+    for _ in $(seq "$n"); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$D/v1/offers" \
+               -H 'Content-Type: application/json' "$@" -d '{}')
+        case "$code" in 429) limited=$((limited + 1));;
+                        400) ;;
+                        *) other=$((other + 1));; esac
+    done
+    test "$other" = "0" || { echo "  $other unexpected status codes" >&2; exit 1; }
+    echo "$limited"
+}
+n=$(burst 25 -H 'X-Forwarded-For: 203.0.113.5')
+test "$n" -gt 0 || { echo "a 25-write burst was never limited" >&2; exit 1; }
+echo "  a burst from one forwarded client is cut off after its burst ($n of 25)"
+n=$(burst 5 -H 'X-Forwarded-For: 203.0.113.6')
+test "$n" = "0" || { echo "another client was charged for the first one's burst" >&2
+    exit 1; }
+echo "  and another client still has its own bucket"
+n=$(burst 5 -H 'X-Forwarded-For: 198.51.100.9, 203.0.113.5')
+test "$n" = "5" || { echo "a chained header was not keyed on its last hop" >&2
+    exit 1; }
+echo "  a chain is keyed on the LAST hop, which is the one the proxy added"
+n=$(burst 25)
+test "$n" = "0" || { echo "loopback with no header was rate-limited" >&2; exit 1; }
+echo "  and the box's own responder, direct from loopback, is not limited"
+curl -fsS "$D/healthz" > /dev/null
+echo "  reads still answer while writes are being refused"
+
+echo
+echo "== HEAD and OPTIONS answer, and CORS is read-only =="
+head=$(curl -s -I "$D/" | head -1)
+case "$head" in *200*) ;; *) echo "  HEAD / -> $head" >&2; exit 1;; esac
+code=$(curl -s -X OPTIONS -o /dev/null -w '%{http_code}' "$D/v1/offers")
+test "$code" = "204" || { echo "  OPTIONS -> $code" >&2; exit 1; }
+allow=$(curl -s -X OPTIONS -D - -o /dev/null "$D/v1/offers" \
+        | tr -d '\r' | sed -n 's/^[Aa]ccess-[Cc]ontrol-[Aa]llow-[Mm]ethods: *//p')
+test "$allow" = "GET" || {
+    echo "  CORS advertises '$allow', not GET alone" >&2; exit 1; }
+echo "  HEAD 200, OPTIONS 204, and cross-origin callers are offered GET only"
+
+echo
 echo "== the attestation log is append-only and self-verifying =="
 curl -fsS "$O/v1/log?n=3" | python3 -c '
 import json,sys
@@ -159,6 +281,74 @@ d=json.load(sys.stdin)["attestations"]
 print("  %d recent attestation(s) published" % len(d))'
 curl -fsS "$O/v1/digest" | python3 -c '
 import json,sys; print("  log digest", json.load(sys.stdin)["digest"][:24] + "...")'
+
+echo
+echo "== an oracle that cannot write its log is not healthy =="
+# An attestation served but not logged is the one thing the log exists to make
+# impossible, so a log that will not take a write is an outage rather than a
+# detail. The process goes on answering with what it last published -- which is
+# correct, and is exactly why /healthz has to say something different.
+chmod 444 "$WORK/attestations.log"
+unhealthy=0
+for i in $(seq 40); do
+    code=$(curl -s -o "$WORK/hz.json" -w '%{http_code}' "$O/healthz")
+    if [ "$code" = "503" ]; then unhealthy=1; break; fi
+    sleep 0.5
+done
+test "$unhealthy" = "1" || {
+    echo "  /healthz stayed green with an unwritable log" >&2
+    cat "$WORK/hz.json" >&2; chmod 644 "$WORK/attestations.log"; exit 1; }
+python3 -c '
+import json,sys
+h = json.load(open(sys.argv[1]))
+assert not h["ok"], h
+assert h["errors"], "503 without saying which market failed"
+print("  503, naming", ", ".join(sorted(h["errors"])))' "$WORK/hz.json"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$O/v1/attestation/GOLD_USDX")
+test "$code" = "200" || { echo "  the last attestation stopped being served" >&2
+    chmod 644 "$WORK/attestations.log"; exit 1; }
+echo "  and the last signed price is still served, because it was logged"
+chmod 644 "$WORK/attestations.log"
+
+echo
+echo "== a book file that is not valid JSON stops the daemon, intact =="
+# The book is the only record of who published what. Starting empty on a parse
+# error would replace it with nothing on the first restart after a bad write,
+# and the offers would be gone for good -- so the daemon refuses to start and
+# leaves the bytes where they are for an operator to restore or move aside.
+printf '{"offers": {"broken"' > "$WORK/corrupt.json"
+BEFORE=$(sha256sum < "$WORK/corrupt.json")
+BPORT=$(port)
+cat > "$WORK/corrupt-cfg.json" <<EOF
+{
+  "listen": "127.0.0.1:$BPORT",
+  "book": "$WORK/corrupt.json",
+  "oracle": "",
+  "markets": ["GOLD/USDX"],
+  "poll": 3600
+}
+EOF
+set +e
+"$BIN/pignusd" --config "$WORK/corrupt-cfg.json" > "$WORK/corrupt.log" 2>&1
+rc=$?
+set -e
+test "$rc" != "0" || { echo "the daemon started on a corrupt book" >&2; exit 1; }
+grep -q "is not valid JSON" "$WORK/corrupt.log" || {
+    echo "it stopped, but did not say the book was the reason" >&2
+    sed 's/^/  /' "$WORK/corrupt.log" >&2; exit 1; }
+test "$(sha256sum < "$WORK/corrupt.json")" = "$BEFORE" || {
+    echo "the corrupt book was rewritten" >&2; exit 1; }
+echo "  refused to start, said why, and left the file byte for byte"
+
+# An ABSENT book is a different thing entirely: it is a fresh install, and
+# starting empty is the only sensible reading of it.
+rm -f "$WORK/corrupt.json"
+"$BIN/pignusd" --config "$WORK/corrupt-cfg.json" --once > "$WORK/fresh.json"
+python3 -c '
+import json,sys
+d = json.load(open(sys.argv[1]))
+assert d["stats"]["offers"] == 0, d["stats"]' "$WORK/fresh.json"
+echo "  and an absent book starts empty, which is what a fresh install is"
 
 echo
 echo "all service drills passed"

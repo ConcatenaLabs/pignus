@@ -151,7 +151,7 @@ def main():
                       "--repay-deadline", str(seqh + 2000),
                       "--abort-after", str(btch + 400),
                       "--d-refund", str(seqh + 1000),
-                      "--lender-prog", lender_prog,
+                      "--lender-prog", lender_prog, "--lots", "2",
                       "--market", "BTC/USDX", "--book", base)
             check("the lender publishes an offer carrying a principal",
                   bool(off.get("btc_offer_id")))
@@ -177,11 +177,7 @@ def main():
             loan = B.loan_from_dict(loan_d)
             ptxid, pvout, _ = B.fund_bitcoin(rig.btc, loan)
             rig.btc_mine(1)
-            vault_txid = B.upgrade_tx(loan, ptxid, pvout).txid()
             dest = bytes.fromhex("0014" + "55" * 20)
-            sighash = B.sighash_for(
-                loan, B.reclaim_tx(loan, vault_txid, 0, dest, 3000),
-                "reclaim").hex()
             take = post(base + "/v1/btc/take", {
                 "btc_offer_id": offer["btc_offer_id"],
                 "borrower_x": loan.borrower_x,
@@ -190,10 +186,8 @@ def main():
                 "h_w": loan.h_w, "w_seq": 0,
                 "prevault_txid": ptxid, "prevault_vout": pvout,
                 "prevault_value": str(loan.prevault_value()),
-                "upgrade_presig": B.presign_upgrade(loan, ptxid, pvout,
-                                                    borrower).hex(),
-                "reclaim_dest": dest.hex(), "reclaim_fee": 3000,
-                "reclaim_sighash": sighash})
+                "btc_height": rig.btc.getblockcount(),
+                "reclaim_dest": dest.hex(), "reclaim_fee": 3000})
             check("the take carries the borrower's own payout program",
                   bool(take.get("take_id")))
 
@@ -216,6 +210,21 @@ def main():
                 return r
 
             before = bw.getbalances()["mine"]["trusted"].get(usdx, 0)
+            respond()                       # draws the secret, publishes its hash
+            reserved = get(base + f"/v1/btc/take/{take['take_id']}")
+            check("the lender drew a secret for THIS take and published its hash",
+                  bool(reserved.get("payment_hash"))
+                  and reserved.get("status") == "reserved",
+                  json.dumps(reserved)[:200])
+            live = B.loan_from_dict({**B.loan_to_dict(loan),
+                                     "payment_hash": reserved["payment_hash"]})
+            vault_txid = B.upgrade_tx(live, ptxid, pvout).txid()
+            check("and the vault the borrower derives is the one it serves",
+                  reserved["vault_txid"] == vault_txid)
+            post(base + "/v1/btc/presig", {
+                "take_id": take["take_id"],
+                "upgrade_presig": B.presign_upgrade(live, ptxid, pvout,
+                                                    borrower).hex()})
             respond()                       # signs the release, pays the principal
             rig.seq_mine(1)
             tk = wait_for(lambda: get(base + f"/v1/btc/take/{take['take_id']}")
@@ -224,9 +233,10 @@ def main():
             check("the responder signs and disburses once the collateral is "
                   "committed", bool(tk) and tk.get("disbursement_txid"),
                   json.dumps(tk)[:200] if tk else "")
-            signed_loan = B.loan_from_dict(tk["loan"])
+            signed_loan = live
             check("with a secret drawn for this take, not for the offer",
-                  bool(tk.get("adaptor_point")) and bool(tk.get("payment_hash")))
+                  bool(tk.get("payment_hash"))
+                  and tk["payment_hash"] == reserved["payment_hash"])
 
             # The principal is not the borrower's until they claim it, and the
             # claim is what starts the loan.
@@ -251,6 +261,39 @@ def main():
             check("the borrower's own address received the principal",
                   float(after) - float(before) >= 99.9,
                   f"before {before} after {after}")
+
+            # A borrower with no browser takes a second lot the same way.
+            cli_ticket = os.path.join(root, "cli-loan.json")
+            bkey = os.path.join(root, "borrower.key")
+            cli("btc-keygen", "--out", bkey)
+            seq_args = ["--rpc", f"http://127.0.0.1:{rig.seq_rpcport}",
+                        "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS,
+                        "--rpc-wallet", "pignus"]
+            btc_args = ["--btc-rpc", f"http://127.0.0.1:{rig.btc_rpcport}",
+                        "--btc-rpc-user", RPC_USER, "--btc-rpc-password",
+                        RPC_PASS, "--btc-rpc-wallet", "pignus"]
+            import threading as _th
+            stop = _th.Event()
+
+            def responder_loop():
+                while not stop.is_set():
+                    respond()
+                    stop.wait(1)
+
+            th = _th.Thread(target=responder_loop, daemon=True)
+            th.start()
+            try:
+                taken = cli("btc-offer-take", "--offer", offer["btc_offer_id"],
+                            "--borrower-key", bkey, "--borrower-prog", b_spk[4:],
+                            "--wait", "60", "--out", cli_ticket,
+                            "--book", base, *seq_args, *btc_args)
+            finally:
+                stop.set(); th.join(timeout=10)
+            check("a borrower with no browser takes an offer from the relay",
+                  taken.get("stage") == "funded"
+                  and rig.btc.gettxout(taken["funding_txid"], 0) is not None
+                  or rig.btc.gettxout(taken["funding_txid"], 1) is not None,
+                  json.dumps(taken)[:200])
 
             respond()                       # reads w off the chain, upgrades
             rig.btc_mine(1)

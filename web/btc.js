@@ -69,6 +69,13 @@ export class Tx {
     return concat(r, u32le(this.locktime >>> 0));
   }
   hex() { return bytesToHex(this.serialize()); }
+  /** The transaction's own id: double SHA-256 of the serialisation WITHOUT
+   *  witnesses, in the order everything displays it. The borrow flow needs it
+   *  before anything is broadcast, because the release the lender signs
+   *  commits to the vault the pre-signed upgrade will create. */
+  txid() {
+    return bytesToHex(Uint8Array.from(sha256(sha256(this.serialize(false)))).reverse());
+  }
 }
 function outpoint(i) { return concat(rev(hexToBytes(i.txid)), u32le(i.vout)); }
 
@@ -139,11 +146,18 @@ export function timelockedSingle(locktime, keyX) {
 // ---------------------------------------------------------------- the loan
 
 /** The Bitcoin collateral output: P2TR(NUMS, {reclaim, seize, timeout}). */
+/** The vault on Bitcoin. RECLAIM carries the SAME hash the Sequentia repayment
+ *  output does, which is the whole cross-chain binding: the secret that pays
+ *  the lender there is the secret that releases the collateral here, by
+ *  construction rather than by anybody's assurance. */
 export function fundingTree(loan) {
   const bx = hexToBytes(loan.borrower_x), lx = hexToBytes(loan.lender_x),
         ox = hexToBytes(loan.oracle_x);
+  if (!loan.payment_hash)
+    throw new Error("this loan names no payment hash, so its collateral could " +
+                    "not be released by repaying");
   return tapTree(NUMS, [
-    ["reclaim", twoOfTwo(bx, lx)],
+    ["reclaim", hashlockedTwoOfTwo(hexToBytes(loan.payment_hash), bx, lx)],
     ["seize", twoOfTwo(lx, ox)],
     ["timeout", timelockedSingle(loan.recover_after, lx)],
   ]);
@@ -226,17 +240,21 @@ export function findOutput(txHex, spk, value) {
 // principal -- which publishes `w` on Sequentia -- lets anyone move it on.
 // So a borrower whose lender never pays loses nothing but time.
 
-function hashlockedSingle(h, keyX) {
+/** SHA256 <h> EQUALVERIFY <A> CHECKSIGVERIFY <B> CHECKSIG: a preimage AND both
+ *  signatures. Neither party can move the output alone, and neither can move it
+ *  before the thing the preimage stands for has happened. */
+function hashlockedTwoOfTwo(h, aX, bX) {
   const pushd = (d) => concat(u8(d.length), d);
-  return concat(u8(0xa8), pushd(h), u8(0x88), pushd(keyX), u8(0xac));
+  return concat(u8(0xa8), pushd(h), u8(0x88),
+                pushd(aX), u8(0xad), pushd(bX), u8(0xac));
 }
 
 export function prevaultTree(loan) {
   if (!loan.h_w || !loan.abort_after)
     throw new Error("this loan has no abortable origination");
-  const bx = hexToBytes(loan.borrower_x);
+  const bx = hexToBytes(loan.borrower_x), lx = hexToBytes(loan.lender_x);
   return tapTree(NUMS, [
-    ["upgrade", hashlockedSingle(hexToBytes(loan.h_w), bx)],
+    ["upgrade", hashlockedTwoOfTwo(hexToBytes(loan.h_w), bx, lx)],
     ["abort", timelockedSingle(loan.abort_after, bx)],
   ]);
 }
@@ -350,16 +368,17 @@ export function seizeSighash(loan, fundingTxid, vout, destSpk, fee) {
 }
 
 /**
- * Finish a reclaim once `t` is known: the lender's completed release signature,
- * the borrower's own, then the leaf and control block. Script order is
- * <borrower> CHECKSIGVERIFY <lender> CHECKSIG, and a witness is consumed
- * top-first, so the lender's signature is pushed first.
+ * Finish a reclaim once the secret is public: the lender's release, the
+ * borrower's own signature, and the secret itself.
  */
 export function completeReclaimTx(loan, fundingTxid, vout, destSpk, fee,
-                                  lenderSig, borrowerSig) {
+                                  lenderSig, borrowerSig, secret) {
   const tree = fundingTree(loan);
   const tx = reclaimTx(loan, fundingTxid, vout, destSpk, fee);
+  // A stack is consumed from the top and the leaf runs SHA256 first, so the
+  // secret is pushed last.
   tx.vin[0].witness = [hexToBytes(lenderSig), hexToBytes(borrowerSig),
+                       hexToBytes(secret),
                        tree.scripts.reclaim, tree.controlBlock("reclaim")];
   return tx;
 }

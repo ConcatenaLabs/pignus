@@ -1,9 +1,11 @@
 # Working on Pignus
 
-Pignus is non-custodial collateralised lending on Sequentia. Borrow USDX against
-GOLD, SILVR, OILX, tSEQ, native BTC or any other unrestricted issued asset; the
-loan's terms are compiled into a covenant and enforced by the script interpreter
-rather than by an operator.
+Pignus is non-custodial collateralised lending on Sequentia. Borrow one issued
+asset against another, or against native Bitcoin on the parent chain, with the
+loan's terms compiled into a covenant and enforced by the script interpreter
+rather than by an operator. No asset is privileged: the testnet quotes its
+markets against USDX because a borrower wants a number they recognise, not
+because anything in the code knows about it.
 
 ## The one thing to understand before changing anything
 
@@ -23,7 +25,10 @@ import Python -- `web/pignus.js` for the browser is one, and it pins itself to
 the same vectors.
 
 So this repo needs a Sequentia **source** checkout. Set `SEQUENTIA_SRC`, or keep
-one at `../Sequentia` or `~/Sequentia`.
+one at `../Sequentia`, `~/Sequentia` or `vendor/sequentia` (git-ignored). An
+explicit `SEQUENTIA_SRC` is treated as a decision, not a hint: a wrong one is
+reported rather than silently falling back to another checkout whose covenant
+may differ.
 
 ## Regenerating the vectors
 
@@ -41,12 +46,13 @@ node-repo covenant change means someone has broken the pinning.
     tests/cli_drill.sh          offline, no node, ~2s -- run this first
     tests/run-tests.sh          everything, including the node integration tests
 
-`tests/test_platform.py` and `tests/test_btc_collateral.py` run on the node's
-functional-test framework but live here, because they test this library rather
-than the node. They need `SEQUENTIA_SRC` and a built `sequentiad`;
-`test_btc_collateral.py` also needs a Bitcoin Core `bitcoind` (`PIGNUS_BITCOIND`,
-default `~/bitcoin-28.0/bin/bitcoind`), and the `tests/*.mjs` browser checks need
-Node.
+`tests/test_platform.py` runs on the node's functional-test framework, so it
+needs a built checkout's `test/config.ini` and is skipped without one. The other
+chain tests start their own `sequentiad` -- and, for the BTC ones, a Bitcoin
+Core `bitcoind` -- through `tests/rig.py`, which needs only the binaries. All of
+them need `SEQUENTIA_SRC` and a built `sequentiad`; the Bitcoin ones read
+`PIGNUS_BITCOIND` (default `~/bitcoin-28.0/bin/bitcoind`), and the `tests/*.mjs`
+browser checks need Node.
 
 `tests/test_lifecycle.py` is the one to run after touching the daemon, the
 watcher, the CLI or `pignus/vault.py`: it drives the CLI through a whole
@@ -111,6 +117,10 @@ source on the box, never copy binaries onto it.
 - Design and security analysis: `docs/pignus-design.md` here. It is the
   authority on the trust surface, the replay window, the 64-bit bound and the
   collateral tiers; this repo's README summarises it.
+- `docs/api.md`: every HTTP endpoint `pignusd` and `pignus-oracle` serve, with
+  request and response shapes. A route added or changed in `bin/pignusd` or
+  `bin/pignus-oracle` is not finished until it is right there too -- the page,
+  the CLI, the responder and the liquidator are all clients of it.
 - `openamp-design.md` and `opendamp-design.md` (restricted assets, Tiers C and
   D) in the node repository's `doc/sequentia/`, and
   `simplicity-dex-covenant-offers-design.md` (where the output-map and

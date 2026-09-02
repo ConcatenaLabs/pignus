@@ -59,12 +59,14 @@ def main():
         w = os.urandom(32)
         tip = btc.getblockcount()
 
+        t = os.urandom(32)
         loan = BC.BtcLoan(
             btc_amount=50_000_000, borrower_x=A.xonly_pubkey(borrower).hex(),
             lender_x=A.xonly_pubkey(lender).hex(),
             oracle_x=A.xonly_pubkey(oracle).hex(),
             recover_after=tip + 400, debt_asset="11" * 32, debt=1000,
             principal=900, repay_deadline=1, h_w=BC.sha256(w).hex(),
+            payment_hash=BC.sha256(t).hex(),
             abort_after=tip + 20, upgrade_fee=3000, d_refund=1,
             borrower_prog="dd" * 20, borrower_ver=0,
             lender_prog="cc" * 20, lender_ver=0)
@@ -91,7 +93,8 @@ def main():
 
         print("\n== the wrong secret cannot move it ==")
         try:
-            BC.complete_upgrade(loan, txid, vout, presig, os.urandom(32))
+            BC.complete_upgrade(loan, txid, vout, presig, os.urandom(32),
+                                lender)
             check("an upgrade with the wrong secret is refused", False)
         except ValueError as e:
             check("an upgrade with the wrong secret is refused",
@@ -107,7 +110,7 @@ def main():
 
         print("\n== whoever holds w completes the move, and the vault is the "
               "one the release was signed against ==")
-        up = BC.complete_upgrade(loan, txid, vout, presig, w)
+        up = BC.complete_upgrade(loan, txid, vout, presig, w, lender)
         expected_txid = BC.upgrade_tx(loan, txid, vout).txid()
         check("the upgrade's id was known before it was broadcast",
               up.txid() == expected_txid)
@@ -121,6 +124,18 @@ def main():
         ok, why = BC.collateral_committed(btc, loan, up.txid(), 0,
                                           min_conf=1, prevault=False)
         check("and the lender's own check agrees", ok, why)
+
+        print("\n== the borrower cannot move the collateral on their own ==")
+        # The whole reason UPGRADE needs both parties: with a borrower-only
+        # leaf, a borrower could take the principal and then walk off with the
+        # collateral, and nothing on the lender's side could stop them.
+        alone = BC.upgrade_tx(loan, txid, vout)
+        tree = loan.prevault_tree()
+        msg = BC._prevault_sighash(loan, alone, "upgrade")
+        alone.vin[0].witness = [A.sign(borrower, msg), presig, w,
+                                tree.leaves["upgrade"],
+                                tree.control_block("upgrade")]
+        rejected(btc, alone, "a borrower-only spend of the pre-vault is refused")
 
         print("\n== a borrower whose principal never came aborts ==")
         loan2 = BC.BtcLoan(**{**BC.loan_to_dict(loan),

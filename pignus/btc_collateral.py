@@ -13,31 +13,41 @@ The Bitcoin side
 ----------------
 A P2TR output with the NUMS internal key (no key path) and three leaves:
 
-    RECLAIM   <borrower> CHECKSIGVERIFY <lender> CHECKSIG
+    RECLAIM   SHA256 <h> EQUALVERIFY <borrower> CHECKSIGVERIFY <lender> CHECKSIG
     SEIZE     <lender>   CHECKSIGVERIFY <oracle> CHECKSIG
     TIMEOUT   <recover_after> CLTV DROP <lender> CHECKSIG
 
-RECLAIM is a 2-of-2, and the lender's half is handed over at origination as an
-ADAPTOR signature under a point `T = t*G`. The borrower holds a release
-signature they cannot yet use.
+RECLAIM needs both parties AND the secret `t`, and `h = SHA256(t)` is the same
+hash the Sequentia repayment output uses. The lender hands over their half at
+origination as a plain signature the borrower can verify; the secret arrives
+later, when the lender takes the repayment.
 
 The Sequentia side
 ------------------
 The borrower repays into a taproot output with
 
-    CLAIM     SHA256 <h> EQUALVERIFY <lender> CHECKSIG        (h = SHA256(t))
-    REFUND    <repay_deadline> CLTV DROP <borrower> CHECKSIG
+    CLAIM     SHA256 <h> EQUALVERIFY, then the whole input to the lender
+    REFUND    <repay_deadline> CLTV DROP, then the whole input to the borrower
+
+Neither leaf takes a signature: each pays a program the address already names,
+so anyone may broadcast either one and it can still only pay the party it was
+always going to pay. That is what lets a borrower settle a cross-chain loan
+from a browser, whose wallet can sign its own inputs and a Bitcoin sighash but
+no covenant leaf.
 
 The lender can only take the repayment by publishing `t`. The borrower reads it
-off the Sequentia chain, completes the adaptor signature, and takes the BTC back.
+off the Sequentia chain and uses it, with the release the lender gave them at
+origination, to take the collateral back.
 
 So the four outcomes are:
 
   * borrower repays, lender claims  -> `t` is public, borrower reclaims the BTC.
     Trustless: neither party can take both sides.
   * borrower repays, lender stalls  -> the repayment refunds to the borrower on
-    REFUND, the lender takes the collateral on TIMEOUT. The loan unwinds and the
-    lender is strictly worse off for stalling, which is why they do not.
+    REFUND, the lender takes the collateral on TIMEOUT. On an over-collateralised
+    loan that stall PAYS the lender, so it is not something to rely on their
+    good sense about: the borrower's protection is the margin `timelocks_sane`
+    insists on between the two deadlines, and repaying early enough to use it.
   * borrower never repays           -> TIMEOUT, the lender sweeps the collateral.
   * price crosses the strike        -> SEIZE, lender and oracle jointly.
 
@@ -87,8 +97,8 @@ class BtcLoan:
     debt_asset: str
     debt: int
     repay_deadline: int         # Sequentia absolute locktime for REFUND
-    adaptor_point: str = ""     # T, x-only hex; set once the lender picks t
-    payment_hash: str = ""      # SHA256(t)
+    payment_hash: str = ""      # SHA256(t), in BOTH chains' scripts
+    adaptor_point: str = ""     # T = t*G, for the DLC maturity path only
     # The principal disbursed to the borrower at origination, in debt-asset
     # atoms (debt = principal + interest). Economic metadata ONLY: it is not in
     # any taproot script, so it never changes the funding or repayment address.
@@ -135,11 +145,25 @@ class BtcLoan:
     # ------------------------------------------------------------- Bitcoin
 
     def funding_tree(self):
+        """The vault on Bitcoin: NUMS internal key, no key path, three leaves.
+
+        RECLAIM carries the SAME hash the Sequentia repayment output does, and
+        that is the whole cross-chain binding. It has to be a hash rather than
+        an assertion: a lender who published a point T and a hash h could claim
+        they came from one secret when they did not, and nobody could check it
+        -- proving `SHA256(t) = h` and `t*G = T` together needs a proof this
+        protocol has no way to carry. With one hash in both scripts there is
+        nothing left to assert: the secret that pays the lender on Sequentia is
+        the secret that releases the collateral here, by construction.
+        """
         bx = bytes.fromhex(self.borrower_x)
         lx = bytes.fromhex(self.lender_x)
         ox = bytes.fromhex(self.oracle_x)
+        if not self.payment_hash:
+            raise ValueError("a vault needs the payment hash both chains share")
         return B.TapTree(B.NUMS, [
-            ("reclaim", B.two_of_two(bx, lx)),
+            ("reclaim", B.hashlocked_two_of_two(
+                bytes.fromhex(self.payment_hash), bx, lx)),
             ("seize", B.two_of_two(lx, ox)),
             ("timeout", B.timelocked_single(self.recover_after, lx)),
         ])
@@ -234,8 +258,9 @@ class BtcLoan:
         if not self.h_w or not self.abort_after:
             raise ValueError("a pre-vault needs h_w and abort_after")
         bx = bytes.fromhex(self.borrower_x)
+        lx = bytes.fromhex(self.lender_x)
         return B.TapTree(B.NUMS, [
-            ("upgrade", B.hashlocked_single(bytes.fromhex(self.h_w), bx)),
+            ("upgrade", B.hashlocked_two_of_two(bytes.fromhex(self.h_w), bx, lx)),
             ("abort", B.timelocked_single(self.abort_after, bx)),
         ])
 
@@ -277,42 +302,47 @@ def sighash_for(loan, tx, leaf_name, input_index=0):
                              script=tree.leaves[leaf_name])
 
 
-def lender_release_adaptor(loan, lender_sec, tx):
-    """The lender's half of RECLAIM, encrypted under the adaptor point.
+def lender_release(loan, lender_sec, tx):
+    """The lender's half of RECLAIM, handed to the borrower at origination.
 
-    This is the whole cross-chain link in one call: after it, the borrower holds
-    a release signature that only `t` can complete, and `t` is what the lender
-    must publish on Sequentia to be paid.
+    A plain signature, which matters: the borrower can CHECK it. The older
+    design handed over an adaptor signature under a point T and asked the
+    borrower to believe that the hash baked into the repayment output came from
+    the same secret. Nothing could check that, and a lender who lied took the
+    repayment and the collateral both. Now the link is the hash itself, in both
+    scripts, and this signature is just the lender's consent to the borrower
+    leaving once the secret is public.
     """
-    msg = sighash_for(loan, tx, "reclaim")
-    return A.encrypt_sign(lender_sec, msg, bytes.fromhex(loan.adaptor_point))
+    return A.sign(lender_sec, sighash_for(loan, tx, "reclaim"))
 
 
-def check_release_adaptor(loan, tx, adaptor_sig) -> bool:
-    """What a borrower MUST run before funding the Bitcoin side.
+def check_release(loan, tx, release_sig) -> bool:
+    """What a borrower MUST run before committing any Bitcoin.
 
-    Funding without checking means locking collateral against a release
-    signature that may be worthless -- the lender could hand over noise and the
-    borrower would discover it only when they tried to leave.
+    Funding without checking means locking collateral against a release that
+    may be worthless -- the lender could hand over noise, and the borrower
+    would discover it only when they tried to leave.
     """
-    msg = sighash_for(loan, tx, "reclaim")
-    return A.encrypt_verify(bytes.fromhex(loan.lender_x), msg,
-                            bytes.fromhex(loan.adaptor_point), adaptor_sig)
+    return A.verify(bytes.fromhex(loan.lender_x),
+                    sighash_for(loan, tx, "reclaim"), release_sig)
 
 
-def complete_reclaim(loan, tx, adaptor_sig, secret, borrower_sec):
-    """Finish the release once `t` is public: decrypt the lender's half, add the
-    borrower's own, and attach the witness."""
-    lender_sig = A.decrypt(adaptor_sig, secret)
+def complete_reclaim(loan, tx, release_sig, secret, borrower_sec):
+    """Take the collateral back, once the secret is public.
+
+    The witness is [lender_sig, borrower_sig, secret]: a stack is consumed from
+    the top and the leaf runs SHA256 first, so the secret is pushed last.
+    """
+    if sha256(secret).hex() != loan.payment_hash:
+        raise ValueError("that secret does not open this loan: it is not the "
+                         "one the repayment output commits to")
     msg = sighash_for(loan, tx, "reclaim")
-    if not A.verify(bytes.fromhex(loan.lender_x), msg, lender_sig):
-        raise ValueError("the completed lender signature does not verify: the "
-                         "secret does not match the adaptor point")
+    if not A.verify(bytes.fromhex(loan.lender_x), msg, release_sig):
+        raise ValueError("the lender's release does not verify against this "
+                         "transaction")
     borrower_sig = A.sign(borrower_sec, msg)
     tree = loan.funding_tree()
-    # Script order is <borrower> CHECKSIGVERIFY <lender> CHECKSIG, and a witness
-    # stack is consumed top-first, so the lender's signature is pushed first.
-    tx.vin[0].witness = [lender_sig, borrower_sig,
+    tx.vin[0].witness = [release_sig, borrower_sig, secret,
                          tree.leaves["reclaim"], tree.control_block("reclaim")]
     return tx
 
@@ -357,17 +387,24 @@ def check_upgrade_presig(loan, prevault_txid, vout, presig) -> bool:
                     upgrade_sighash(loan, prevault_txid, vout), presig)
 
 
-def complete_upgrade(loan, prevault_txid, vout, presig, secret_w):
-    """Finish the move once `w` is public on Sequentia. Anyone can broadcast
-    it; the lender is simply the one who wants to."""
+def complete_upgrade(loan, prevault_txid, vout, presig, secret_w, lender_sec):
+    """Start the loan, once `w` is public on Sequentia.
+
+    Only the lender can do this, and only after the borrower has taken the
+    principal. Both halves are deliberate: if the borrower could move the
+    pre-vault alone they would take the principal and walk off with the
+    collateral, and if the lender could move it without `w` they would start a
+    loan they had not paid for.
+    """
     if sha256(secret_w).hex() != loan.h_w:
         raise ValueError("that secret is not the one this pre-vault commits to")
     tx = upgrade_tx(loan, prevault_txid, vout)
     tree = loan.prevault_tree()
-    if not A.verify(bytes.fromhex(loan.borrower_x),
-                    _prevault_sighash(loan, tx, "upgrade"), presig):
+    msg = _prevault_sighash(loan, tx, "upgrade")
+    if not A.verify(bytes.fromhex(loan.borrower_x), msg, presig):
         raise ValueError("the borrower's advance signature does not verify")
-    tx.vin[0].witness = [presig, secret_w, tree.leaves["upgrade"],
+    lender_sig = A.sign(lender_sec, msg)
+    tx.vin[0].witness = [lender_sig, presig, secret_w, tree.leaves["upgrade"],
                          tree.control_block("upgrade")]
     return tx
 
@@ -1025,11 +1062,16 @@ def collateral_committed(btc_node, loan, funding_txid, funding_vout,
     want_spk = (loan.prevault_spk() if use_prevault else loan.funding_spk()).hex()
     want_value = loan.prevault_value() if use_prevault else int(loan.btc_amount)
     try:
-        out = btc_node.gettxout(funding_txid, int(funding_vout), False)
+        # The mempool counts for FINDING it -- an unconfirmed funding is the
+        # ordinary case a minute after a borrower broadcasts, and "unknown" is
+        # the wrong thing to tell an operator about it. Depth is what the gate
+        # below is for.
+        out = btc_node.gettxout(funding_txid, int(funding_vout), True)
     except Exception as e:                              # noqa: BLE001
         return False, f"the Bitcoin node could not read that outpoint: {e}"
     if out is None:
-        return False, "that outpoint is unspent nowhere: it is spent or unknown"
+        return False, ("that outpoint is not unspent anywhere the node can see: "
+                       "it has been spent, or it was never broadcast")
     got_spk = str(out.get("scriptPubKey", {}).get("hex", ""))
     if got_spk != want_spk:
         return False, ("that outpoint does not pay this loan's collateral "
@@ -1040,8 +1082,8 @@ def collateral_committed(btc_node, loan, funding_txid, funding_vout,
                        f"{want_value} this loan requires")
     conf = int(out.get("confirmations", 0) or 0)
     if conf < int(min_conf):
-        return False, (f"the collateral has {conf} confirmation(s), below the "
-                       f"{min_conf} required")
+        return False, (f"waiting for the collateral to confirm: {conf} of the "
+                       f"{min_conf} confirmation(s) required")
     return True, f"collateral confirmed at depth {conf}"
 
 

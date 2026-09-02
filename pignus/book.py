@@ -363,7 +363,8 @@ class Book:
             self._save()
             return rec
 
-    def btc_offer_lots_left(self, btc_offer_id, take_ttl=1800):
+    def btc_offer_lots_left(self, btc_offer_id, take_ttl=1800,
+                            signed_ttl=6 * 3600):
         """How many loans of this offer are still on the table.
 
         A take that was never signed expires, because a borrower who walks away
@@ -381,7 +382,13 @@ class Book:
             status = t.get("status", "pending")
             if status in ("aborted", "refunded", "expired"):
                 continue
-            if status == "pending" and now - int(t.get("created", now)) > take_ttl:
+            age = now - int(t.get("created", now))
+            if status == "pending" and age > take_ttl:
+                continue
+            # A signed take whose collateral never appeared frees its lot too,
+            # eventually: a taker who funds nothing must not be able to hold a
+            # lender's whole offer shut.
+            if status == "signed" and signed_ttl and age > signed_ttl:
                 continue
             held += 1
         return max(0, int(rec.get("lots") or 1) - held)

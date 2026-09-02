@@ -114,7 +114,7 @@ def main():
               paid["scriptPubKey"]["hex"] == "0014" + loan.borrower_prog)
 
         print("\n== so the lender can start the loan ==")
-        up = BC.complete_upgrade(loan, f_txid, f_vout, presig, secret)
+        up = BC.complete_upgrade(loan, f_txid, f_vout, presig, secret, lender)
         btc.sendrawtransaction(up.hex())
         rig.btc_mine(1)
         vault = btc.gettxout(up.txid(), 0, False)
@@ -144,10 +144,10 @@ def main():
         dest = bytes.fromhex(btc.getaddressinfo(
             btc.getnewaddress())["scriptPubKey"])
         rtx = BC.reclaim_tx(loan, up.txid(), 0, dest, 3000)
-        asig = BC.lender_release_adaptor(loan, lender, rtx)
+        release = BC.lender_release(loan, lender, rtx)
         check("the release the lender signed verifies before it is used",
-              BC.check_release_adaptor(loan, rtx, asig))
-        done = BC.complete_reclaim(loan, rtx, asig, got_t, borrower)
+              BC.check_release(loan, rtx, release))
+        done = BC.complete_reclaim(loan, rtx, release, got_t, borrower)
         btc.sendrawtransaction(done.hex())
         rig.btc_mine(1)
         back = btc.gettxout(done.txid(), 0, False)

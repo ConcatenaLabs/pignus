@@ -113,6 +113,26 @@ function psetInput(u) {
 }
 
 /**
+ * What the vault coin actually holds, which is what every leaf reads.
+ *
+ * The covenant compares against the INPUT's value, not against the terms:
+ * `returned >= C`, `required_return = C - seize`, `swept >= locked`. A vault
+ * funded with MORE than the terms state is legal and can only be exited by
+ * paying out what it holds; one funded with LESS can be exited by no leaf at
+ * all, so composing against it builds a transaction the interpreter refuses.
+ * Say so here instead. Mirrors VaultSpender._held in pignus/vault.py.
+ */
+function held(terms, collateralAmount) {
+  const have = b(collateralAmount);
+  const want = b(terms.collateral_amount ?? have);
+  if (have < want)
+    throw new WalletError(
+      `that vault holds ${have} atoms of collateral but these terms say ` +
+      `${want}; refusing to compose an exit no leaf would accept`);
+  return have;
+}
+
+/**
  * The fee a composition will pay: which asset, how many atoms, and below what
  * a change output in it would be dust.
  *
@@ -302,24 +322,32 @@ export function buildTakeOffer({ terms, offerOutpoint, offerValue, principal,
   const { outs: change, folded } = changeOutputs(spend, changeSpk, feeAsset,
                                                  dustAtoms);
   const fee = b(feeAmount) + folded;
+  let feePlaced = false;
   if (remainder > 0n) {
     outs.push({ asset: terms.debt_asset, value: remainder, script: offerSpk });
+  } else if (feeAsset !== terms.debt_asset) {
+    // Drawing the LAST lot: the TAKE leaf reads any debt-asset output at index
+    // 1 as a remainder claim, so something else has to sit there. The fee
+    // output is always available and costs nothing extra -- and the coins for
+    // an exact take are often prepared, leaving no change at all to fill it
+    // with. The same choice pignus.vault.take_offer makes.
+    outs.push(feeOutput(feeAsset, fee));
+    feePlaced = true;
   } else {
     const filler = change.find(o => o.asset !== terms.debt_asset);
     if (!filler)
       throw new WalletError(
-        "This draws the last lot of the offer, so the transaction needs a " +
-        "change output in some asset other than the debt asset, and this " +
-        "composition has none. Use a collateral coin larger than the " +
-        "collateral amount, or pay the network fee from a coin larger than " +
-        "the fee in an asset other than the debt asset, so there is change " +
-        "to place.");
+        "This draws the last lot of the offer, so the transaction needs an " +
+        "output at index 1 that is not the debt asset, and the network fee " +
+        "is being paid in the debt asset. Pay the fee in another asset, or " +
+        "use a collateral coin larger than the collateral amount, so there " +
+        "is change to place there.");
     outs.push(filler);
     change.splice(change.indexOf(filler), 1);
   }
   outs.push({ asset: terms.debt_asset, value: b(principal), script: changeSpk });
   outs.push(...change);
-  outs.push(feeOutput(feeAsset, fee));
+  if (!feePlaced) outs.push(feeOutput(feeAsset, fee));
 
   const covenantInput = {
     txid: offerOutpoint.txid, vout: offerOutpoint.vout,
@@ -366,14 +394,14 @@ export function buildRepay({ terms, vaultOutpoint, collateralAmount, singleLeaf,
     throw new WalletError(
       "the vault at that outpoint is not what these terms compile to -- " +
       "refusing to build a spend for it");
+  const locked = held(terms, collateralAmount);
 
   const wants = [[terms.debt_asset, b(terms.debt)], [feeAsset, b(feeAmount)]];
   const { inputs, spend } = gather(utxos, wants);
 
   const outs = [
     { asset: terms.debt_asset, value: b(terms.debt), script: lenderSpk },
-    { asset: terms.collateral_asset, value: b(collateralAmount),
-      script: borrowerSpk },
+    { asset: terms.collateral_asset, value: locked, script: borrowerSpk },
   ];
   const { outs: change, folded } = changeOutputs(spend, changeSpk, feeAsset,
                                                  dustAtoms);
@@ -390,7 +418,7 @@ export function buildRepay({ terms, vaultOutpoint, collateralAmount, singleLeaf,
       inputs: [{
         txid: vaultOutpoint.txid, vout: vaultOutpoint.vout,
         witnessUtxo: { asset: terms.collateral_asset,
-                       value: b(collateralAmount), script: vaultSpk },
+                       value: locked, script: vaultSpk },
         finalWitness: witness,
       }, ...inputs.map(psetInput)],
       outputs: outs,
@@ -398,7 +426,7 @@ export function buildRepay({ terms, vaultOutpoint, collateralAmount, singleLeaf,
     fee, folded,
     summary: [
       `Pay ${fmt(terms.debt)} of ${short(terms.debt_asset)} to the lender`,
-      `Take back all ${fmt(collateralAmount)} of ${short(terms.collateral_asset)}`,
+      `Take back all ${fmt(locked)} of ${short(terms.collateral_asset)}`,
       "No oracle and no signature: this exit is always open to you",
     ],
   };
@@ -422,6 +450,7 @@ export function thresholdEvidence(terms, attestations, { liquidate }) {
   const threshold = Number(terms.oracle_threshold || keys.length);
   const notBefore = b(terms.not_before);
   const strike = b(terms.strike);
+  const scale = b(terms.price_scale ?? 100000);
   const feed = feedId(terms.market);
   const byKey = {};
   for (const a of attestations) byKey[a.oracle_x] = a;
@@ -429,6 +458,10 @@ export function thresholdEvidence(terms, attestations, { liquidate }) {
   keys.forEach((k, i) => {
     const a = byKey[k];
     if (!a) return;
+    // The scale is baked into the leaf and is not signed, so the same number
+    // means a different price at a different scale. An attestation quoted at
+    // another one is not evidence about this loan, whoever signed it.
+    if (a.price_scale != null && b(a.price_scale) !== scale) return;
     if (!verifySchnorr(k, attestationMessage(feed, a.timestamp, a.price), a.signature))
       return;
     if (b(a.timestamp) < notBefore) return;
@@ -470,6 +503,14 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
         `at ${price} this position is not liquidatable: the strike is ` +
         `${terms.strike}, and the covenant checks that itself`);
   } else {
+    // The scale is baked into the leaf and signed by nobody, so the covenant
+    // reads whatever integer it is handed as though it were quoted at the
+    // vault's own scale. Ten times too small opens LIQUIDATE on a healthy loan.
+    const scale = b(terms.price_scale ?? 100000);
+    if (attestation.price_scale != null && b(attestation.price_scale) !== scale)
+      throw new WalletError(
+        `that attestation is at price scale ${attestation.price_scale} but ` +
+        `this loan computes at ${scale}; the covenant would misread it`);
     price = b(attestation.price);
     if (!atMaturity && !isLiquidatable(terms, price))
       throw new WalletError(
@@ -495,9 +536,17 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
   const vaultSpk = singleLeaf
     ? P.bytesToHex(offer.offerVaultScriptPubKey(terms))
     : P.bytesToHex(vaultScriptPubKey(terms));
+  // The same check repay and recover make. A seizure pays a taker, so building
+  // one against a coin these terms do not describe is the one composition
+  // whose mistake somebody profits from.
+  if (vaultSpk !== vaultOutpoint.scriptPubkey)
+    throw new WalletError(
+      "the vault at that outpoint is not what these terms compile to -- " +
+      "refusing to build a spend for it");
 
+  const locked = held(terms, collateralAmount);
   const seize = seizureAt(terms, price);
-  const surplus = surplusAt(terms, collateralAmount, price);
+  const surplus = surplusAt(terms, locked, price);
   const wants = [[terms.debt_asset, b(terms.debt)], [feeAsset, b(feeAmount)]];
   const { inputs, spend } = gather(utxos, wants);
 
@@ -511,7 +560,7 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
     outs.push({ asset: terms.collateral_asset, value: surplus,
                 script: borrowerSpk });
     outs.push({ asset: terms.collateral_asset,
-                value: b(collateralAmount) - surplus, script: takerSpk });
+                value: locked - surplus, script: takerSpk });
   } else {
     // Under water: the covenant requires no return, but its probe treats ANY
     // collateral-asset output at 2k+1 as a return and then demands the
@@ -533,7 +582,7 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
       change.splice(change.indexOf(filler), 1);
       outs.push(filler);
     }
-    outs.push({ asset: terms.collateral_asset, value: b(collateralAmount),
+    outs.push({ asset: terms.collateral_asset, value: locked,
                 script: takerSpk });
   }
   outs.push(...change);
@@ -552,7 +601,7 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
       inputs: [{
         txid: vaultOutpoint.txid, vout: vaultOutpoint.vout,
         witnessUtxo: { asset: terms.collateral_asset,
-                       value: b(collateralAmount), script: vaultSpk },
+                       value: locked, script: vaultSpk },
         finalWitness: witness,
       }, ...inputs.map(psetInput)],
       outputs: outs,
@@ -561,7 +610,7 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
     seize, surplus, fee, folded,
     summary: [
       `Pay ${fmt(terms.debt)} of ${short(terms.debt_asset)} to the lender`,
-      `Keep ${fmt(b(collateralAmount) - surplus)} of ${short(terms.collateral_asset)}`,
+      `Keep ${fmt(locked - surplus)} of ${short(terms.collateral_asset)}`,
       surplus > 0n
         ? `Return ${fmt(surplus)} to the borrower -- the covenant enforces this`
         : "This position is under water: there is no surplus to return",
@@ -658,9 +707,10 @@ export function buildRecover({ terms, vaultOutpoint, collateralAmount, singleLea
     throw new WalletError(
       "the vault at that outpoint is not what these terms compile to -- " +
       "refusing to build a spend for it");
+  const locked = held(terms, collateralAmount);
   const wants = [[feeAsset, b(feeAmount)]];
   const { inputs, spend } = gather(utxos, wants);
-  const outs = [{ asset: terms.collateral_asset, value: b(collateralAmount),
+  const outs = [{ asset: terms.collateral_asset, value: locked,
                   script: lenderSpk }];
   const { outs: change, folded } = changeOutputs(spend, changeSpk, feeAsset,
                                                  dustAtoms);
@@ -675,7 +725,7 @@ export function buildRecover({ terms, vaultOutpoint, collateralAmount, singleLea
       inputs: [{
         txid: vaultOutpoint.txid, vout: vaultOutpoint.vout,
         witnessUtxo: { asset: terms.collateral_asset,
-                       value: b(collateralAmount), script: vaultSpk },
+                       value: locked, script: vaultSpk },
         finalWitness: witness,
       }, ...inputs.map(psetInput)],
       outputs: outs,
@@ -683,7 +733,7 @@ export function buildRecover({ terms, vaultOutpoint, collateralAmount, singleLea
     }),
     fee, folded,
     summary: [
-      `Sweep all ${fmt(collateralAmount)} of ${short(terms.collateral_asset)} to the lender`,
+      `Sweep all ${fmt(locked)} of ${short(terms.collateral_asset)} to the lender`,
       `Open since block ${terms.recover_after}: the oracle-liveness backstop`,
     ],
   };

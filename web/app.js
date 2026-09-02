@@ -208,17 +208,51 @@ function holdings(explicitOnly = false) {
   return h;
 }
 
+/**
+ * The size the book prices this kind of transaction at.
+ *
+ * A flow the book publishes no size for is a page and a book that disagree
+ * about what this site composes. Rather than invent a number, take the largest
+ * size the book does publish -- which over-pays rather than under-pays, so the
+ * transaction still relays -- and mark it, so the confirmation can say the fee
+ * rests on an estimate instead of quietly charging for a guess.
+ */
+function feeVsize(flow) {
+  const table = state.fees.vsize || {};
+  if (table[flow]) return { vsize: Number(table[flow]), estimated: false };
+  const sizes = Object.values(table).map(Number).filter(n => n > 0);
+  if (!sizes.length) return null;
+  return { vsize: Math.max(...sizes), estimated: true };
+}
+
+/**
+ * The reference-unit fee this flow pays, before it is priced in an asset.
+ *
+ * The rate comes from the book, which takes it from its node, and it has no
+ * sensible stand-in: a made-up feerate composes a transaction the network may
+ * never relay. So when it is missing the page says so rather than guessing.
+ */
 function feeRfa(flow) {
-  const vsize = state.fees.vsize?.[flow] || 2000;
-  const ratePerKvb = BigInt(state.fees.feerate_rfa_per_kvb || 2000);
-  return (ratePerKvb * BigInt(vsize) + 999n) / 1000n;
+  const perKvb = state.fees.feerate_rfa_per_kvb;
+  const s = feeVsize(flow);
+  if (!perKvb || !s)
+    throw new WalletError(
+      "the book has published no fee rate for this chain, so the page cannot " +
+      "price a network fee. That usually means its node is unreachable; try " +
+      "again shortly.");
+  return (BigInt(perKvb) * BigInt(s.vsize) + 999n) / 1000n;
+}
+
+/** Atoms per whole unit, the scale the node's exchange rates are quoted at. */
+function rateScale() {
+  return BigInt(state.fees.rate_scale || 100000000);
 }
 
 /** The fee for `flow`, in atoms of `asset`, or null if the book prices none. */
 function feeAtoms(flow, asset) {
   const rate = state.fees.rates?.[asset];
   if (!rate) return null;
-  const atoms = (feeRfa(flow) * 100000000n + BigInt(rate) - 1n) / BigInt(rate);
+  const atoms = (feeRfa(flow) * rateScale() + BigInt(rate) - 1n) / BigInt(rate);
   return atoms < 1n ? 1n : atoms;
 }
 
@@ -274,20 +308,33 @@ function feeChoices(flow, committed = {}) {
   }).sort((x, y) => meta(x).ticker.localeCompare(meta(y).ticker));
 }
 
+// The node's dust policy, in the numbers pignus/fees.py carries beside it:
+// DUST_RELAY_TX_FEE is 100 rfa per kvB, and GetDustThreshold charges an
+// explicit output's own 78 bytes plus a 67-byte estimate of the input that
+// will one day spend it. A book that publishes its node's own figures
+// overrides both.
+const DUST_RELAY_RFA_PER_KVB = 100n;
+const DUST_OUTPUT_VSIZE = 145n;
+
 /**
  * Below how many atoms of the fee asset a change output would be dust.
  *
  * The node refuses an explicit output in the fee asset below its dust
- * threshold, so those atoms go to the fee instead. Without a published rate
- * both composers fall back to the same constant.
+ * threshold, so those atoms go to the fee instead. The threshold is per asset:
+ * 15 atoms of an asset at rate 1e8, 15,000 of one at 1e5. A fixed number is
+ * wrong in both directions, so it is computed from the fee asset's own rate --
+ * the same arithmetic as fees.dust_atoms, because a change output the two
+ * composers disagree about is a transaction one of them cannot send. Without a
+ * rate for the asset both fall back to the same constant.
  */
 function dustFor(asset) {
   const rate = state.fees.rates?.[asset];
-  const perKvb = BigInt(state.fees.dust_relay_rfa_per_kvb || 0);
-  if (!rate || !perKvb) return flows.DUST_FOLD;
-  const rfa = (perKvb * 133n + 999n) / 1000n;
-  const atoms = (rfa * 100000000n + BigInt(rate) - 1n) / BigInt(rate);
-  return atoms > flows.DUST_FOLD ? atoms : flows.DUST_FOLD;
+  if (!rate) return flows.DUST_FOLD;
+  const perKvb = BigInt(state.fees.dust_relay_rfa_per_kvb || DUST_RELAY_RFA_PER_KVB);
+  const bytes = BigInt(state.fees.dust_output_vsize || DUST_OUTPUT_VSIZE);
+  const rfa = (perKvb * bytes + 999n) / 1000n;
+  const atoms = (rfa * rateScale() + BigInt(rate) - 1n) / BigInt(rate);
+  return atoms < 1n ? 1n : atoms;
 }
 
 /** A composition failure in the asset's own units, rather than in atoms. */
@@ -564,15 +611,39 @@ function renderIntro() {
     (cross ? ", or against native Bitcoin." : ".");
 }
 
+/** How old a market's newest verified attestation is, in plain words. */
+function priceAge(m) {
+  const s = Number(m.age_seconds);
+  if (!Number.isFinite(s)) return "an unknown age";
+  return s < 120 ? `${Math.round(s)} seconds old`
+    : s < 7200 ? `${Math.round(s / 60)} minutes old`
+    : `${(s / 3600).toFixed(1)} hours old`;
+}
+
 function renderMarkets() {
   paint("#markets", state.markets.map(m => {
-    const fresh = m.age_seconds != null && m.age_seconds < 600;
+    // The book decides what counts as fresh, from its own configured window;
+    // the age comparison here is only for a book that does not say.
+    const fresh = m.stale != null ? !m.stale
+      : (m.age_seconds != null && m.age_seconds < 600);
+    const tags = [];
+    if (m.cross_chain) tags.push('<span class="tag dim">cross-chain</span>');
+    else if (m.lendable) tags.push('<span class="tag ok">lendable</span>');
+    else if (m.stale) tags.push('<span class="tag warn" title="the newest ' +
+      'attestation this book could verify for this market is ' + esc(priceAge(m)) +
+      ', which is past the age it will lend on. Nothing can be borrowed or ' +
+      'lent here until the oracle catches up.">stale price</span>');
+    else tags.push('<span class="tag dim" title="this ticker has no asset id in the registry or the node\'s labels, so it cannot be lent against here">not in the registry</span>');
+    // The oracle quotes a price at assumed decimals. If they are not the
+    // registry's, the number is right and means something else.
+    if (m.precision_mismatch)
+      tags.push('<span class="tag bad" title="the oracle quotes this market at ' +
+        'different asset precisions than the registry gives, so its price does ' +
+        'not mean what it appears to; nothing is lent against it">precision mismatch</span>');
     return `<div class="card m">
       <div class="row" style="justify-content:space-between">
         <span class="mk">${esc(m.collateral_ticker)} / ${esc(m.debt_ticker)}</span>
-        ${m.cross_chain ? '<span class="tag dim">cross-chain</span>'
-          : m.lendable ? '<span class="tag ok">lendable</span>'
-          : '<span class="tag dim" title="this ticker has no asset id in the registry or the node\'s labels, so it cannot be lent against here">not in the registry</span>'}
+        ${tags.join(" ")}
       </div>
       <div class="px">${m.unit_price == null ? "—" : money(m.unit_price, m.unit_price < 10 ? 4 : 2)}</div>
       <div class="meta">${m.price == null ? "no attestation"
@@ -703,6 +774,109 @@ function wireDetails(box) {
   });
 }
 
+// -------------------------------------------------------- how a loan ended
+
+/**
+ * The account of a closed loan, read back off the closing transaction.
+ *
+ * A borrower who has been liquidated is owed the evidence, not a state tag.
+ * All of it is on chain: the leaf the spender had to reveal names the exit, a
+ * seizure's witness carries the oracle's own price, timestamp and signature,
+ * and the outputs say what was actually paid. So this shows the price they
+ * were closed at, whether it verifies against the key their own vault bakes
+ * in, and what that price should have bought against what it did.
+ */
+function exitBlock(x, t) {
+  const c = t.collateral_asset, d = t.debt_asset;
+  const scale = x.price_scale || t.price_scale || 100000;
+  const px = (p) => `${money(unitPrice(p, scale, c, d), 4)} ${esc(meta(d).ticker)}`;
+  // An amount the book could not read -- a blinded output, or one paying
+  // somewhere the terms do not name -- is reported as unreadable rather than
+  // as a zero, which would read as "you were paid nothing".
+  const at = (v, asset) => (v == null ? '<span class="small">not readable</span>'
+                                      : amount(v, asset));
+  const rows = [];
+  rows.push(`<span class="k">Exit</span><span>${esc(x.exit)}${x.height
+    ? ` · block ${Number(x.height).toLocaleString()}`
+    : ' · <span class="small">not in a block yet</span>'}</span>`);
+  for (const a of x.attestations || []) {
+    if (!a.present) {
+      rows.push(`<span class="k">Oracle ${shortHex(a.oracle_x, 10)}</span>` +
+                '<span><span class="tag dim" title="the covenant allows an oracle to abstain, and this one did">abstained</span></span>');
+      continue;
+    }
+    const when = a.timestamp
+      ? new Date(Number(a.timestamp) * 1000).toLocaleString() : "—";
+    rows.push(`<span class="k">Oracle ${shortHex(a.oracle_x, 10)}</span><span>` +
+      `${a.price == null ? "—" : px(a.price)} <span class="small">signed ${esc(when)}</span> ` +
+      (a.verified
+        ? '<span class="tag ok" title="checked here against the key baked into this vault\'s own address">signature verified</span>'
+        : '<span class="tag bad" title="this signature does not check out against the key baked into this vault\'s address">signature does NOT verify</span>') +
+      "</span>");
+  }
+  if (x.price_used != null)
+    rows.push(`<span class="k">Price it closed at</span><span>${px(x.price_used)}` +
+      `<span class="small"> · the strike was ${px(x.strike)}</span></span>`);
+  if (x.seize_expected != null || x.seize_paid != null)
+    rows.push(`<span class="k">Seized</span><span>${at(x.seize_paid, c)}` +
+      `<span class="small"> · that price buys ${at(x.seize_expected, c)}</span></span>`);
+  if (x.surplus_expected != null || x.surplus_paid != null)
+    rows.push(`<span class="k">Back to the borrower</span><span>${at(x.surplus_paid, c)}` +
+      `<span class="small"> · that price leaves ${at(x.surplus_expected, c)}</span></span>`);
+  if (x.lender_paid != null)
+    rows.push(`<span class="k">Paid to the lender</span><span>${at(x.lender_paid, d)}` +
+      `<span class="small"> · the debt was ${at(x.debt, d)}</span></span>`);
+  const problems = (x.problems || []).length
+    ? `<div class="note bad" style="margin:8px 0 0">${(x.problems || [])
+        .map(p => esc(p)).join("<br>")}</div>`
+    : "";
+  return `<div class="kv">${rows.join("")}</div>${problems}` +
+    `<div class="small" style="margin-top:6px">Every line above is read out of ` +
+    `<a href="${txLink(x.spent_by)}" class="mono">${shortHex(x.spent_by, 12)}</a>` +
+    `, and each signature is checked against the key this vault's own address commits to.</div>`;
+}
+
+// One fetch per closed loan. The tables redraw every half minute and a closing
+// transaction never changes, so the answer is worth keeping.
+const _exits = new Map();
+
+function wireExits(box, rows) {
+  const targets = Array.from(box.querySelectorAll("[data-exit]"));
+  if (!targets.length) return;
+  const fill = async (el) => {
+    const id = el.dataset.exit;
+    if (el.dataset.done) return;
+    el.dataset.done = "1";
+    if (_exits.has(id)) { el.innerHTML = _exits.get(id); return; }
+    el.innerHTML = '<span class="small">reading the closing transaction…</span>';
+    const l = rows.find(r => (r.loan_id || r.txid) === id);
+    if (!l) { el.innerHTML = ""; return; }   // the list moved under the fetch
+    try {
+      const html = exitBlock(await api(`v1/loan/${encodeURIComponent(id)}/exit`),
+                             JSON.parse(l.terms));
+      _exits.set(id, html);
+      el.innerHTML = html;
+    } catch (e) {
+      // Not cached: a book that was unreachable, or a close still in the
+      // mempool, can answer perfectly well the next time it is asked.
+      el.dataset.done = "";
+      el.innerHTML = `<span class="small">This book cannot account for that ` +
+        `exit yet: ${esc(e.message)}</span>`;
+    }
+  };
+  const fillOpen = () => targets.forEach(el => {
+    const row = el.closest("tr.det");
+    if (row && !row.hidden) fill(el);
+  });
+  fillOpen();
+  // wireDetails has already put the toggle on these buttons; chain onto it so
+  // the fetch happens when a row is actually opened, and not before.
+  box.querySelectorAll("[data-det]").forEach(b => {
+    const toggle = b.onclick;
+    b.onclick = (ev) => { if (toggle) toggle(ev); fillOpen(); };
+  });
+}
+
 // --------------------------------------------------------------- offers
 
 function pendingOffers() {
@@ -740,17 +914,20 @@ function pendingView(p) {
 }
 
 function offersView() {
-  const funded = state.offers.filter(o => o.kind === "funded");
-  const listed = new Set(funded.map(o => String(o.outpoint)));
+  // Every offer the book carries is a funded one: its coin was checked on
+  // chain before the listing was accepted, and nothing publishes any other
+  // kind.
+  const book = state.offers;
+  const onChain = new Set(book.map(o => String(o.outpoint)));
   const pend = [];
   for (const p of pendingOffers()) {
-    if (listed.has(String(p.outpoint))) { forgetPending(p.txid); continue; }
+    if (onChain.has(String(p.outpoint))) { forgetPending(p.txid); continue; }
     try { pend.push(pendingView(p)); } catch { /* a record we cannot read */ }
   }
   if (state.offersFilter === "mine")
-    return [...pend, ...funded.filter(o => mine(o.lender_prog) || manageToken(o.offer_id))];
-  if (state.offersFilter === "all") return [...pend, ...funded];
-  return funded.filter(o => (o.status || "open") === "open");
+    return [...pend, ...book.filter(o => mine(o.lender_prog) || manageToken(o.offer_id))];
+  if (state.offersFilter === "all") return [...pend, ...book];
+  return book.filter(o => (o.status || "open") === "open");
 }
 
 function renderOffers() {
@@ -899,6 +1076,16 @@ function renderLoans() {
       acts.push(`<button class="sm" data-det="${esc(key)}" data-focus="det:${esc(key)}" aria-expanded="${state.details.has(key)}">Details</button>`);
       const closed = l.spent_by ? `<a class="small" href="${txLink(l.spent_by)}">closing tx</a>` : "";
       const depth = l.min_depth ?? state.minDepth;
+      // A close is as provisional as a funding until it is buried: Sequentia
+      // follows Bitcoin, so a shallow closing transaction can still be undone
+      // and the loan come back. Show its depth rather than a settled tag.
+      const closedConf = l.closed_confirmations != null
+        ? Number(l.closed_confirmations)
+        : (state.height != null && l.spent_height
+            ? state.height - Number(l.spent_height) + 1 : 0);
+      const shallow = l.spent_by && closedConf < depth
+        ? ` <span class="small" title="the closing transaction is not buried yet; until it is, this loan can come back">${closedConf}/${depth}</span>`
+        : "";
       const oracle = (t.oracles && t.oracles.length)
         ? `<span class="sub2">${esc(l.oracle || "")} oracles</span>` : "";
       const spk = derived(`vault:${l.txid}:${l.vout}`, () => l.single_leaf
@@ -911,13 +1098,14 @@ function renderLoans() {
         <td data-label="price / liq.">${now != null ? money(now, now < 10 ? 4 : 2) : "—"} / ${money(liq, liq < 10 ? 4 : 2)}<span class="sub2">${esc(l.debt_ticker)} per ${esc(l.collateral_ticker)}${l.ltv != null ? ` · LTV ${(l.ltv * 100).toFixed(0)}%` : ""}</span></td>
         <td data-label="health"><span class="tag health ${cls}">${h == null ? "no price" : h.toFixed(3)}</span></td>
         <td data-label="matures">${whenBlock(t.maturity)}</td>
-        <td data-label="state"><span class="tag ${STATE_CLS[l.state] || "dim"}" title="${esc(STATE_WHY[l.state] || "")}">${esc(l.state)}</span>${l.state === "UNCONFIRMED" && l.confirmations != null ? ` <span class="small">${l.confirmations}/${depth}</span>` : ""}${l.note ? `<span class="sub2">${esc(l.note)}</span>` : ""}<br>${closed}</td>
+        <td data-label="state"><span class="tag ${STATE_CLS[l.state] || "dim"}" title="${esc(STATE_WHY[l.state] || "")}">${esc(l.state)}</span>${l.state === "UNCONFIRMED" && l.confirmations != null ? ` <span class="small">${l.confirmations}/${depth}</span>` : ""}${shallow}${l.note ? `<span class="sub2">${esc(l.note)}</span>` : ""}<br>${closed}</td>
         <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>` +
       detailsRow(key, 9, detailsBlock({
         idLabel: "loan id", id: l.loan_id || l.txid,
         outpoint: `${l.txid}:${l.vout}`, spk, terms: l.terms, t,
         extra: `<span class="k">Vault</span><span>${l.single_leaf
-          ? "single leaf (taken from a funded offer)" : "four leaves (originated directly)"}</span>` }));
+          ? "single leaf (taken from a funded offer)" : "four leaves (originated directly)"}</span>`
+          + (l.spent_by ? `<span class="k">How it ended</span><span data-exit="${esc(l.loan_id || l.txid)}">…</span>` : "") }));
     }).join("") + "</tbody></table>";
   paint("#loans", html, (b) => {
     const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
@@ -928,6 +1116,7 @@ function renderLoans() {
     hook("default", l => seize(l, true));
     hook("recover", recover);
     wireDetails(b);
+    wireExits(b, rows);
     wireCopy(b, (id) => (rows.find(l => (l.loan_id || l.txid) === id) || {}).terms || "");
   });
 }
@@ -996,12 +1185,40 @@ function lendInputs() {
   };
 }
 
+/**
+ * Every market this book could lend against, price or no price.
+ *
+ * A market whose oracle has gone quiet is still a market: dropping it out of
+ * the form leaves a lender staring at a list that grew shorter for no stated
+ * reason. It stays, and the preview says why nothing can be built on it yet.
+ */
+function lendableMarkets() {
+  return state.markets.filter(m => !m.cross_chain && m.collateral_asset
+                                   && m.debt_asset);
+}
+
 /** The terms a lend form describes, in atoms, or a reason it cannot be built. */
 function lendTerms() {
   const i = lendInputs();
   const m = i.m;
   if (!m) throw new Error("pick a market");
-  if (!m.lendable) throw new Error(`${m.market} cannot be lent against here`);
+  if (!m.lendable) {
+    // The strike and the collateral both come off the attested price, so an
+    // offer built on a stale one is priced against a market that has moved.
+    if (m.stale)
+      throw new Error(`${m.market} has no fresh price: the newest attestation ` +
+        `this book could verify is ${priceAge(m)}. An offer takes its ` +
+        `collateral and its strike from that number, so nothing can be built ` +
+        `on it until the oracle catches up.`);
+    if (m.precision_mismatch)
+      throw new Error(`${m.market}'s oracle quotes it at different asset ` +
+        "precisions than the registry gives, so its price does not mean what " +
+        "it appears to; nothing can be lent against it until the two agree");
+    if (m.price == null)
+      throw new Error(`${m.market} has no attestation at all yet, so there is ` +
+        "no price to set a strike against");
+    throw new Error(`${m.market} cannot be lent against here`);
+  }
   if (!(i.principal > 0)) throw new Error("enter an amount to lend");
   if (!(i.openLtv > 0 && i.openLtv < i.liqLtv && i.liqLtv <= 1))
     throw new Error("the opening loan-to-value must be below the liquidation one, and both under 100%");
@@ -1065,8 +1282,9 @@ function lendTerms() {
 function renderLendForm() {
   const sel = $("#marketsel");
   const cur = sel.value;
-  const opts = state.markets.filter(m => m.lendable).map(m =>
-    `<option value="${esc(m.market)}">${esc(m.collateral_ticker)} / ${esc(m.debt_ticker)}</option>`).join("");
+  const opts = lendableMarkets().map(m =>
+    `<option value="${esc(m.market)}">${esc(m.collateral_ticker)} / ${esc(m.debt_ticker)}` +
+    `${m.lendable ? "" : " — no fresh price"}</option>`).join("");
   if (sel.innerHTML !== opts) {          // leave an open dropdown alone
     sel.innerHTML = opts;
     if (cur) sel.value = cur;
@@ -1141,6 +1359,10 @@ async function confirmAndSend(label, make, opts = {}) {
         <select id="feeasset"${choices.length > 1 ? "" : " disabled"}>${options}</select>
         <span class="small">any asset the network prices; nothing here is privileged</span>
       </div>
+      ${feeVsize(flow)?.estimated ? `<div class="hint" style="margin:8px 0 0">This
+      book publishes no size estimate for this kind of transaction, so the fee
+      above is priced at the largest size it does publish. It over-pays rather
+      than risking a transaction the network will not relay.</div>` : ""}
       ${problem ? `<div class="hint" style="color:var(--bad);margin:8px 0 0">${problem}</div>` : ""}
       <div class="hint" style="margin:8px 0 0">Your wallet will show its own view of this
       before you approve it. If the two disagree, reject it.</div>
@@ -1272,6 +1494,15 @@ async function borrow(o) {
     const out = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
     if (!out) throw new Error(
       "cannot see that offer on chain right now; it may just have been taken");
+    // The offer's ADDRESS pins the terms but not what the coin holds. Its
+    // value is a remainder and can be anything a whole lot fits in, but the
+    // asset can only be the debt asset: the TAKE leaf pays the principal out
+    // of this coin, so an offer funded in something else pays nothing.
+    if (out.asset !== t.debt_asset)
+      throw new Error(out.asset
+        ? "that offer's coin does not hold the asset it promises to lend"
+        : "that offer's coin has a blinded asset, so nothing can be checked " +
+          "about what it would actually lend you");
     const collateral = big(o.collateral || t.collateral_amount);
     const { c, d } = tickers(t);
     const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
@@ -1333,6 +1564,9 @@ async function withdraw(o) {
     const [txid, vout] = String(o.outpoint).split(":");
     const out = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
     if (!out) throw new Error("that offer's coin is gone already");
+    if (out.asset !== t.debt_asset)
+      throw new Error("that offer's coin does not hold the debt asset the " +
+                      "refund leaf pays out, so there is nothing to return");
     const sent = await confirmAndSend("Withdraw offer", (fee) => {
       const built = flows.buildWithdrawOffer({
         terms: t, offerOutpoint: { txid, vout: Number(vout), scriptPubkey: out.scriptPubKey },
@@ -1364,7 +1598,14 @@ async function vaultArgs(l, t) {
   if (!out) throw new Error(
     "that vault is already spent, or the book's node cannot see it; refresh " +
     "the list");
-  if (out.asset && out.asset !== t.collateral_asset)
+  // Both halves matter. An asset the book cannot see is a blinded one, and
+  // every leaf here compares assets, so a spend composed against a coin whose
+  // asset nobody can read is a spend nobody can settle.
+  if (!out.asset)
+    throw new Error("the asset at that outpoint is not visible (a blinded " +
+                    "output); a vault must hold an explicit amount of an " +
+                    "asset anyone can check");
+  if (out.asset !== t.collateral_asset)
     throw new Error("the coin at that outpoint does not hold this loan's " +
                     "collateral asset");
   return { terms: t,
@@ -1398,14 +1639,18 @@ async function seize(l, atMaturity) {
     const t = JSON.parse(l.terms);
     const market = t.market.replace("/", "_");
     const isThreshold = !!(t.oracles && t.oracles.length);
+    const scale = big(t.price_scale || 100000);
     let single = null, set = null;
     if (isThreshold) {
       // A threshold loan is closed with several oracles' attestations, one
       // per key; the book aggregates them, and each is verified here against
-      // the key THIS LOAN names before it is used.
+      // the key THIS LOAN names before it is used. An attestation quoted at
+      // another price scale is dropped with them: the scale is baked into the
+      // leaf and signed by nobody, so the same number is a different price.
       const got = await api(`v1/attestations/${market}`);
       set = (got.attestations || []).filter(a =>
         t.oracles.includes(a.oracle_x) &&
+        (a.price_scale == null || big(a.price_scale) === scale) &&
         pig.verifySchnorr(a.oracle_x,
           pig.attestationMessage(pig.feedId(t.market), a.timestamp, a.price),
           a.signature));
@@ -1414,13 +1659,29 @@ async function seize(l, atMaturity) {
                         "attestation right now; the covenant would refuse it.");
     } else {
       single = await api(`v1/attestation/${market}`);
-      // Verify the SIGNATURE against the key THIS LOAN bakes in. The oracle is
-      // trusted for a number and never for the transport that carried it, and a
-      // loan only accepts the oracle it named.
+      // Verify the SIGNATURE against the key THIS LOAN bakes in, and the price
+      // SCALE against the one it computes at. The oracle is trusted for a
+      // number and never for the transport that carried it, a loan only
+      // accepts the oracle it named, and a number quoted at another scale is
+      // one the covenant would read as a different price entirely.
       if (!pig.verifyAttestation(t, single))
         throw new Error("that attestation does not verify against the oracle this " +
-                        "loan names, so the covenant would refuse it. Refusing to build it.");
+                        "loan names, or is quoted at another price scale, so the " +
+                        "covenant would misread it. Refusing to build it.");
     }
+    // A seizure takes somebody's collateral, and the covenant will accept any
+    // attestation its own key signed however old it is. So a stale price is
+    // refused here, which is the only place it can be.
+    const mk = marketFor(t);
+    const staleAge = single?.age != null ? `${Number(single.age)} seconds old`
+      : mk ? priceAge(mk) : "of an unknown age";
+    if (single?.stale ?? mk?.stale)
+      throw new Error(
+        `the newest attestation this book can verify for ${t.market} is ` +
+        `${staleAge}, past the age it treats as current. Closing a position ` +
+        "on a price the market has moved away from splits the collateral at " +
+        "the wrong number, so this page refuses it until the oracle catches " +
+        "up. pignus-cli will build it against a stale price with --allow-stale.");
     const args = await vaultArgs(l, t);
     const flow = (atMaturity ? "default" : "liquidate") + (l.single_leaf ? "" : "4");
     const { c, d } = tickers(t);
@@ -1864,42 +2125,66 @@ async function checkRepurchase(ev) {
   let terms;
   try { terms = JSON.parse($("#repoterms").value); }
   catch (e) { say("bad", "Those terms are not valid JSON: " + esc(e.message)); return; }
-  let spk, words;
+  let spk, words, atoms;
   try {
     spk = pig._internals.bytesToHex(repo.repurchaseScriptPubKey(terms));
-    words = repo.describe(terms);
+    // Nobody reads a quantity in atoms or an asset by twelve hex characters,
+    // so the sentence is rendered in tickers and units -- and the atoms it was
+    // built from are put underneath, because that is what the covenant reads
+    // and what a second tool would be checked against.
+    words = repo.describe(terms, (a, x) => `${units(a, x)} ${meta(x).ticker}`);
+    atoms = repoAtoms(terms);
   } catch (e) {
     say("bad", "These terms do not describe a repurchase this page will compose: " + esc(e.message));
     return;
   }
+  const said = `<p>${esc(words)}</p><p class="mono">${esc(atoms)}</p>`;
   const txid = $("#repotxid").value.trim();
   if (!txid) {
     say("ok", `<p><strong>These terms compile to</strong><br><code>${spk}</code></p>` +
-        `<p>${esc(words)}</p><p class="hint">Give the funding txid to check the coin itself.</p>`);
+        said + `<p class="hint">Give the funding txid to check the coin itself.</p>`);
     return;
   }
   busy(true, "reading the chain");
   try {
     const vout = parseInt($("#repovout").value || "0", 10);
     const o = await api(`v1/outpoint/${txid}/${vout}`);
-    repo.verifyRepurchaseFunding(terms, o.scriptPubKey, o.value);
+    // The address pins neither the money terms nor the asset, so the funded
+    // AMOUNT and the funded ASSET are the whole of what can catch a lie about
+    // them. A coin whose asset the book cannot see settles nothing: a bond in
+    // some cheap asset sits at the right address in the right quantity and is
+    // worth nothing to the borrower, because RETURN and FORFEIT both pay out
+    // the debt asset.
+    if (!o.asset)
+      throw new Error("the coin's asset is not visible (blinded output, or " +
+                      "the book did not report it); a repurchase bond must be " +
+                      "explicit, because the covenant compares its value");
+    repo.verifyRepurchaseFunding(terms, o.scriptPubKey, o.value, o.asset);
     const conf = Number(o.confirmations || 0);
     if (conf < state.minDepth) {
       say("ok", `<p><span class="tag warn">funded, not yet buried</span> ` +
           `<strong>The coin at <code>${esc(txid)}:${vout}</code> pays the address ` +
-          `these terms compile to and holds exactly the bond they name, but it has ` +
-          `${conf}/${state.minDepth} confirmations.</strong> Do not transfer the asset ` +
-          `yet: an unconfirmed bond can be replaced, and Sequentia reorgs when Bitcoin ` +
-          `reorgs. Check again once it is buried.</p><p>${esc(words)}</p>`);
+          `these terms compile to and holds exactly the bond they name, in the bond ` +
+          `asset, but it has ${conf}/${state.minDepth} confirmations.</strong> Do not ` +
+          `transfer the asset yet: an unconfirmed bond can be replaced, and Sequentia ` +
+          `reorgs when Bitcoin reorgs. Check again once it is buried.</p>` + said);
     } else {
       say("ok", `<p><strong>This is the repurchase you were shown.</strong> The coin at ` +
           `<code>${esc(txid)}:${vout}</code> pays the address these terms compile to, ` +
-          `and holds exactly the bond they name. It is buried ${conf} block` +
-          `${conf === 1 ? "" : "s"} deep.</p><p>${esc(words)}</p>`);
+          `and holds exactly the bond they name, in the bond asset. It is buried ` +
+          `${conf} block${conf === 1 ? "" : "s"} deep.</p>` + said);
     }
   } catch (e) {
     say("bad", "<strong>REFUSED.</strong> " + esc(e.message));
   } finally { busy(false); }
+}
+
+/** The same quantities in atoms, which is what the covenant actually reads. */
+function repoAtoms(terms) {
+  const r = repo.normaliseRepurchase(terms);
+  return `${r.debt} atoms sold · ${r.principal} paid now · ${r.moneyDebt} to ` +
+         `buy it back · ${r.bond} bond · collateral valued at ` +
+         `${r.collateralValue}`;
 }
 
 // ------------------------------------------------------------------ boot

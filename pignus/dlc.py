@@ -210,10 +210,39 @@ def adaptor_sign_cets(loan, ann, buckets, sec, funding_txid, vout,
     return out
 
 
+def settlement_tree(loan):
+    """The output a DLC-settled loan is funded into.
+
+    Deliberately NOT the loan vault. The vault's RECLAIM leaf demands the
+    secret that binds the two chains together, which at maturity nobody has --
+    that is the whole point of settling by attestation instead. So a DLC loan
+    funds its own two-leaf output:
+
+        SETTLE   <borrower> CHECKSIGVERIFY <lender> CHECKSIG
+        TIMEOUT  <recover_after> CLTV DROP <lender> CHECKSIG
+
+    SETTLE takes both parties, and both of them only ever sign the contract
+    transactions they agreed at origination -- one per outcome, each unusable
+    until the oracle's attestation completes it. TIMEOUT is the same backstop
+    the vault has, for an oracle that never speaks.
+    """
+    bx = bytes.fromhex(loan.borrower_x)
+    lx = bytes.fromhex(loan.lender_x)
+    return B.TapTree(B.NUMS, [
+        ("settle", B.two_of_two(bx, lx)),
+        ("timeout", B.timelocked_single(loan.recover_after, lx)),
+    ])
+
+
+def funding_spk(loan):
+    """Where a borrower sends the collateral for a DLC-settled loan."""
+    return settlement_tree(loan).scriptPubKey()
+
+
 def _cet_sighash(loan, tx):
-    tree = loan.funding_tree()
+    tree = settlement_tree(loan)
     spent = [B.TxOut(loan.btc_amount, tree.scriptPubKey())]
-    return B.taproot_sighash(tx, spent, 0, script=tree.leaves["reclaim"])
+    return B.taproot_sighash(tx, spent, 0, script=tree.leaves["settle"])
 
 
 def verify_cets(loan, ann, cets, signer_x):
@@ -237,13 +266,13 @@ def complete_cet(loan, ann, my_cets, their_cets, outcome, attestation,
     msg = _cet_sighash(loan, tx)
     theirs = A.decrypt(their_sig, attestation)
     mine = A.sign(my_sec, msg)
-    tree = loan.funding_tree()
-    # RECLAIM is <borrower> CHECKSIGVERIFY <lender> CHECKSIG; the witness is
+    tree = settlement_tree(loan)
+    # SETTLE is <borrower> CHECKSIGVERIFY <lender> CHECKSIG; the witness is
     # consumed top-first, so the lender's signature is pushed first.
     if i_am_borrower:
         witness = [theirs, mine]          # theirs = lender's
     else:
         witness = [mine, theirs]          # mine = lender's
-    tx.vin[0].witness = witness + [tree.leaves["reclaim"],
-                                   tree.control_block("reclaim")]
+    tx.vin[0].witness = witness + [tree.leaves["settle"],
+                                   tree.control_block("settle")]
     return tx

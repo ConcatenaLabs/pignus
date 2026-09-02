@@ -40,15 +40,13 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
-from pignus import oracle as O                       # noqa: E402
+from pignus import atoms, compat, oracle as O        # noqa: E402
 from pignus.node import Node, RpcError               # noqa: E402
 from pignus.offers import offer_vault_address        # noqa: E402
 from pignus.terms import LoanTerms                   # noqa: E402
 from pignus import fees as F                         # noqa: E402
 from pignus.vault import Outpoint, VaultSpender, select_funding   # noqa: E402
 from pignus.watcher import VaultWatcher, State       # noqa: E402
-
-COIN = 100_000_000
 
 
 def canon(market):
@@ -105,11 +103,23 @@ def main():
                     help="an oracle to read prices from; repeatable. Loans are "
                          "judged against the key each one bakes, so name every "
                          "oracle whose loans this bot should close")
-    ap.add_argument("--rpc", default="http://127.0.0.1:18443")
-    ap.add_argument("--rpc-user")
-    ap.add_argument("--rpc-password")
-    ap.add_argument("--rpc-wallet")
-    ap.add_argument("--rpc-cookie")
+    ap.add_argument("--rpc", default=os.environ.get(
+        "PIGNUS_RPC_URL", "http://127.0.0.1:18776"),
+        help="the Sequentia node's JSON-RPC url (18776 on the default chain, "
+             "7040 on elementsregtest), or PIGNUS_RPC_URL")
+    ap.add_argument("--rpc-user", default=os.environ.get("PIGNUS_RPC_USER"),
+                    help="RPC user, or PIGNUS_RPC_USER")
+    ap.add_argument("--rpc-password",
+                    default=os.environ.get("PIGNUS_RPC_PASSWORD"),
+                    help="RPC password, or PIGNUS_RPC_PASSWORD; prefer "
+                         "--rpc-cookie or the environment, because a command "
+                         "line is readable by every process on the machine -- "
+                         "and this one runs for the life of the book")
+    ap.add_argument("--rpc-wallet", default=os.environ.get("PIGNUS_RPC_WALLET"),
+                    help="the node wallet to spend and sign with")
+    ap.add_argument("--rpc-cookie", default=os.environ.get("PIGNUS_RPC_COOKIE"),
+                    help="path to the node's .cookie file, used when "
+                         "--rpc-user is not given; or PIGNUS_RPC_COOKIE")
     ap.add_argument("--taker-spk", help="hex scriptPubKey to receive seized collateral")
     ap.add_argument("--taker-address", help="address to receive seized collateral")
     ap.add_argument("--fee-asset", help="label or hex; default: the debt asset "
@@ -144,6 +154,15 @@ def main():
         ap.error("--fee-amount needs --fee-asset")
     if not args.taker_spk and not args.taker_address:
         ap.error("need --taker-spk or --taker-address")
+
+    # Before the node, the book or a wallet: a builder that has drifted from the
+    # golden vectors derives vault addresses this bot would then compose real
+    # money against. One line and exit 3, rather than a traceback per round.
+    try:
+        compat.load_covenant()
+    except compat.CovenantUnavailable as e:
+        print(f"pignus-liquidator: {e}", file=sys.stderr)
+        return 3
 
     node = Node(url=args.rpc, user=args.rpc_user, password=args.rpc_password,
                 wallet=args.rpc_wallet, cookie_path=args.rpc_cookie)
@@ -196,27 +215,41 @@ def main():
                 print(f"ignoring {key}: the coin there is not what these terms "
                       "compile to", file=sys.stderr)
                 continue
-            if got.get("asset") is None:
+            if got.get("asset") is None or "value" not in got:
                 print(f"ignoring {key}: the vault coin is blinded, and the "
                       "covenant cannot read a blinded amount", file=sys.stderr)
                 continue
-            value = int(round(float(got["value"]) * COIN))
-            if got["asset"] != t.collateral_asset or value != t.collateral_amount:
-                print(f"ignoring {key}: the coin holds {value} of "
-                      f"{got['asset'][:8]}…, not {t.collateral_amount} of "
-                      f"{t.collateral_asset[:8]}…", file=sys.stderr)
+            # From the chain, never from the terms: every leaf reads the INPUT's
+            # own value, so an over-funded vault is exited by paying out what it
+            # holds. Less than the terms lock is the only impossible one.
+            value = atoms(got["value"])
+            if got["asset"] != t.collateral_asset:
+                print(f"ignoring {key}: the coin holds {got['asset'][:8]}…, "
+                      f"not the collateral asset {t.collateral_asset[:8]}…",
+                      file=sys.stderr)
+                continue
+            if value < t.collateral_amount:
+                print(f"ignoring {key}: the coin holds {value} atoms and the "
+                      f"terms lock {t.collateral_amount}; no leaf would accept "
+                      "an exit from it", file=sys.stderr)
                 continue
             watcher.track(key, t, txid, vout, single_leaf=single)
             loans[key] = (t, Outpoint(txid, vout, value, t.collateral_asset),
                           single)
 
     def fee_for(t, flow):
-        """(asset, atoms) for this exit, mirroring pignus-cli's choice."""
+        """(asset, atoms, rate) for this exit, mirroring pignus-cli's choice.
+
+        The rate comes back too: the threshold below which the node calls an
+        output dust is per asset and rate-dependent, so change folded at a fixed
+        number of atoms is either given away or refused by the relay.
+        """
         table = F.fee_table(node)
+        rates = table["rates"]
         if args.fee_amount:
-            return fee_asset, int(args.fee_amount)
+            return fee_asset, int(args.fee_amount), rates.get(fee_asset)
         if fee_asset:
-            rate = table["rates"].get(fee_asset)
+            rate = rates.get(fee_asset)
             if not rate:
                 # No silent second choice: the operator named the asset this
                 # bot pays in, and paying in another one is not a smaller
@@ -224,13 +257,13 @@ def main():
                 raise ValueError(f"the node publishes no fee rate for "
                                  f"{args.fee_asset}")
             return fee_asset, F.fee_atoms(rate, F.VSIZE[flow],
-                                          table["feerate_rfa_per_kvb"])
+                                          table["feerate_rfa_per_kvb"]), rate
         have = {}
         for u in node.listunspent():
-            if u.get("spendable"):
-                have[u["asset"]] = have.get(u["asset"], 0) + int(
-                    round(float(u["amount"]) * COIN))
-        return F.pick_fee(table, have, flow, [t.debt_asset])
+            if u.get("spendable") and u.get("asset"):
+                have[u["asset"]] = have.get(u["asset"], 0) + atoms(u["amount"])
+        asset, cost = F.pick_fee(table, have, flow, [t.debt_asset])
+        return asset, cost, rates.get(asset)
 
     def oracle_key(url):
         ox = oracle_keys.get(url)
@@ -282,10 +315,11 @@ def main():
     def evidence_for(who, t, ev):
         """The attestations from `ev` that THIS loan can actually be closed
         with: signed by a key it names, at the scale it computes with."""
-        out = {}
+        out, unwatched = {}, []
         for k in t.oracle_keys:
             att = ev.get((k.lower(), canon(t.market)))
             if att is None:
+                unwatched.append(k)
                 continue
             if not O.verify(k, att, t.price_scale):
                 # A good signature at another price_scale is a good signature
@@ -302,6 +336,13 @@ def main():
             if att.timestamp < t.not_before:
                 continue
             out[k] = att
+        if not out and unwatched:
+            # A loan is judged on the keys IT names. One this bot never asked
+            # for is not a loan that is healthy, it is a loan nobody here can
+            # price -- and silence would read as the first.
+            note(who, f"loan names oracle {unwatched[0][:16]}…, which this bot "
+                      "does not watch: add --oracle <url> for it, or point "
+                      "--book at a book that aggregates it")
         return out
 
     def decide(v, ev, height):
@@ -335,18 +376,29 @@ def main():
         return None
 
     def check_coin(v, t, single):
-        """The vault coin, re-read, or None. Nothing is composed against a
-        remembered outpoint: a coin already seized by another racer, or a book
-        entry that never described the coin it named, would otherwise cost a
-        preparing transaction and a rejected broadcast every round."""
+        """The vault coin, re-read from the chain, or None.
+
+        Nothing is composed against a remembered outpoint: a coin already seized
+        by another racer, or a book entry that never described the coin it
+        named, would otherwise cost a preparing transaction and a rejected
+        broadcast every round. The AMOUNT comes from here too, because every
+        leaf reads the input's own value: an over-funded vault is exited by
+        paying out what it holds, and only a coin holding less than the terms
+        lock is one no leaf would accept.
+        """
         got = node.gettxout(v.txid, v.vout, True)
         if got is None:
             return None
         want = (offer_vault_address(t) if single else t.script_pubkey()).hex()
-        value = int(round(float(got["value"]) * COIN))
+        if got.get("asset") is None or "value" not in got:
+            note(v.loan_id, "the vault coin is blinded, and the covenant cannot "
+                            "read a blinded amount")
+            loans.pop(v.loan_id, None)
+            return None
+        value = atoms(got["value"])
         if (got["scriptPubKey"]["hex"] != want
-                or got.get("asset") != t.collateral_asset
-                or value != t.collateral_amount):
+                or got["asset"] != t.collateral_asset
+                or value < t.collateral_amount):
             note(v.loan_id, "the vault coin is not what these terms compile to")
             loans.pop(v.loan_id, None)
             return None
@@ -387,10 +439,11 @@ def main():
                 outpoint = check_coin(v, t, single)
                 if outpoint is None:
                     continue
-                fee_asset_, fee_amount = fee_for(
+                fee_asset_, fee_amount, rate = fee_for(
                     t, (kind if single else kind + "4"))
-                spender = VaultSpender(node, t, fee_asset_, fee_amount,
-                                       single_leaf=single)
+                spender = VaultSpender(
+                    node, t, fee_asset_, fee_amount, single_leaf=single,
+                    dust_fold=F.dust_atoms(rate) if rate else None)
                 wants = {t.debt_asset: t.debt}
                 wants[fee_asset_] = wants.get(fee_asset_, 0) + fee_amount
                 funding = select_funding(node, wants,

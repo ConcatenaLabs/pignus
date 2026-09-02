@@ -662,9 +662,19 @@ export function attestationMessage(feed, timestamp, price) {
  * Not against whatever key the site is advertising: a vault names its own
  * oracle, and an attestation from anyone else is worthless to it however
  * convincing it looks.
+ *
+ * The price SCALE is checked too, when the attestation carries one. The scale
+ * is baked into the leaf and is not part of the signed message, so a price
+ * quoted at one scale and read at another carries a perfectly good signature
+ * over a number that means something else: ten times too small opens LIQUIDATE
+ * on a healthy loan and seizes ten times the collateral, ten times too large
+ * makes the loan unliquidatable. The covenant cannot see the difference, so
+ * this is the only place it can be caught. Mirrors pignus.oracle.verify.
  */
 export function verifyAttestation(terms, att) {
   const t = normaliseTerms(terms);
+  if (att.price_scale != null && big(att.price_scale, "price_scale") !== t.priceScale)
+    return false;
   const msg = attestationMessage(t.feedId, att.timestamp, att.price);
   return t.oracleKeys.some(k => verifySchnorr(k, msg, att.signature));
 }
@@ -761,6 +771,11 @@ export function selfTest(vectors) {
  * Throws if they differ, and throws if `selfTest()` has not passed -- deriving
  * an address from an unpinned implementation is exactly the thing this module
  * exists to prevent, so it refuses rather than answering confidently.
+ *
+ * This is the FOUR-LEAF vault of a directly originated loan. A loan drawn from
+ * a funded offer lives in the single-leaf tree instead, at a different address:
+ * check that one against `offerVaultScriptPubKey` in offer.js, which is what
+ * the page does for a loan the book marks `single_leaf`.
  */
 export function verifyFunding(terms, fundingScriptPubKey) {
   if (_selfTested === null)

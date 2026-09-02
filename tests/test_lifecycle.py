@@ -115,6 +115,16 @@ def cli(*args, wallet, rig, book, expect=0):
         return {"raw": r.stdout}
 
 
+def owns(node, prog_hex, ver):
+    """Can this wallet spend from that payout program? The address is derived
+    from the script rather than looked up, because a covenant pays a program
+    and knows nothing about addresses."""
+    spk = ("0014" if int(ver) == 0 else "5120") + prog_hex
+    desc = node.getdescriptorinfo(f"raw({spk})")["descriptor"]
+    addr = node.deriveaddresses(desc)[0]
+    return bool(node.getaddressinfo(addr).get("ismine"))
+
+
 def main():
     with Rig() as rig:
         n = rig.seq
@@ -154,6 +164,7 @@ def main():
                        "logfile": os.path.join(rig.root, "att.log"),
                        "listen": f"127.0.0.1:{oracle_port}", "interval": 1,
                        "price_scale": 100000, "markets": ["GOLD/USDX"],
+                       "precisions": {"GOLD": 8, "USDX": 8},
                        "source": {"type": "http_bulk", "url": feed + "/prices"}},
                       f)
         bcfg = os.path.join(rig.root, "pignusd.json")
@@ -220,10 +231,15 @@ def main():
                           and get(f"{book}/v1/loan/{loan1['loan_id']}"))
             check("loan 1 is LIVE and single-leaf", bool(l1) and l1["single_leaf"],
                   json.dumps(l1)[:200])
-            bprog = wallet_payout(bw)[1]
-            check("loan 1 pays out to the borrower's wallet",
-                  l1 and len(l1["borrower_prog"]) == 40
-                  and l1["borrower_ver"] == 0 if l1 else False)
+            # Not "the program I asked the wallet for": every call to
+            # getnewaddress hands out a different one, so comparing against a
+            # program read on either side of the take compares two fresh
+            # addresses. What matters is that the loan pays somewhere this
+            # wallet can actually spend from.
+            check("loan 1 pays out to a program the borrower's wallet owns",
+                  bool(l1) and l1["borrower_ver"] == 0
+                  and owns(bw, l1["borrower_prog"], 0),
+                  f"{l1 and l1.get('borrower_prog')}")
             view = wait_for(lambda: get(f"{book}/v1/offer/{oid}")["lots_left"] == 1
                             and get(f"{book}/v1/offer/{oid}"))
             check("the offer followed its remainder: one lot left, at the take "
@@ -280,6 +296,34 @@ def main():
                            get(f"{book}/v1/loan/{l2['loan_id']}"), seconds=120)
             check("after the price drops the book flags loan 2 liquidatable",
                   bool(l2v), json.dumps(l2v)[:200] if l2v else "")
+            if not l2v:
+                return 1
+
+            # The bot that would do this unattended. A dry run must reach the
+            # same conclusion the book did and broadcast nothing: this is the
+            # only thing between "the liquidator works" and "the liquidator
+            # spends somebody's collateral on a price it never checked".
+            bot = subprocess.run(
+                [sys.executable, os.path.join(BIN, "pignus-liquidator"),
+                 "--once", "--dry-run", "--book", book,
+                 "--oracle", f"http://127.0.0.1:{oracle_port}",
+                 "--taker-address", n.getnewaddress(),
+                 "--rpc", f"http://127.0.0.1:{rig.seq_rpcport}",
+                 "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS,
+                 "--rpc-wallet", "pignus"], capture_output=True, text=True)
+            check("the liquidation bot runs clean against the live book",
+                  bot.returncode == 0, bot.stderr[-300:])
+            # The bot names a loan by its TERMS -- the hash of the vault
+            # scriptPubKey -- while the book keys by outpoint, because two
+            # fundings of one set of terms are two loans and one vault.
+            check("and names loan 2 as the one to liquidate",
+                  f"liquidate: {l2['terms_id'][:16]}" in bot.stderr,
+                  bot.stderr[-300:])
+            check("without broadcasting anything on a dry run",
+                  "broadcast" not in bot.stderr
+                  and get(f"{book}/v1/loan/{l2['loan_id']}")["state"] == "LIVE",
+                  bot.stderr[-200:])
+
             before = bw.getbalances()["mine"]["trusted"].get(c, 0)
             cli("liquidate", "--loan", l2["loan_id"], wallet="pignus", rig=rig,
                 book=book)
@@ -341,6 +385,37 @@ def main():
             check("under water, the borrower gets nothing back and the seizure "
                   "still verifies", float(after) == float(before),
                   f"before {before} after {after}")
+            # ---- what the book answers about its own history -----------------
+            # A filter that quietly returns nothing reads as "you have no
+            # loans" rather than "that is not a question".
+            allo = get(book + "/v1/offers?status=all")["offers"]
+            check("status=all lists the taken offer",
+                  any(o["offer_id"] == oid for o in allo),
+                  json.dumps([o["status"] for o in allo]))
+            check("and the default list does not",
+                  all(o["offer_id"] != oid
+                      for o in get(book + "/v1/offers")["offers"]))
+            repaid = get(book + "/v1/loans?state=REPAID")["loans"]
+            check("state=REPAID returns exactly the loan that was repaid",
+                  [l["loan_id"] for l in repaid] == [loan1["loan_id"]],
+                  json.dumps([l["loan_id"][:12] for l in repaid]))
+            try:
+                urllib.request.urlopen(book + "/v1/loans?state=REPAYD",
+                                       timeout=10).read()
+                bad = 200
+            except urllib.error.HTTPError as e:
+                bad = e.code
+            check("a misspelt state is refused rather than answered with an "
+                  "empty book", bad == 400, str(bad))
+            try:
+                urllib.request.urlopen(book + "/v1/attestation/NOPE_USDX",
+                                       timeout=10).read()
+                miss = 200
+            except urllib.error.HTTPError as e:
+                miss = e.code
+            check("a market this book does not follow is a 404", miss == 404,
+                  str(miss))
+
             hz = get(book + "/healthz")
             check("the daemon is healthy at the end", hz["ok"], json.dumps(hz))
         finally:
