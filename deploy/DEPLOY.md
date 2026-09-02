@@ -105,8 +105,8 @@ beside them. All of it holds secrets, so keep the archive 0600 and copy it off
 the box:
 
 ```bash
-mkdir -p /root/backups
-tar czf /root/backups/pignus-$(date +%F).tgz \
+mkdir -p /var/lib/pignus-backup
+tar czf /var/lib/pignus-backup/pignus-$(date +%F).tgz \
     /root/sequentia/pignus-data \
     /root/sequentia/pignus-btc-keys \
     /root/sequentia/pignusd.json \
@@ -123,7 +123,8 @@ released by the secret that key's holder publishes, so it sits until the
 timeout. A responder state file that is gone can cost a principal paid twice.
 
 `pignus-backup.service` is that command as a unit, at `UMask=0077` so the
-archive is 0600, and `pignus-backup.timer` runs it daily and catches up a day
+archive is 0600. It writes to `/var/lib/pignus-backup`, which systemd creates
+and keeps writable for it; `pignus-backup.timer` runs it daily and catches up a day
 the box was switched off for. `systemctl start pignus-backup` takes one now and
 `journalctl -u pignus-backup` says how the last one went. The unit counts tar's
 exit 1 as success: the oracle appends to its attestation log while the archive
