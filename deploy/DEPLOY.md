@@ -98,18 +98,29 @@ Publish the key so borrowers and lenders can pin it:
 
 ## Backups
 
-Everything Pignus keeps is under `/root/sequentia/pignus-data`, plus the config
-files beside it. All of it holds secrets, so keep the archive 0600 and copy it
-off the box:
+Everything Pignus keeps that is not on a chain: the oracle keys and their
+attestation logs, the book, the lender key a cross-chain responder signs with,
+the state file that stops it paying a principal twice, and the config files
+beside them. All of it holds secrets, so keep the archive 0600 and copy it off
+the box:
 
 ```bash
 mkdir -p /root/backups
 tar czf /root/backups/pignus-$(date +%F).tgz \
     /root/sequentia/pignus-data \
+    /root/sequentia/pignus-btc-keys \
     /root/sequentia/pignusd.json \
     /root/sequentia/pignus-oracle*.json \
     /root/sequentia/pignus-responder.json
 ```
+
+What each piece costs to lose is worth knowing before it happens. An oracle key
+that is gone leaves every loan baked to it unliquidatable until it matures --
+nobody is robbed, because a vault whose oracle is dead still has its oracle-free
+repayment exit and its lender's backstop, but it is a slow, ugly failure. A
+lender key that is gone costs the BORROWERS: their collateral can only be
+released by the secret that key's holder publishes, so it sits until the
+timeout. A responder state file that is gone can cost a principal paid twice.
 
 `pignus-backup.service` is that command as a unit, at `UMask=0077` so the
 archive is 0600, and `pignus-backup.timer` runs it daily and catches up a day
