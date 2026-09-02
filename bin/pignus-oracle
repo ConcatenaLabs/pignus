@@ -648,7 +648,12 @@ def main():
         cfg = json.load(f)
     # Only the serving and signing paths may create a key; asking what the key
     # is must never answer with a new one.
-    o = Oracle(cfg, create_key=not args.print_pubkey)
+    # Only the SERVING path may create a key. Asking what the key is must never
+    # answer with a new one -- and neither must signing a seizure: an oracle
+    # whose keyfile has gone missing and signs with a fresh key produces a
+    # signature no loan on any chain accepts, quietly, where the operator
+    # believes a seizure has been authorised.
+    o = Oracle(cfg, create_key=not (args.print_pubkey or args.sign_seize))
 
     if args.print_pubkey:
         print(o.xonly.hex())
@@ -664,8 +669,19 @@ def main():
                 req = _json.load(fh)
             loan, want = _BC.check_seize_request(req)
             args.sighash = want
-            args.market = args.market or loan.market
-            args.strike = args.strike or int(loan.strike)
+            # The LOAN's own market and strike, always. These are what the
+            # signature is logged against and what a borrower later holds the
+            # oracle to; letting a command line override them would let the
+            # party asking for a seizure choose the terms it is judged by.
+            for name, mine, theirs in (("--market", args.market, loan.market),
+                                       ("--strike", args.strike,
+                                        int(loan.strike))):
+                if mine and str(mine) != str(theirs):
+                    raise SystemExit(
+                        f"{name} says {mine} and the loan in that request says "
+                        f"{theirs}. The loan decides: remove {name}.")
+            args.market = loan.market
+            args.strike = int(loan.strike)
         missing = [f for f, v in (("--sighash", args.sighash),
                                   ("--market", args.market),
                                   ("--strike", args.strike)) if not v]

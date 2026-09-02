@@ -109,8 +109,13 @@ class LoanTerms:
                 "the oracle never resolved, not a second way to call it early")
         # The 64-bit bound the seizure arithmetic works inside. DEFAULT has no
         # strike to bound the price, so an unset max_price leaves the builder
-        # assuming 2^40; the larger of the two is what has to fit.
-        bound = self.max_price or max(self.strike, 1 << 40)
+        # assuming 2^40. LIQUIDATE does have one -- it opens strictly under the
+        # strike -- so the strike is a bound the arithmetic must survive
+        # whatever max_price says. Taking the max of all three is the point: an
+        # explicit max_price BELOW the strike would otherwise let a loan pass
+        # this check and still overflow on the branch it is most likely to
+        # take.
+        bound = max(self.max_price or (1 << 40), self.strike, 1)
         if self.gross * self.price_scale + bound >= (1 << 63):
             raise ValueError(
                 f"gross {self.gross:,} x price_scale {self.price_scale:,} + "
@@ -187,11 +192,25 @@ class LoanTerms:
         tap, _ = self.build()
         return bytes(tap.scriptPubKey)
 
-    def loan_id(self) -> str:
-        """A stable identifier: the vault scriptPubKey's hash. Two loans with
-        identical terms and identical parties collide, which is correct -- they
-        are the same vault, and funding both would be funding one twice."""
-        return hashlib.sha256(self.script_pubkey()).hexdigest()
+    def loan_id(self, single_leaf=False) -> str:
+        """A stable IDENTIFIER for these terms: the hash of the vault
+        scriptPubKey they compile to. Two loans with identical terms and
+        identical parties collide, which is correct -- they are the same vault,
+        and funding both would be funding one twice.
+
+        It is a name, not an address, and by default it is the FOUR-LEAF
+        vault's. A loan drawn from an offer lives in the single-leaf vault
+        instead, at a different address built from the same terms, so this is
+        not where such a loan's coin is -- pass `single_leaf=True` for that
+        one. Callers that key records by it should keep whichever form they
+        started with, because changing it renames every record they hold.
+        """
+        if single_leaf:
+            from .offers import offer_vault_address     # imported here: offers
+            spk = offer_vault_address(self)             # imports terms
+        else:
+            spk = self.script_pubkey()
+        return hashlib.sha256(spk).hexdigest()
 
     # ------------------------------------------------------------ economics
 
@@ -224,8 +243,13 @@ class LoanTerms:
         return float("inf") if v == 0 else self.debt / v
 
     def liquidation_price(self) -> int:
-        """The price at or under which LIQUIDATE opens. The strike IS that
-        price; this exists so callers stop re-deriving it from the ratio."""
+        """The strike: LIQUIDATE opens strictly UNDER this price, never at it.
+
+        `is_liquidatable` is the same rule and the one to call. This exists so
+        callers stop re-deriving the number from the ratio, and the strictness
+        is stated because a loan exactly at its strike is a loan nobody may
+        seize -- the difference matters at the only moment it comes up.
+        """
         return self.strike
 
     def is_liquidatable(self, price: int) -> bool:
@@ -343,9 +367,41 @@ class LoanTerms:
 
     @classmethod
     def from_json(cls, s):
+        """Read terms back from a document, whoever wrote it.
+
+        Numbers arrive as STRINGS from a browser, and must. JavaScript loses
+        integers above 2^53, so anything an amount could reach is serialised
+        decimally there rather than as a JSON number -- and a value silently
+        rounded is a covenant address that does not match, or a debt nobody
+        agreed to. So the strings are the correct wire form and coercing them
+        is this function's job.
+        """
+        import dataclasses
         d = dict(json.loads(s) if isinstance(s, str) else s)
         if "oracles" in d and d["oracles"] is not None:
             d["oracles"] = tuple(d["oracles"])
+        for f in dataclasses.fields(cls):
+            if f.type is not int or f.name not in d or d[f.name] is None:
+                continue
+            v = d[f.name]
+            if isinstance(v, bool):
+                raise ValueError(f"{f.name} is a number, not a true/false")
+            if isinstance(v, int):
+                continue
+            try:
+                # Exact, and decimal. float() would take "1e30" and lose the
+                # low digits of anything large, which is the whole problem
+                # these strings exist to avoid.
+                d[f.name] = int(str(v).strip())
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{f.name} must be a whole number, not {v!r}") from None
+        unknown = set(d) - {f.name for f in dataclasses.fields(cls)}
+        if unknown:
+            # A field nobody reads is a field somebody thinks is being
+            # enforced. Saying so beats a TypeError from the constructor.
+            raise ValueError("these terms carry fields this book does not "
+                             "know: " + ", ".join(sorted(unknown)))
         return cls(**d)
 
     def describe(self, price=None) -> str:

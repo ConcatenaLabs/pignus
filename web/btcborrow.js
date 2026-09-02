@@ -344,8 +344,9 @@ export async function borrow(wallet, offer, ui) {
     reclaim_spk: reclaimSpk,
     reclaim_fee: reclaimFee,
     release_sig: releaseSig,
-    status: "funded",
+    funded: true,
   };
+  rec.status = stageOf(rec);
   rememberLoan(rec);
   return { ftxid, rec, take_id: take.take_id };
 }
@@ -374,14 +375,34 @@ export async function claimPrincipal(wallet, rec, ui) {
     refundVer: loan.lender_ver,
   });
   const spk = hex(tree.scriptPubKey());
-  if (spk !== d.disbursement_spk)
+  const vout = Number(d.disbursement_vout || 0);
+  // Read the coin itself. The covenant sweeps the WHOLE input, so a claim
+  // sized from the document is a claim the leaf refuses the moment the lender
+  // pays an atom more than the terms say -- and the page would keep offering
+  // the button with no way to tell why it failed. What is at the outpoint is
+  // also what says the output really pays these terms' address: a relay's own
+  // `disbursement_spk` field is the relay's word for it, and nothing else.
+  const out = await ui.api(`v1/outpoint/${d.disbursement_txid}/${vout}`)
+    .catch(() => null);
+  if (!out)
+    throw new Error("the principal the lender reported is not at that outpoint " +
+      "any more. It may have been claimed already, or never confirmed.");
+  if (out.scriptPubKey !== spk)
     throw new Error("the principal was paid into an output these terms do not " +
       "compile to. Do not act on it; report the offer.");
+  if (out.asset !== loan.debt_asset)
+    throw new Error("the coin at that outpoint is not the asset this loan is " +
+      "denominated in. Do not act on it; report the offer.");
+  const principal = String(out.value);
+  const owed = (BigInt(loan.principal || 0) || BigInt(loan.debt));
+  if (BigInt(principal) < owed)
+    throw new Error("the principal paid is " + principal + " atoms, less than " +
+      "the " + owed + " these terms promise. Do not claim it: your collateral " +
+      "is still abortable, and claiming would start the loan at the full debt.");
   ui.busy(true, "claiming the principal…");
-  const principal = (BigInt(loan.principal || 0) || BigInt(loan.debt)).toString();
   const { pset } = await buildHashlockClaim({
     tree, leaf: "claim", preimage: hex(secret),
-    outpoint: { txid: d.disbursement_txid, vout: Number(d.disbursement_vout || 0) },
+    outpoint: { txid: d.disbursement_txid, vout },
     value: principal, asset: loan.debt_asset,
     payeeSpk: progToSpk(loan.borrower_prog, loan.borrower_ver),
     utxos: await ui.utxos(), changeSpk: await ui.changeSpk(),
@@ -389,7 +410,10 @@ export async function claimPrincipal(wallet, rec, ui) {
   });
   const signedPset = await wallet.signPset(pset);
   const txid = await wallet.broadcast({ pset: signedPset });
-  rec.status = "claimed"; rec.claim_txid = txid; rememberLoan(rec);
+  // The BORROWER's claim of the principal. Named for what it is: the lender
+  // has a claim of their own later, and one word for both is how a settled
+  // loan came to read as one still waiting for its collateral to be vaulted.
+  rec.principal_claim_txid = txid; rec.status = stageOf(rec); rememberLoan(rec);
   await report(wallet, ui, rec, "claimed-principal", txid, 0).catch(() => {});
   return txid;
 }
@@ -439,7 +463,8 @@ export async function repay(wallet, rec, ui) {
   });
   const signedPset = await wallet.signPset(pset);
   const txid = await wallet.broadcast({ pset: signedPset });
-  rec.status = "repaid"; rec.repay_txid = txid; rememberLoan(rec);
+  rec.repay_txid = txid; rec.repay_vout = 0;
+  rec.status = stageOf(rec); rememberLoan(rec);
   await report(wallet, ui, rec, "repaid", txid, 0).catch(() => {});
   return txid;
 }
@@ -455,19 +480,21 @@ export async function repay(wallet, rec, ui) {
  */
 export async function reclaim(wallet, rec, ui, { minDepth = 6, force = false } = {}) {
   const loan = rec.loan;
-  const t = await ui.api("v1/btc/take/" + rec.take_id);
-  if (!t.secret_t)
-    throw new Error("the lender has not claimed your repayment yet, so the " +
-      "secret that releases your collateral is not on chain. Nothing to do " +
-      "but wait; if they never claim, you can take the repayment back after " +
+  const t = await ui.api("v1/btc/take/" + rec.take_id).catch(() => ({}));
+  const found = await findSecret(rec, t, ui);
+  if (!found)
+    throw new Error("the secret that releases your collateral is not on chain " +
+      "yet: the lender has not claimed your repayment. Nothing to do but " +
+      "wait; if they never claim, you can take the repayment back after " +
       "Sequentia block " + Number(loan.repay_deadline).toLocaleString() + ".");
-  if (hex(P.sha256(toBytes(t.secret_t))) !== loan.payment_hash)
+  const { secret, claimTxid } = found;
+  if (hex(P.sha256(toBytes(secret))) !== loan.payment_hash)
     throw new Error("the secret published does not match this loan. Do not act " +
       "on it.");
   // How deep the claim is, read from the chain rather than from the relay: the
   // whole point of waiting is that a reorg could undo it, and a number the
   // relay made up is no protection against that.
-  const depth = await ui.confirmations(t.claim_txid);
+  const depth = await ui.confirmations(claimTxid);
   if (depth < minDepth && !force)
     throw new Error(`the claim that published the secret has ${depth} ` +
       `confirmation(s). Sequentia reorgs when Bitcoin reorgs, so spending your ` +
@@ -486,10 +513,34 @@ export async function reclaim(wallet, rec, ui, { minDepth = 6, force = false } =
   })).signature;
   const tx = btc.completeReclaimTx(loan, vaultTxid, 0, toBytes(rec.reclaim_spk),
                                    rec.reclaim_fee, rec.release_sig,
-                                   borrowerSig, t.secret_t);
+                                   borrowerSig, secret);
   const txid = await wallet.request("broadcast", { chain: "bitcoin", hex: tx.hex() });
-  rec.status = "reclaimed"; rememberLoan(rec);
+  rec.terminal = "reclaimed"; rec.status = "reclaimed"; rememberLoan(rec);
   return txid;
+}
+
+/**
+ * The secret that releases the collateral, from the relay if it published one
+ * and from the CHAIN if it did not.
+ *
+ * A lender who claims a repayment publishes the preimage whether they mean to
+ * or not: the covenant leaf forces it into the witness. So the relay's copy is
+ * a convenience and the chain is the source. Depending on the convenience left
+ * a borrower with no way to their own collateral whenever the lender's report
+ * failed, their claim's outputs were spent, or they simply stopped answering.
+ */
+async function findSecret(rec, take, ui) {
+  const loan = rec.loan;
+  const said = take.secret_t || rec.secret_t || "";
+  if (said && hex(P.sha256(toBytes(said))) === loan.payment_hash)
+    return { secret: said, claimTxid: take.claim_txid || rec.lender_claim_txid };
+  const txid = rec.repay_txid || take.repay_txid;
+  if (!txid) return null;
+  const vout = Number(rec.repay_vout ?? take.repay_vout ?? 0);
+  const spend = await ui.api(`v1/spend/${txid}/${vout}`).catch(() => null);
+  const secret = spend && spend.preimages && spend.preimages[loan.payment_hash];
+  if (!secret) return null;
+  return { secret, claimTxid: spend.spend_txid };
 }
 
 /**
@@ -515,7 +566,7 @@ export async function abort(wallet, rec, ui) {
   const tx = btc.completeAbortTx(loan, rec.prevault_txid, rec.prevault_vout,
                                  toBytes(dest), fee, sig);
   const txid = await wallet.request("broadcast", { chain: "bitcoin", hex: tx.hex() });
-  rec.status = "aborted"; rememberLoan(rec);
+  rec.terminal = "aborted"; rec.status = "aborted"; rememberLoan(rec);
   return txid;
 }
 
@@ -530,15 +581,29 @@ const KEY = "pignus.btcloans";
 
 export function rememberLoan(rec) {
   try {
+    // Read immediately before writing, and merge rather than replace. Two
+    // tabs on the same wallet each hold their own copy of a loan, and a tab
+    // that loaded first would otherwise write its stale record back over a
+    // repayment the other one just made.
     const m = JSON.parse(localStorage.getItem(KEY) || "{}");
-    m[rec.take_id] = rec;
+    const was = m[rec.take_id] || {};
+    const merged = { ...was, ...rec };
+    // A fact never becomes false. Whichever tab learned one keeps it.
+    for (const k of ["disbursement_txid", "principal_claim_txid", "upgrade_txid",
+                     "repay_txid", "lender_claim_txid", "secret_t",
+                     "principal_refund_txid", "terminal", "funded"])
+      if (was[k] && !rec[k]) merged[k] = was[k];
+    merged.status = stageOf(merged);
+    m[rec.take_id] = merged;
     localStorage.setItem(KEY, JSON.stringify(m));
   } catch { /* a browser with storage off still completes the flow in memory */ }
 }
 
 export function savedLoans() {
-  try { return Object.values(JSON.parse(localStorage.getItem(KEY) || "{}")); }
-  catch { return []; }
+  try {
+    return Object.values(JSON.parse(localStorage.getItem(KEY) || "{}"))
+      .map(r => ({ ...r, status: stageOf(r) }));
+  } catch { return []; }
 }
 
 export function forgetLoan(takeId) {
@@ -549,7 +614,12 @@ export function forgetLoan(takeId) {
 }
 
 /** Every loan this wallet has taken, from the relay, merged over whatever the
- *  browser remembered. This is what makes a cleared cache survivable. */
+ *  browser remembered. This is what makes a cleared cache survivable.
+ *
+ *  Every field the recovery paths need is carried across, not just the ones
+ *  the happy path uses: a borrower who cleared their browser must still be
+ *  able to take a repayment back that nobody claimed, and that needs the
+ *  outpoint it went to. */
 export async function recoverLoans(wallet, ui) {
   const borrower_x = (await wallet.request("getBtcPublicKey", {})).pubkey_x;
   const remote = await ui.api("v1/btc/takes?borrower_x=" + borrower_x)
@@ -576,35 +646,72 @@ export async function recoverLoans(wallet, ui) {
       // The relay calls the lender's release `adaptor_sig` on the wire; it is
       // an ordinary signature, and the record here calls it what it is.
       release_sig: t.release_sig ?? t.adaptor_sig ?? was.release_sig,
-      // The relay's status never moves a loan BACKWARDS. It does not know
-      // what this borrower has done -- a repayment it has not been told about,
-      // a principal just claimed -- and letting it overwrite that would offer
-      // somebody the Repay button twice.
-      status: laterOf(was.status, t.status),
+      // What each party has actually DONE. These are the facts every step and
+      // every button is decided from, because a fact only ever becomes true:
+      // two parties pushing one status along one line is what let a settled
+      // loan read as one still waiting to be repaid.
+      disbursement_txid: t.disbursement_txid ?? was.disbursement_txid,
+      disbursement_vout: t.disbursement_vout ?? was.disbursement_vout,
+      principal_claim_txid: t.principal_claim_txid ?? was.principal_claim_txid,
+      upgrade_txid: t.upgrade_txid ?? was.upgrade_txid,
+      repay_txid: t.repay_txid ?? was.repay_txid,
+      repay_vout: t.repay_vout ?? was.repay_vout,
+      // The LENDER's claim of the repayment, and the secret it published.
+      lender_claim_txid: t.claim_txid ?? was.lender_claim_txid,
+      secret_t: t.secret_t || was.secret_t || "",
+      // The LENDER taking back a principal nobody claimed. A different event
+      // from the borrower taking back a repayment nobody claimed, and the two
+      // used to share the word "refunded" and contradict each other.
+      principal_refund_txid: t.refund_txid ?? was.principal_refund_txid,
     };
+    rec.status = stageOf(rec);
     local.set(t.take_id, rec);
     rememberLoan(rec);
   }
-  return [...local.values()];
+  return [...local.values()].map(r => ({ ...r, status: stageOf(r) }));
+}
+
+/**
+ * How far along a loan is, worked out from what has happened rather than from
+ * a status somebody set.
+ *
+ * A status was one word two parties pushed along one line, and they do not see
+ * the same events: the relay learns the lender's steps, the browser the
+ * borrower's. So `live` could arrive after `claimed` and pin a settled loan at
+ * "repay me", and `claimed` meant "the borrower took the principal" here and
+ * "the lender took the repayment" there. Facts do not have that problem. Each
+ * one below only ever becomes true, and the latest true one is the stage.
+ */
+export function stageOf(rec) {
+  const done = (rec.terminal || "");
+  if (done) return done;                       // reclaimed, aborted, repaid-back
+  if (rec.principal_refund_txid) return "principal-refunded";
+  if (rec.secret_t || rec.lender_claim_txid) return "repayment-claimed";
+  if (rec.repay_txid) return "repaid";
+  if (rec.upgrade_txid) return "live";
+  if (rec.principal_claim_txid) return "principal-taken";
+  if (rec.disbursement_txid) return "disbursed";
+  if (rec.release_sig) return "signed";
+  if (rec.prevault_txid && rec.funded) return "funded";
+  return rec.handshake || "requested";
+}
+
+// A lender stops claiming a repayment this many Sequentia blocks before the
+// written deadline, because claiming publishes the secret and a borrower whose
+// own refund had opened could take back the debt AND the collateral. It is the
+// deadline a borrower is really held to, so it is the one they are told.
+export const CLAIM_MARGIN_BLOCKS = 120;
+
+export function effectiveRepayDeadline(loan) {
+  return Number(loan.repay_deadline) - CLAIM_MARGIN_BLOCKS;
 }
 
 /** What the borrower can do with a loan right now, and what it is waiting for. */
-// How far along a loan is, so two views of it can be compared. The relay knows
-// the lender's steps; this browser knows the borrower's; neither knows both.
-const ORDER = ["requested", "reserved", "pending", "signed", "funded",
-               "disbursed", "claimed-principal", "claimed", "live", "repaid",
-               "reclaimed", "refunded", "aborted"];
-
-function laterOf(a, b) {
-  const ia = ORDER.indexOf(a || ""), ib = ORDER.indexOf(b || "");
-  if (ia < 0) return b || a || "funded";
-  if (ib < 0) return a;
-  return ia >= ib ? a : b;
-}
-
 export function nextStep(rec, heights) {
   const l = rec.loan || {};
-  switch (rec.status) {
+  const abortable = "Your collateral becomes abortable at Bitcoin block " +
+    Number(l.abort_after).toLocaleString() + ".";
+  switch (stageOf(rec)) {
     case "requested":
     case "reserved":
     case "pending":
@@ -623,43 +730,63 @@ export function nextStep(rec, heights) {
       return { action: "claim", label: "Claim the principal",
                note: "The principal is waiting in an output only you can " +
                      "open. Taking it is what starts the loan." };
-    case "claimed-principal":
-    case "claimed":
+    case "principal-taken":
       // The principal has been taken but the collateral has not moved into the
       // vault yet. Repaying now would pay for a loan that has not started, and
       // the release names a vault that does not exist.
       return { action: null, label: "",
                note: "You have the principal. The lender starts the loan by " +
                      "moving your collateral into its vault, which is theirs " +
-                     "to do and takes a confirmation or two." };
-    case "refunded":
+                     "to do and takes a confirmation or two. " + abortable };
+    case "principal-refunded":
       return { action: "abort", label: "Take the collateral back",
                note: "The principal went back to the lender unclaimed, so " +
-                     "there is no loan. Your collateral is abortable from " +
-                     "Bitcoin block " +
-                     Number(l.abort_after).toLocaleString() + "." };
+                     "there is no loan. " + abortable };
     case "live":
       return { action: "repay", label: "Repay",
                note: "Repay before Sequentia block " +
-                     Number(l.repay_deadline).toLocaleString() + "." };
+                     effectiveRepayDeadline(l).toLocaleString() + ". A lender " +
+                     "stops claiming after that, and a repayment nobody " +
+                     "claims releases no collateral." };
     case "repaid":
+      return { action: null, label: "",
+               note: "Waiting for the lender to claim your repayment, which " +
+                     "is what publishes the secret that releases your " +
+                     "collateral. If they never do, you can take the " +
+                     "repayment back after Sequentia block " +
+                     Number(l.repay_deadline).toLocaleString() + "." };
+    case "repayment-claimed":
       return { action: "reclaim", label: "Take the collateral back",
-               note: "Available once the lender claims your repayment, which " +
-                     "is what publishes the secret that releases it." };
+               note: "Your debt is settled and the secret that releases your " +
+                     "collateral is on chain." };
     case "reclaimed":
       return { action: null, label: "", note: "Settled." };
     case "aborted":
       return { action: null, label: "", note: "Aborted; collateral returned." };
+    case "repayment-refunded":
+      return { action: "reclaim", label: "Take the collateral back",
+               note: "You took your repayment back because nobody claimed it. " +
+                     "Your collateral is still in the vault until the secret " +
+                     "appears or the lender sweeps it at Bitcoin block " +
+                     Number(l.recover_after).toLocaleString() + "." };
     default:
       return { action: null, label: "", note: "" };
   }
 }
 
-/** True when the borrower may abort: the principal never arrived and the
- *  deadline has passed. */
+/** True when the borrower may abort: the collateral is still in the pre-vault,
+ *  the principal was never taken, and the deadline has passed.
+ *
+ *  Decided from what happened, not from a status. The upgrade is what spends
+ *  the pre-vault, so anything after it makes an abort a transaction the chain
+ *  will simply reject -- and offering the button is worse than not having it,
+ *  because it tells the borrower a story about their loan that is not true. */
 export function canAbort(rec, heights) {
   if (!rec.loan || !rec.loan.abort_after) return false;
-  if (["claimed", "live", "repaid", "reclaimed", "aborted"].includes(rec.status))
-    return false;
-  return Number(heights.btc || 0) >= Number(rec.loan.abort_after);
+  if (rec.terminal) return false;
+  if (rec.upgrade_txid || rec.repay_txid || rec.secret_t ||
+      rec.lender_claim_txid) return false;
+  const h = Number(heights && heights.btc);
+  if (!Number.isFinite(h) || h <= 0) return false;
+  return h >= Number(rec.loan.abort_after);
 }

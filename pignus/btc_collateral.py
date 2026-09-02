@@ -72,6 +72,7 @@ the design document and the reason both mechanisms exist here.
 import hashlib
 from dataclasses import dataclass
 
+from . import atoms as _atoms
 from . import adaptor as A
 from . import btcscript as B
 from .compat import load_covenant
@@ -439,6 +440,29 @@ CLAIM_MARGIN_SECONDS = 2 * 3600
 # The shortest term worth calling one: the gap between the last moment a loan
 # can start and the moment its repayment window shuts.
 TERM_MINIMUM_SECONDS = 24 * 3600
+# The same margin as a count of Sequentia blocks, which is the unit the
+# repayment deadline is written in. A lender must stop claiming this far before
+# `repay_deadline`, because claiming publishes the secret and a borrower whose
+# own refund had opened could then take back the repayment AND the collateral.
+# The refusal is permanent -- height only rises -- so this is the deadline the
+# borrower is actually held to, and it is what every tool must quote them.
+CLAIM_MARGIN_BLOCKS = CLAIM_MARGIN_SECONDS // SEQ_BLOCK_SECONDS
+# The floor on the fee carried by the pre-vault, which pays for the upgrade.
+# That transaction is signed in advance by both parties, spends a covenant
+# leaf, and sets a final sequence, so NEITHER side can replace it or pay for a
+# child. Whatever is committed at origination is the only fee it will ever
+# have.
+MIN_UPGRADE_FEE = 10_000
+
+
+def effective_repay_deadline(loan):
+    """The last Sequentia block at which repaying still works.
+
+    The written deadline is not it: a lender stops claiming, and so stops
+    publishing the secret, `CLAIM_MARGIN_BLOCKS` earlier. Quoting the written
+    one to a borrower invites them to pay into a window nobody will answer.
+    """
+    return int(loan.repay_deadline) - CLAIM_MARGIN_BLOCKS
 
 
 def timelocks_sane(loan, btc_height, seq_height, *,
@@ -476,10 +500,16 @@ def timelocks_sane(loan, btc_height, seq_height, *,
                     "the collateral becomes abortable too soon after the "
                     "principal's deadline: a lender who is paid could still "
                     "lose the collateral. Move abort_after later.")
-    if seq_s(loan.repay_deadline) < CLAIM_MARGIN_SECONDS:
+    # Measured against the EFFECTIVE deadline, not the written one. A loan
+    # whose last two hours nobody will answer is a loan whose repayment window
+    # is two hours shorter than it says, and checking the written figure is how
+    # a borrower ends up following the instructions exactly and losing.
+    d_repay = effective_repay_deadline(loan)
+    if seq_s(d_repay) < CLAIM_MARGIN_SECONDS:
         problems.append(
             f"the repayment deadline is only "
-            f"{seq_s(loan.repay_deadline) // 60} minutes away")
+            f"{max(0, seq_s(d_repay)) // 60} minutes away, allowing for the "
+            f"margin a lender stops claiming in")
     if btc_s(loan.recover_after) - seq_s(loan.repay_deadline) < REPAY_MARGIN_SECONDS:
         problems.append(
             "the lender can sweep the collateral too soon after the repayment "
@@ -489,7 +519,7 @@ def timelocks_sane(loan, btc_height, seq_height, *,
     # do that as late as d_refund. Without this, a set of deadlines that passes
     # every other check can leave a borrower with a repayment window that is
     # already over by the time their loan begins.
-    if loan.d_refund and seq_s(loan.repay_deadline) - seq_s(loan.d_refund) \
+    if loan.d_refund and seq_s(d_repay) - seq_s(loan.d_refund) \
             < TERM_MINIMUM_SECONDS:
         problems.append(
             "the repayment deadline is too close to the last moment the loan "
@@ -500,6 +530,23 @@ def timelocks_sane(loan, btc_height, seq_height, *,
             "the lender's sweep opens before the collateral stops being "
             "abortable, which is not a loan in between. Move recover_after "
             "past abort_after.")
+    # The upgrade's fee is fixed at origination and can never be raised. Every
+    # party calls this function, so this is where the floor belongs: the relay
+    # checked it, and a loan arranged by hand never passes a relay at all.
+    if loan.abort_after and int(loan.upgrade_fee) < MIN_UPGRADE_FEE:
+        problems.append(
+            f"the upgrade fee is {loan.upgrade_fee} satoshis. That move is "
+            f"signed in advance and can be neither replaced nor paid for by a "
+            f"child, so anything under {MIN_UPGRADE_FEE} risks a loan that "
+            f"cannot be started.")
+    # One secret must not open both sides. If the hash that releases the
+    # collateral is the hash that releases the principal, the borrower's own
+    # claim of the principal publishes the secret that frees their collateral,
+    # and they keep both.
+    if loan.payment_hash and loan.h_w and loan.payment_hash == loan.h_w:
+        problems.append(
+            "the repayment and the principal are locked to the same secret, "
+            "so claiming one would release the other. Refusing this loan.")
     return problems
 
 
@@ -691,7 +738,7 @@ def _wallet_holdings(node):
         asset = ids.get(key, key)
         if len(asset) != 64:
             continue
-        out[asset] = out.get(asset, 0) + int(round(float(amount) * COIN))
+        out[asset] = out.get(asset, 0) + _atoms(amount)
     return out
 
 
@@ -815,7 +862,7 @@ def _outpoint_value(node, txid, vout, asset, want):
     if got_asset not in (None, asset):
         raise ValueError(f"{txid}:{vout} holds {got_asset}, not the asset this "
                          "loan is denominated in")
-    held = int(round(float(out.get("value", 0)) * COIN))
+    held = _atoms(out.get("value", 0))
     if held < int(want):
         raise ValueError(f"{txid}:{vout} holds {held}, less than the {want} "
                          "these terms name")
@@ -939,23 +986,42 @@ def tx_confirmations(node, txid, vout_hint=0, scan_depth=SPEND_SCAN_DEPTH):
     Returns -1 when nothing about the transaction can be found at all, 0 when
     it is only in the mempool.
     """
+    conf, _height = tx_depth(node, txid, vout_hint, scan_depth)
+    return conf
+
+
+def tx_depth(node, txid, vout_hint=0, scan_depth=SPEND_SCAN_DEPTH):
+    """(confirmations, block height) for a transaction, without an index.
+
+    The height comes back because depth alone cannot be re-checked later: the
+    caller that wants to know whether a transaction is still buried, or which
+    Bitcoin header its block anchored to, needs the block it landed in. Height
+    is None when it is unconfirmed or unfindable.
+    """
+    tip = int(node.getblockcount())
     try:
         out = node.gettxout(txid, int(vout_hint), True)
         if out is not None:
-            return int(out.get("confirmations", 0) or 0)
+            conf = int(out.get("confirmations", 0) or 0)
+            return conf, (tip - conf + 1 if conf > 0 else None)
     except Exception:                                   # noqa: BLE001
         pass
     try:                       # mempool, or a node that does have an index
         raw = node.getrawtransaction(txid, True)
-        return int(raw.get("confirmations", 0) or 0)
+        conf = int(raw.get("confirmations", 0) or 0)
+        if raw.get("blockhash"):
+            try:
+                return conf, int(node.getblock(raw["blockhash"], 1)["height"])
+            except Exception:                           # noqa: BLE001
+                pass
+        return conf, (tip - conf + 1 if conf > 0 else None)
     except Exception:                                   # noqa: BLE001
         pass
-    tip = int(node.getblockcount())
     for h in range(tip, max(0, tip - scan_depth) - 1, -1):
         block = node.getblock(node.getblockhash(h), 1)
         if txid in block.get("tx", []):
-            return tip - h + 1
-    return -1
+            return tip - h + 1, h
+    return -1, None
 
 
 def spend_witness(node, txid, vout, since_height=None,
@@ -1046,17 +1112,57 @@ def preimage_from_claim(node, claim_txid, vout=0, expect_hash=None):
     raise ValueError("no 32-byte preimage in that transaction's witnesses")
 
 
-def anchor_safe(node, txid, min_depth=6, vout_hint=0):
-    """A pragmatic anchor-safety check before acting on a revealed preimage.
+# How deep the PARENT chain's block must be before a Sequentia transaction
+# anchored to it is treated as settled. Two Bitcoin blocks is the shortest
+# depth that survives an ordinary one-block reorg of the parent chain.
+MIN_ANCHOR_DEPTH = 2
 
-    The chain's first principle: a Bitcoin-driven reorg can undo a Sequentia
-    transaction. Before anyone spends on the strength of a secret read off the
-    Sequentia chain, the transaction that published it must be buried enough
-    that undoing it would take a Bitcoin reorg they are willing to discount.
+
+def anchor_safe(node, txid, min_depth=6, vout_hint=0, btc_node=None,
+                min_anchor_depth=MIN_ANCHOR_DEPTH, height=None):
+    """Is it safe to spend on the strength of a secret read off this chain?
+
+    The chain's first principle decides the unit. Sequentia reorgs whenever
+    Bitcoin reorgs, so counting Sequentia confirmations measures the wrong
+    thing: six of them are six minutes, about six tenths of one Bitcoin block,
+    and a single ordinary Bitcoin reorg undoes ten of them at once. What has to
+    be deep is the BITCOIN header the transaction's block anchored to.
+
+    Given `btc_node`, that is what this checks: the Sequentia block carrying
+    the transaction names a parent-chain header, and that header must still be
+    in the parent chain and `min_anchor_depth` blocks deep. Without a Bitcoin
+    node it falls back to Sequentia depth, which is weaker, and says so by
+    demanding the same number of blocks the caller asked for.
+
+    Pass `height` when the caller already knows which Sequentia block the
+    transaction landed in; it saves a backward scan, and it is the only way to
+    re-check a transaction whose outputs have since been spent.
     Returns (ok, confirmations); a transaction nobody can find is never safe.
     """
-    conf = tx_confirmations(node, txid, vout_hint)
-    return conf >= int(min_depth), max(0, conf)
+    if height is None:
+        conf, height = tx_depth(node, txid, vout_hint)
+    else:
+        conf = max(0, int(node.getblockcount()) - int(height) + 1)
+    if conf < int(min_depth) or height is None:
+        return False, max(0, conf)
+    if btc_node is None:
+        return True, conf
+    try:
+        block = node.getblock(node.getblockhash(int(height)), 1)
+    except Exception:                                   # noqa: BLE001
+        return False, max(0, conf)
+    anchor = block.get("anchorhash") or ""
+    if not anchor or int(anchor, 16) == 0:
+        # A chain without anchoring: Sequentia depth is all there is.
+        return True, conf
+    try:
+        header = btc_node.getblockheader(anchor, True)
+    except Exception:                                   # noqa: BLE001
+        # The anchor is not in the parent chain this node follows. Either it
+        # was reorged away -- in which case the Sequentia block is going too --
+        # or this node cannot see it. Neither is a thing to spend on.
+        return False, max(0, conf)
+    return int(header.get("confirmations", -1)) >= int(min_anchor_depth), conf
 
 
 # ------------------------------------------------------------- Bitcoin funding
@@ -1118,7 +1224,7 @@ def collateral_committed(btc_node, loan, funding_txid, funding_vout,
     if got_spk != want_spk:
         return False, ("that outpoint does not pay this loan's collateral "
                        "script: it holds somebody else's coin")
-    value = int(round(float(out.get("value", 0)) * COIN))
+    value = _atoms(out.get("value", 0))
     if value != want_value:
         return False, (f"that outpoint holds {value} satoshis, not the "
                        f"{want_value} this loan requires")

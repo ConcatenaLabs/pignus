@@ -86,6 +86,8 @@ Endpoints:
     GET  /v1/loans/{id}        one loan, with health at the current price
     GET  /v1/loans/{id}/exit   how a closed loan ended, read back off the chain
     GET  /v1/outpoint/{txid}/{vout}   what an outpoint holds (mempool included)
+    GET  /v1/spend/{txid}/{vout}      the spend of an outpoint, and the
+                                      preimages its witness published
     GET  /v1/attestation/{market}     the primary oracle's latest attestation
                                (?oracle=<x> for one other oracle's)
     GET  /v1/attestations/{market}    one verified attestation per oracle
@@ -112,6 +114,7 @@ Endpoints:
     POST /v1/btc/refunded      the lender reports an unclaimed principal taken
                                back
     POST /v1/btc/claimed-principal   the borrower reports taking the principal
+    POST /v1/btc/repaid        the borrower reports paying the debt
     GET  /healthz
 
 `/v1/offer/{id}` and `/v1/loan/{id}` are accepted as aliases of the plural
@@ -376,6 +379,12 @@ class Service:
         self.node_error = None
         self.oracle_error = None
         self.oracle_errors = []
+        # Offer events this daemon dropped because it could never apply them,
+        # and how many are still queued. Both are served by /healthz: a queue
+        # that only grows is a book falling behind its own chain, and nothing
+        # else would say so.
+        self.event_errors = []
+        self.event_backlog = 0
         self.last_poll = 0
         self.height = None
         self.assets = {}            # asset id -> {ticker, name, precision}
@@ -441,6 +450,16 @@ class Service:
         # "COLLATERAL/DEBT"; the debt asset of a market whose debt ticker
         # matches this is worth 1 reference unit. Configurable, not hardcoded.
         self.reference_ticker = cfg.get("reference_ticker", "USDX")
+        # Where a reader of this book's page should be sent to look at a
+        # transaction, an explorer or the oracle's own log. Configurable
+        # because a self-hosted book is not behind the testnet's reverse proxy
+        # and its neighbours live somewhere else; the page falls back to its
+        # own defaults for whatever is left unset, which is why these are empty
+        # strings rather than guesses.
+        self.explorer_url = cfg.get("explorer_url", "").rstrip("/")
+        self.explorer_tx_url = cfg.get("explorer_tx_url", "")
+        self.btc_explorer_tx_url = cfg.get("btc_explorer_tx_url", "")
+        self.oracle_public_url = cfg.get("oracle_public_url", "").rstrip("/")
 
     # ------------------------------------------------------------- the oracle
 
@@ -738,16 +757,35 @@ class Service:
         # Offer events are applied IN ORDER, and a failed one is retried on
         # the next poll rather than dropped: the event is what registers the
         # loan an offer opened, and the watcher has already moved on.
+        #
+        # But only a failure that could pass LATER is worth retrying. An event
+        # this daemon can never apply -- terms it cannot parse, a take whose
+        # shape it does not understand -- would otherwise sit at the head of
+        # the queue for ever, and every later event, including every loan every
+        # other offer opens, would queue up behind it without bound. So a
+        # verdict about the event itself is final and the event is dropped,
+        # loudly; only a book or node failure is retried.
         while w.events:
             ev = w.events[0]
             try:
                 self._apply_offer_event(ev)
+            except (ValueError, TypeError, KeyError, AssertionError) as e:
+                # A judgement about this event, which will not change.
+                self.event_errors.append(
+                    f"offer {str(ev.get('offer_id', '?'))[:12]}: dropped the "
+                    f"'{ev.get('kind')}' event: {type(e).__name__}: {e}")
+                print(self.event_errors[-1], file=sys.stderr)
+                w.events.pop(0)
+                continue
             except Exception as e:              # noqa: BLE001
                 print(f"offer {str(ev.get('offer_id', '?'))[:12]}: cannot "
                       f"apply the '{ev.get('kind')}' event yet, retrying "
                       f"next poll: {type(e).__name__}: {e}", file=sys.stderr)
                 break
             w.events.pop(0)
+        # A queue that keeps growing is a daemon falling behind its own chain.
+        # Say so where an operator is already looking.
+        self.event_backlog = len(w.events)
         for o in list(w.offers.values()):
             self._reconcile_offer(o)
 
@@ -1310,6 +1348,9 @@ class Service:
         prevault_vout = int(body["prevault_vout"])
         if len(prevault_txid) != 64:
             raise ValueError("that is not a transaction id")
+        # Both of these are decided again, atomically, by `put_btc_take`. They
+        # are here so a caller is told which of their two fields is the problem
+        # before any work is done on the rest of the request.
         clash = self.book.btc_take_by_funding(prevault_txid, prevault_vout)
         if clash is not None:
             raise ValueError("that outpoint already funds take "
@@ -1317,14 +1358,15 @@ class Service:
         # And one secret opens one loan. Two takes committing to the same
         # secret share a pre-vault address and a disbursement address, and the
         # moment one of them publishes it the other's collateral can be moved
-        # into a vault nobody paid for.
-        for other in self.book.btc_takes.values():
-            if (other.get("loan", {}).get("h_w") == loan.h_w
-                    and other.get("take_id") != body.get("take_id")):
-                raise ValueError(
-                    "that origination commitment is already in use by take "
-                    f"{other['take_id']}. Draw a fresh one: two loans sharing "
-                    "a secret are one loan either party can settle twice")
+        # into a vault nobody paid for. Answered from the book's commitment
+        # ledger rather than by scanning the takes, because a take is pruned
+        # and a secret must never become reusable.
+        who = self.book.btc_hash_in_use(loan.h_w, body.get("take_id"))
+        if who is not None:
+            raise ValueError(
+                "that origination commitment is already in use by take "
+                f"{who}. Draw a fresh one: two loans sharing a secret are one "
+                "loan either party can settle twice")
         if int(body.get("prevault_value", 0)) != loan.prevault_value():
             raise ValueError("the funding named does not hold the collateral "
                              "plus the fee this loan needs")
@@ -1403,6 +1445,7 @@ class Service:
         each of them says so here rather than only in a log nobody reads."""
         now = time.time()
         stale = self.stale_markets()
+        btc_h = self.btc_height()
         reasons = []
         if self.node is None:
             reasons.append("no node configured; chain states are frozen")
@@ -1417,6 +1460,12 @@ class Service:
                            f"{int(now - self.last_poll)}s ago")
         if stale:
             reasons.append("stale price: " + ", ".join(stale))
+        if self.event_backlog:
+            # Not fatal on its own -- one poll can leave an event waiting for a
+            # book write -- but a backlog that persists means loans an offer
+            # opened are not being registered, so it belongs in the reasons.
+            reasons.append(f"{self.event_backlog} offer event(s) waiting to "
+                           "be applied")
         return {
             "ok": not reasons,
             "error": "; ".join(reasons) or None,
@@ -1444,11 +1493,20 @@ class Service:
             "reference_ticker": self.reference_ticker,
             "oracles": len(self.oracle_keys),
             "oracle_errors": list(self.oracle_errors),
+            "event_errors": list(self.event_errors[-10:]),
+            "event_backlog": self.event_backlog,
             "node": bool(self.node),
             # Whether this book can see the parent chain. Without it, a
             # cross-chain loan's Bitcoin-side deadlines are not checked here at
             # all, and every take it accepts says so in its warnings.
-            "btc_node": self.btc_height() is not None}
+            "explorer_url": self.explorer_url,
+            "oracle_public_url": self.oracle_public_url,
+            "btc_node": btc_h is not None,
+            # ...and the height itself, because every Bitcoin-side deadline a
+            # borrower is shown or checks is measured against it. A page with
+            # no parent-chain height cannot tell them when their collateral
+            # becomes abortable, so it refuses to originate at all.
+            "btc_height": btc_h}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1603,6 +1661,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/markets":
             return self._send(200, {"markets": s.market_rows(),
                                     "height": s.height,
+                                    # The parent chain's tip. A cross-chain
+                                    # loan's abort and sweep are written in
+                                    # Bitcoin blocks, so a page without this
+                                    # cannot say when either opens.
+                                    "btc_height": s.btc_height(),
+                                    "explorer_tx_url": s.explorer_tx_url,
+                                    "btc_explorer_tx_url": s.btc_explorer_tx_url,
                                     "reference_ticker": s.reference_ticker,
                                     "block_seconds": s.block_seconds,
                                     "min_depth": s.min_depth,
@@ -1712,6 +1777,56 @@ class Handler(BaseHTTPRequestHandler):
                 "asset": got.get("asset"),
                 "value": str(atoms(got["value"])),
                 "confirmations": got.get("confirmations", 0)})
+        if path.startswith("/v1/spend/"):
+            # WHO spent an outpoint, and what they put in the witness to do it.
+            #
+            # This is how a borrower gets their collateral back when nobody
+            # tells them the secret. The lender's claim of a repayment PUBLISHES
+            # the preimage -- the covenant leaf forces it into the witness --
+            # so the chain always has it even when the lender's relay report
+            # never arrived, their node lost the claim, or they simply went
+            # away. A page that could only read the relay's copy had one way to
+            # learn it and no second one, and the collateral was the cost.
+            parts = path[len("/v1/spend/"):].split("/")
+            if not s.node:
+                return self._send(503, {"error": "no node configured; chain "
+                                                 "lookups are unavailable"})
+            if (len(parts) != 2 or not parts[1].isdigit()
+                    or len(parts[0]) != 64 or not _is_hex(parts[0])):
+                return self._send(400, {"error": "an outpoint is a 64-hex txid "
+                                                 "and a vout number"})
+            txid, vout = parts[0].lower(), int(parts[1])
+            try:
+                from pignus import btc_collateral as BC
+                if s.node.gettxout(txid, vout, True) is not None:
+                    return self._send(404, {
+                        "error": "that output is still unspent, so nothing has "
+                                 "been published against it yet"})
+                found = BC.spend_witness(s.node, txid, vout,
+                                         scan_depth=s.back_scan_cap)
+            except RpcError as e:
+                return self._send(400, {"error": f"the node would not read "
+                                                 f"that outpoint: {e}"})
+            if not found:
+                return self._send(404, {
+                    "error": "the spend of that outpoint is not within this "
+                             "book's scan window"})
+            spend_txid, witness, conf = found
+            # Every 32-byte item in the witness, with its hash. A caller knows
+            # which hash its own loan commits to, so it can pick without this
+            # book having to know anything about their loan.
+            import hashlib
+            preimages = {}
+            for item in witness:
+                try:
+                    raw = bytes.fromhex(item)
+                except ValueError:
+                    continue
+                if len(raw) == 32:
+                    preimages[hashlib.sha256(raw).hexdigest()] = item
+            return self._send(200, {
+                "txid": txid, "vout": vout, "spend_txid": spend_txid,
+                "confirmations": conf, "preimages": preimages})
         if path.startswith("/v1/attestations/"):
             market = path[len("/v1/attestations/"):].replace("_", "/").upper()
             out = []
@@ -1896,21 +2011,32 @@ class Handler(BaseHTTPRequestHandler):
                                  "spoken for; try again later or find another"})
                 loan, dest, problems = s.btc_check_take(offer, body)
                 from pignus import btc_collateral as BC
-                rec = s.book.put_btc_take({
-                    "btc_offer_id": offer["btc_offer_id"],
-                    "loan": BC.loan_to_dict(loan),
-                    "borrower_x": loan.borrower_x,
-                    "borrower_seq_spk": str(body.get("borrower_seq_spk", "")),
-                    "w_seq": int(body.get("w_seq", 0)),
-                    "prevault_txid": str(body["prevault_txid"]).lower(),
-                    "prevault_vout": int(body["prevault_vout"]),
-                    "prevault_value": str(loan.prevault_value()),
-                    "prevault_spk": loan.prevault_spk().hex(),
-                    "reclaim_dest": dest,
-                    "reclaim_fee": int(body.get("reclaim_fee", 3000)),
-                    "disbursement_spk": loan.disbursement_spk().hex(),
-                    "status": "requested",
-                    "warnings": problems})
+                # The check above is a courtesy that answers early. This is the
+                # one that decides: the last lot, the funding outpoint and the
+                # commitment are all claimed under one lock, with the insert,
+                # so two borrowers arriving together cannot both win.
+                try:
+                    rec = s.book.put_btc_take(
+                        {"btc_offer_id": offer["btc_offer_id"],
+                         "loan": BC.loan_to_dict(loan),
+                         "borrower_x": loan.borrower_x,
+                         "borrower_seq_spk": str(body.get("borrower_seq_spk", "")),
+                         "w_seq": int(body.get("w_seq", 0)),
+                         "prevault_txid": str(body["prevault_txid"]).lower(),
+                         "prevault_vout": int(body["prevault_vout"]),
+                         "prevault_value": str(loan.prevault_value()),
+                         "prevault_spk": loan.prevault_spk().hex(),
+                         "reclaim_dest": dest,
+                         "reclaim_fee": int(body.get("reclaim_fee", 3000)),
+                         "disbursement_spk": loan.disbursement_spk().hex(),
+                         "status": "requested",
+                         "warnings": problems},
+                        lots_of=offer["btc_offer_id"], take_ttl=BTC_TAKE_TTL,
+                        signed_ttl=BTC_SIGNED_TAKE_TTL)
+                except ValueError as e:
+                    if "lot" in str(e):
+                        return self._send(409, {"error": str(e)})
+                    raise
                 return self._send(200, rec)
             if path == "/v1/btc/hash":
                 # The lender draws this loan's secret and publishes its hash.
@@ -1935,6 +2061,22 @@ class Handler(BaseHTTPRequestHandler):
                 if take.get("payment_hash") and take["payment_hash"] != phash:
                     return self._send(409, {"error": "this take already has a "
                                             "payment hash; it cannot change"})
+                # One secret must never open both sides of a loan. If the hash
+                # that releases the collateral is the hash that releases the
+                # principal, the borrower's own claim publishes the secret that
+                # frees their collateral and they keep both.
+                if phash == str(take["loan"].get("h_w", "")).lower():
+                    return self._send(400, {
+                        "error": "that hash is the one the principal is locked "
+                                 "to. One secret opening both sides would let "
+                                 "the borrower keep the collateral as well."})
+                # And it must not be another loan's. A hash shared between two
+                # takes makes either borrower's repayment release the other's
+                # collateral.
+                if not s.book.claim_btc_hash(phash, take["take_id"]):
+                    return self._send(409, {
+                        "error": "that hash is already committed to another "
+                                 "loan on this book"})
                 loan = dict(take["loan"])
                 loan["payment_hash"] = phash
                 loan["adaptor_point"] = point
@@ -2053,8 +2195,14 @@ class Handler(BaseHTTPRequestHandler):
                         R.CLAIMED_TAG,
                         {"txid": str(body.get("claim_txid", "")).lower(),
                          "secret": str(body.get("secret_t", "")).lower()},
-                        lambda f: {"status": "claimed", "claim_txid": f["txid"],
-                                   "secret_t": f["secret"]}),
+                        # The secret is written only when there is one. A claim
+                        # is reported twice -- once when it is made, again with
+                        # the secret once it is buried -- and letting the empty
+                        # first form overwrite the second would take back the
+                        # one value that releases a borrower's collateral.
+                        lambda f: ({"status": "claimed", "claim_txid": f["txid"]}
+                                   | ({"secret_t": f["secret"]} if f["secret"]
+                                      else {}))),
                     "refunded": (
                         R.REFUNDED_TAG,
                         {"txid": str(body.get("refund_txid", "")).lower()},
@@ -2100,15 +2248,20 @@ class Handler(BaseHTTPRequestHandler):
                         "error": "that report is not signed by this loan's "
                                  "borrower, so it will not be believed"})
                 # A hint, and nothing more. It records where the borrower says
-                # their payment landed and changes no status: a lender's
-                # responder scans by status, so letting a borrower set one would
-                # let them steer what the lender does and does not look at.
+                # their payment landed and changes NO status. A status a
+                # borrower can set is a status they can use: one that moved a
+                # take out of the step a lender was acting on would leave the
+                # principal paid and the collateral never taken into the vault.
+                # It would also pin the offer's lot for ever, since a status
+                # nothing else writes is one nothing else clears. The lender's
+                # responder reads the chain and its own records instead, so
+                # this field only ever saves it a scan.
                 if kind == "claimed-principal":
                     s.book.update_btc_take(take["take_id"],
                                            principal_claim_txid=txid)
                 else:
                     s.book.update_btc_take(take["take_id"], repay_txid=txid,
-                                           repay_vout=vout, status="repaid")
+                                           repay_vout=vout)
                 return self._send(200, {"ok": True})
             if path == "/v1/loans":
                 open_loans = sum(1 for r in s.book.loans.values()

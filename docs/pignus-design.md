@@ -231,10 +231,17 @@ the terms are inside the address the borrower reconstructs.
 The take is one atomic transaction:
 
     inputs   the offer's coin, borrower's collateral utxo(s)
-    outputs  the vault (L of C at the covenant address)
+    outputs  the vault (L of C at the covenant address)          <- 2k
+             the offer's remainder, if it held more than one lot <- 2k+1
              the principal (the loan amount of D) to the borrower
-             the offer's remainder, if it held more than one lot
              +  changes, and the network fee output
+
+The first two positions are not a convention: with the offer's coin at input
+`k`, the covenant reads output `2k` as the vault and output `2k+1` as the
+remainder claimed back to the offer's own address. Putting the borrower's
+principal at `2k+1` is the obvious mistake and the leaf refuses it. When the
+whole offer is drawn there is no remainder, and output `2k+1` must then be one
+that does NOT carry the debt asset -- the network fee output serves.
 
 The borrower MUST, before signing, reconstruct the vault address from the terms
 and check it equals the vault output's scriptPubKey, and check the internal key
@@ -536,8 +543,9 @@ parent chain will cost. It cannot be replaced -- the signature commits to the
 whole transaction -- and its only output is the vault, which nobody can spend
 to pay for it, so it cannot be bumped from either end either. A fee too low to
 confirm before `abort_after` is a loan the lender has paid for and cannot
-start. That is why the pre-vault carries a deliberately generous fee, why the
-relay refuses an offer whose fee could not plausibly confirm, and why the
+start. That is why the pre-vault carries a deliberately generous fee, why
+`timelocks_sane` -- which every party calls, relay or not -- refuses a loan
+whose upgrade fee is under a flat 10,000 satoshis, and why the
 margin above is measured in days rather than hours. The same function refuses a loan whose `recover_after` does not sit a day
 past `repay_deadline`, because a lender who could claim a repayment after the
 Bitcoin timeout had opened would be racing the borrower for the collateral with
@@ -635,11 +643,15 @@ into the vault that hash implies), `/v1/btc/adaptor` (the release
 coming back) and the lender's reports that the principal is paid, the loan is
 started, the repayment is claimed or an unclaimed principal is taken back. The
 borrower reports two things of their own -- where they took the principal and
-where they paid the debt -- and those are signed by the borrower's key for the
-same reason the lender's are signed by theirs: everything either of them says is
-on a chain anyway, but an unauthenticated hint that moved a take out of the
-status a responder scans would stop a principal being paid, for good.
-`docs/api.md` documents each of them.
+where they paid the debt -- and those record an outpoint and change no status at
+all. That asymmetry is the point. A status a borrower can set is a status they
+can use: one that moved a take out from under the step their lender was about to
+take would leave the principal paid and the collateral never vaulted, and it
+would pin a lot of the lender's offer in a state nothing else clears. So a
+responder decides what to do from its OWN state file and the two chains, never
+from a status the relay is holding, and the borrower's reports only ever save it
+a scan. They are signed all the same, because an unsigned hint is a way to write
+into somebody else's loan. `docs/api.md` documents each of them.
 
 The relay holds no key and can move nothing, and it is never believed. Every
 message a responder will act on carries a BIP340 signature by the key the loan
@@ -880,12 +892,15 @@ anchor-driven reorg has undone (section 6.4) secures nothing, and there is no
 watcher here to notice.
 
 Because both halves matter, `repo-verify` reports a **state** and never an
-"ok": `not-funded`, `bond-only`, `funded-unburied`, `live`, `forfeitable`,
-`settled`. `bond-only` is what a bond checked on its own earns, and it is the
-answer to guard against -- a bond nobody has matched against the transfer it
-secures is a number, not a claim. `--min-confirmations` is where each side's
-tolerance for a reorg goes; below it the state is `funded-unburied` however
-correct both halves are.
+"ok": `not-funded`, `leg-one-only`, `bond-only`, `funded-unburied`, `live`,
+`forfeitable`, `settled`. `bond-only` is what a bond checked on its own earns,
+and it is the answer to guard against -- a bond nobody has matched against the
+transfer it secures is a number, not a claim. `leg-one-only` is its mirror and
+worse: the lender is holding the asset with nothing posted for its return.
+`--min-confirmations` is where each side's tolerance for a reorg goes; below it
+the state is `funded-unburied` however correct both halves are. The command's
+exit status says the same thing to a script: 0 for `live`, `forfeitable` and
+`settled`, and 4 for every state that is not one to act on.
 
 The settlement itself is composed in two steps, because it needs signatures from
 both parties and the covenant's witness must go on last. `repo-settle
