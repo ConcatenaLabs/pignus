@@ -148,8 +148,8 @@ function sha256(msg) {
     H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
   }
   const out = new Uint8Array(32);
-  new DataView(out.buffer).setUint32(0, H[0]);
-  for (let i = 0; i < 8; i++) new DataView(out.buffer).setUint32(i * 4, H[i]);
+  const odv = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) odv.setUint32(i * 4, H[i]);
   return out;
 }
 
@@ -281,6 +281,7 @@ const OP = {
   NIP: 0x77, SWAP: 0x7c, ROT: 0x7b, EQUAL: 0x87, EQUALVERIFY: 0x88,
   ONEADD: 0x8b, ADD: 0x93, LESSTHAN: 0x9f, GREATERTHANOREQUAL: 0xa2,
   VERIFY: 0x69, IF: 0x63, ELSE: 0x67, ENDIF: 0x68, CHECKSIG: 0xac,
+  SHA256: 0xa8,
   CLTV: 0xb1, CSFS: 0xc1, CSFSV: 0xc2, INSPECTINPUTVALUE: 0xc9,
   INSPECTINPUTSCRIPTPUBKEY: 0xca, PUSHCURRENTINPUTINDEX: 0xcd,
   INSPECTOUTPUTASSET: 0xce, INSPECTOUTPUTVALUE: 0xcf,
@@ -410,6 +411,24 @@ function seizureLeaf(t, { strike, maturity }) {
   return s.bytes();
 }
 
+/**
+ * Everything at output 2k, to one pinned payee: the whole input value, in the
+ * one asset, at the one program.
+ *
+ * Whatever gates a leaf decides WHO may trigger it; this body decides where the
+ * money can possibly go, which is the part that has to hold whoever triggers it.
+ */
+function sweepBody(s, asset, prog, ver) {
+  s.op(OP.PUSHCURRENTINPUTINDEX, OP.INSPECTINPUTVALUE, OP.ONE, OP.EQUALVERIFY);
+  s.op(...CREDIT_IDX).op(OP.INSPECTOUTPUTASSET, OP.ONE, OP.EQUALVERIFY)
+    .push(asset).op(OP.EQUALVERIFY);
+  s.op(...CREDIT_IDX).op(OP.INSPECTOUTPUTSCRIPTPUBKEY, verOp(ver),
+                         OP.EQUALVERIFY).push(prog).op(OP.EQUALVERIFY);
+  s.op(...CREDIT_IDX).op(OP.INSPECTOUTPUTVALUE, OP.ONE, OP.EQUALVERIFY);
+  s.op(OP.SWAP, OP.GREATERTHANOREQUAL64);
+  return s;
+}
+
 function recoverLeaf(t) {
   // Signature-free, like REPAY: after the backstop height anyone may sweep the
   // vault, but only to the lender's PINNED payout. That is what lets a lender
@@ -418,14 +437,24 @@ function recoverLeaf(t) {
   // nobody could exercise.
   const s = new ScriptBuilder();
   s.num(t.recoverAfter).op(OP.CLTV, OP.DROP);
-  s.op(OP.PUSHCURRENTINPUTINDEX, OP.INSPECTINPUTVALUE, OP.ONE, OP.EQUALVERIFY);
-  s.op(...CREDIT_IDX).op(OP.INSPECTOUTPUTASSET, OP.ONE, OP.EQUALVERIFY)
-    .push(t.assetC).op(OP.EQUALVERIFY);
-  s.op(...CREDIT_IDX).op(OP.INSPECTOUTPUTSCRIPTPUBKEY, verOp(t.lenderVer),
-                         OP.EQUALVERIFY).push(t.lenderProg).op(OP.EQUALVERIFY);
-  s.op(...CREDIT_IDX).op(OP.INSPECTOUTPUTVALUE, OP.ONE, OP.EQUALVERIFY);
-  s.op(OP.SWAP, OP.GREATERTHANOREQUAL64);
-  return s.bytes();
+  return sweepBody(s, t.assetC, t.lenderProg, t.lenderVer).bytes();
+}
+
+/**
+ * Pay everything to one pinned payee, to whoever publishes the preimage.
+ *
+ * The cross-chain half of Pignus needs one fact to travel from Sequentia to
+ * Bitcoin, and the only thing that crosses is a secret. The payout is pinned,
+ * so publishing the secret can only pay the party it was always going to pay,
+ * and the secret is known only to that party, so nobody else can trigger it
+ * early. Witness: [preimage, leaf, control block].
+ */
+function hashlockLeaf(preimageHash, asset, payeeProg, payeeVer) {
+  if (preimageHash.length !== 32)
+    throw new Error("a SHA-256 commitment is 32 bytes");
+  const s = new ScriptBuilder();
+  s.op(OP.SHA256).push(preimageHash).op(OP.EQUALVERIFY);
+  return sweepBody(s, asset, payeeProg, payeeVer).bytes();
 }
 
 // --------------------------------------------------------------- taproot
@@ -538,6 +567,65 @@ export function vaultScriptPubKey(terms) {
 }
 
 /**
+ * The two-leaf hashlocked output both cross-chain payments use.
+ *
+ * CLAIM pays the payee to whoever publishes the preimage, which is how a secret
+ * crosses from Sequentia to Bitcoin; REFUND returns the money to the sender once
+ * a deadline makes it clear the secret is never coming. Neither leaf needs a
+ * signature and neither can pay anyone but the party it names, so both sides can
+ * check the address they are about to fund by rebuilding it -- which is what
+ * this is for.
+ *
+ * `asset` is an RPC-display asset id, as everywhere else in the page; the
+ * reversing into internal order happens here.
+ */
+export function hashlockTaptree({ preimageHash, asset, payeeProg, payeeVer = 1,
+                                  refundAfter, refundProg, refundVer = 1 }) {
+  const a = reverse(hexToBytes(asset));
+  const claim = hashlockLeaf(hexToBytes(preimageHash), a,
+                             hexToBytes(payeeProg), payeeVer);
+  const refund = recoverLeaf({ recoverAfter: Number(refundAfter), assetC: a,
+                               lenderProg: hexToBytes(refundProg),
+                               lenderVer: refundVer });
+  const hc = leafHash(claim), hr = leafHash(refund);
+  const root = branchHash(hc, hr);
+  const tweak = taggedHash("TapTweak/elements", concat(NUMS, root));
+  const { x, negated } = tweakAddPubkey(NUMS, tweak);
+  const cb = (sibling) => concat(Uint8Array.from([LEAF_VERSION + (negated ? 1 : 0)]),
+                                 NUMS, sibling);
+  return {
+    leaves: { claim, refund },
+    controlBlocks: { claim: cb(hr), refund: cb(hc) },
+    negated,
+    scriptPubKey: () => concat(Uint8Array.from([0x51, 0x20]), x),
+  };
+}
+
+/** The order the four leaves are hashed into the tree, and its exit names. */
+export const EXITS = ["repay", "liquidate", "default", "recover"];
+
+/**
+ * The control block that proves one exit of a four-leaf vault.
+ *
+ * It lives here, beside the tree it describes, so there is ONE computation of
+ * the branch order and the parity byte -- and so `selfTest` can pin it against
+ * the golden vectors, which a spender-side copy could never be.
+ */
+export function controlBlock(terms, exit) {
+  const i = EXITS.indexOf(exit);
+  if (i < 0) throw new Error("unknown exit: " + exit);
+  const l = vaultLeaves(terms);
+  const h = EXITS.map(n => leafHash(l[n]));
+  const root = branchHash(branchHash(h[0], h[1]), branchHash(h[2], h[3]));
+  const tweak = taggedHash("TapTweak/elements", concat(NUMS, root));
+  const { negated } = tweakAddPubkey(NUMS, tweak);
+  // The tree is ((repay, liquidate), (default, recover)), so a leaf's proof is
+  // its sibling followed by the other pair's branch.
+  return concat(Uint8Array.from([LEAF_VERSION + (negated ? 1 : 0)]), NUMS,
+                h[i ^ 1], i < 2 ? branchHash(h[2], h[3]) : branchHash(h[0], h[1]));
+}
+
+/**
  * BIP340 verification over a message of ANY length, which is what
  * CHECKSIGFROMSTACK does and therefore what an attestation needs.
  *
@@ -574,9 +662,19 @@ export function attestationMessage(feed, timestamp, price) {
  * Not against whatever key the site is advertising: a vault names its own
  * oracle, and an attestation from anyone else is worthless to it however
  * convincing it looks.
+ *
+ * The price SCALE is checked too, when the attestation carries one. The scale
+ * is baked into the leaf and is not part of the signed message, so a price
+ * quoted at one scale and read at another carries a perfectly good signature
+ * over a number that means something else: ten times too small opens LIQUIDATE
+ * on a healthy loan and seizes ten times the collateral, ten times too large
+ * makes the loan unliquidatable. The covenant cannot see the difference, so
+ * this is the only place it can be caught. Mirrors pignus.oracle.verify.
  */
 export function verifyAttestation(terms, att) {
   const t = normaliseTerms(terms);
+  if (att.price_scale != null && big(att.price_scale, "price_scale") !== t.priceScale)
+    return false;
   const msg = attestationMessage(t.feedId, att.timestamp, att.price);
   return t.oracleKeys.some(k => verifySchnorr(k, msg, att.signature));
 }
@@ -628,6 +726,39 @@ export function selfTest(vectors) {
     if (spk !== c.scriptPubKey)
       throw new Error(`scriptPubKey differs on vault case '${c.name}': ` +
                       `${spk} != ${c.scriptPubKey}`);
+    // The control blocks matter as much as the address: a wrong branch order
+    // or parity byte produces a witness the interpreter refuses, which is a
+    // signature already given away for a spend that cannot happen.
+    for (const [name, want] of Object.entries(c.control_blocks || {})) {
+      const got = bytesToHex(controlBlock(terms, name));
+      if (got !== want)
+        throw new Error(`control block '${name}' differs on vault case ` +
+                        `'${c.name}'`);
+    }
+  }
+  // The cross-chain payments use the same leaves through a two-leaf tree, and
+  // a wrong address there strands a principal or a repayment just as surely.
+  for (const c of vectors.hashlocks || []) {
+    const p = c.params;
+    const tree = hashlockTaptree({
+      preimageHash: p.preimage_hash,
+      asset: bytesToHex(reverse(hexToBytes(p.asset))),
+      payeeProg: p.payee_prog, payeeVer: p.payee_ver ?? 1,
+      refundAfter: p.refund_after,
+      refundProg: p.refund_prog, refundVer: p.refund_ver ?? 1,
+    });
+    for (const [name, want] of Object.entries(c.leaves)) {
+      const got = bytesToHex(tree.leaves[name]);
+      if (got !== want)
+        throw new Error(`hashlock leaf '${name}' differs on case '${c.name}'`);
+    }
+    if (bytesToHex(tree.scriptPubKey()) !== c.scriptPubKey)
+      throw new Error(`hashlock address differs on case '${c.name}'`);
+    for (const [name, want] of Object.entries(c.control_blocks || {})) {
+      if (bytesToHex(tree.controlBlocks[name]) !== want)
+        throw new Error(`hashlock control block '${name}' differs on case ` +
+                        `'${c.name}'`);
+    }
   }
   _selfTested = vectors.vaults.length;
   return _selfTested;
@@ -640,6 +771,11 @@ export function selfTest(vectors) {
  * Throws if they differ, and throws if `selfTest()` has not passed -- deriving
  * an address from an unpinned implementation is exactly the thing this module
  * exists to prevent, so it refuses rather than answering confidently.
+ *
+ * This is the FOUR-LEAF vault of a directly originated loan. A loan drawn from
+ * a funded offer lives in the single-leaf tree instead, at a different address:
+ * check that one against `offerVaultScriptPubKey` in offer.js, which is what
+ * the page does for a loan the book marks `single_leaf`.
  */
 export function verifyFunding(terms, fundingScriptPubKey) {
   if (_selfTested === null)
@@ -690,5 +826,5 @@ export const _internals = { sha256, taggedHash, hexToBytes, bytesToHex, le8, big
                             // ONE definition of each leaf in the browser, which
                             // is the whole reason the golden vectors mean
                             // anything.
-                            repayLeaf, recoverLeaf, NUMS,
+                            repayLeaf, recoverLeaf, NUMS, LEAF_VERSION,
                             pointAdd, pointMul, liftX, mod, N, P, Gx, Gy };

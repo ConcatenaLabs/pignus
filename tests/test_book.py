@@ -16,8 +16,13 @@ Proven here, with a node behind the book:
   REJECT a real outpoint that holds something else
   REJECT a real offer output described with ALTERED terms
   REJECT an offer holding less than one principal
+  REJECT re-publishing a listed coin without its manage token (409)
+  REJECT cancelling a listing without that token, or with the wrong one
+  PASS   cancelling it with the token, once
   PASS   a real loan is accepted and tracked
   REJECT a loan whose outpoint is not the vault its terms compile to
+  REJECT a vault at the right address holding the wrong amount
+  REJECT a vault at the right address holding the wrong asset
 """
 
 import json
@@ -54,6 +59,25 @@ def post(url, body):
     req = urllib.request.Request(
         url, data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def get(url):
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode() or "{}")
+
+
+def delete(url, token=None):
+    req = urllib.request.Request(url, method="DELETE")
+    if token is not None:
+        req.add_header("X-Manage-Token", token)
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             return r.status, json.loads(r.read().decode())
@@ -148,6 +172,59 @@ def main():
             check("and its on-chain value is recorded from the chain, not the "
                   "claim", body.get("funded_value") == str(2900 * COIN),
                   str(body.get("funded_value")))
+            offer_id, tok = body.get("offer_id"), body.get("manage_token")
+            check("the publisher is handed a manage token, once", bool(tok))
+
+            # The id is DERIVED from the terms and the coin. An id a publisher
+            # could choose is an id anyone could choose, and publishing under
+            # someone else's would replace their record, manage token and all.
+            code, body2 = post(base + "/v1/offers", dict(
+                good, offer_id="00" * 16, status="taken",
+                funded_value=str(1), created=1))
+            check("re-publishing the same coin without its token is a 409",
+                  code == 409, f"{code} {json.dumps(body2)[:120]}")
+            code, view = get(f"{base}/v1/offer/{offer_id}")
+            check("and the listing it tried to overwrite is untouched",
+                  code == 200 and view["outpoint"] == f"{txid}:{vout}"
+                  and view["status"] == "open"
+                  and view["funded_value"] == str(2900 * COIN),
+                  json.dumps(view)[:200])
+            check("a body's own offer_id is ignored: the id is the one the book "
+                  "derived", offer_id not in ("00" * 16,))
+
+            # --- the manage token ----------------------------------------
+            code, body2 = delete(f"{base}/v1/offers/{offer_id}")
+            check("cancelling with no token is refused", code == 403, str(code))
+            code, body2 = delete(f"{base}/v1/offers/{offer_id}", "not-the-token")
+            check("and so is cancelling with the wrong one", code == 403,
+                  str(code))
+            check("neither refusal removed the listing",
+                  get(f"{base}/v1/offer/{offer_id}")[0] == 200)
+            code, body2 = post(base + "/v1/offers", dict(good, manage_token=tok))
+            check("but the publisher may republish their own listing",
+                  code == 200, f"{code} {json.dumps(body2)[:120]}")
+            code, body2 = delete(f"{base}/v1/offers/{offer_id}", tok)
+            check("the token cancels it", code == 200
+                  and body2.get("removed") is True, json.dumps(body2)[:120])
+            code, _ = delete(f"{base}/v1/offers/{offer_id}", tok)
+            check("and cancelling it twice is a clean 404", code == 404,
+                  str(code))
+            code, body = post(base + "/v1/offers", good)
+            check("the coin can be listed again once the listing is gone",
+                  code == 200, f"{code} {json.dumps(body)[:120]}")
+            offer_id = body["offer_id"]
+
+            # --- what /v1/outpoint says about a coin ----------------------
+            code, op = get(f"{base}/v1/outpoint/{txid}/{vout}")
+            check("the outpoint endpoint reports the coin as a decimal string "
+                  "of atoms, not a float",
+                  code == 200 and op.get("value") == str(2900 * COIN),
+                  json.dumps(op)[:160])
+            code, op = get(f"{base}/v1/outpoint/{'00' * 32}/0")
+            check("a coin that is not there is a 404", code == 404, str(code))
+            code, op = get(f"{base}/v1/outpoint/{txid}/notanumber")
+            check("and a vout that is not a number is refused, not a 500",
+                  code in (400, 404), str(code))
 
             code, body = post(base + "/v1/offers", {
                 **good, "outpoint": "00" * 32 + ":0"})
@@ -195,6 +272,47 @@ def main():
             check("a loan whose outpoint is not its vault is refused",
                   code == 400 and "does not hold" in body.get("error", ""),
                   json.dumps(body)[:120])
+
+            # The address commits to the terms but NOT to what the coin holds,
+            # so a vault at exactly the right address can hold one atom, or the
+            # wrong asset entirely. Everything the page and the liquidator
+            # compute -- health, LTV, what a seizure takes -- is derived from
+            # the terms, so a vault that does not hold what they say puts a
+            # whole fictional position in front of everyone.
+            thin = LoanTerms(**{**json.loads(tj),
+                                "maturity": terms.maturity + 1})
+            thin_spk = thin.script_pubkey()
+            thin_addr = n.deriveaddresses(
+                n.getdescriptorinfo(f"raw({thin_spk.hex()})")["descriptor"])[0]
+            ttxid = n.sendtoaddress(address=thin_addr, amount=0.00000001,
+                                    assetlabel=c, fee_asset_label="bitcoin")
+            rig.seq_mine(1)
+            tvout = next(o["n"] for o in n.getrawtransaction(ttxid, True)["vout"]
+                         if o["scriptPubKey"]["hex"] == thin_spk.hex())
+            code, body = post(base + "/v1/loans",
+                              {"terms": thin.to_json(), "txid": ttxid,
+                               "vout": tvout})
+            check("a vault at the right address holding one atom is refused",
+                  code == 400 and "atoms, but the terms lock" in body.get("error", ""),
+                  json.dumps(body)[:160])
+
+            wrong = LoanTerms(**{**json.loads(tj),
+                                 "maturity": terms.maturity + 2})
+            wrong_spk = wrong.script_pubkey()
+            wrong_addr = n.deriveaddresses(
+                n.getdescriptorinfo(f"raw({wrong_spk.hex()})")["descriptor"])[0]
+            wtxid = n.sendtoaddress(address=wrong_addr, amount=10, assetlabel=d,
+                                    fee_asset_label="bitcoin")
+            rig.seq_mine(1)
+            wvout = next(o["n"] for o in n.getrawtransaction(wtxid, True)["vout"]
+                         if o["scriptPubKey"]["hex"] == wrong_spk.hex())
+            code, body = post(base + "/v1/loans",
+                              {"terms": wrong.to_json(), "txid": wtxid,
+                               "vout": wvout})
+            check("and one holding the right amount of the WRONG asset is too",
+                  code == 400
+                  and "not the collateral asset" in body.get("error", ""),
+                  json.dumps(body)[:160])
         finally:
             proc.terminate()
             proc.wait(timeout=20)

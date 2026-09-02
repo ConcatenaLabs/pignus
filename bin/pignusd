@@ -16,9 +16,18 @@ Config:
       "listen":   "127.0.0.1:8741",
       "book":     "/var/lib/pignus/book.json",
       "oracle":   "http://127.0.0.1:8740",
+      "oracles":  ["http://127.0.0.1:8742", "http://127.0.0.1:8743"],
       "registry": "http://127.0.0.1:3005",
       "markets":  ["GOLD/USDX", "SILVR/USDX", "OILX/USDX"],
       "poll":     30,
+      "block_seconds":    60,
+      "reference_ticker": "USDX",
+      "max_price_age":    600,
+      "min_depth":        2,
+      "rescan_depth":     1500,
+      "back_scan_cap":    200,
+      "prune_after":      2592000,
+      "trusted_proxies":  ["127.0.0.1", "::1"],
       "rpc":      {"url": "http://127.0.0.1:18200", "user": "...",
                    "password": "...", "wallet": ""}
     }
@@ -29,34 +38,92 @@ last knew, and says so in /healthz rather than pretending the states are fresh.
 nobody has to type a 64-hex id into a form; the node's own asset labels are
 the fallback.
 
+`oracle` is the PRIMARY oracle: its key is the one this book hands lenders and
+its attestations are the prices shown. `oracles` are further independent
+endpoints, quoted for threshold loans; they never stand in for the primary,
+because a vault verifies against the key baked into it. A price older than
+`max_price_age` seconds is stale: health, LTV and liquidatable are withheld
+rather than computed from it, and /healthz turns unhealthy.
+
+`min_depth` is how deep a funding must be before a loan reads as LIVE, and
+`rescan_depth` how far back a poll walks to find a spend it missed.
+`back_scan_cap` is how many blocks one poll may fetch for those backward walks:
+the walk is the expensive half of a poll, so it is rationed and a search that
+runs out of budget resumes on the next one. A watcher that was down for longer
+than `rescan_depth` cannot reach the gap at all; start it once with
+`--rescan-from <height>` and the forward scan reads those blocks again.
+`prune_after` is how long a finished record is kept: an offer whose coin is
+spent, a vault that closed, a cross-chain take that ended. The chain is the
+record and this book is an index of it, so nothing pruned is lost -- but every
+list is rendered from end to end on every read, and a record nothing can happen
+to any more pays that for ever. Anything still open is kept whatever its age,
+and a zero keeps everything.
+`trusted_proxies` are the peers whose `X-Forwarded-For` this daemon believes,
+which is how the write rate limit is keyed per client behind a reverse proxy;
+a request arriving from a trusted proxy WITHOUT that header is the box's own
+tooling and is not rate-limited.
+
 The book follows the chain on its own. An offer's coin is watched; when it is
 taken, the borrower's payout program is read out of the witness, the new vault
 is registered as a loan, and the offer moves to its remainder. So a loan taken
-by ANY wallet -- through this page or not -- turns up here.
+by ANY wallet -- through this page or not -- turns up here, provided the take is
+within the watcher's reach: forwards from wherever it last scanned, and back at
+most `rescan_depth` blocks. After longer downtime than that, start it once with
+`--rescan-from <height>`.
 
 Endpoints:
     GET  /                     the page
     GET  /v1/markets           markets: prices, asset ids, tickers, precisions
     GET  /v1/assets            the registry, keyed by asset id
     GET  /v1/fees              the node's fee exchange rates and relay floor
-    GET  /v1/offers            open offers      (?market=, ?status=all)
-    GET  /v1/offer/{id}        one offer, with what its coin holds right now
+    GET  /v1/offers            open offers  (?market=, ?status=all, ?limit=)
+    GET  /v1/offers/{id}       one offer, with what its coin holds right now
     POST /v1/offers            publish a funded offer (checked on chain first)
     DELETE /v1/offers/{id}     drop a listing (the coin is untouched)
-    GET  /v1/loans             known loans     (?state=, ?market=)
+    GET  /v1/loans             known loans (?state=, ?market=, ?oracle_x=,
+                               ?limit=)
     POST /v1/loans             register a loan for watching (checked first)
-    GET  /v1/loan/{id}         one loan, with health at the current price
+    GET  /v1/loans/{id}        one loan, with health at the current price
+    GET  /v1/loans/{id}/exit   how a closed loan ended, read back off the chain
     GET  /v1/outpoint/{txid}/{vout}   what an outpoint holds (mempool included)
-    GET  /v1/attestation/{market}     the latest verified attestation
+    GET  /v1/attestation/{market}     the primary oracle's latest attestation
+                               (?oracle=<x> for one other oracle's)
+    GET  /v1/attestations/{market}    one verified attestation per oracle
     GET  /v1/stats             counts, live debt, positions near their strike
-    GET  /v1/oracle            the oracle key and feeds this book quotes against
+    GET  /v1/oracle            the primary oracle key this book quotes against
+    GET  /v1/oracles           every oracle key, for an m-of-n threshold loan
     GET  /v1/vectors           the golden vectors the browser pins itself to
+    GET  /v1/btc/offers        BTC-collateral offers        (?status=)
+    GET  /v1/btc/offer/{id}    one offer, with the lots left on it
+    POST /v1/btc/offers        a lender publishes one, signed by their own key
+    POST /v1/btc/offers/{id}/withdraw   the same lender takes it down
+    POST /v1/btc/take          a borrower asks for a loan
+    POST /v1/btc/hash          the lender draws this loan's secret and
+                               publishes its hash, which both chains commit to
+    POST /v1/btc/presig        the borrower signs the move into the vault,
+                               which they can only derive once that hash exists
+    GET  /v1/btc/takes         the queue   (?status=, ?offer_id=, ?borrower_x=)
+    GET  /v1/btc/take/{id}     one take
+    POST /v1/btc/adaptor       the lender returns a release, with its own secret
+    POST /v1/btc/disbursed     the lender reports the principal paid
+    POST /v1/btc/upgraded      the lender reports the loan started
+    POST /v1/btc/claimed       the lender publishes the secret that releases
+                               the collateral
+    POST /v1/btc/refunded      the lender reports an unclaimed principal taken
+                               back
+    POST /v1/btc/claimed-principal   the borrower reports taking the principal
     GET  /healthz
+
+`/v1/offer/{id}` and `/v1/loan/{id}` are accepted as aliases of the plural
+forms. The page's own files in web/ are served by their bare name (.js, .json,
+.css, .svg) and nothing else is.
 """
 
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -66,29 +133,70 @@ from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
-from pignus import oracle as O                     # noqa: E402
-from pignus import fees as F                       # noqa: E402
-from pignus.book import Book                       # noqa: E402
-from pignus.node import Node, RpcError             # noqa: E402
-from pignus.offers import (                        # noqa: E402
+from pignus import __version__, atoms               # noqa: E402
+from pignus import compat                           # noqa: E402
+from pignus import oracle as O                      # noqa: E402
+from pignus import fees as F                        # noqa: E402
+from pignus.book import Book, OfferExists           # noqa: E402
+from pignus.node import Node, RpcError              # noqa: E402
+from pignus.offers import (                         # noqa: E402
     NotOnChain, check_outpoint, offer_address, offer_vault_address,
 )
-from pignus.terms import LoanTerms, feed_id        # noqa: E402
-from pignus.watcher import VaultWatcher, State     # noqa: E402
+from pignus.terms import LoanTerms, feed_id         # noqa: E402
+from pignus.watcher import State, VaultWatcher, CLOSED   # noqa: E402
 
 WEB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "web")
 MAX_BODY = 256 * 1024
 # A book anyone can write to is a book anyone can flood. These are generous for
-# a testnet and small enough that the whole file stays cheap to rewrite.
+# a testnet and small enough that the whole file stays cheap to rewrite. They
+# count what is still LIVE: a book that has seen 2000 listings over its life is
+# not full, and a lifetime cap would eventually refuse everybody.
 MAX_OFFERS = 2000
+# How long a take that nobody has signed holds a lender's offer shut. A borrower
+# who asks for a release and walks away must not close an offer for ever; a
+# lender who has signed one has committed, and that take keeps its place.
+BTC_TAKE_TTL = 1800
+# The move into the vault is signed at origination and cannot be replaced, so
+# its fee is decided before anyone knows what the parent chain will cost. At
+# roughly 180 vbytes this is about 55 sat/vB, which is generous on testnet4 and
+# is the point: an upgrade that cannot confirm before the collateral becomes
+# abortable is a loan the lender has paid for and cannot start.
+MIN_UPGRADE_FEE = 10_000
+# What a Bitcoin output has to hold to be worth anything: below this the network
+# will not relay the transaction that spends it.
+BTC_DUST = 330
+# And how long a take that WAS signed holds one without the collateral ever
+# appearing. A lender has committed to a signed take, so it keeps its place --
+# but not for ever against a taker who never funded anything, or every lot of
+# every offer could be consumed for the cost of a few requests.
+BTC_SIGNED_TAKE_TTL = 6 * 3600
 MAX_LOANS = 5000
-COIN = 100_000_000
+# How many registrations one client may have waiting to bury at once. A loan is
+# registered before its funding is confirmed, so a caller can hand the book a
+# mempool transaction and then double-spend it: every one of those becomes a
+# GHOST that stays in the book. A real borrower opens one loan at a time; this
+# bounds what a flood of never-confirmed ones can cost.
+MAX_PENDING_PER_CLIENT = 20
+CLOSED_NAMES = {s.value for s in CLOSED}
+# The states a registration is still waiting on: not yet buried, or buried and
+# then undone. Both are cheap to manufacture, so both count against the cap.
+PENDING_NAMES = {State.UNCONFIRMED.value, State.GHOST.value}
+STATE_NAMES = {s.value for s in State}
 
 # Market symbols that are not registry tickers. The Sequence token is listed
 # as tSEQ on the testnet; native Bitcoin has no Sequentia asset id at all, so a
-# BTC market is cross-chain and this page cannot originate against it.
+# BTC market is cross-chain: it is not lendable through the covenant offers,
+# and is served by the /v1/btc/* endpoints instead.
 ALIASES = {"SEQ": "tSEQ", "TSEQ": "tSEQ"}
 NATIVE = {"BTC", "TBTC"}
+# What a client may say about an offer. Everything else about a record -- its
+# id, its status, when it was created, what its coin holds -- is the book's to
+# decide or this daemon's to read off the chain, or a publisher could overwrite
+# somebody else's listing by naming it. `manage_token` is passed through
+# because the book uses it to recognise a REPUBLISH of the same coin by the
+# same publisher; a listing that does not exist yet is not authenticated by it.
+OFFER_FIELDS = ("terms", "kind", "outpoint", "principal", "collateral",
+                "expiry_locktime", "manage_token")
 
 
 class _RateLimiter:
@@ -99,9 +207,13 @@ class _RateLimiter:
         self.rate, self.burst = rate, burst
         self._buckets = {}
         self._lock = threading.Lock()
+        self._calls = 0
 
     def allow(self, key, now):
         with self._lock:
+            self._calls += 1
+            if self._calls % 1000 == 0 or len(self._buckets) > 10_000:
+                self._sweep(now)
             tokens, last = self._buckets.get(key, (self.burst, now))
             tokens = min(self.burst, tokens + (now - last) * self.rate)
             if tokens < 1.0:
@@ -110,8 +222,97 @@ class _RateLimiter:
             self._buckets[key] = (tokens - 1.0, now)
             return True
 
+    def _sweep(self, now):
+        """Forget buckets that have refilled to full: they say the same thing
+        as a client never seen before, and once the key is a real client
+        address the map would otherwise grow forever."""
+        idle = self.burst / self.rate
+        for k in [k for k, (_t, last) in self._buckets.items()
+                  if now - last >= idle]:
+            del self._buckets[k]
+
 
 WRITE_LIMIT = _RateLimiter()
+# A second bucket for everyone together, so a flood spread over many source
+# addresses still cannot rewrite the book file thousands of times a second.
+GLOBAL_WRITE_LIMIT = _RateLimiter(rate=20.0, burst=200)
+
+# Records that cannot be rendered, and the error each last failed with. Every
+# list is fetched every few seconds by every open page and by the liquidator,
+# so one bad record is logged when it starts failing rather than once per read.
+UNRENDERABLE = {}
+
+
+def _is_hex(text):
+    return bool(text) and all(c in "0123456789abcdefABCDEF" for c in text)
+
+
+def _git_rev():
+    """The checkout this daemon is running from, when there is one.
+
+    Two boxes reporting the same version number can still be running different
+    code; the revision is what settles it. Read once, at start-up, and left out
+    entirely when there is no checkout to read -- a release tarball is not a
+    working tree, and inventing a revision for it would be worse than silence.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    try:
+        out = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+GIT_REV = _git_rev()
+
+
+def _limit(rows, q):
+    """`?limit=N` over a list that is already newest-first. The default is the
+    whole book, because the page filters states itself and would otherwise
+    silently stop showing a reader their own older loans."""
+    try:
+        n = int(q.get("limit", ["0"])[0])
+    except (TypeError, ValueError):
+        raise ValueError("limit must be a number")
+    if n < 0:
+        raise ValueError("limit must not be negative")
+    return rows[:n] if n else rows
+
+
+def _attested(att, oracle_x, max_age):
+    """One attestation as it is served: the signed fields untouched, with who
+    signed it and how old it is beside them.
+
+    Age is not a signed property and cannot be -- an attestation is a signature
+    over a price at a timestamp, and nothing about it changes as it ages. But a
+    reader acting on it needs to know, and a page that shows an hour-old price
+    without saying so is showing fiction. Readers that only want the signed
+    fields drop these on the way in.
+    """
+    d = att.to_dict()
+    d["oracle_x"] = oracle_x
+    d["age"] = max(0, int(time.time()) - int(att.timestamp))
+    d["stale"] = d["age"] > max_age
+    return d
+
+
+def _loan_oracle_keys(rec):
+    """Every oracle key a stored loan's document names, lower-cased.
+
+    Read straight out of the terms rather than through LoanTerms: this backs a
+    filter, and a filter must not fail on the one record that cannot be built.
+    Both `oracle_x` and the threshold set are included, because the question it
+    answers -- may this key be retired yet? -- is better answered generously.
+    """
+    try:
+        d = json.loads(rec.get("terms") or "{}")
+    except (TypeError, ValueError):
+        return ()
+    keys = list(d.get("oracles") or []) + [d.get("oracle_x")]
+    return tuple(str(k).lower() for k in keys if k)
 
 
 def _views(render, rows):
@@ -119,18 +320,27 @@ def _views(render, rows):
     500-ing the whole list because one stored record is malformed."""
     out = []
     for r in rows:
+        rid = r.get("offer_id") or r.get("loan_id") or "?"
         try:
             out.append(render(r))
         except Exception as e:                      # noqa: BLE001
-            sys.stderr.write(f"skipping unrenderable record "
-                             f"{r.get('offer_id') or r.get('loan_id') or '?'}: "
-                             f"{type(e).__name__}: {e}\n")
+            msg = f"{type(e).__name__}: {e}"
+            if UNRENDERABLE.get(rid) != msg:
+                sys.stderr.write(f"skipping unrenderable record {rid}: {msg}\n")
+            UNRENDERABLE[rid] = msg
+        else:
+            UNRENDERABLE.pop(rid, None)
     return out
 
 
 class Service:
     def __init__(self, cfg):
         self.cfg = cfg
+        # The book is rewritten through a temporary file in its own directory,
+        # so that directory has to exist before the first write rather than at
+        # the first POST, which is hours later and looks like a different fault.
+        os.makedirs(os.path.dirname(os.path.abspath(cfg["book"])) or ".",
+                    exist_ok=True)
         self.book = Book(cfg["book"])
         self.oracle_url = cfg.get("oracle", "").rstrip("/")
         # One book can quote against several INDEPENDENT oracles, which is what
@@ -147,29 +357,80 @@ class Service:
         self.oracle_keys = []                       # x-only hex, in url order
         self.oracle_key_by_url = {}
         self.att_by_oracle = {}                     # (oracle_x, market) -> att
+        # What each oracle says the two assets of a market are denominated in.
+        # The price is an integer scaled by those precisions, so an oracle
+        # working from one set and a registry publishing another do not disagree
+        # about a label -- they disagree about the number, by a factor of ten
+        # per decimal, and nothing on chain would notice.
+        self.oracle_precisions = {}                 # (oracle_x, market) -> (c,d)
+        # The scale the PRIMARY quotes each market at. An attestation carries a
+        # perfectly good signature over an integer whose meaning depends on it.
+        self.price_scales = {}                      # market -> price_scale
         self.registry_url = cfg.get("registry", "").rstrip("/")
         self.markets = list(cfg.get("markets", []))
-        self.prices = {}
+        # The last VERIFIED attestation per market, whatever its age. The
+        # prices acted on are the young ones, from fresh_prices().
         self.attestations = {}
         self.oracle_x = None
         self.node = None
         self.node_error = None
         self.oracle_error = None
+        self.oracle_errors = []
         self.last_poll = 0
         self.height = None
         self.assets = {}            # asset id -> {ticker, name, precision}
         self.by_ticker = {}         # TICKER (upper) -> asset id
-        self.fee_table = {"rates": {}, "relay_floor_rfa_per_kvb": 100,
-                          "feerate_rfa_per_kvb": F.DEFAULT_FEERATE_RFA_PER_KVB,
-                          "vsize": dict(F.VSIZE)}
+        self.fee_table = F.empty_table()
         self._registry_at = 0
+        self.poll_interval = max(2, int(cfg.get("poll", 30)))
+        # How deep a funding must be before a loan reads as LIVE. The design
+        # says depth is the lender's risk appetite, so it is configuration, not
+        # a constant -- and the page shows the number it is actually using.
+        self.min_depth = int(cfg.get("min_depth", 2))
+        self.rescan_depth = int(cfg.get("rescan_depth", 1500))
+        # The backward walk is the expensive half of a poll. This is how many
+        # blocks one poll may fetch for it, so a book with a long history cannot
+        # spend an entire poll reading it back.
+        self.back_scan_cap = int(cfg.get("back_scan_cap", 200))
+        # How long a finished record is kept. Thirty days is long past every
+        # deadline a loan has and long past when anyone reads back how one
+        # ended, and short enough that a book serving a busy market does not
+        # render years of history on every fetch.
+        self.prune_after = int(cfg.get("prune_after", 30 * 24 * 3600))
+        # A price older than this is not a price. Health, LTV and liquidatable
+        # are withheld rather than computed from it.
+        self.max_price_age = int(cfg.get("max_price_age", 600))
+        self.trusted_proxies = set(str(p) for p in
+                                   cfg.get("trusted_proxies",
+                                           ["127.0.0.1", "::1"]))
         rpc = cfg.get("rpc")
         if rpc and rpc.get("url"):
             self.node = Node(url=rpc["url"], user=rpc.get("user"),
                              password=rpc.get("password"),
                              wallet=rpc.get("wallet") or None,
                              cookie_path=rpc.get("cookie"))
-        self.watcher = VaultWatcher(self.node) if self.node else None
+        # A Bitcoin node, if this book is asked to carry cross-chain messages.
+        # It never spends anything: it is here so the book reads the parent
+        # chain's tip itself rather than believing a height a client sent, and
+        # so it can say plainly when it cannot see that chain at all.
+        self.btc_node = None
+        btc_rpc = cfg.get("btc_rpc")
+        if btc_rpc and btc_rpc.get("url"):
+            self.btc_node = Node(url=btc_rpc["url"], user=btc_rpc.get("user"),
+                                 password=btc_rpc.get("password"),
+                                 wallet=btc_rpc.get("wallet") or None,
+                                 cookie_path=btc_rpc.get("cookie"))
+        self.watcher = (VaultWatcher(self.node, min_depth=self.min_depth,
+                                     rescan_depth=self.rescan_depth,
+                                     back_scan_cap=self.back_scan_cap)
+                        if self.node else None)
+        # Which client registered which loan, so a flood of registrations that
+        # never bury is charged to whoever made it. Swept as it is read.
+        self._pending_by_client = {}
+        # A vault address is a pure function of the terms, and deriving one is
+        # script assembly plus an EC tweak. /v1/loans renders every loan on
+        # every fetch, so the derivations are kept.
+        self._spk_cache = {}
         self._lock = threading.Lock()
         # refresh_chain runs on the poll thread AND synchronously inside a POST
         # handler thread; VaultWatcher.poll mutates shared state, so the two
@@ -183,29 +444,52 @@ class Service:
 
     # ------------------------------------------------------------- the oracle
 
+    @staticmethod
+    def _att_key(oracle_x, market):
+        """How an attestation is filed: by key and market, both canonicalised.
+
+        The covenant compares oracle keys as BYTES and derives the feed id from
+        an upper-cased market name, so `AB…` and `ab…` are one oracle to it, and
+        `gold/usdx` is one market. Keying on the strings verbatim would file a
+        loan's own oracle under a name it never looks up, and the loan would
+        show no price at all."""
+        return (str(oracle_x).lower(), str(market).upper())
+
     def refresh_prices(self):
         if not self.oracle_urls:
             return
-        keys, key_by_url, errors = [], {}, []
+        primary = self.oracle_urls[0]
+        key_by_url, errors = {}, []
         for url in self.oracle_urls:
             try:
                 with urllib.request.urlopen(f"{url}/v1/pubkey", timeout=8) as r:
-                    ox = json.loads(r.read().decode())["oracle_x"]
-                keys.append(ox)
-                key_by_url[url] = ox
+                    key_by_url[url] = json.loads(r.read().decode())["oracle_x"]
             except Exception as e:                  # noqa: BLE001
                 errors.append(f"{url}: {type(e).__name__}: {e}")
         with self._lock:
-            self.oracle_keys = keys
+            # Configured order, not the order they happened to answer in.
+            self.oracle_keys = [key_by_url[u] for u in self.oracle_urls
+                                if u in key_by_url]
             self.oracle_key_by_url = key_by_url
             # The FIRST oracle is the "primary": its price is what the page
-            # shows and what a plain single-oracle loan bakes in.
-            self.oracle_x = keys[0] if keys else None
-        self.oracle_error = "; ".join(errors) if errors and not keys else None
+            # shows and what a plain single-oracle loan bakes in. An outage of
+            # the primary must NOT promote the next oracle. A vault verifies
+            # against the key baked into it, so serving another signer's key
+            # and attestations would hand lenders a key their loans do not use
+            # and break the check on every loan already open. Keep the last key
+            # known, stop updating the price, and say so in /healthz.
+            if primary in key_by_url:
+                self.oracle_x = key_by_url[primary]
+        primary_err = next((e for e in errors if e.startswith(primary + ":")),
+                           None)
+        self.oracle_error = (f"primary oracle unreachable: {primary_err}"
+                             if primary_err else None)
+        fresh_primary = 0
         for url in self.oracle_urls:
             ox = key_by_url.get(url)
             if not ox:
                 continue
+            self._refresh_oracle_precisions(url, ox, errors)
             for m in self.markets:
                 try:
                     a_url = f"{url}/v1/attestation/{m.replace('/', '_')}"
@@ -219,11 +503,95 @@ class Service:
                 # number, not for the transport that carried it.
                 if not O.verify(ox, att):
                     continue
+                scale = int(att.price_scale)
+                if url == primary:
+                    self.price_scales[m] = scale
+                elif self.price_scales.get(m) not in (None, scale):
+                    # A good signature over a number that means something else.
+                    # The scale is not in the signed message, so a second oracle
+                    # quoting at ten times the primary's is not detectable from
+                    # the signature -- and quoting one against the other would
+                    # make a healthy loan look liquidatable by a factor of ten.
+                    errors.append(
+                        f"{url}: quotes {m} at price_scale {scale}, but the "
+                        f"primary quotes it at {self.price_scales[m]}; that "
+                        "attestation is not comparable and was dropped")
+                    continue
                 with self._lock:
-                    self.att_by_oracle[(ox, m)] = att
-                    if ox == self.oracle_x:
-                        self.prices[m] = att.price
+                    self.att_by_oracle[self._att_key(ox, m)] = att
+                    if url == primary:
+                        fresh_primary += 1
                         self.attestations[m] = att
+        if primary_err is None and self.markets and not fresh_primary:
+            self.oracle_error = (f"primary oracle {primary} published no "
+                                 "attestation this book could verify")
+        self.oracle_errors = errors
+
+    def _refresh_oracle_precisions(self, url, ox, errors):
+        """What each oracle believes the two assets of a market are denominated
+        in. The price is an integer scaled by exactly those two precisions, so
+        an oracle configured against 8 decimals and a registry publishing 2
+        agree about every label and disagree about the number by a millionfold.
+        Nothing on chain would notice, which is why it is checked here."""
+        try:
+            with urllib.request.urlopen(f"{url}/v1/markets", timeout=8) as r:
+                rows = json.loads(r.read().decode()).get("markets") or []
+        except Exception as e:                      # noqa: BLE001
+            errors.append(f"{url}/v1/markets: {type(e).__name__}: {e}")
+            return
+        with self._lock:
+            for row in rows:
+                m = str(row.get("market") or "")
+                cp = row.get("collateral_precision")
+                dp = row.get("debt_precision")
+                if not m or cp is None or dp is None:
+                    continue
+                self.oracle_precisions[self._att_key(ox, m)] = (int(cp), int(dp))
+
+    def fresh_prices(self):
+        """The prices young enough to act on. A price kept from hours ago is
+        still a verified attestation -- freshness is not a covenant property --
+        but it is not something to compute a liquidation from."""
+        now = int(time.time())
+        return {m: a.price for m, a in self.attestations.items()
+                if now - a.timestamp <= self.max_price_age}
+
+    def stale_markets(self):
+        fresh = self.fresh_prices()
+        return sorted(m for m in self.markets if m not in fresh)
+
+    def price_for(self, t):
+        """The price to judge ONE set of terms by, or None.
+
+        Not the book's primary price: a vault verifies against the keys baked
+        into it, so a loan built on another oracle -- one left behind by a key
+        rotation, or a threshold set -- has to be shown at those keys' price or
+        at no price at all. A number from a key the covenant will not accept is
+        a number nobody can act on, and putting it on the page as health and
+        LTV would invite exactly that.
+
+        The attestations here are already verified against the key they are
+        filed under; what is checked again is what depends on the terms rather
+        than on the oracle: the scale the loan computes at, the timestamp floor
+        the covenant enforces, and how many the vault requires. The covenant
+        takes the MAXIMUM of the prices presented and the best a spender can
+        present is the `threshold` lowest, so the threshold-th lowest is the
+        number the script would actually compute with.
+        """
+        now = int(time.time())
+        prices = []
+        for k in t.oracle_keys:
+            att = self.att_by_oracle.get(self._att_key(k, t.market))
+            if att is None or now - att.timestamp > self.max_price_age:
+                continue
+            if int(att.price_scale) != int(t.price_scale):
+                continue
+            if att.timestamp < t.not_before:
+                continue
+            prices.append(att.price)
+        if len(prices) < t.threshold:
+            return None
+        return sorted(prices)[t.threshold - 1]
 
     # ----------------------------------------------------------- the registry
 
@@ -283,60 +651,157 @@ class Service:
         except Exception as e:                      # noqa: BLE001
             print(f"fees: {type(e).__name__}: {e}", file=sys.stderr)
 
-    def refresh_chain(self):
+    def refresh_chain(self, wait=0):
+        """Reconcile the book to the chain.
+
+        `wait` is how long a caller will hold on for the poll thread to finish
+        the reconciliation it is in the middle of. The loop passes nothing and
+        skips -- it will come round again in a few seconds. A POST passes a
+        second or two, because the record it is about to serve back is the one
+        the caller will read the confirmations off: skipping there answers
+        UNCONFIRMED for a funding the chain has already buried.
+        """
         if not self.watcher:
             return
         w = self.watcher
-        if not self._chain_lock.acquire(blocking=False):
+        got = (self._chain_lock.acquire(timeout=wait) if wait > 0
+               else self._chain_lock.acquire(blocking=False))
+        if not got:
             return          # a reconcile is already in flight; let it finish
         try:
             self.height = self.node.getblockcount()
-            for rec in self.book.list_loans():
-                if rec["loan_id"] in w.vaults:
-                    continue
-                try:
-                    terms = LoanTerms.from_json(rec["terms"])
-                except Exception as e:              # noqa: BLE001
-                    print(f"loan {rec.get('loan_id','?')[:12]}: unparseable "
-                          f"terms, skipping: {e}", file=sys.stderr)
-                    continue
-                w.track(rec["loan_id"], terms, rec["txid"], rec["vout"],
-                        single_leaf=bool(rec.get("single_leaf")))
-            for off in self.book.list_offers(status="open"):
-                if off.get("kind") != "funded" or off["offer_id"] in w.offers:
-                    continue
-                try:
-                    txid, _, vout = str(off["outpoint"]).rpartition(":")
-                    w.track_offer(off["offer_id"],
-                                  LoanTerms.from_json(off["terms"]), txid,
-                                  int(vout), int(off["principal"]),
-                                  int(off["collateral"]),
-                                  int(off["expiry_locktime"]))
-                except Exception as e:              # noqa: BLE001
-                    print(f"offer {off.get('offer_id','?')[:12]}: cannot track, "
-                          f"skipping: {e}", file=sys.stderr)
-            for v in w.poll():
-                self.book.update_loan(v.loan_id, state=v.state.value,
-                                      confirmations=v.confirmations,
-                                      spent_by=v.spent_by, note=v.note)
-            for v in w.vaults.values():
-                rec = self.book.loans.get(v.loan_id)
-                if rec and rec.get("confirmations") != v.confirmations:
-                    self.book.update_loan(v.loan_id, confirmations=v.confirmations)
-            for ev in w.drain_events():
-                self._apply_offer_event(ev)
-            for o in w.offers.values():
-                rec = self.book.offers.get(o.offer_id)
-                if rec and o.status == "open" and (
-                        rec.get("funded_value") != str(o.value)
-                        or rec.get("confirmations") != o.confirmations):
-                    self.book.update_offer(o.offer_id, funded_value=str(o.value),
-                                           confirmations=o.confirmations)
-            self.node_error = None
+            # One write for the whole reconciliation. Confirmations move on
+            # every block for every live loan and every open offer, and each of
+            # those used to rewrite the entire book under the lock the request
+            # handlers take.
+            with self.book.batch():
+                self._reconcile(w)
         except Exception as e:                      # noqa: BLE001
             self.node_error = f"node: {type(e).__name__}: {e}"
         finally:
             self._chain_lock.release()
+
+    def _reconcile(self, w):
+        for rec in self.book.list_loans():
+            if rec["loan_id"] in w.vaults:
+                continue
+            try:
+                terms = LoanTerms.from_json(rec["terms"])
+            except Exception as e:              # noqa: BLE001
+                print(f"loan {rec.get('loan_id','?')[:12]}: unparseable "
+                      f"terms, skipping: {e}", file=sys.stderr)
+                continue
+            # Hand back what the book already knew. A vault re-tracked from
+            # nothing looks like a funding that never buried, which is what
+            # a reorged-away funding looks like too.
+            w.track(rec["loan_id"], terms, rec["txid"], rec["vout"],
+                    single_leaf=bool(rec.get("single_leaf")),
+                    state=rec.get("state") or "UNCONFIRMED",
+                    confirmations=rec.get("confirmations") or 0,
+                    spent_by=rec.get("spent_by") or "",
+                    spent_height=rec.get("spent_height") or 0,
+                    note=rec.get("note") or "",
+                    funding_height=rec.get("funding_height") or 0,
+                    funding_block=rec.get("funding_block") or "")
+        for off in self.book.list_offers(status="all"):
+            # Ghosts too: a funding undone by a Bitcoin reorg can come back,
+            # and only a watched offer can be seen to come back. Everything
+            # else -- taken, withdrawn, gone -- is finished.
+            if off.get("status", "open") not in ("open", "ghost"):
+                continue
+            if off.get("kind") != "funded" or off["offer_id"] in w.offers:
+                continue
+            try:
+                txid, _, vout = str(off["outpoint"]).rpartition(":")
+                w.track_offer(off["offer_id"],
+                              LoanTerms.from_json(off["terms"]), txid,
+                              int(vout), int(off["principal"]),
+                              int(off["collateral"]),
+                              int(off["expiry_locktime"]),
+                              confirmations=off.get("confirmations") or 0,
+                              status=off.get("status") or "open",
+                              value=int(off.get("funded_value") or 0))
+            except Exception as e:              # noqa: BLE001
+                print(f"offer {off.get('offer_id','?')[:12]}: cannot track, "
+                      f"skipping: {e}", file=sys.stderr)
+        try:
+            w.poll()
+            self.node_error = None
+        except Exception as e:                  # noqa: BLE001
+            self.node_error = f"node: {type(e).__name__}: {e}"
+        # Reconcile everything tracked, not only what this poll reported as
+        # changed. A poll that raises part way has already moved vaults the
+        # watcher will never report again, and the book would keep calling
+        # a closed loan LIVE for as long as it ran.
+        for v in list(w.vaults.values()):
+            self._reconcile_loan(v)
+        # Offer events are applied IN ORDER, and a failed one is retried on
+        # the next poll rather than dropped: the event is what registers the
+        # loan an offer opened, and the watcher has already moved on.
+        while w.events:
+            ev = w.events[0]
+            try:
+                self._apply_offer_event(ev)
+            except Exception as e:              # noqa: BLE001
+                print(f"offer {str(ev.get('offer_id', '?'))[:12]}: cannot "
+                      f"apply the '{ev.get('kind')}' event yet, retrying "
+                      f"next poll: {type(e).__name__}: {e}", file=sys.stderr)
+                break
+            w.events.pop(0)
+        for o in list(w.offers.values()):
+            self._reconcile_offer(o)
+
+    def _reconcile_loan(self, v):
+        """Write what the watcher believes about a vault, key by key, so a
+        record that missed one update is repaired by the next poll."""
+        rec = self.book.loans.get(v.loan_id)
+        if rec is None:
+            return
+        # funding_height and funding_block go with the rest. They are the pair
+        # that tells a Bitcoin-driven reorg from a spend out of the backward
+        # walk's reach; a restart that lost them re-tracks the vault as one that
+        # never buried, and the reorg the book exists to report reads instead as
+        # "spent by something we cannot see".
+        want = {"state": v.state.value, "confirmations": v.confirmations,
+                "spent_by": v.spent_by, "spent_height": v.spent_height,
+                "note": v.note, "funding_height": v.funding_height,
+                "funding_block": v.funding_block}
+        diff = {k: val for k, val in want.items() if rec.get(k) != val}
+        if not diff:
+            return
+        try:
+            self.book.update_loan(v.loan_id, **diff)
+        except Exception as e:                      # noqa: BLE001
+            print(f"loan {v.loan_id[:12]}: cannot record "
+                  f"{', '.join(sorted(diff))}: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+
+    def _reconcile_offer(self, o):
+        rec = self.book.offers.get(o.offer_id)
+        if rec is None:
+            return
+        if o.status == "open":
+            # The outpoint too: a partial take moves the coin to the remainder,
+            # and a book left pointing at the spent one advertises an offer
+            # nobody can take.
+            want = {"outpoint": f"{o.txid}:{o.vout}",
+                    "funded_value": str(o.value),
+                    "confirmations": o.confirmations}
+        elif rec.get("status", "open") == "open":
+            # The coin is gone and the event that said so was lost. An offer
+            # nobody can take must not stay on the page as one anybody can.
+            want = {"status": o.status, "funded_value": "0"}
+        else:
+            return
+        diff = {k: val for k, val in want.items() if rec.get(k) != val}
+        if not diff:
+            return
+        try:
+            self.book.update_offer(o.offer_id, **diff)
+        except Exception as e:                      # noqa: BLE001
+            print(f"offer {o.offer_id[:12]}: cannot record "
+                  f"{', '.join(sorted(diff))}: {type(e).__name__}: {e}",
+                  file=sys.stderr)
 
     def _apply_offer_event(self, ev):
         """What the chain did to an offer, written into the book."""
@@ -379,14 +844,85 @@ class Service:
                                    spent_by=ev.get("txid", ""),
                                    note=ev.get("note", ""))
 
+    def prune_book(self):
+        """Drop the records that have been finished for long enough.
+
+        This decides nothing about a loan. The chain is the record and a pruned
+        loan can be read back off it; what goes is an index entry, and what it
+        stops costing is a full render of the whole book on every read.
+        """
+        if self.prune_after <= 0:
+            return
+        # The watcher is unwatched here too, and a POST can be reconciling on
+        # another thread: hold the lock refresh_chain holds rather than take
+        # records out from under a poll that is iterating them. A prune that
+        # cannot get it waits for the next one; there is no hurry.
+        if not self._chain_lock.acquire(timeout=5):
+            return
+        try:
+            dropped = self.book.prune(self.prune_after)
+            if not any(dropped.values()):
+                return
+            self._stop_watching(dropped)
+        except Exception as e:                      # noqa: BLE001
+            # A book that cannot be pruned is still a book worth serving.
+            print(f"prune: {type(e).__name__}: {e}", file=sys.stderr)
+            return
+        finally:
+            self._chain_lock.release()
+        names = {"offers": "offer", "loans": "loan", "btc_takes": "BTC take"}
+        counts = ", ".join(
+            f"{len(v)} {names.get(k, k)}{'' if len(v) == 1 else 's'}"
+            for k, v in dropped.items() if v)
+        print(f"pignusd: pruned {counts} finished more than "
+              f"{self.prune_after}s ago", file=sys.stderr)
+
+    def _stop_watching(self, dropped):
+        """Stop watching what the book has just forgotten.
+
+        The watcher indexes what it tracks by the outpoint it rests in, and
+        looks the record up through that index for every input of every block
+        it scans. So the index entry has to go with the record: one left
+        pointing at a vault that is no longer tracked raises inside the block
+        scan, which is the one place this daemon must not fall over.
+        """
+        loans = set(dropped.get("loans") or ())
+        offers = set(dropped.get("offers") or ())
+        for rid in loans | offers:
+            UNRENDERABLE.pop(rid, None)
+        w = self.watcher
+        if w is None:
+            return
+        for lid in loans:
+            w.vaults.pop(lid, None)
+        for oid in offers:
+            w.offers.pop(oid, None)
+        for attr, gone in (("_by_outpoint", loans), ("_by_offer", offers)):
+            index = getattr(w, attr, None)
+            if not isinstance(index, dict):
+                continue        # indexed some other way; leave it whole
+            for key in [k for k, rid in index.items() if rid in gone]:
+                del index[key]
+
     def loop(self, interval):
+        first = True
         while True:
             started = time.time()
-            self.refresh_registry()
+            self.refresh_registry(force=first)
             self.refresh_prices()
             self.refresh_fees()
             self.refresh_chain()
+            self.prune_book()
             self.last_poll = int(time.time())
+            if first:
+                # The first pass re-tracks every loan and walks back for spends
+                # it missed, which on a long-idle book takes a while. It runs
+                # here rather than before the socket is bound, so the page and
+                # /healthz answer -- and say "initial sync" -- throughout.
+                print(f"pignusd: first sync done in "
+                      f"{time.time() - started:.1f}s at height {self.height}",
+                      file=sys.stderr)
+                first = False
             time.sleep(max(2.0, interval - (time.time() - started)))
 
     # ----------------------------------------------------------- verification
@@ -402,9 +938,8 @@ class Service:
         """
         terms = LoanTerms.from_json(body["terms"])
         if body.get("kind") != "funded":
-            raise ValueError("this book lists FUNDED offers: a signed offer "
-                             "needs the lender online and has nothing on chain "
-                             "to check")
+            raise ValueError('an offer must be funded: set kind to "funded" '
+                             "and name the outpoint its principal rests in")
         outpoint = str(body.get("outpoint") or "")
         if ":" not in outpoint:
             raise ValueError("a funded offer must name outpoint 'txid:vout'")
@@ -417,7 +952,7 @@ class Service:
         collateral = int(body.get("collateral") or terms.collateral_amount)
         expiry = int(body.get("expiry_locktime") or terms.maturity)
         want = offer_address(terms, principal, collateral, expiry)
-        got = check_outpoint(self.node, txid, vout, want, "offer")
+        got = self._outpoint_holds(txid, vout, want, "offer")
         if got["asset"] and got["asset"] != terms.debt_asset:
             raise NotOnChain(
                 f"that outpoint holds {got['asset'][:16]}…, not the debt asset "
@@ -432,9 +967,28 @@ class Service:
         body["funded_value"] = str(got["value"])
         body["confirmations"] = got["confirmations"]
 
+    def _outpoint_holds(self, txid, vout, want, what):
+        """check_outpoint, with a confidential output turned into a sentence.
+
+        A blinded output has no `value` to read, and the covenant needs an
+        explicit amount anyway -- so this is a refusal with a reason, not the
+        KeyError it used to be.
+        """
+        try:
+            return check_outpoint(self.node, txid, vout, want, what)
+        except KeyError:
+            raise NotOnChain(f"that output is confidential; a {what} must hold "
+                             "an explicit amount anyone can check")
+
     def verify_loan(self, body):
         """Refuse to track a loan whose outpoint is not the vault its terms
-        compile to. Same reason as above, and the same cheap check."""
+        compile to, or does not hold what the terms say it locks.
+
+        Same reason as above: everything a reader is shown about a loan --
+        health, LTV, what a liquidator would seize -- is computed from the
+        terms, so a vault holding one atom of something else would put a whole
+        fictional position on every screen and in every liquidator's feed.
+        """
         terms = LoanTerms.from_json(body["terms"])
         if not self.node:
             raise NotOnChain(
@@ -442,31 +996,67 @@ class Service:
         single = bool(body.get("single_leaf"))
         want = (offer_vault_address(terms) if single
                 else terms.script_pubkey())
-        check_outpoint(self.node, body["txid"], body["vout"], want, "loan")
+        got = self._outpoint_holds(body["txid"], body["vout"], want, "loan")
+        if got["asset"] and got["asset"] != terms.collateral_asset:
+            raise NotOnChain(
+                f"that vault holds {got['asset'][:16]}…, not the collateral "
+                f"asset {terms.collateral_asset[:16]}…")
+        # Exactly, not at least: the covenant returns what is locked, so terms
+        # that overstate or understate the coin misprice every figure derived
+        # from them.
+        if got["value"] != terms.collateral_amount:
+            raise NotOnChain(
+                f"that vault holds {got['value']} atoms, but the terms lock "
+                f"{terms.collateral_amount}")
+        return got
 
     # -------------------------------------------------------------- rendering
 
     def market_rows(self):
         rows = []
+        fresh = self.fresh_prices()
         for m in self.markets:
             att = self.attestations.get(m)
             n_oracles = sum(1 for ox in self.oracle_keys
-                            if (ox, m) in self.att_by_oracle)
+                            if self._att_key(ox, m) in self.att_by_oracle)
             c_sym, _, d_sym = m.partition("/")
             c_asset, c_tick = self.resolve(c_sym)
             d_asset, d_tick = self.resolve(d_sym)
+            c_prec = (self.assets.get(c_asset) or {}).get("precision", 8)
+            d_prec = (self.assets.get(d_asset) or {}).get("precision", 8)
+            # What the PRIMARY oracle scaled the price by, against what the
+            # registry says the two assets are denominated in. They are the same
+            # two numbers, arrived at independently; when they differ the price
+            # is out by a factor of ten per decimal and nothing else can see it.
+            said = self.oracle_precisions.get(self._att_key(self.oracle_x, m))
+            mismatch = bool(said and c_asset and d_asset
+                            and said != (c_prec, d_prec))
             rows.append({
                 "market": m, "feed_id": feed_id(m).hex(),
                 "collateral_ticker": c_tick, "debt_ticker": d_tick,
                 "collateral_asset": c_asset, "debt_asset": d_asset,
-                "collateral_precision": (self.assets.get(c_asset) or {}).get("precision", 8),
-                "debt_precision": (self.assets.get(d_asset) or {}).get("precision", 8),
+                "collateral_precision": c_prec,
+                "debt_precision": d_prec,
+                "oracle_precisions": list(said) if said else None,
+                "precision_mismatch": mismatch,
                 "cross_chain": c_sym.strip().upper() in NATIVE,
-                "lendable": bool(c_asset and d_asset and att),
+                # A cross-chain market is priced and watched here, but it is
+                # not lendable through the covenant offers: its collateral is
+                # on the parent chain, where none of the covenant runs. Saying
+                # otherwise puts native Bitcoin in the lend form and in the
+                # sentence about what the network enforces.
+                "lendable": bool(c_asset and d_asset and m in fresh
+                                 and not mismatch
+                                 and c_sym.strip().upper() not in NATIVE),
+                "stale": bool(att) and m not in fresh,
                 "debt_is_reference": d_tick.upper() == self.reference_ticker.upper(),
                 "price": att.price if att else None,
                 "price_scale": att.price_scale if att else None,
-                "unit_price": (O.unquote_price(att.price,
+                # Quoted per WHOLE unit of each asset, so the precisions the
+                # price was scaled by have to come back out of it: with the
+                # 8/8 default a market whose debt asset has two decimals reads
+                # a million times too small.
+                "unit_price": (O.unquote_price(att.price, c_prec, d_prec,
                                                price_scale=att.price_scale)
                                if att else None),
                 "timestamp": att.timestamp if att else None,
@@ -495,7 +1085,8 @@ class Service:
         out["maturity"] = t.maturity
         out["lender_prog"] = t.payout_programs[0]
         out["lender_ver"] = t.lender_ver
-        price = self.prices.get(t.market)
+        out["oracle_x"] = t.oracle_x
+        price = self.price_for(t)
         if price is not None:
             out["price"] = price
             out["open_ltv"] = round(t.principal / max(1, t.collateral_value(price)), 4)
@@ -508,9 +1099,21 @@ class Service:
             out["lots_left"] = None
         return out
 
+    def vault_spk(self, terms, terms_id, single):
+        key = (terms_id, bool(single))
+        spk = self._spk_cache.get(key)
+        if spk is None:
+            spk = (offer_vault_address(terms) if single
+                   else terms.script_pubkey()).hex()
+            if len(self._spk_cache) > MAX_LOANS:
+                self._spk_cache.clear()
+            self._spk_cache[key] = spk
+        return spk
+
     def loan_view(self, rec):
         t = LoanTerms.from_json(rec["terms"])
-        price = self.prices.get(t.market)
+        # This loan's OWN oracles, not the book's primary: see price_for.
+        price = self.price_for(t)
         out = dict(rec)
         self._tickers(out, t)
         out["collateral_asset"] = t.collateral_asset
@@ -527,54 +1130,325 @@ class Service:
         out["lender_ver"] = t.lender_ver
         out["borrower_ver"] = t.borrower_ver
         out["oracle"] = f"{t.threshold}-of-{len(t.oracle_keys)}"
+        out["oracle_x"] = t.oracle_x
+        out["oracle_keys"] = list(t.oracle_keys)
         # A loan originated through a funded offer lives in the SINGLE-LEAF
         # vault; the browser needs to know which, because the two have
         # different addresses and different witnesses.
         single = bool(rec.get("single_leaf"))
         out["single_leaf"] = single
-        out["vault_address"] = (offer_vault_address(t) if single
-                                else t.script_pubkey()).hex()
+        out["vault_address"] = self.vault_spk(
+            t, rec.get("terms_id") or t.loan_id(), single)
         if self.height is not None:
             out["height"] = self.height
             out["past_maturity"] = self.height >= t.maturity
             out["recover_open"] = self.height >= t.recover_after
+        # How deep the CLOSE is, which is a different question from how deep the
+        # funding was. A repayment or a liquidation one block old can still be
+        # reorged out, and showing it as simply settled tells a borrower their
+        # collateral is back when it may not be. Zero means either not closed at
+        # all or closed only in the mempool.
+        spent_height = int(rec.get("spent_height") or 0)
+        out["spent_height"] = spent_height
+        # The depth this book calls a funding buried at, beside the loan it was
+        # applied to: a reader counting confirmations should not have to fetch
+        # another endpoint to learn what number they are counting towards.
+        out["min_depth"] = self.min_depth
+        out["closed_confirmations"] = (self.height - spent_height + 1
+                                       if self.height and spent_height else 0)
         if price is not None:
             out["price"] = price
-            out["health"] = round(t.health(price), 4)
-            out["ltv"] = round(t.ltv(price), 4)
+            # Terms with a zero strike, or collateral worth nothing at this
+            # price, make these infinite, and infinity is not JSON: the page
+            # would lose the whole list rather than one number.
+            if t.strike:
+                out["health"] = round(t.health(price), 4)
+            if t.collateral_value(price):
+                out["ltv"] = round(t.ltv(price), 4)
             out["liquidatable"] = t.is_liquidatable(price)
             out["seizure_if_liquidated"] = t.seizure_at(price)
             out["surplus_if_liquidated"] = t.surplus_at(price)
         return out
 
+    # ----------------------------------------------------- explaining a close
+
+    def spending_tx(self, v):
+        """The transaction that closed a vault, or None if it is out of reach.
+
+        Never `getrawtransaction` by txid: the committee nodes run without a
+        transaction index, so a mined transaction cannot be looked up by id at
+        all and the call fails in a way that reads like the transaction not
+        existing. A mined spend is read out of the block the watcher recorded
+        it in; a spend still in the mempool is the one case the node can answer
+        by id, because it is holding it.
+        """
+        if not self.node or not v.spent_by:
+            return None
+        try:
+            if v.spent_height and int(v.spent_height) > 0:
+                blk = self.node.getblock(
+                    self.node.getblockhash(int(v.spent_height)), 2)
+                for tx in blk.get("tx", []):
+                    if tx.get("txid") == v.spent_by:
+                        return tx
+                return None
+            if v.spent_by not in (self.node.getrawmempool() or []):
+                return None
+            return self.node.getrawtransaction(v.spent_by, True)
+        except Exception as e:                      # noqa: BLE001
+            print(f"loan {v.loan_id[:12]}: cannot read the closing "
+                  f"transaction: {type(e).__name__}: {e}", file=sys.stderr)
+            return None
+
+    def explain_exit(self, loan_id):
+        """Everything a closed loan's account can be rebuilt from, or None.
+
+        A borrower who was liquidated is owed the price it happened at and the
+        signature behind it, not a state tag -- so this returns the oracle
+        evidence out of the witness, checked against the key the vault itself
+        bakes in, beside what the terms say that price buys and what the
+        transaction actually paid.
+        """
+        v = self.watcher.vaults.get(loan_id) if self.watcher else None
+        if v is None or not v.spent_by:
+            return None
+        tx = self.spending_tx(v)
+        if tx is None:
+            return {"loan_id": loan_id, "spent_by": v.spent_by,
+                    "height": int(v.spent_height or 0), "exit": v.state.value,
+                    "problems": ["the transaction that closed this loan is not "
+                                 "in reach: it is neither in the block this "
+                                 "book recorded nor in the mempool"]}
+        want = (v.txid, int(v.vout))
+        k = next((i for i, vin in enumerate(tx.get("vin", []))
+                  if (vin.get("txid"), vin.get("vout")) == want), None)
+        if k is None:
+            return {"loan_id": loan_id, "spent_by": v.spent_by,
+                    "height": int(v.spent_height or 0), "exit": v.state.value,
+                    "problems": ["that transaction does not spend this vault; "
+                                 "the book is pointing at the wrong one"]}
+        return self.watcher.explain_exit(v, tx, k)
+
+    # ------------------------------------------- registrations still to bury
+
+    def pending_registrations(self, key):
+        """How many loans this client has registered that have not buried.
+
+        Counted by re-reading the book, and swept while counting: a loan that
+        went LIVE or closed stops being charged to whoever registered it, so a
+        borrower who opens loans one after another is never refused.
+        """
+        if key is None:
+            return 0
+        with self._lock:
+            ids = self._pending_by_client.get(key) or []
+            still = [i for i in ids
+                     if (self.book.loans.get(i) or {}).get("state")
+                     in PENDING_NAMES]
+            if still:
+                self._pending_by_client[key] = still
+            else:
+                self._pending_by_client.pop(key, None)
+            return len(still)
+
+    def note_registration(self, key, loan_id):
+        if key is None:
+            return
+        with self._lock:
+            ids = self._pending_by_client.setdefault(key, [])
+            if loan_id not in ids:
+                ids.append(loan_id)
+
     # ------------------------------------------------------- BTC collateral
 
-    def btc_reclaim_sighash(self, loan_dict, funding_txid, funding_vout,
+    def btc_vault_outpoint(self, loan, prevault_txid, prevault_vout):
+        """Where the collateral will be once the loan starts.
+
+        The lender's release is signed against the VAULT, not the pre-vault, and
+        the vault's outpoint is fixed the moment the borrower signs the one
+        transaction that can create it -- which is why an id is known here
+        before anything is broadcast."""
+        from pignus import btc_collateral as BC
+        return BC.upgrade_tx(loan, prevault_txid, int(prevault_vout)).txid(), 0
+
+    def btc_reclaim_sighash(self, loan, vault_txid, vault_vout,
                             reclaim_dest_hex, fee):
         """Recompute the reclaim sighash the lender's adaptor signature must
         commit to, so the relay never passes on a request to sign something
         other than the loan it claims to be."""
         from pignus import btc_collateral as BC
-        loan = BC.loan_from_dict(loan_dict)
-        tx = BC.reclaim_tx(loan, funding_txid, int(funding_vout),
+        tx = BC.reclaim_tx(loan, vault_txid, int(vault_vout),
                            bytes.fromhex(reclaim_dest_hex), int(fee))
         return BC.sighash_for(loan, tx, "reclaim").hex()
 
+    def btc_check_take(self, offer, body):
+        """Everything the relay can check about a take REQUEST.
+
+        None of it protects the relay, which has nothing to lose. It protects
+        the two parties from each other and from the relay: the borrower's
+        payout is baked into the addresses, and the collateral's own address is
+        rebuilt here rather than accepted.
+
+        The vault, and the release that commits to it, cannot be checked yet:
+        both depend on the hash of a secret the lender has not drawn. That is
+        the next step of the handshake, not this one.
+        """
+        from pignus import btc_collateral as BC
+        from pignus import btc_relay as R
+        loan_d = dict(offer["loan"])
+        loan_d["borrower_x"] = str(body["borrower_x"]).lower()
+        loan_d["h_w"] = str(body["h_w"]).lower()
+        loan_d["borrower_prog"] = R.check_program(body["borrower_prog"],
+                                                  body.get("borrower_ver", 0))
+        loan_d["borrower_ver"] = int(body.get("borrower_ver", 0))
+        loan = BC.loan_from_dict(loan_d)
+
+        if len(loan.borrower_x) != 64 or len(loan.h_w) != 64:
+            raise ValueError("a take needs the borrower's key and their "
+                             "origination commitment, both 32 bytes")
+        prevault_txid = str(body["prevault_txid"]).lower()
+        prevault_vout = int(body["prevault_vout"])
+        if len(prevault_txid) != 64:
+            raise ValueError("that is not a transaction id")
+        clash = self.book.btc_take_by_funding(prevault_txid, prevault_vout)
+        if clash is not None:
+            raise ValueError("that outpoint already funds take "
+                             f"{clash['take_id']}; one coin funds one loan")
+        # And one secret opens one loan. Two takes committing to the same
+        # secret share a pre-vault address and a disbursement address, and the
+        # moment one of them publishes it the other's collateral can be moved
+        # into a vault nobody paid for.
+        for other in self.book.btc_takes.values():
+            if (other.get("loan", {}).get("h_w") == loan.h_w
+                    and other.get("take_id") != body.get("take_id")):
+                raise ValueError(
+                    "that origination commitment is already in use by take "
+                    f"{other['take_id']}. Draw a fresh one: two loans sharing "
+                    "a secret are one loan either party can settle twice")
+        if int(body.get("prevault_value", 0)) != loan.prevault_value():
+            raise ValueError("the funding named does not hold the collateral "
+                             "plus the fee this loan needs")
+        dest = str(body["reclaim_dest"]).lower()
+        if len(dest) not in (44, 68) or any(c not in "0123456789abcdef"
+                                            for c in dest):
+            raise ValueError("that is not a Bitcoin output script")
+        fee = int(body.get("reclaim_fee", 3000))
+        # The release the lender is about to sign commits to a transaction
+        # paying btc_amount - fee. A fee at or above the collateral makes that
+        # output negative or dust, so the release verifies and the reclaim can
+        # never be broadcast -- which a borrower finds out only when they try
+        # to leave.
+        if fee < 1 or int(loan.btc_amount) - fee < BTC_DUST:
+            raise ValueError(
+                f"a reclaim fee of {fee} satoshis leaves nothing spendable of "
+                f"{loan.btc_amount}: the release would be one the borrower "
+                "could never use")
+
+        # Heights this daemon read itself. A height a client sends is a height
+        # an attacker chooses, and every cross-chain margin is measured against
+        # it -- a borrower passing zero would make every Bitcoin-side deadline
+        # look infinitely far away.
+        problems = []
+        btc_height = self.btc_height()
+        if self.node is not None and btc_height is not None:
+            try:
+                problems = BC.timelocks_sane(loan, btc_height,
+                                             int(self.height or 0))
+            except Exception:                           # noqa: BLE001
+                problems = []
+        elif btc_height is None:
+            problems = ["this book cannot see the parent chain, so it cannot "
+                        "check this loan's Bitcoin deadlines: check them "
+                        "yourself before funding anything"]
+        return loan, dest, problems
+
+    def btc_height(self):
+        """The parent chain's tip, from this book's own Bitcoin node.
+
+        None when it has none: a book without one can still carry messages, and
+        says so rather than pretending to have checked a deadline it could not.
+        """
+        node = getattr(self, "btc_node", None)
+        if node is None:
+            return None
+        try:
+            return int(node.getblockcount())
+        except Exception:                               # noqa: BLE001
+            return None
+
+    def btc_take_loan(self, take, payment_hash=None):
+        """The loan a take is for, as the RELAY understands it.
+
+        Rebuilt from the offer that was signed plus the four things a taker
+        chooses, so a take record cannot quietly say something the lender never
+        offered. Every party does this for itself; the relay does it so that
+        what it serves is at least self-consistent.
+        """
+        from pignus import btc_collateral as BC
+        from pignus import btc_relay as R
+        offer = self.book.btc_offers.get(take.get("btc_offer_id")) or {}
+        d = dict(offer.get("loan") or {})
+        got = dict(take.get("loan") or {})
+        for k in ("borrower_x", "h_w", "borrower_prog", "borrower_ver"):
+            d[k] = got.get(k, "")
+        R.check_program(d["borrower_prog"], d.get("borrower_ver", 0))
+        d["payment_hash"] = (payment_hash or got.get("payment_hash") or "")
+        d["adaptor_point"] = got.get("adaptor_point", "")
+        return BC.loan_from_dict(d)
+
     def health(self):
+        """Healthy means the numbers being served are current. A price kept
+        from an hour ago, a poll thread that stopped, or no node at all all
+        leave the book answering with figures that look live and are not, so
+        each of them says so here rather than only in a log nobody reads."""
+        now = time.time()
+        stale = self.stale_markets()
+        reasons = []
+        if self.node is None:
+            reasons.append("no node configured; chain states are frozen")
+        if self.node_error:
+            reasons.append(self.node_error)
+        if self.oracle_error:
+            reasons.append(self.oracle_error)
+        if not self.last_poll:
+            reasons.append("initial sync")
+        elif now - self.last_poll > max(120, 3 * self.poll_interval):
+            reasons.append(f"poll thread stalled: last finished "
+                           f"{int(now - self.last_poll)}s ago")
+        if stale:
+            reasons.append("stale price: " + ", ".join(stale))
         return {
-            "ok": self.node_error is None and self.oracle_error is None,
-            "error": self.node_error or self.oracle_error,
+            "ok": not reasons,
+            "error": "; ".join(reasons) or None,
+            "version": __version__,
+            "git_rev": GIT_REV,
+            # How many golden vector cases the covenant tripwire checked in this
+            # process. Zero would mean the builder was never loaded, so an
+            # operator can confirm the check ran rather than assume it.
+            "covenant_vectors": compat.verified_cases(),
             "height": self.height,
             "last_poll": self.last_poll, "markets": len(self.markets),
-            "priced": len(self.prices),
+            "priced": len(self.fresh_prices()),
+            "stale_markets": stale,
+            "max_price_age": self.max_price_age,
+            "min_depth": self.min_depth,
+            "rescan_depth": self.rescan_depth,
+            "back_scan_cap": self.back_scan_cap,
+            "prune_after": self.prune_after,
             "offers": len(self.book.list_offers(status="open")),
             "loans": len(self.book.loans),
+            "unrenderable": len(UNRENDERABLE),
             "assets": len(self.assets),
             "fee_rates": len(self.fee_table.get("rates", {})),
             "block_seconds": self.block_seconds,
             "reference_ticker": self.reference_ticker,
             "oracles": len(self.oracle_keys),
-            "node": bool(self.node)}
+            "oracle_errors": list(self.oracle_errors),
+            "node": bool(self.node),
+            # Whether this book can see the parent chain. Without it, a
+            # cross-chain loan's Bitcoin-side deadlines are not checked here at
+            # all, and every take it accepts says so in its warnings.
+            "btc_node": self.btc_height() is not None}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -589,23 +1463,65 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(payload, (bytes, bytearray)):
             body = bytes(payload)
         elif ctype == "application/json":
-            body = json.dumps(payload, indent=2).encode()
+            # allow_nan=False: `Infinity` is valid Python and invalid JSON, and
+            # one of them in one record loses the whole document at the reader.
+            body = json.dumps(payload, indent=2, allow_nan=False).encode()
         else:
             body = payload
+        if not self._body_read:
+            # Answering without having consumed the request body: the bytes
+            # left on the socket would be read as the next request line, so
+            # this connection ends here rather than desynchronising.
+            self.close_connection = True
         self.send_response(code)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # The page is served from here, so it is same-origin and needs none of
+        # this. Reading the book from elsewhere is welcome; writing to it from
+        # a visitor's browser on someone else's site is not, so the wildcard is
+        # offered on reads only.
+        if self.command in ("GET", "HEAD", "OPTIONS"):
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
         return True
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        # A manage token in a query string is a secret in the journal. The
+        # header is the right place for it; redact it either way.
+        line = re.sub(r"(?i)(token=)[^&\s\"]+", r"\1…", fmt % args)
+        sys.stderr.write("%s - %s\n" % (self.address_string(), line))
+
+    def _client_key(self):
+        """Who to charge a write to.
+
+        Behind a reverse proxy every request arrives from loopback, so keying
+        the rate limit on the socket peer gives the whole internet one bucket
+        and one flooder locks everybody out. The forwarded-for header is only
+        believed from a peer configured as a proxy, and then only its LAST hop:
+        earlier entries are whatever the client claimed. A request from a
+        trusted peer with no such header is the box's own responder or CLI --
+        it is not a public client, and it is not rate-limited.
+        """
+        peer = self.client_address[0] if self.client_address else ""
+        if peer in self.svc.trusted_proxies:
+            fwd = (self.headers.get("X-Forwarded-For")
+                   or self.headers.get("X-Real-IP") or "")
+            hop = fwd.split(",")[-1].strip()
+            return hop or None
+        return peer
+
+    def _rate_limited(self):
+        key = self._client_key()
+        if key is None:
+            return False
+        now = time.time()
+        return not WRITE_LIMIT.allow(key, now) or \
+            not GLOBAL_WRITE_LIMIT.allow("all", now)
 
     # The site is plain ES modules with no build step, so the browser fetches
     # them by name. Only files that actually exist in web/ are served, and only
@@ -630,20 +1546,54 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, f.read(), self.STATIC[ext])
 
     def do_OPTIONS(self):
-        self._send(204, b"", "text/plain")
+        self._body_read = True
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def do_HEAD(self):
         self.do_GET()
 
+    # Connections are kept alive, so a request whose body is never read leaves
+    # those bytes to be parsed as the next request line -- which surfaces as a
+    # random 400 for whoever the proxy pools that connection to next.
+    _body_read = True
+
+    def _length(self):
+        try:
+            return int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return -1
+
     def _body(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        n = self._length()
+        if n < 0:
+            self.close_connection = True
+            raise ValueError("Content-Length must be a whole number of bytes")
         if n > MAX_BODY:
+            self.close_connection = True
             raise ValueError("request body too large")
-        return json.loads(self.rfile.read(n).decode() or "{}")
+        raw = self.rfile.read(n)
+        self._body_read = True
+        return json.loads(raw.decode() or "{}")
+
+    def _discard_body(self):
+        """Read and throw away the body of a request being refused early."""
+        n = self._length()
+        if n < 0 or n > MAX_BODY:
+            self.close_connection = True
+            return
+        if n:
+            self.rfile.read(n)
+        self._body_read = True
 
     def _get(self, path, q):
         s = self.svc
-        if path == "/":
+        if path in ("/", "/index.html"):
             with open(os.path.join(WEB, "index.html"), "rb") as f:
                 return self._send(200, f.read(), "text/html; charset=utf-8")
         if self._static(path):
@@ -654,7 +1604,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"markets": s.market_rows(),
                                     "height": s.height,
                                     "reference_ticker": s.reference_ticker,
-                                    "block_seconds": s.block_seconds})
+                                    "block_seconds": s.block_seconds,
+                                    "min_depth": s.min_depth,
+                                    "max_price_age": s.max_price_age})
         if path == "/v1/assets":
             return self._send(200, {"assets": s.assets})
         if path == "/v1/fees":
@@ -664,9 +1616,14 @@ class Handler(BaseHTTPRequestHandler):
             # these before deriving any address a user will act on. Parsed
             # rather than streamed, so a corrupt file fails here and not in
             # a browser that is about to derive an address from it.
-            with open(os.path.join(
-                    os.path.dirname(WEB), "pignus", "vectors.json")) as f:
-                return self._send(200, json.load(f))
+            try:
+                with open(os.path.join(
+                        os.path.dirname(WEB), "pignus", "vectors.json")) as f:
+                    return self._send(200, json.load(f))
+            except FileNotFoundError:
+                return self._send(500, {"error": "pignus/vectors.json is "
+                                        "missing; the browser has nothing to "
+                                        "pin itself against"})
         if path == "/v1/oracle":
             return self._send(200, {
                 "oracle_x": s.oracle_x, "url": s.oracle_url,
@@ -679,20 +1636,49 @@ class Handler(BaseHTTPRequestHandler):
                                     "urls": list(s.oracle_urls)})
         if path == "/v1/offers":
             rows = s.book.list_offers(market=q.get("market", [None])[0],
-                                      kind=q.get("kind", [None])[0],
                                       status=q.get("status", ["open"])[0])
-            return self._send(200, {"offers": _views(s.offer_view, rows)})
-        if path.startswith("/v1/offer/"):
-            rec = s.book.offers.get(path[len("/v1/offer/"):])
+            return self._send(200, {"offers": _views(s.offer_view,
+                                                     _limit(rows, q))})
+        if path.startswith("/v1/offer/") or path.startswith("/v1/offers/"):
+            rec = s.book.offers.get(path.partition("/v1/")[2].partition("/")[2])
             if not rec:
                 return self._send(404, {"error": "no such offer"})
             return self._send(200, s.offer_view(rec))
         if path == "/v1/loans":
-            rows = s.book.list_loans(state=q.get("state", [None])[0],
+            state = q.get("state", [None])[0]
+            if state and state not in STATE_NAMES:
+                # A misspelt state used to return an empty book, which reads as
+                # "you have no loans" rather than "that is not a state".
+                raise ValueError("state must be one of "
+                                 + ", ".join(sorted(STATE_NAMES)))
+            rows = s.book.list_loans(state=state,
                                      market=q.get("market", [None])[0])
-            return self._send(200, {"loans": _views(s.loan_view, rows)})
-        if path.startswith("/v1/loan/"):
-            rec = s.book.loans.get(path[len("/v1/loan/"):])
+            # By oracle key, so the loans still baked to a retired key can be
+            # listed during a rotation -- that set is exactly what has to mature
+            # before the old oracle can be switched off.
+            ox = (q.get("oracle_x", [None])[0] or "").lower()
+            if ox:
+                rows = [r for r in rows if ox in _loan_oracle_keys(r)]
+            return self._send(200, {"loans": _views(s.loan_view,
+                                                    _limit(rows, q))})
+        if (path.startswith("/v1/loan/") or path.startswith("/v1/loans/")) \
+                and path.endswith("/exit"):
+            # How a loan ended, read back off the chain. A liquidated borrower
+            # has no other way to see the price they were liquidated at.
+            loan_id = path.partition("/v1/")[2].partition("/")[2][:-len("/exit")]
+            if not s.book.loans.get(loan_id):
+                return self._send(404, {"error": "no such loan"})
+            if not s.watcher:
+                return self._send(503, {"error": "no node configured; a close "
+                                                 "cannot be read back"})
+            out = s.explain_exit(loan_id)
+            if out is None:
+                return self._send(404, {"error": "that loan is still open, or "
+                                                 "this book has not seen it "
+                                                 "close"})
+            return self._send(200, out)
+        if path.startswith("/v1/loan/") or path.startswith("/v1/loans/"):
+            rec = s.book.loans.get(path.partition("/v1/")[2].partition("/")[2])
             if not rec:
                 return self._send(404, {"error": "no such loan"})
             return self._send(200, s.loan_view(rec))
@@ -701,52 +1687,88 @@ class Handler(BaseHTTPRequestHandler):
             # browser uses this to confirm an offer still exists and holds what
             # the book says before composing anything against it.
             parts = path[len("/v1/outpoint/"):].split("/")
-            if len(parts) != 2 or not parts[1].isdigit() or not s.node:
-                return self._send(404, {"error": "no node, or bad outpoint"})
-            txid, vout = parts[0], int(parts[1])
-            got = s.node.gettxout(txid, vout, True)
+            if not s.node:
+                return self._send(503, {"error": "no node configured; chain "
+                                                 "lookups are unavailable"})
+            if (len(parts) != 2 or not parts[1].isdigit()
+                    or len(parts[0]) != 64 or not _is_hex(parts[0])):
+                return self._send(400, {"error": "an outpoint is a 64-hex txid "
+                                                 "and a vout number"})
+            txid, vout = parts[0].lower(), int(parts[1])
+            try:
+                got = s.node.gettxout(txid, vout, True)
+            except RpcError as e:
+                return self._send(400, {"error": f"the node would not read "
+                                                 f"that outpoint: {e}"})
             if got is None:
                 return self._send(404, {"error": "unspent output not found; "
                                                  "it may already be spent"})
+            if got.get("value") is None:
+                return self._send(400, {"error": "that output is confidential; "
+                                                 "its amount is not public"})
             return self._send(200, {
                 "txid": txid, "vout": vout,
                 "scriptPubKey": got["scriptPubKey"]["hex"],
                 "asset": got.get("asset"),
-                "value": str(int(round(float(got["value"]) * COIN))),
+                "value": str(atoms(got["value"])),
                 "confirmations": got.get("confirmations", 0)})
         if path.startswith("/v1/attestations/"):
             market = path[len("/v1/attestations/"):].replace("_", "/").upper()
             out = []
             for ox in s.oracle_keys:
-                att = s.att_by_oracle.get((ox, market))
+                att = s.att_by_oracle.get(s._att_key(ox, market))
                 if att is not None:
-                    d = att.to_dict()
-                    d["oracle_x"] = ox
-                    out.append(d)
+                    out.append(_attested(att, ox, s.max_price_age))
             return self._send(200, {"market": market, "attestations": out})
         if path.startswith("/v1/attestation/"):
             market = path[len("/v1/attestation/"):].replace("_", "/").upper()
-            att = s.attestations.get(market)
+            # `?oracle=` for one particular signer's, so a loan baked to a key
+            # this book no longer calls primary can still be priced.
+            ox = (q.get("oracle", [None])[0] or "").lower()
+            att = (s.att_by_oracle.get(s._att_key(ox, market)) if ox
+                   else s.attestations.get(market))
             if att is None:
-                return self._send(404, {"error": f"no attestation for {market}"})
-            return self._send(200, att.to_dict())
+                return self._send(404, {"error": f"no attestation for {market}"
+                                        + (f" from oracle {ox[:16]}…" if ox
+                                           else "")})
+            return self._send(200, _attested(att, ox or s.oracle_x,
+                                             s.max_price_age))
         if path == "/v1/btc/offers":
-            return self._send(200, {"offers": s.book.list_btc_offers(
-                status=q.get("status", ["open"])[0])})
+            offers = s.book.list_btc_offers(status=q.get("status", ["open"])[0])
+            for o in offers:
+                o["lots_left"] = s.book.btc_offer_lots_left(
+                    o["btc_offer_id"], BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)
+            return self._send(200, {"offers": offers})
+        if path.startswith("/v1/btc/offer/"):
+            rec = s.book.btc_offers.get(path[len("/v1/btc/offer/"):])
+            if not rec:
+                return self._send(404, {"error": "no such BTC offer"})
+            rec = dict(rec)
+            rec["lots_left"] = s.book.btc_offer_lots_left(
+                rec["btc_offer_id"], BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)
+            return self._send(200, rec)
         if path == "/v1/btc/takes":
-            return self._send(200, {"takes": s.book.list_btc_takes(
+            takes = s.book.list_btc_takes(
                 offer_id=q.get("offer_id", [None])[0],
-                status=q.get("status", [None])[0])})
+                status=q.get("status", [None])[0])
+            # A browser's storage is not where a loan lives. Asking by borrower
+            # key is what lets somebody who cleared it, or moved to another
+            # machine, find their own loans again.
+            who = (q.get("borrower_x", [None])[0] or "").lower()
+            if who:
+                takes = [t for t in takes if t.get("borrower_x", "") == who]
+            return self._send(200, {"takes": takes})
         if path.startswith("/v1/btc/take/"):
             rec = s.book.btc_takes.get(path[len("/v1/btc/take/"):])
             if not rec:
                 return self._send(404, {"error": "no such take"})
             return self._send(200, rec)
         if path == "/v1/stats":
-            return self._send(200, s.book.stats(s.prices))
+            return self._send(200, s.book.stats(s.fresh_prices()))
         return self._send(404, {"error": "no such endpoint", "path": path})
 
     def do_GET(self):
+        self._body_read = True          # a GET carries no body to drain
         u = urlparse(self.path)
         path = u.path.rstrip("/") or "/"
         try:
@@ -756,126 +1778,399 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
         except FileNotFoundError:
             self._send(500, {"error": "web/index.html is missing"})
+        except ValueError as e:
+            self._send(400, {"error": str(e)})
         except Exception as e:                      # noqa: BLE001
+            sys.stderr.write(f"GET {path}: {type(e).__name__}: {e}\n")
             self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def do_POST(self):
         s = self.svc
+        self._body_read = False
         path = urlparse(self.path).path.rstrip("/") or "/"
-        if not WRITE_LIMIT.allow(self.client_address[0], time.time()):
+        if self._rate_limited():
+            self._discard_body()
             return self._send(429, {"error": "too many writes; slow down"})
         try:
             body = self._body()
             if path == "/v1/offers":
-                if len(s.book.offers) >= MAX_OFFERS:
+                # Only what a publisher is entitled to say: everything else in
+                # the body is dropped here rather than stored and served back
+                # as if the book had checked it.
+                offer = {k: body[k] for k in OFFER_FIELDS if k in body}
+                # The cap counts LIVE listings, so a REPUBLISH of a coin that is
+                # already listed adds none and is let through even when the book
+                # is full: refusing a lender who is only refreshing their own
+                # listing would read as a bug, and would leave a stale record on
+                # the page instead of the corrected one.
+                outpoint = str(offer.get("outpoint") or "")
+                listed = any(o.get("outpoint") == outpoint
+                             for o in s.book.list_offers(status="all"))
+                if not listed and \
+                        len(s.book.list_offers(status="open")) >= MAX_OFFERS:
                     return self._send(429, {"error": "the book is full"})
-                s.verify_offer(body)
-                rec = s.book.put_offer(body)      # carries manage_token once
-                s.refresh_chain()
+                s.verify_offer(offer)
+                rec = s.book.put_offer(offer)     # carries manage_token once
+                s.refresh_chain(wait=2)
                 view = s.offer_view(s.book.offers.get(rec["offer_id"], rec))
                 view["manage_token"] = rec.get("manage_token")
                 return self._send(200, view)
             if path == "/v1/btc/offers":
-                # A lender publishes a BTC-collateral offer: the loan terms with
-                # T and h, no borrower yet. Minimal sanity only -- the borrower
-                # verifies every address themselves before funding.
-                loan = body.get("loan") or {}
+                # A lender publishes a cross-chain offer. The relay is not
+                # trusted for any of it, so the one thing it must establish is
+                # that the lender really published it: an offer carrying
+                # somebody else's key would make their own responder pay out.
+                from pignus import btc_relay as R
+                loan = dict(body.get("loan") or {})
                 for k in ("btc_amount", "lender_x", "oracle_x", "recover_after",
-                          "debt_asset", "debt", "repay_deadline",
-                          "adaptor_point", "payment_hash"):
+                          "debt_asset", "debt", "repay_deadline", "abort_after",
+                          "d_refund", "lender_prog", "upgrade_fee",
+                          "market", "strike"):
                     if loan.get(k) in (None, ""):
                         raise ValueError(f"the offer's loan is missing {k}")
+                market = str(body.get("market", ""))
+                lots = max(1, int(body.get("lots", 1)))
+                if not R.verify_offer(loan, market, lots,
+                                      str(body.get("offer_sig", ""))):
+                    return self._send(403, {
+                        "error": "that offer is not signed by the key it names "
+                                 "as the lender. An unsigned offer would make "
+                                 "somebody else's responder pay it out."})
+                if int(loan["strike"]) <= 0:
+                    raise ValueError(
+                        "an offer must name the price a seizure would be "
+                        "justified below. This tier's seizure is the lender "
+                        "and the oracle signing together, with no price test "
+                        "in the script, so the strike is the only thing that "
+                        "makes one checkable afterwards")
+                if loan.get("oracle_x") == loan.get("lender_x"):
+                    raise ValueError("the lender cannot be their own oracle: "
+                                     "that is collateral its holder may seize "
+                                     "on their own say-so")
+                if int(loan["upgrade_fee"]) < MIN_UPGRADE_FEE:
+                    raise ValueError(
+                        f"the fee carried for moving the collateral into the "
+                        f"vault is {loan['upgrade_fee']} satoshis, under the "
+                        f"{MIN_UPGRADE_FEE} this relay accepts. That "
+                        "transaction is signed in advance and cannot be "
+                        "replaced or fee-bumped, so a fee too low to confirm "
+                        "is a loan that cannot start")
+                loan["lender_prog"] = R.check_program(loan["lender_prog"],
+                                                      loan.get("lender_ver", 0))
+                loan["lender_ver"] = int(loan.get("lender_ver", 0))
                 rec = s.book.put_btc_offer({
-                    "loan": loan, "market": body.get("market", ""),
+                    "btc_offer_id": R.offer_id(loan, market, lots),
+                    "loan": loan, "market": market, "lots": lots,
+                    "offer_sig": str(body.get("offer_sig", "")),
                     "responder": body.get("responder", ""),
-                    "note": body.get("note", "")})
+                    "note": str(body.get("note", ""))[:200]})
                 return self._send(200, rec)
+            if path.startswith("/v1/btc/offers/") and path.endswith("/withdraw"):
+                from pignus import btc_relay as R
+                oid = path[len("/v1/btc/offers/"):-len("/withdraw")]
+                offer = s.book.btc_offers.get(oid)
+                if not offer:
+                    return self._send(404, {"error": "no such offer"})
+                if not R.verify_report(offer["loan"]["lender_x"],
+                                       R.WITHDRAW_TAG, oid,
+                                       str(body.get("sig", ""))):
+                    return self._send(403, {"error": "only the lender who "
+                                            "published an offer can withdraw it"})
+                s.book.update_btc_offer(oid, status="withdrawn")
+                return self._send(200, {"ok": True, "btc_offer_id": oid})
             if path == "/v1/btc/take":
-                # A borrower asks a lender to adaptor-sign their reclaim. The
-                # relay recomputes the reclaim sighash and refuses a request
-                # whose sighash does not match the loan + funding it names, so a
-                # lender is never asked to sign a mystery transaction.
+                # A borrower asks for a loan. Everything they claim is rebuilt
+                # here from the offer's own terms -- but not the vault, which
+                # depends on a secret the lender has not drawn yet. That is the
+                # next step, and it is why this is a request rather than a take.
                 offer = s.book.btc_offers.get(body.get("btc_offer_id"))
                 if not offer:
                     return self._send(404, {"error": "no such BTC offer"})
-                loan = dict(offer["loan"])
-                loan["borrower_x"] = body["borrower_x"]
-                want = s.btc_reclaim_sighash(
-                    loan, body["funding_txid"], body["funding_vout"],
-                    body["reclaim_dest"], body.get("reclaim_fee", 3000))
-                if want != str(body.get("reclaim_sighash", "")).lower():
-                    raise ValueError(
-                        "the reclaim sighash does not match the loan and funding "
-                        "named; refusing to relay a request to sign something else")
-                rec = s.book.put_btc_take({
-                    "btc_offer_id": offer["btc_offer_id"], "loan": loan,
-                    "borrower_x": body["borrower_x"],
-                    "borrower_seq_spk": body.get("borrower_seq_spk", ""),
-                    "funding_txid": body["funding_txid"],
-                    "funding_vout": int(body["funding_vout"]),
-                    "reclaim_dest": body["reclaim_dest"],
-                    "reclaim_fee": int(body.get("reclaim_fee", 3000)),
-                    "reclaim_sighash": want})
-                return self._send(200, rec)
-            if path == "/v1/btc/adaptor":
-                # The lender's responder returns its adaptor signature. The relay
-                # VERIFIES it against the loan's lender key, the adaptor point and
-                # the reclaim sighash before storing, so a borrower never acts on
-                # a release that would not complete.
-                take = s.book.btc_takes.get(body.get("take_id"))
-                if not take:
-                    return self._send(404, {"error": "no such take"})
+                if offer.get("status", "open") != "open":
+                    return self._send(409, {"error": "that offer is closed"})
+                if s.book.btc_offer_lots_left(offer["btc_offer_id"],
+                                              BTC_TAKE_TTL,
+                                              BTC_SIGNED_TAKE_TTL) <= 0:
+                    return self._send(409, {
+                        "error": "every loan on that offer is already taken or "
+                                 "spoken for; try again later or find another"})
+                loan, dest, problems = s.btc_check_take(offer, body)
                 from pignus import btc_collateral as BC
-                loan = BC.loan_from_dict(take["loan"])
-                asig = bytes.fromhex(body["adaptor_sig"])
-                from pignus import adaptor as A
-                ok = A.encrypt_verify(
-                    bytes.fromhex(loan.lender_x),
-                    bytes.fromhex(take["reclaim_sighash"]),
-                    bytes.fromhex(loan.adaptor_point), asig)
-                if not ok:
-                    raise ValueError("that adaptor signature does not verify "
-                                     "against the loan; refusing to store it")
-                s.book.update_btc_take(take["take_id"],
-                                       adaptor_sig=body["adaptor_sig"],
-                                       status="signed")
-                return self._send(200, {"ok": True, "take_id": take["take_id"]})
-            if path == "/v1/btc/disbursed":
-                # The lender's responder reports that it has sent the principal
-                # to the borrower on Sequentia -- the other half of the loan.
+                rec = s.book.put_btc_take({
+                    "btc_offer_id": offer["btc_offer_id"],
+                    "loan": BC.loan_to_dict(loan),
+                    "borrower_x": loan.borrower_x,
+                    "borrower_seq_spk": str(body.get("borrower_seq_spk", "")),
+                    "w_seq": int(body.get("w_seq", 0)),
+                    "prevault_txid": str(body["prevault_txid"]).lower(),
+                    "prevault_vout": int(body["prevault_vout"]),
+                    "prevault_value": str(loan.prevault_value()),
+                    "prevault_spk": loan.prevault_spk().hex(),
+                    "reclaim_dest": dest,
+                    "reclaim_fee": int(body.get("reclaim_fee", 3000)),
+                    "disbursement_spk": loan.disbursement_spk().hex(),
+                    "status": "requested",
+                    "warnings": problems})
+                return self._send(200, rec)
+            if path == "/v1/btc/hash":
+                # The lender draws this loan's secret and publishes its hash.
+                # One secret per loan: sharing one across an offer's takes would
+                # let any borrower's repayment release every other borrower's
+                # collateral.
+                from pignus import btc_relay as R
                 take = s.book.btc_takes.get(body.get("take_id"))
                 if not take:
                     return self._send(404, {"error": "no such take"})
+                lender_x = take["loan"]["lender_x"]
+                phash = str(body.get("payment_hash", "")).lower()
+                point = str(body.get("adaptor_point", "")).lower()
+                if len(phash) != 64:
+                    raise ValueError("a payment hash is 32 bytes")
+                if not R.verify_report(lender_x, R.HASH_TAG, take["take_id"],
+                                       str(body.get("auth", "")),
+                                       payment_hash=phash,
+                                       adaptor_point=point):
+                    return self._send(403, {"error": "that hash is not signed "
+                                            "by this loan's lender"})
+                if take.get("payment_hash") and take["payment_hash"] != phash:
+                    return self._send(409, {"error": "this take already has a "
+                                            "payment hash; it cannot change"})
+                loan = dict(take["loan"])
+                loan["payment_hash"] = phash
+                loan["adaptor_point"] = point
+                from pignus import btc_collateral as BC
+                ln = BC.loan_from_dict(loan)
                 s.book.update_btc_take(
-                    take["take_id"], status="disbursed",
-                    disbursement_txid=str(body.get("disbursement_txid", "")))
+                    take["take_id"], loan=loan, payment_hash=phash,
+                    adaptor_point=point, status="reserved",
+                    hash_auth=str(body.get("auth", "")),
+                    vault_txid=BC.upgrade_tx(ln, take["prevault_txid"],
+                                             int(take["prevault_vout"])).txid(),
+                    vault_vout=0,
+                    repayment_spk=ln.repayment_spk().hex())
                 return self._send(200, {"ok": True, "take_id": take["take_id"]})
+            if path == "/v1/btc/presig":
+                # The borrower signs the one transaction that can move their
+                # collateral into the vault, now that they can derive it.
+                from pignus import btc_relay as R
+                from pignus import btc_collateral as BC
+                take = s.book.btc_takes.get(body.get("take_id"))
+                if not take:
+                    return self._send(404, {"error": "no such take"})
+                if not take.get("payment_hash"):
+                    return self._send(409, {"error": "this take has no payment "
+                                            "hash yet; there is no vault to "
+                                            "sign for"})
+                presig = str(body.get("upgrade_presig", "")).lower()
+                loan = s.btc_take_loan(take)
+                if not BC.check_upgrade_presig(loan, take["prevault_txid"],
+                                               int(take["prevault_vout"]),
+                                               bytes.fromhex(presig)):
+                    raise ValueError("that signature does not move this "
+                                     "collateral into this loan's vault")
+                s.book.update_btc_take(take["take_id"], upgrade_presig=presig,
+                                       status="pending")
+                return self._send(200, {"ok": True, "take_id": take["take_id"]})
+            if path == "/v1/btc/adaptor":
+                # The lender returns the release: an ordinary signature over
+                # the transaction that gives the collateral back, which the
+                # borrower can check for themselves before committing anything.
+                from pignus import btc_relay as R
+                from pignus import btc_collateral as BC
+                from pignus import adaptor as A
+                take = s.book.btc_takes.get(body.get("take_id"))
+                if not take:
+                    return self._send(404, {"error": "no such take"})
+                if not take.get("upgrade_presig"):
+                    return self._send(409, {
+                        "error": "this take has no advance signature yet, so "
+                                 "there is nothing safe to release"})
+                lender_x = take["loan"]["lender_x"]
+                asig = str(body.get("release_sig")
+                               or body.get("adaptor_sig", "")).lower()
+                point = str(body.get("adaptor_point", take.get("adaptor_point", ""))).lower()
+                phash = str(body.get("payment_hash", take.get("payment_hash", ""))).lower()
+                if not R.verify_report(lender_x, R.ADAPTOR_TAG, take["take_id"],
+                                       str(body.get("auth", "")),
+                                       adaptor_point=point, payment_hash=phash,
+                                       adaptor_sig=asig):
+                    return self._send(403, {"error": "that reply is not signed "
+                                            "by this loan's lender"})
+                if phash != take.get("payment_hash"):
+                    return self._send(409, {"error": "that release is for a "
+                                            "different payment hash than this "
+                                            "take reserved"})
+                held = take.get("release_sig") or take.get("adaptor_sig")
+                if held and held != asig:
+                    return self._send(409, {"error": "this take already holds a "
+                                            "release; it cannot be replaced"})
+                ln = s.btc_take_loan(take)
+                vault_txid = BC.upgrade_tx(ln, take["prevault_txid"],
+                                           int(take["prevault_vout"])).txid()
+                sighash = BC.sighash_for(
+                    ln, BC.reclaim_tx(ln, vault_txid, 0,
+                                      bytes.fromhex(take["reclaim_dest"]),
+                                      int(take.get("reclaim_fee", 3000))),
+                    "reclaim")
+                if not A.verify(bytes.fromhex(lender_x), sighash,
+                                bytes.fromhex(asig)):
+                    raise ValueError("that release does not verify against the "
+                                     "loan it claims to be for; refusing to "
+                                     "store it")
+                s.book.update_btc_take(
+                    take["take_id"], release_sig=asig, adaptor_sig=asig,
+                    status="signed",
+                    # Kept, and served: it is what lets a borrower check that
+                    # the payment hash their repayment commits to really came
+                    # from the lender rather than from whoever runs this.
+                    adaptor_auth=str(body.get("auth", "")),
+                    vault_txid=vault_txid, vault_vout=0)
+                return self._send(200, {"ok": True, "take_id": take["take_id"]})
+            if path in ("/v1/btc/disbursed", "/v1/btc/upgraded",
+                        "/v1/btc/claimed", "/v1/btc/refunded"):
+                # Everything a lender's responder reports about a take. Each one
+                # changes what a borrower believes and acts on, so each carries
+                # the lender's signature over exactly the fields it reports.
+                from pignus import btc_relay as R
+                take = s.book.btc_takes.get(body.get("take_id"))
+                if not take:
+                    return self._send(404, {"error": "no such take"})
+                lender_x = take["loan"]["lender_x"]
+                kind = path.rsplit("/", 1)[1]
+                tag, fields, update = {
+                    "disbursed": (
+                        R.DISBURSED_TAG,
+                        {"txid": str(body.get("disbursement_txid", "")).lower(),
+                         "vout": int(body.get("disbursement_vout", 0))},
+                        lambda f: {"status": "disbursed",
+                                   "disbursement_txid": f["txid"],
+                                   "disbursement_vout": f["vout"]}),
+                    "upgraded": (
+                        R.UPGRADED_TAG,
+                        {"txid": str(body.get("upgrade_txid", "")).lower()},
+                        lambda f: {"status": "live", "upgrade_txid": f["txid"]}),
+                    "claimed": (
+                        R.CLAIMED_TAG,
+                        {"txid": str(body.get("claim_txid", "")).lower(),
+                         "secret": str(body.get("secret_t", "")).lower()},
+                        lambda f: {"status": "claimed", "claim_txid": f["txid"],
+                                   "secret_t": f["secret"]}),
+                    "refunded": (
+                        R.REFUNDED_TAG,
+                        {"txid": str(body.get("refund_txid", "")).lower()},
+                        lambda f: {"status": "refunded",
+                                   "refund_txid": f["txid"]}),
+                }[kind]
+                if not R.verify_report(lender_x, tag, take["take_id"],
+                                       str(body.get("auth", "")), **fields):
+                    return self._send(403, {
+                        "error": "that report is not signed by this loan's "
+                                 "lender, so it will not be believed"})
+                if kind == "claimed" and fields["secret"]:
+                    import hashlib
+                    if hashlib.sha256(bytes.fromhex(fields["secret"])).hexdigest() \
+                            != take["loan"].get("payment_hash"):
+                        return self._send(400, {
+                            "error": "that secret does not open this loan's "
+                                     "repayment; refusing to publish it"})
+                s.book.update_btc_take(take["take_id"], **update(fields))
+                return self._send(200, {"ok": True, "take_id": take["take_id"]})
+            if path in ("/v1/btc/claimed-principal", "/v1/btc/repaid"):
+                # The BORROWER's own reports. Both are hints -- everything they
+                # say is on chain anyway -- but an unauthenticated hint is a
+                # denial of service: flipping a take out of the status a
+                # responder scans would stop a principal being paid, or an
+                # unclaimed one being taken back, for good. So the borrower
+                # signs them with the key the take already names.
+                from pignus import btc_relay as R
+                take = s.book.btc_takes.get(body.get("take_id"))
+                if not take:
+                    return self._send(404, {"error": "no such take"})
+                kind = path.rsplit("/", 1)[1]
+                txid = str(body.get("txid") or body.get("claim_txid")
+                           or body.get("repay_txid", ""))[:64].lower()
+                vout = int(body.get("vout", 0))
+                tag = (R.CLAIMED_PRINCIPAL_TAG if kind == "claimed-principal"
+                       else R.REPAID_TAG)
+                if not R.verify_report(take.get("borrower_x", ""), tag,
+                                       take["take_id"],
+                                       str(body.get("auth", "")),
+                                       txid=txid, vout=vout):
+                    return self._send(403, {
+                        "error": "that report is not signed by this loan's "
+                                 "borrower, so it will not be believed"})
+                # A hint, and nothing more. It records where the borrower says
+                # their payment landed and changes no status: a lender's
+                # responder scans by status, so letting a borrower set one would
+                # let them steer what the lender does and does not look at.
+                if kind == "claimed-principal":
+                    s.book.update_btc_take(take["take_id"],
+                                           principal_claim_txid=txid)
+                else:
+                    s.book.update_btc_take(take["take_id"], repay_txid=txid,
+                                           repay_vout=vout, status="repaid")
+                return self._send(200, {"ok": True})
             if path == "/v1/loans":
-                if len(s.book.loans) >= MAX_LOANS:
+                open_loans = sum(1 for r in s.book.loans.values()
+                                 if r.get("state") not in CLOSED_NAMES)
+                if open_loans >= MAX_LOANS:
                     return self._send(429, {"error": "the book is full"})
-                s.verify_loan(body)
-                rec = s.book.put_loan(body["terms"], body["txid"], body["vout"],
-                                      state=body.get("state", "UNCONFIRMED"),
-                                      single_leaf=bool(body.get("single_leaf")),
-                                      offer_id=body.get("offer_id"))
-                s.refresh_chain()
+                # A loan is registered before its funding is buried, so a caller
+                # can hand over a mempool transaction and then double-spend it.
+                # Each of those leaves a GHOST behind, and nothing on chain was
+                # ever spent to make one, so the only thing bounding them is
+                # this: how many one client may have waiting at a time.
+                who = self._client_key()
+                waiting = s.pending_registrations(who)
+                if waiting >= MAX_PENDING_PER_CLIENT:
+                    return self._send(429, {
+                        "error": f"you have {waiting} registrations still "
+                                 "waiting for their funding to bury; wait for "
+                                 "those to confirm before registering more"})
+                got = s.verify_loan(body)
+                # No caller-supplied state: a loan is not originated until its
+                # funding is buried, and a register that could claim LIVE at
+                # zero confirmations would say so on the page. The watcher
+                # decides, from the chain, in the refresh two lines down.
+                rec = s.book.put_loan(
+                    body["terms"], body["txid"], body["vout"],
+                    single_leaf=bool(body.get("single_leaf")),
+                    confirmations=got["confirmations"],
+                    offer_id=(body.get("offer_id")
+                              if body.get("offer_id") in s.book.offers
+                              else None))
+                s.note_registration(who, rec["loan_id"])
+                s.refresh_chain(wait=2)
                 return self._send(200, s.loan_view(
                     s.book.loans.get(rec["loan_id"], rec)))
             return self._send(404, {"error": "no such endpoint", "path": path})
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
+        except OfferExists as e:
+            # Not a bad request: the coin is listed and this caller did not
+            # prove it owns the listing.
+            return self._send(409, {"error": str(e)})
         except NotOnChain as e:
             return self._send(400, {"error": str(e)})
         except (KeyError, ValueError, TypeError) as e:
-            return self._send(400, {"error": f"{type(e).__name__}: {e}"})
+            # A 4xx body is read by a person, on the page, in a red box: the
+            # Python class name in front of it told them nothing.
+            sys.stderr.write(f"POST {path}: {type(e).__name__}: {e}\n")
+            msg = (f"missing field {e.args[0]}" if isinstance(e, KeyError)
+                   and e.args else str(e))
+            return self._send(400, {"error": msg})
         except Exception as e:                      # noqa: BLE001
+            sys.stderr.write(f"POST {path}: {type(e).__name__}: {e}\n")
             return self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def do_DELETE(self):
         u = urlparse(self.path)
+        self._body_read = False
         path = u.path.rstrip("/")
-        if not WRITE_LIMIT.allow(self.client_address[0], time.time()):
+        if self._rate_limited():
+            self._discard_body()
             return self._send(429, {"error": "too many writes; slow down"})
+        self._discard_body()
         try:
             if path.startswith("/v1/offers/"):
                 offer_id = path[len("/v1/offers/"):]
@@ -896,6 +2191,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "no such endpoint"})
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
+        except Exception as e:                      # noqa: BLE001
+            sys.stderr.write(f"DELETE {path}: {type(e).__name__}: {e}\n")
+            return self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
 
 def main():
@@ -903,30 +2201,59 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--once", action="store_true",
                     help="refresh once and print the state, without serving")
+    ap.add_argument("--rescan-from", type=int, metavar="HEIGHT",
+                    help="read the chain again from this height, forwards. "
+                         "The backward walk a poll does is bounded, so a book "
+                         "that was down for longer than rescan_depth blocks "
+                         "cannot see what happened while it was away; this "
+                         "does, a capped number of blocks per poll.")
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = json.load(f)
-    svc = Service(cfg)
+    try:
+        # Load the covenant before anything is served. Every vault address this
+        # daemon shows is derived from it, and the golden vectors are checked on
+        # the way through -- so a checkout that has drifted from the proven
+        # builder stops here, rather than on the first offer somebody publishes.
+        compat.load_covenant()
+        svc = Service(cfg)
+    except compat.CovenantUnavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
 
-    svc.refresh_registry(force=True)
-    svc.refresh_prices()
-    svc.refresh_fees()
-    svc.refresh_chain()
+    if args.rescan_from is not None:
+        if svc.watcher is None:
+            print("error: --rescan-from needs a node; this config has no rpc",
+                  file=sys.stderr)
+            return 1
+        svc.watcher.rescan_from(args.rescan_from)
+        print(f"pignusd: rescanning from height {args.rescan_from}",
+              file=sys.stderr)
+
     if args.once:
+        svc.refresh_registry(force=True)
+        svc.refresh_prices()
+        svc.refresh_fees()
+        svc.refresh_chain()
+        svc.last_poll = int(time.time())
         print(json.dumps({"markets": svc.market_rows(),
-                          "stats": svc.book.stats(svc.prices),
+                          "stats": svc.book.stats(svc.fresh_prices()),
                           "health": svc.health()}, indent=2))
         return
 
-    threading.Thread(target=svc.loop, args=(int(cfg.get("poll", 30)),),
-                     daemon=True).start()
     host, _, port = cfg.get("listen", "127.0.0.1:8741").rpartition(":")
     Handler.svc = svc
     srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
-    print(f"pignusd: {len(svc.markets)} market(s), {len(svc.assets)} asset(s) "
-          f"named, book {cfg['book']}, serving on {host}:{port}", file=sys.stderr)
+    # Bind and serve BEFORE the first sync. That sync re-tracks every loan and
+    # can walk a long way back for spends it missed; done first, the page is a
+    # proxy error for as long as it takes and nothing says why. Served first,
+    # /healthz answers "initial sync" from the start.
+    threading.Thread(target=svc.loop, args=(svc.poll_interval,),
+                     daemon=True).start()
+    print(f"pignusd: {len(svc.markets)} market(s), book {cfg['book']}, "
+          f"serving on {host}:{port}; syncing", file=sys.stderr)
     srv.serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

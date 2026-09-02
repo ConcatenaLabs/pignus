@@ -1,22 +1,21 @@
 # Pignus: non-custodial collateralised lending on Sequentia
 
-Status (2026-08-22): the loan-vault covenant (section 2) is implemented in the
-node repository's
-[`test/functional/pignus_covenant.py`](https://github.com/ConcatenaLabs/Sequentia/blob/master/test/functional/pignus_covenant.py)
-and proven against the node by `feature_pignus_vault.py`, which is in the test
-runner, with the oracle set (6.1), funded offers (3) and the attack suite proven
-by `feature_pignus_oracle_set.py`, `feature_pignus_offer.py` and
-`feature_pignus_attack.py` beside it. The oracle, the loan book, the watcher,
-the browser client, the Bitcoin-collateral construction (section 7) and the
-OpenDAMP repurchase (8.1) are implemented in this repository. The oracle, the
-loan book and the browser client run on the testnet at
-[sequentiatestnet.com/lending/](https://sequentiatestnet.com/lending/), and
-`pignus-cli` is on the download page.
+The loan-vault covenant (section 2) lives in the node repository's
+[`test/functional/pignus_covenant.py`](https://github.com/ConcatenaLabs/Sequentia/blob/master/test/functional/pignus_covenant.py),
+where it is proven against a node by `feature_pignus_vault.py`,
+`feature_pignus_oracle_set.py`, `feature_pignus_offer.py`,
+`feature_pignus_hashlock.py` and `feature_pignus_attack.py`. Everything that
+drives it -- the oracle, the loan book, the watcher, the browser client and the
+Bitcoin-collateral construction (section 7) -- lives in the `pignus` repository,
+and runs on the testnet at
+[sequentiatestnet.com/lending/](https://sequentiatestnet.com/lending/). The
+OpenDAMP repurchase (8.1) is there too: the bond vault, the verification of both
+legs, the forfeit path, and the four-input settlement `pignus-cli repo-settle`
+composes and then attaches the covenant witness to.
 
 *Pignus* is the Roman-law term for property pledged as security for a debt: the
 creditor holds the pledge, the debt is owed separately, and redeeming the debt
-redeems the pledge. That is exactly the shape of the thing, and it is a working
-name -- renaming costs one identifier.
+redeems the pledge. That is exactly the shape of the thing.
 
 Companion documents, all in other repositories:
 [`openamp-design.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/openamp-design.md) and
@@ -147,15 +146,15 @@ enough past `maturity` that a transient oracle outage cannot reach it;
 `maturity + 30 days` is the suggested default, and the borrower must check the
 gap before funding, because it is the borrower who pays for a short one.
 
-It used to require the lender's signature, and that was wrong. The browser
-wallet extension signs its own transaction inputs but cannot sign a covenant
-leaf, and exposes no x-only key to bake into one -- so a lender using a browser
-had a backstop nobody could execute, which is not a backstop but a trap holding
-their collateral. Pinning the destination fixes that and is better on its own
-terms: the lender needs no key beyond the address they are paid at, so there is
-nothing to lose, and they need not be online, for the same reason REPAY is
-permissionless. Letting anyone trigger it is safe because it can only ever pay
-the lender.
+RECOVER pins its destination rather than demanding the lender's signature, and
+that is the better design on its own terms. A browser wallet extension signs its
+own transaction inputs but cannot sign a covenant leaf, and exposes no x-only
+key to bake into one, so a signature-gated backstop would be one that a lender
+using a browser could never execute -- not a backstop but a trap holding their
+collateral. With the destination pinned the lender needs no key beyond the
+address they are paid at, so there is nothing to lose, and need not be online,
+for the same reason REPAY is permissionless. Letting anyone trigger it is safe
+because it can only ever pay the lender.
 
 **No exit in the system needs a signature.** Every leaf reads what it enforces
 out of the transaction and pays a pinned destination. That is what makes the
@@ -179,7 +178,7 @@ until somebody tries to leave it.
 
 ### 2.7 Sizes and limits
 
-Measured leaf sizes: REPAY 192 bytes, LIQUIDATE 352, DEFAULT 345, RECOVER 39.
+Measured leaf sizes: REPAY 192 bytes, LIQUIDATE 352, DEFAULT 345, RECOVER 97.
 A REPAY spend is in the same class as a covenant CLOB fill (a few hundred
 vbytes; the measured user capacity of a block is about 89,999 vB), which
 matters: doing
@@ -213,35 +212,45 @@ that product eats 60 of the 63 available bits by itself.
 
 ## 3. Origination
 
-One atomic transaction, signed by both parties, no escrow:
-
-    inputs   borrower's collateral utxo(s), lender's principal utxo(s)
-    outputs  0: the vault (L of C at the covenant address)
-             1: principal (the loan amount of D) to the borrower
-             +  changes, and the network fee output
-
-Either party can walk away before signing and nobody is ever exposed to the
-other. This is the same PSET co-signing flow SeqDEX already uses for same-chain
-atomic swaps, so it is proven machinery rather than new machinery.
-
-The borrower MUST, before signing, reconstruct the vault address from the terms
-and check it equals output 0's scriptPubKey, and check the internal key is NUMS.
-That single check is what makes everything in section 1 true; a wallet that
-skips it has silently reintroduced a trusted party. `pignus-cli verify` and the
-wallet integration both do it, and the daemon never asks a user to sign a vault
-it did not reconstruct locally.
-
-**Offers.** Lenders publish signed offers (asset pair, size, rate, term, strike,
-oracle) to the book; borrowers take one. The book is pure discovery -- it holds
-no funds and cannot alter terms, because the terms are inside the address the
-borrower reconstructs. A *funded* resting offer, where the lender's principal
-sits in its own covenant that anyone may take by locking a correctly-shaped
-vault in the same transaction, is implemented in the node repository's
-[`test/functional/pignus_offer.py`](https://github.com/ConcatenaLabs/Sequentia/blob/master/test/functional/pignus_offer.py)
-and proven by `feature_pignus_offer.py`; `pignus/offers.py` and `web/offer.js`
-drive it. The offer covenant recomputes the vault's taproot address from a
+**Offers.** A lender's offer is FUNDED: the principal already rests in an offer
+covenant, and any borrower may take it unilaterally, in one transaction that
+locks a correctly shaped vault. The lender need not be online, and the book has
+a coin it can check rather than a promise it cannot. That covenant is in the node
+repository's
+[`test/functional/pignus_offer.py`](https://github.com/ConcatenaLabs/Sequentia/blob/master/test/functional/pignus_offer.py),
+proven by `feature_pignus_offer.py` and driven by `pignus/offers.py` and
+`web/offer.js`; it recomputes the vault's taproot address from a
 witness-supplied borrower key with `OP_TWEAKVERIFY` plus the tagged hashes, the
 technique OpenAMP's containment covenant proved.
+
+A *signed* offer -- one the lender must be online to co-sign at take time -- is
+strictly worse and does not exist here: the book refuses any other kind. The
+book itself is pure discovery. It holds no funds and cannot alter terms, because
+the terms are inside the address the borrower reconstructs.
+
+The take is one atomic transaction:
+
+    inputs   the offer's coin, borrower's collateral utxo(s)
+    outputs  the vault (L of C at the covenant address)
+             the principal (the loan amount of D) to the borrower
+             the offer's remainder, if it held more than one lot
+             +  changes, and the network fee output
+
+The borrower MUST, before signing, reconstruct the vault address from the terms
+and check it equals the vault output's scriptPubKey, and check the internal key
+is NUMS. That single check is what makes everything in section 1 true; a wallet
+that skips it has silently reintroduced a trusted party. `pignus-cli verify` and
+the page both do it, and the page never asks a wallet to sign a vault it did not
+reconstruct locally.
+
+A direct origination -- both parties signing one transaction that funds the
+vault and pays the principal, with no offer covenant in between -- is the same
+shape, and `build_origination` in `pignus/vault.py` composes it. Either party
+can walk away before signing and neither is ever exposed to the other; it is the
+same PSET co-signing flow SeqDEX already uses for same-chain atomic swaps, so it
+is proven machinery rather than new. It is nevertheless a library and nothing
+more: no command, page flow or book entry uses it, because a funded offer does
+the same job without needing the lender at the keyboard.
 
 ## 4. The oracle
 
@@ -288,18 +297,24 @@ later, after the price has recovered. What this is and is not:
 - It is a **timing advantage**, and the borrower's cure is the same either way:
   repay, or top up before the dip.
 
-Two mitigations, in increasing cost:
+Two mitigations, in increasing cost.
 
-1. **Epoch commitment (recommended, oracle-side).** The oracle signs
-   `feed_id || epoch || price` where `epoch` advances every N minutes, and the
-   vault bakes a `min_epoch`. This does not remove the window, it bounds how far
-   back a saved attestation can reach only if `min_epoch` advances -- which
-   requires re-covenanting. Useful mainly for short-term loans, where
-   `not_before` can be set close to origination.
-2. **Re-covenanting on top-up.** A borrower adding collateral moves to a fresh
-   vault with a later `not_before`, which retires every attestation older than
-   the top-up. This is the practical answer and it falls out of the design for
-   free: a top-up is a REPAY-and-reopen, or an explicit new origination.
+### 5.1 Re-covenanting on top-up
+
+A borrower adding collateral moves to a fresh vault with a later `not_before`,
+which retires every attestation older than the top-up. This is the practical
+answer and it falls out of the design for free: a top-up is a REPAY-and-reopen,
+or an explicit new origination.
+
+### 5.2 Epoch commitment
+
+A possible oracle-side extension, not implemented: the oracle would sign
+`feed_id || epoch || price` where `epoch` advances every N minutes, and the
+vault would bake a `min_epoch`. That does not remove the window; it bounds how
+far back a saved attestation can reach, and only while `min_epoch` advances --
+which requires re-covenanting. It would be useful mainly for short-term loans,
+where `not_before` can be set close to origination. What the oracle signs today
+is `feed_id || timestamp || price`, and nothing here reads an epoch.
 
 This gap is inherent to putting an external fact into a script, and every
 oracle-driven on-chain lending design has some version of it. It is written down
@@ -325,14 +340,17 @@ difference between the fabricated and the true price on the seized portion --
 bad, publicly evident from the signed log, and bounded. It cannot steal the
 collateral.
 
-Hardening comes in two shapes, and both are implemented.
+Hardening comes in two shapes. The first is open to any operator willing to put
+a threshold signer behind the oracle's key; the second is in the covenant.
 
-**A threshold group key** (FROST, the `PolicySigner` seam OpenAMP already
-built): the vault names ONE key, the m-of-n lives in the signing protocol, and
-nothing on chain changes. Cheapest, and the group key's invariance under
-resharing means the signer set can rotate without moving a single vault address.
-Its cost is that the signers must run a joint protocol -- there is a coordinator,
-and the signers' liveness is coupled.
+**A threshold group key** (FROST, the `PolicySigner` seam OpenAMP already built)
+would have the vault name ONE key, with the m-of-n living in the signing
+protocol and nothing on chain changing. That is the cheapest shape, and the
+group key's invariance under resharing means the signer set can rotate without
+moving a single vault address. Its cost is that the signers must run a joint
+protocol -- there is a coordinator, and the signers' liveness is coupled.
+Pignus's oracle daemon signs alone from one keyfile, so an operator who wants
+this brings their own signer.
 
 **An on-chain oracle set** (`oracles=[...]`, `oracle_threshold=m`): the vault
 names n keys and the covenant counts valid signatures itself. The oracles never
@@ -351,12 +369,12 @@ exactly the `m` lowest attestations they hold, which makes the effective price
 the m-th lowest of the set -- a robust quantile rather than any one oracle's
 number.
 
-Two properties fall out and are worth stating. A single compromised oracle can
-no longer trigger a liquidation, because it cannot reach the threshold alone --
-and a signature from one key replayed into another key's slot fails, since every
-slot pins its own key. A single dead oracle can no longer block one either, so
-the set improves both halves of the trust problem rather than trading one for
-the other. An abstaining slot carries an EMPTY signature, which
+Two properties fall out and are worth stating. A single compromised oracle
+cannot trigger a liquidation, because it cannot reach the threshold alone -- and
+a signature from one key replayed into another key's slot fails, since every
+slot pins its own key. A single dead oracle cannot block one either, so the set
+improves both halves of the trust problem rather than trading one for the
+other. An abstaining slot carries an EMPTY signature, which
 `OP_CHECKSIGFROMSTACK` treats as false; a non-empty invalid signature aborts the
 script instead, so a slot cannot be stuffed with rubbish to fake an abstention.
 
@@ -383,11 +401,18 @@ indifferent to who wins. The bonus is what prices the race.
 Sequentia reorgs when Bitcoin reorgs, in real time, and that outranks
 everything. So a vault funding transaction can be undone by an anchor-driven
 reorg, exactly as a covenant CLOB order can. The watcher therefore classifies a
-vault whose funding has been reorged away as GHOST and drops it, the same way
-`seqob-watcher` does, and a lender must not treat a loan as originated until its
-funding is buried by the depth their risk appetite justifies. This is not a
-Pignus-specific caveat; it is the chain's first principle, and any design that
-pretended otherwise would be wrong.
+vault whose funding has been reorged away as GHOST, keeps it out of every LIVE
+view, and goes on watching it -- the funding transaction is still valid and is
+normally mined again, and the vault returns to UNCONFIRMED or LIVE when it is.
+A lender must not treat a loan as originated until its funding is buried by the
+depth their risk appetite justifies. This is not a Pignus-specific caveat; it is
+the chain's first principle, and any design that pretended otherwise would be
+wrong.
+
+Only a watched outpoint can be seen to come back, which is why a ghost is
+re-tracked across a restart rather than forgotten, and why the funding height
+and block hash are persisted with it: they are what tells an anchor-driven reorg
+from a spend the watcher simply could not reach.
 
 ## 7. Native Bitcoin as collateral
 
@@ -403,36 +428,138 @@ Bitcoin side (`pignus/btc_collateral.py`): a P2TR funding output with the
 NUMS internal key -- no key path, the same rule as the Sequentia vault -- and
 three leaves:
 
-- leaf RECLAIM: `<P_borrower> CHECKSIGVERIFY <P_lender> CHECKSIG` -- a 2-of-2,
-  the repayment path;
+- leaf RECLAIM: `SHA256 <h> EQUALVERIFY <P_borrower> CHECKSIGVERIFY
+  <P_lender> CHECKSIG` -- both parties and the secret, the repayment path;
 - leaf SEIZE: `<P_lender> CHECKSIGVERIFY <P_oracle> CHECKSIG` -- lender and
   oracle jointly, the liquidation path;
 - leaf TIMEOUT: `<recover_after> CLTV DROP <P_lender> CHECKSIG` -- the backstop.
 
-Repayment is linked to the BTC release by an adaptor signature
-(`pignus/adaptor.py`) on the lender's half of RECLAIM, which makes the solvent
-path trustless:
+Repayment is linked to the BTC release by ONE HASH, which appears in both
+chains' scripts:
 
-1. The lender picks a secret `t` and publishes `T = t·G` and `h = SHA256(t)`.
+1. The lender picks a secret `t` and publishes `h = SHA256(t)`.
 2. At origination the lender hands the borrower their half of the RECLAIM
-   signature on the transaction that returns the BTC to the borrower, as an
-   **adaptor** signature under `T`. The borrower holds a release signature they
-   cannot yet complete.
-3. The borrower repays on Sequentia into a taproot output with two leaves:
-   CLAIM, `OP_SHA256 <h> OP_EQUALVERIFY <P_lender> CHECKSIG`, and REFUND,
-   `<repay_deadline> CLTV DROP <P_borrower> CHECKSIG` if the lender stalls.
+   signature on the transaction that returns the BTC -- an ordinary BIP340
+   signature the borrower verifies on the spot. RECLAIM also demands `t`, so
+   the borrower holds a release they cannot yet use.
+3. The borrower repays on Sequentia into a hashlocked output whose CLAIM leaf
+   pays the lender against `t` and whose REFUND leaf returns the money to the
+   borrower after `repay_deadline`.
 4. The lender claims the repayment, which publishes `t` on the Sequentia chain.
-5. The borrower reads `t`, completes the adaptor signature, adds their own half,
-   and takes the BTC back through RECLAIM.
+5. The borrower reads `t` off the chain and spends RECLAIM with it, the
+   lender's release and their own signature.
 
-If the lender never claims, the borrower recovers the principal repayment after
-the CLTV and the lender takes the BTC via TIMEOUT: the loan unwinds, nobody is
-robbed, and the lender is strictly worse off for stalling, so they do not.
+**The link is a hash rather than an adaptor signature, and that is the point.**
+An adaptor signature under a point `T = t·G` would make step 2 a signature the
+borrower cannot complete until `t` is public, which sounds like the same thing.
+It is not, because it asks the borrower to believe that the `h` baked into their
+repayment output and the `T` their release is encrypted under came from one
+secret. Nothing available here checks that: proving `SHA256(t) = h` and
+`t·G = T` together needs a proof this protocol has no way to carry, and a lender
+who published an unrelated `h` would take the repayment AND keep the collateral,
+with no collusion and no race. With one hash in both scripts there is nothing
+left to assert and nothing left to take on trust -- the borrower compiles both
+scripts and reads the same 32 bytes out of each.
+
+If the lender never claims, the borrower recovers the repayment after the CLTV
+and the lender takes the BTC via TIMEOUT: the loan unwinds and neither side is
+robbed, though the stall is not free for the borrower -- see the exposure table
+below.
 
 The claimant on the Bitcoin side must re-run the anchor-safety check on the
 Sequentia reveal before acting on `t`, for the reason in section 6.4 -- a
 covenant cannot introspect anchoring, so this stays a watcher discipline. This
 is the same discipline the SeqDEX cross-chain leg already documents.
+
+**Origination is atomic, because otherwise it is a gift.** Steps 1 to 5 describe
+a loan that already exists. Getting into one is the harder half, and the obvious
+sequence -- borrower funds the vault, lender then sends the principal -- gives
+the lender a free option: say nothing, wait for `recover_after`, and sweep
+collateral that was never paid for. No amount of care on the borrower's side
+detects it in advance. So the collateral does not go into the vault first.
+
+The borrower funds a **pre-vault**, a P2TR output with the NUMS internal key and
+two leaves, where `w` is a secret the borrower chooses and `H_w = SHA256(w)`:
+
+- leaf UPGRADE: `SHA256 <H_w> EQUALVERIFY <P_borrower> CHECKSIGVERIFY
+  <P_lender> CHECKSIG` -- moves the collateral into the vault, and needs both
+  parties: a borrower who could move it alone would take the principal and walk
+  off with the collateral, and a lender who could move it without `w` would
+  start a loan they had not paid for;
+- leaf ABORT: `<abort_after> CLTV DROP <P_borrower> CHECKSIG` -- takes it back.
+
+The borrower signs the single UPGRADE transaction, pre-vault to vault, at
+origination, before anything is broadcast. That fixes the vault's outpoint,
+which is what the lender's release has to commit to, and it means the lender can
+start the loan the moment `w` is public -- without the borrower being online.
+The pre-vault holds `btc_amount + upgrade_fee`, because after origination the
+borrower may be gone and the move still has to pay for itself.
+
+It also imposes an order. The vault's address commits to `h`, so the borrower
+cannot sign the move into it until the lender has drawn the secret: the
+handshake is ask, hash, pre-sign, release, fund. Every step before the last
+commits nothing, so a borrower who stops at any of them has lost nothing but the
+time.
+
+The principal is paid into a hashlocked Sequentia output of the same shape as
+the repayment: CLAIM pays the borrower against `w`, REFUND returns it to the
+lender after `d_refund`. Both Sequentia outputs use the covenant's
+`build_hashlock_leaf`, so **neither leg needs a signature** and neither can pay
+anyone but the party its address already names. That is what lets a browser
+drive the whole thing: the wallet extension signs its own inputs and a Bitcoin
+sighash, but no Sequentia covenant leaf, and here it does not have to.
+
+Origination therefore runs:
+
+| # | who | what | if it stops here |
+|---|---|---|---|
+| 1 | borrower | prepares the pre-vault funding, unbroadcast, and asks for a loan | nothing has happened |
+| 2 | lender | draws this loan's secret and publishes `h` | nothing has happened |
+| 3 | borrower | can now derive the vault, and pre-signs UPGRADE | nothing has happened |
+| 4 | lender | verifies that pre-signature and signs RECLAIM | nothing has happened |
+| 5 | borrower | verifies the release, broadcasts the pre-vault funding | borrower ABORTs at `abort_after`, out only a fee |
+| 6 | lender | sees the collateral confirmed, pays the principal into the hashlock | lender REFUNDs at `d_refund`; borrower ABORTs |
+| 7 | borrower | claims the principal, publishing `w` | lender REFUNDs at `d_refund`; borrower ABORTs |
+| 8 | lender | reads `w`, waits for the claim to be anchor-safe, broadcasts UPGRADE | **the lender loses**: the borrower has the principal and, at `abort_after`, the collateral |
+
+Only the last step exposes anyone to a loss rather than to a delay, and only the
+lender, who controls whether they are online. The margin between `d_refund` and
+`abort_after` is what makes that exposure a choice rather than a race, which is
+why `timelocks_sane()` refuses a loan whose deadlines do not leave it: at least a
+day, in wall-clock seconds, converting each chain's heights at its own block
+time.
+
+The fee on that last step is the other half of the same exposure, and it is
+worth stating rather than leaving to be discovered. The borrower signs the move
+into the vault at origination, so its fee is fixed before anyone knows what the
+parent chain will cost. It cannot be replaced -- the signature commits to the
+whole transaction -- and its only output is the vault, which nobody can spend
+to pay for it, so it cannot be bumped from either end either. A fee too low to
+confirm before `abort_after` is a loan the lender has paid for and cannot
+start. That is why the pre-vault carries a deliberately generous fee, why the
+relay refuses an offer whose fee could not plausibly confirm, and why the
+margin above is measured in days rather than hours. The same function refuses a loan whose `recover_after` does not sit a day
+past `repay_deadline`, because a lender who could claim a repayment after the
+Bitcoin timeout had opened would be racing the borrower for the collateral with
+the repayment already in hand.
+
+**What each party is exposed to, once a loan is live.** The bounded losses are
+worth stating plainly rather than being left as "nobody is robbed":
+
+| outcome | borrower ends with | lender ends with |
+|---|---|---|
+| borrower repays, lender claims | the collateral, less the interest | the debt |
+| borrower repays, lender stalls past `repay_deadline` | the repayment back, less two fees; the collateral is lost at TIMEOUT | the collateral, worth more than the debt on an over-collateralised loan |
+| borrower never repays | nothing | the collateral, at TIMEOUT |
+| price crosses the strike | the collateral, less what SEIZE took | the debt, if the oracle co-signs |
+
+The second row is the honest one: a lender who stalls gives up the repayment and
+takes collateral worth more, so on an over-collateralised loan stalling **pays**.
+The borrower's protection is not the lender's incentive; it is the margin
+`timelocks_sane()` enforces plus the borrower's own duty to repay early enough
+that the claim is buried well before `recover_after`. A borrower who repays at
+the last block has chosen the risk. The page says so where the repay button is,
+rather than in a document nobody reads.
 
 ### 7.2 Why an oracle leaf and not a DLC
 
@@ -454,32 +581,106 @@ So Pignus uses the shape that fits each job:
 - **Liquidation during the term** -- the 2-of-2 SEIZE leaf. The oracle must
   actively co-sign, which is a real and stated trust assumption, and the same
   one section 6.1 already bounds on the Sequentia side.
-- **Settlement at maturity** -- a genuine DLC, built in `pignus/dlc.py` for the
-  maturity path specifically, because there the outcome set is one-dimensional
-  and the date is known. The oracle announces one public event, the BTC/USDX
-  price at the maturity date, and attests it without knowing any loan exists;
-  each side adaptor-signs one contract-execution transaction per price bucket,
-  and the attestation is the decryption key for exactly one of them. That
-  removes the oracle's per-loan involvement at maturity entirely.
+- **Settlement at maturity** -- the shape that fits is a DLC, because there the
+  outcome set is one-dimensional and the date is known. The oracle announces one
+  public event, the BTC/USDX price at the maturity date, and attests it without
+  knowing any loan exists; each side adaptor-signs one contract-execution
+  transaction per price bucket, and the attestation is the decryption key for
+  exactly one of them, which removes the oracle's per-loan involvement at
+  maturity entirely. `pignus/dlc.py` implements those primitives -- the
+  announcement, the price buckets, the CETs and the attestation -- and proves
+  them on a rig. It is not wired into the oracle daemon, the CLI or the page: a
+  live cross-chain loan settles at maturity through TIMEOUT, to the lender.
 
 Stating it plainly: BTC collateral is the one tier where the oracle is trusted
 *interactively* rather than only for a number. That is the price of collateral
 on a chain with no covenants, and it is why the unrestricted-asset tier is the
 one to use where a choice exists.
 
+### 7.3 What the borrower trusts
+
+Section 2's tier asks a borrower to trust an oracle for one number. This one
+asks for more, and the list is short enough to state:
+
+- **The lender, to claim the repayment.** Repayment and release are bound, but
+  nothing forces the lender to pick up the money. The exposure table above says
+  what stalling costs and what it pays.
+- **The lender, to be reachable at origination.** A lender who signs the release
+  and then vanishes before the collateral is upgraded costs themselves, not the
+  borrower -- but a lender who never signs at all costs the borrower the
+  pre-vault fee and a wait until `abort_after`.
+- **The oracle named in the offer.** SEIZE is a plain 2-of-2 with no covenant to
+  refuse it, so the oracle's signature *is* the liquidation decision. A borrower
+  should check the offer's `oracle_x` against the set the book publishes, and
+  refuse an offer whose oracle is the lender's own key -- which the tools also
+  refuse to build. Every co-signature the oracle makes is published beside the
+  attestation that justified it, so the decision is checkable afterwards even
+  though it cannot be constrained beforehand.
+- **The deadline ordering.** `timelocks_sane()` refuses a loan whose deadlines
+  do not leave the margins section 7.1 describes, but a borrower building terms
+  by hand should read them: the gap between `d_refund` and `abort_after`, and
+  between `repay_deadline` and `recover_after`, is what makes each exposure a
+  choice rather than a race.
+
+Nothing in the list is the relay, and nothing in it is Pignus.
+
+### 7.4 Origination through the book
+
+Two people who already know each other exchange a ticket file by hand. To be
+found by strangers, a lender publishes an offer on a `pignusd`, which carries
+messages between the parties: `/v1/btc/offers` (the lender's offers),
+`/v1/btc/take` (a borrower asking for a loan), `/v1/btc/hash` (the lender
+drawing this loan's secret), `/v1/btc/presig` (the borrower signing the move
+into the vault that hash implies), `/v1/btc/adaptor` (the release
+coming back) and the lender's reports that the principal is paid, the loan is
+started, the repayment is claimed or an unclaimed principal is taken back. The
+borrower reports two things of their own -- where they took the principal and
+where they paid the debt -- and those are signed by the borrower's key for the
+same reason the lender's are signed by theirs: everything either of them says is
+on a chain anyway, but an unauthenticated hint that moved a take out of the
+status a responder scans would stop a principal being paid, for good.
+`docs/api.md` documents each of them.
+
+The relay holds no key and can move nothing, and it is never believed. Every
+message a responder will act on carries a BIP340 signature by the key the loan
+already names, over a tagged hash of exactly the fields that matter; the relay
+verifies before storing and the responder verifies again before acting. An
+unsigned offer would let anyone publish in a lender's name and have that
+lender's own responder pay it out, which is the attack the signatures exist for.
+The relay also recomputes rather than accepts: it rebuilds every address from
+the offer's own terms plus the four things a taker chooses, checks the
+borrower's advance signature moves that collateral into that vault, and checks
+the lender's release against the vault it derived -- before storing either. And
+a lender's responder repeats all of it, because the relay is a message carrier,
+not an authority: it rebuilds each loan from the offer IT signed rather than
+from the take the relay hands back.
+
+Each take draws its **own** secret `t`. One secret shared across an offer's
+takes would let any borrower's repayment release every other borrower's
+collateral.
+
+The lender's half runs as a process (`pignus-cli btc-respond`), because the
+lender draws secrets and drawing a secret in a browser means storing it in one.
+It keeps a state file recording what it has already done, which is what stops a
+principal being paid twice across a crash. That process is the one component in
+this tier whose absence costs the other party: a borrower whose take is never
+signed waits and aborts, and a borrower whose collateral is never upgraded keeps
+the principal.
+
 ## 8. Collateral tiers
 
 | Tier | Assets | Enforcement | Trust |
 |---|---|---|---|
 | A | tSEQ, GOLD, SILVR, OILX, EURX, SBTC, and any unrestricted issued asset | The section-2 covenant | Oracle, for one number |
-| B | Native BTC | Section 7, cross-chain | Oracle, interactively, for liquidation only |
-| C | OpenAMP (`cosign`) assets | A pledge the policy server enforces | Oracle **and** the issuer |
-| D | OpenDAMP (`damp`) assets | Not lending: a repurchase (8.1) | Oracle, and the lender for the bond |
+| B | Native BTC | Section 7, cross-chain | Oracle, interactively, for liquidation; the lender, for claiming the repayment and for being reachable at origination |
+| C | OpenAMP (`cosign`) assets | A pledge the policy server enforces | The issuer's policy server, and before maturity the borrower's consent |
+| D | OpenDAMP (`damp`) assets | Not lending: a repurchase (8.1) | The lender, for the bond; no oracle |
 
-**Tier A** is the design. USDX is the debt asset throughout; every unrestricted
-asset can be collateral, and the fee for any of it is payable in any accepted
-asset, because no asset is privileged here any more than anywhere else on
-Sequentia.
+**Tier A** is the design. Any unrestricted asset can be the collateral and any
+can be the debt -- the testnet quotes markets against USDX because a borrower
+wants a number they recognise, not because the covenant knows anything about it.
+The fee for any of it is payable in whatever the payer holds, because no asset
+is privileged here any more than anywhere else on Sequentia.
 
 **Tier C** deserves a blunt statement. A restricted asset can only live in the
 shapes its issuer permits -- for OpenAMP, a 2-of-2 enclave output with the
@@ -489,7 +690,7 @@ is exactly the transfer restriction the issuer exists to enforce. Self-enforcing
 collateral and issuer-enforced transferability are in direct tension. You can
 have one.
 
-So the collateral does not move. What shipped in `openampd` is a **pledge**: a
+So the collateral does not move. What `openampd` enforces is a **pledge**: a
 record that part of a holder's balance stands behind a debt, and a transfer
 check that refuses to let it leave. A holder may spend anything above their open
 pledges and nothing below, and pledges accumulate, so a second lender is never
@@ -517,13 +718,15 @@ would freeze permanently rather than secure anything.
 What Tier C costs is not hidden anywhere: the lender's security is the issuer's
 promise, not a script. A policy server that is dishonest or compromised can
 release a pledge without repayment, and no amount of checking on the lender's
-side would reveal it beforehand. The platform labels a Tier C loan
-issuer-permissioned wherever a user can see it; presenting it quietly beside a
-Tier A loan would be a lie.
+side would reveal it beforehand. A Tier C loan is labelled issuer-permissioned
+wherever a user can see it, because presenting it quietly beside a Tier A loan
+would be a lie. That is the `pledge-*` commands of `pignus-cli`, which print the
+sentence `openamp.describe()` builds: there is no pledge tab on the page and the
+book carries no pledges, so the CLI is the whole of Tier C's surface.
 
-**Tier D** is not open any more, and the answer is negative. A seizure-backed
-loan against an OpenDAMP asset is impossible, for three independent structural
-reasons, any one of which is sufficient:
+**Tier D** admits no seizure-backed loan, and the answer is structural rather
+than a matter of effort. Three independent reasons, any one of which is
+sufficient:
 
 1. **The collateral cannot enter a vault.** The verifier covenant requires that
    every output carrying the regulated asset pays `C_U(Y)` for a witness-supplied
@@ -616,18 +819,25 @@ they are owed. The full shape:
 | # | Input | | # | Output |
 |---|---|---|---|---|
 | 0 | the OpenDAMP verifier output | | 0 | the verifier output, returned |
-| 1 | `C_U(lender)`, holding q | | 1 | q to `C_U(borrower)` |
-| 2 | the bond vault | | 2 | the bond, to the lender |
-| 3 | the borrower's debt-asset UTXO | | 3 | `debt`, to the lender |
+| 1 | the bond vault | | 1 | `debt`, to the lender |
+| 2 | `C_U(lender)`, holding q | | 2 | q to `C_U(borrower)` |
+| 3 | the borrower's debt-asset UTXO | | 3 | the bond, to the lender |
 | | | | 4 | the borrower's change |
 | | | | 5 | the fee |
+
+The vault sits at input 1 because RETURN inspects outputs `2k` and `2k+1` for
+its own input index `k` (section 2.1): at input 1 those are outputs 2 and 3,
+which is where the asset goes back to the borrower and the bond goes to the
+lender. Input 0 is taken by the verifier, which OpenDAMP requires, and input 2
+would push the pair to outputs 4 and 5. There is exactly one place the vault can
+be, and it is not a matter of preference.
 
 That is four inputs and six outputs, which is **exactly** OpenDAMP's
 `N_max_inputs` and `N_max_outputs`. There is no spare slot in either direction.
 Two consequences the platform must enforce, because nothing else will:
 
-- The borrower's debt-asset side must be a **single** UTXO. Pignus consolidates
-  it first if it is not, in a separate transaction, before composing settlement.
+- The borrower's debt-asset side must be a **single** UTXO. Pignus refuses to
+  compose a settlement otherwise; consolidate first, in its own transaction.
 - The **fee is paid in the debt asset**, out of that same input. A separate fee
   input would not fit. Sequentia's any-asset fees make this ordinary rather than
   a workaround, and OpenDAMP's fee delta (opendamp-design.md 2.3) is what lets
@@ -653,17 +863,40 @@ borrower is made whole at the price the deal was struck at, not at the price on
 the day. If the collateral appreciates and the lender declines to return it, the
 borrower keeps `principal + bond` and loses the upside. That is the borrower's
 residual exposure, it is not fixable without a price feed for a private
-restricted asset, and Pignus states it in those words on the confirmation
-screen. Where such a feed does exist, the parties may instead use a
-three-leaf variant adding `build_liquidate_leaf`, and the platform offers it
-only when a feed is configured for that asset.
+restricted asset, and `describe()` states it in those words wherever the terms
+are shown. Where such a feed exists, a three-leaf variant adding
+`build_liquidate_leaf` is possible; Pignus builds only the two-leaf vault.
 
-**Naming.** The product is labelled **repurchase**, never "loan", in the book, in
-the offer list and on the confirmation, and the borrower's confirmation says in
-one sentence that they are selling the asset and holding a claim. It is not
-collateralized lending and must never be shown as if it were. It is also how
-securities financing actually works, which is the point: the regulated-asset
-tier ends up with the regulated-market instrument.
+**Naming.** The product is labelled **repurchase**, never "loan", wherever it
+appears: the `repo-*` commands, the sentence `RepurchaseTerms.describe()`
+builds, and the page's *Check a repurchase* tab. That sentence says in one line
+that the borrower is selling the asset and holding a claim.
+
+The loan book and the watcher do not carry repurchases. Each side verifies the
+bond with `repo-verify` -- which demands the exact bond amount, because the
+address cannot pin the money terms -- and leg one with `verify_leg_one`, and
+re-verifies after the depth its risk appetite justifies: a bond whose funding an
+anchor-driven reorg has undone (section 6.4) secures nothing, and there is no
+watcher here to notice.
+
+Because both halves matter, `repo-verify` reports a **state** and never an
+"ok": `not-funded`, `bond-only`, `funded-unburied`, `live`, `forfeitable`,
+`settled`. `bond-only` is what a bond checked on its own earns, and it is the
+answer to guard against -- a bond nobody has matched against the transfer it
+secures is a number, not a claim. `--min-confirmations` is where each side's
+tolerance for a reorg goes; below it the state is `funded-unburied` however
+correct both halves are.
+
+The settlement itself is composed in two steps, because it needs signatures from
+both parties and the covenant's witness must go on last. `repo-settle
+--skeleton` builds the transaction above from the terms and the four outpoints
+it is given -- refusing a verifier coin carrying the repurchase's own asset, a
+blinded coin, a `C_U` holding the wrong asset or the wrong amount, and a fee in
+anything but the debt asset -- and `repo-settle --attach` puts the RETURN
+witness on the version everybody has signed. The vault always lands at input 1,
+for the reason above; the composer places it there and that is not something a
+caller can choose. A borrower whose debt coin needs no change leaves five
+outputs rather than six, which the narrower OpenDAMP shape also accepts.
 
 ## 9. Where the code lives
 
@@ -675,18 +908,37 @@ daemon driving it ships separately.
 What runs where:
 
 - **the browser**, at `/lending/` -- composes every transaction, derives every
-  address, and sends only a signature request to the wallet extension. It is
-  the only place a second implementation of the covenant exists (`web/pignus.js`
-  and `web/offer.js`), because a browser cannot import the Python one; both are
-  pinned byte for byte to the golden vectors and the page refuses to run at all
-  if that pinning fails.
+  address, and sends only a signature request to the wallet extension. It
+  carries the second implementations, because a browser cannot import the
+  Python: `web/pignus.js` and `web/offer.js` for the covenant,
+  `web/repurchase.js` for the repurchase vault, and `web/btc.js` and
+  `web/adaptor.js` for the parent chain. Each is pinned byte for byte to golden
+  vectors the proven Python emits (`pignus/vectors.json`,
+  `web/btc_vectors.json`, `web/adaptor_vectors.json`). The loan pin is fatal --
+  the page refuses to run without it -- while the repurchase and cross-chain
+  pins only disable their own tabs, so a deployment whose vectors predate them
+  still serves loans and refuses to check what it cannot verify. Both legs of a
+  cross-chain loan are settled here too, which is only possible because neither
+  of them needs a signature.
+- **the wallet extension** -- holds every key. It signs its own Sequentia
+  inputs and, for a cross-chain loan, the Bitcoin funding and the reclaim. It
+  cannot sign a covenant leaf and exposes no x-only key to bake into one, which
+  is why every exit in section 2 and both legs in section 7 are signature-free.
 - **the CLI**, on the downloads page -- the same operations against your own
-  node, for anyone who would rather not use a website.
+  node, for anyone who would rather not use a website, plus the lender's side of
+  a cross-chain loan, which is a process rather than a page: the lender draws
+  the secrets, and drawing a secret in a browser means storing it in one.
+- **the cross-chain relay**, the `/v1/btc/*` endpoints of `pignusd` -- carries
+  offers, takes, releases and reports between borrower and lender. It holds no
+  key and can move nothing, and section 7.4 says why nothing it carries has to
+  be believed.
+- **the lender's responder**, `pignus-cli btc-respond` on the lender's own
+  machine, holding their key and their two nodes' RPC -- signs each take,
+  disburses the principal, starts the loan and claims the repayment. Whoever
+  publishes a cross-chain offer runs one; on the testnet that is the operator,
+  so for native-BTC loans the operator IS a lender, an active counterparty with
+  money at stake. It is the one component in that tier whose absence costs the
+  other party.
 - **the oracle and the loan book** -- services on the testnet server. Neither
   can move anything: the book is discovery, and the oracle asserts a number.
-
-Two things were found only by building the browser client, and both are worth
-recording because neither was visible from the library side: payouts that could
-only be taproot (section 2.6), and exits that required a signature the extension
-cannot make (section 2.5). A design that is only ever exercised by its own test
-suite hides exactly this class of defect.
+  `docs/api.md` in this repository documents everything both of them serve.

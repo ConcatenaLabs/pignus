@@ -30,9 +30,9 @@ import { _internals as P, vaultLeaves } from "./pignus.js";
 
 const { hexToBytes, bytesToHex, leafHash, branchHash, taggedHash, le8, big } = P;
 
-const NUMS = hexToBytes(
-  "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0");
-const LEAF_VERSION = 0xc4;
+// One definition each, from the module the golden vectors pin. A second copy
+// here would agree today and drift the day one of them is corrected.
+const { NUMS, LEAF_VERSION } = P;
 
 // The same sentinel the Python builder splits on. It is not a constant either
 // side may change alone: both must locate the borrower key at the same offsets.
@@ -262,7 +262,10 @@ export function takeWitness(tree, terms) {
   ];
 }
 
-/** Spend a vault the offer created. `exit` is repay | liquidate | default. */
+/**
+ * Spend a vault the offer created. `exit` is repay | liquidate | default |
+ * recover (selector 0..3, matching pignus_offer._SELECTOR).
+ */
 export function offerVaultWitness(terms, exit, data = []) {
   const leaf = offerVaultLeaf(terms);
   const root = leafHash(leaf);

@@ -14,7 +14,7 @@
 // same code the covenant's signatures are checked with, so a parity or nonce
 // convention cannot differ between the two chains' halves of one protocol.
 
-import { _internals as P } from "./pignus.js";
+import { _internals as P, hashlockTaptree } from "./pignus.js";
 
 const { sha256, taggedHash, hexToBytes, bytesToHex } = P;
 const u8 = (...b) => Uint8Array.from(b);
@@ -69,6 +69,13 @@ export class Tx {
     return concat(r, u32le(this.locktime >>> 0));
   }
   hex() { return bytesToHex(this.serialize()); }
+  /** The transaction's own id: double SHA-256 of the serialisation WITHOUT
+   *  witnesses, in the order everything displays it. The borrow flow needs it
+   *  before anything is broadcast, because the release the lender signs
+   *  commits to the vault the pre-signed upgrade will create. */
+  txid() {
+    return bytesToHex(Uint8Array.from(sha256(sha256(this.serialize(false)))).reverse());
+  }
 }
 function outpoint(i) { return concat(rev(hexToBytes(i.txid)), u32le(i.vout)); }
 
@@ -131,19 +138,35 @@ export function twoOfTwo(aX, bX) {
                 Uint8Array.of(OP.CHECKSIG));
 }
 export function timelockedSingle(locktime, keyX) {
-  const n = scriptNum(locktime);
-  return concat(concat(Uint8Array.of(n.length), n),
-                Uint8Array.of(OP.CLTV, OP.DROP), push(keyX), Uint8Array.of(OP.CHECKSIG));
+  // 1..16 are the small-integer opcodes, not one-byte pushes. Every realistic
+  // locktime is far above 16, so this branch is unreachable in practice -- and
+  // that is exactly why it is here: an encoding that differs from the Python
+  // only for values nobody uses is a divergence nothing would ever catch, in
+  // code whose whole job is to agree byte for byte.
+  const push0to16 = (v) => Uint8Array.of(v === 0 ? 0x00 : 0x50 + v);
+  const head = (Number.isInteger(locktime) && locktime >= 0 && locktime <= 16)
+    ? push0to16(locktime)
+    : (() => { const n = scriptNum(locktime);
+               return concat(Uint8Array.of(n.length), n); })();
+  return concat(head, Uint8Array.of(OP.CLTV, OP.DROP), push(keyX),
+                Uint8Array.of(OP.CHECKSIG));
 }
 
 // ---------------------------------------------------------------- the loan
 
 /** The Bitcoin collateral output: P2TR(NUMS, {reclaim, seize, timeout}). */
+/** The vault on Bitcoin. RECLAIM carries the SAME hash the Sequentia repayment
+ *  output does, which is the whole cross-chain binding: the secret that pays
+ *  the lender there is the secret that releases the collateral here, by
+ *  construction rather than by anybody's assurance. */
 export function fundingTree(loan) {
   const bx = hexToBytes(loan.borrower_x), lx = hexToBytes(loan.lender_x),
         ox = hexToBytes(loan.oracle_x);
+  if (!loan.payment_hash)
+    throw new Error("this loan names no payment hash, so its collateral could " +
+                    "not be released by repaying");
   return tapTree(NUMS, [
-    ["reclaim", twoOfTwo(bx, lx)],
+    ["reclaim", hashlockedTwoOfTwo(hexToBytes(loan.payment_hash), bx, lx)],
     ["seize", twoOfTwo(lx, ox)],
     ["timeout", timelockedSingle(loan.recover_after, lx)],
   ]);
@@ -158,6 +181,136 @@ function spendTx(loan, fundingTxid, vout, destSpk, fee, locktime = 0) {
 }
 export function reclaimTx(loan, fundingTxid, vout, destSpk, fee) {
   return spendTx(loan, fundingTxid, vout, destSpk, fee);
+}
+
+/**
+ * Read a serialised transaction far enough to find an output.
+ *
+ * A wallet returns a signed funding transaction, not an index, and the release
+ * the lender signs commits to one exact outpoint. Assuming the collateral is
+ * output zero works right up until a wallet orders its outputs differently,
+ * and then the signature covers the change instead: the collateral is
+ * committed with no valid way out of it. So the output is found, not assumed.
+ */
+export function parseTxOutputs(hexOrBytes) {
+  const b = typeof hexOrBytes === "string" ? hexToBytes(hexOrBytes) : hexOrBytes;
+  let o = 4;                                    // version
+  if (b[o] === 0x00 && b[o + 1] === 0x01) o += 2;   // segwit marker + flag
+  const readCompact = () => {
+    const n = b[o];
+    if (n < 0xfd) { o += 1; return n; }
+    if (n === 0xfd) { const v = b[o + 1] | (b[o + 2] << 8); o += 3; return v; }
+    if (n === 0xfe) {
+      const v = new DataView(b.buffer, b.byteOffset + o + 1, 4).getUint32(0, true);
+      o += 5; return v;
+    }
+    const v = Number(new DataView(b.buffer, b.byteOffset + o + 1, 8).getBigUint64(0, true));
+    o += 9; return v;
+  };
+  const nin = readCompact();
+  for (let i = 0; i < nin; i++) {
+    o += 36;                                    // outpoint
+    // Read the length FIRST: `o += readCompact()` would add to the offset the
+    // call itself already advanced, and land in the middle of the script.
+    const sigLen = readCompact();
+    o += sigLen;                                // scriptSig
+    o += 4;                                     // sequence
+  }
+  const nout = readCompact();
+  const outs = [];
+  for (let i = 0; i < nout; i++) {
+    const value = new DataView(b.buffer, b.byteOffset + o, 8).getBigInt64(0, true);
+    o += 8;
+    const len = readCompact();
+    outs.push({ n: i, value, spk: b.slice(o, o + len) });
+    o += len;
+  }
+  return outs;
+}
+
+/**
+ * Which output of `txHex` pays `spk` exactly `value` satoshis. Throws rather
+ * than guessing: a borrower who cannot find their own collateral in their own
+ * funding transaction must not broadcast it.
+ */
+export function findOutput(txHex, spk, value) {
+  const want = bytesToHex(spk);
+  for (const o of parseTxOutputs(txHex))
+    if (bytesToHex(o.spk) === want && o.value === BigInt(value)) return o.n;
+  throw new Error(
+    "that funding transaction does not pay the collateral address the agreed " +
+    "amount. Nothing has been broadcast.");
+}
+
+// --------------------------------------------------------------- pre-vault
+//
+// The collateral does not go straight into the vault. It waits in a two-leaf
+// output the borrower can take back, and only the borrower's own claim of the
+// principal -- which publishes `w` on Sequentia -- lets anyone move it on.
+// So a borrower whose lender never pays loses nothing but time.
+
+/** SHA256 <h> EQUALVERIFY <A> CHECKSIGVERIFY <B> CHECKSIG: a preimage AND both
+ *  signatures. Neither party can move the output alone, and neither can move it
+ *  before the thing the preimage stands for has happened. */
+function hashlockedTwoOfTwo(h, aX, bX) {
+  const pushd = (d) => concat(u8(d.length), d);
+  return concat(u8(0xa8), pushd(h), u8(0x88),
+                pushd(aX), u8(0xad), pushd(bX), u8(0xac));
+}
+
+export function prevaultTree(loan) {
+  if (!loan.h_w || !loan.abort_after)
+    throw new Error("this loan has no abortable origination");
+  const bx = hexToBytes(loan.borrower_x), lx = hexToBytes(loan.lender_x);
+  return tapTree(NUMS, [
+    ["upgrade", hashlockedTwoOfTwo(hexToBytes(loan.h_w), bx, lx)],
+    ["abort", timelockedSingle(loan.abort_after, bx)],
+  ]);
+}
+export function prevaultSpk(loan) { return prevaultTree(loan).scriptPubKey(); }
+export function prevaultValue(loan) {
+  return BigInt(loan.btc_amount) + BigInt(loan.upgrade_fee ?? 3000);
+}
+export function prevaultAddress(loan, hrp = "tb") {
+  const spk = prevaultSpk(loan);
+  return segwitAddress(spk[0] === 0x51 ? 1 : spk[0] - 0x50, spk.slice(2), hrp);
+}
+
+/** The one transaction that moves the collateral from the pre-vault into the
+ *  vault. Signed in advance by the borrower, so the vault's outpoint -- and the
+ *  release the lender signs against it -- is known before any Bitcoin moves. */
+export function upgradeTx(loan, prevaultTxid, vout) {
+  const tx = new Tx(2, 0);
+  tx.vin.push({ txid: prevaultTxid, vout, sequence: 0xffffffff, witness: [] });
+  tx.vout.push({ value: BigInt(loan.btc_amount), spk: fundingSpk(loan) });
+  return tx;
+}
+function prevaultSighash(loan, tx, leafName, inputIndex = 0) {
+  const tree = prevaultTree(loan);
+  const spent = [{ value: prevaultValue(loan), spk: tree.scriptPubKey() }];
+  return taprootSighash(tx, spent, inputIndex, tree.scripts[leafName]);
+}
+export function upgradeSighash(loan, prevaultTxid, vout) {
+  return prevaultSighash(loan, upgradeTx(loan, prevaultTxid, vout), "upgrade");
+}
+/** The transaction that takes the collateral back when no principal ever came.
+ *  `sign` is called with the sighash and returns a BIP340 signature. */
+export function abortTx(loan, prevaultTxid, vout, destSpk, fee) {
+  const tx = new Tx(2, Number(loan.abort_after));
+  tx.vin.push({ txid: prevaultTxid, vout, sequence: 0xfffffffe, witness: [] });
+  tx.vout.push({ value: prevaultValue(loan) - BigInt(fee), spk: destSpk });
+  return tx;
+}
+export function abortSighash(loan, prevaultTxid, vout, destSpk, fee) {
+  return prevaultSighash(loan, abortTx(loan, prevaultTxid, vout, destSpk, fee),
+                         "abort");
+}
+export function completeAbortTx(loan, prevaultTxid, vout, destSpk, fee, sig) {
+  const tree = prevaultTree(loan);
+  const tx = abortTx(loan, prevaultTxid, vout, destSpk, fee);
+  tx.vin[0].witness = [hexToBytes(sig), tree.scripts.abort,
+                       tree.controlBlock("abort")];
+  return tx;
 }
 
 // ------------------------------------------------------------------ sighash
@@ -185,23 +338,32 @@ export function sighashFor(loan, tx, leafName, inputIndex = 0) {
 }
 
 /**
- * The Sequentia repayment output (an ELEMENTS taproot): the hashlocked
- * CLAIM / REFUND the debt is paid into. A borrower rebuilds this from the
- * loan to confirm they are paying the address the terms compile to -- the
- * cross-chain analog of verify_funding. Uses pignus.js's Elements taproot
- * (leaf version 0xc4, /elements tags), not the Bitcoin one above.
+ * The two Sequentia outputs a cross-chain loan pays through, rebuilt here so a
+ * borrower can check every address before committing to it.
+ *
+ * Both are covenant outputs (Elements tapscript, leaf version 0xc4), not
+ * Bitcoin ones: CLAIM pays a pinned payee against a secret, REFUND returns the
+ * money to the sender after a deadline. Neither takes a signature, which is
+ * exactly why a browser can settle both legs.
  */
 export function repaymentSpk(loan) {
-  const h = hexToBytes(loan.payment_hash);
-  const lx = hexToBytes(loan.lender_x), bx = hexToBytes(loan.borrower_x);
-  const pushd = (d) => concat(u8(d.length), d);
-  const claim = concat(u8(0xa8), pushd(h), u8(0x88), pushd(lx), u8(0xac));
-  const dl = scriptNum(loan.repay_deadline);
-  const refund = concat(pushd(dl), u8(0xb1, 0x75), pushd(bx), u8(0xac));
-  const root = P.branchHash(P.leafHash(claim), P.leafHash(refund));
-  const tweak = taggedHash("TapTweak/elements", concat(NUMS, root));
-  const { x } = P.tweakAddPubkey(NUMS, tweak);
-  return concat(u8(0x51, 0x20), x);
+  return hashlockTaptree({
+    preimageHash: loan.payment_hash, asset: loan.debt_asset,
+    payeeProg: loan.lender_prog, payeeVer: loan.lender_ver,
+    refundAfter: loan.repay_deadline, refundProg: loan.borrower_prog,
+    refundVer: loan.borrower_ver,
+  }).scriptPubKey();
+}
+
+/** Where the lender pays the principal: the borrower opens it with `w`, and
+ *  opening it is what starts the loan. */
+export function disbursementSpk(loan) {
+  return hashlockTaptree({
+    preimageHash: loan.h_w, asset: loan.debt_asset,
+    payeeProg: loan.borrower_prog, payeeVer: loan.borrower_ver,
+    refundAfter: loan.d_refund, refundProg: loan.lender_prog,
+    refundVer: loan.lender_ver,
+  }).scriptPubKey();
 }
 
 
@@ -215,16 +377,17 @@ export function seizeSighash(loan, fundingTxid, vout, destSpk, fee) {
 }
 
 /**
- * Finish a reclaim once `t` is known: the lender's completed release signature,
- * the borrower's own, then the leaf and control block. Script order is
- * <borrower> CHECKSIGVERIFY <lender> CHECKSIG, and a witness is consumed
- * top-first, so the lender's signature is pushed first.
+ * Finish a reclaim once the secret is public: the lender's release, the
+ * borrower's own signature, and the secret itself.
  */
 export function completeReclaimTx(loan, fundingTxid, vout, destSpk, fee,
-                                  lenderSig, borrowerSig) {
+                                  lenderSig, borrowerSig, secret) {
   const tree = fundingTree(loan);
   const tx = reclaimTx(loan, fundingTxid, vout, destSpk, fee);
+  // A stack is consumed from the top and the leaf runs SHA256 first, so the
+  // secret is pushed last.
   tx.vin[0].witness = [hexToBytes(lenderSig), hexToBytes(borrowerSig),
+                       hexToBytes(secret),
                        tree.scripts.reclaim, tree.controlBlock("reclaim")];
   return tx;
 }
@@ -297,6 +460,8 @@ export function selfTest(v) {
      v.seize_sighash);
   if (v.repayment_spk)
     eq("repayment_spk", bytesToHex(repaymentSpk(loan)), v.repayment_spk);
+  if (v.disbursement_spk)
+    eq("disbursement_spk", bytesToHex(disbursementSpk(loan)), v.disbursement_spk);
   if (v.funding_address_tb)
     eq("funding_address", fundingAddress(loan, "tb"), v.funding_address_tb);
   return 3;   // leaves proven

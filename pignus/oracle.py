@@ -22,10 +22,14 @@ the fact that a liquidation was justified, which is the only thing that makes a
 trusted price source accountable.
 """
 
+import collections
 import hashlib
+import io
 import json
+import os
+import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 
 from .compat import load_covenant
 
@@ -74,7 +78,13 @@ class Attestation:
 
     @classmethod
     def from_dict(cls, d):
-        return cls(**d)
+        # Extra keys are dropped rather than refused: a server may wrap the
+        # signed fields in informational ones (how old the attestation is,
+        # which oracle served it), and a reader that dies on those is a reader
+        # that breaks the moment a publisher says one more true thing. The
+        # signed fields are the ones verify() checks, and they are unaffected.
+        keep = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in keep})
 
 
 def sign(sec: bytes, market: str, price: int, price_scale: int,
@@ -134,13 +144,27 @@ def verify_schnorr_varlen(xonly: bytes, sig: bytes, msg: bytes) -> bool:
     return ((r * R[2] * R[2]) % k.SECP256K1_FIELD_SIZE) == R[0]
 
 
-def verify(oracle_x, att: Attestation) -> bool:
-    """Check an attestation exactly as the covenant will, plus the market/feed
-    agreement the covenant cannot see (the covenant knows only the feed id)."""
+def verify(oracle_x, att: Attestation, price_scale=None) -> bool:
+    """Check an attestation exactly as the covenant will, plus the two things
+    the covenant cannot see: that the market and the feed id agree (the covenant
+    knows only the feed id), and that the price is quoted at the scale the
+    caller is about to compute with.
+
+    `price_scale` is the vault's own `terms.price_scale`. The scale is NOT in
+    the signed message, because the covenant only ever handles the integer -- so
+    an attestation signed at another scale carries a perfectly good signature
+    over a number that means something else. Ten times too small opens
+    LIQUIDATE on a healthy loan and seizes ten times the collateral; ten times
+    too large makes the loan unliquidatable. Pass the scale whenever the answer
+    will be used for arithmetic, and leave it out only when the question really
+    is "did this key sign this?".
+    """
     from .terms import feed_id
     if isinstance(oracle_x, str):
         oracle_x = bytes.fromhex(oracle_x)
     if feed_id(att.market).hex() != att.feed_id:
+        return False
+    if price_scale is not None and int(att.price_scale) != int(price_scale):
         return False
     try:
         sig = bytes.fromhex(att.signature)
@@ -164,12 +188,17 @@ def select_threshold(terms, attestations):
     exactly that, so a liquidator does not have to rediscover the argument.
     """
     keys = terms.oracle_keys
+    # Keyed by lower-case hex on both sides. The covenant compares bytes, so
+    # `AB…` and `ab…` are the same oracle to it; matching the strings verbatim
+    # would silently fail the threshold with every attestation present, and the
+    # caller would be told the position is not liquidatable.
+    by_key = {str(k).lower(): a for k, a in attestations.items()}
     usable = {}
     for i, k in enumerate(keys):
-        att = attestations.get(k)
+        att = by_key.get(str(k).lower())
         if att is None:
             continue
-        if not verify(k, att):
+        if not verify(k, att, terms.price_scale):
             continue
         if att.timestamp < terms.not_before:
             continue
@@ -262,6 +291,11 @@ class PriceSource:
     """Where prices come from. Subclasses supply `reference_price(symbol)` in the
     feed's reference currency."""
 
+    def refresh(self) -> None:
+        """Take one snapshot, for a source that has one. Called once at the top
+        of a signing round so that every market in the round is priced from the
+        same numbers; sources without a snapshot do nothing."""
+
     def reference_price(self, symbol: str) -> float:
         raise NotImplementedError
 
@@ -313,33 +347,58 @@ class BulkHttpPriceSource(PriceSource):
     Lookups are case-insensitive, because feed tickers are not consistently
     cased (the Sequentia demo feed serves `tBTC`) and a price that is present but
     unreachable because of capitalisation is the most annoying possible outage.
+
+    Two ages, and they answer different questions. `max_age` is how long a
+    snapshot this oracle already holds may go on being signed when the feed
+    stops answering: a brief outage should not stop the oracle, and a long one
+    must. `feed_max_age` is how stale the feed says its OWN numbers are -- a
+    price server whose upstream died keeps serving its last prices, and an
+    oracle that re-signs those with a fresh timestamp is manufacturing
+    freshness that does not exist. Both refuse rather than guess, because a
+    refusal is visible in `/healthz` and in `/v1/markets` while a stale number
+    is not.
     """
 
     def __init__(self, url: str, timeout: float = 8.0, field: str = "price",
-                 max_age: float = 300.0):
+                 max_age: float = 300.0, feed_max_age: float = 300.0):
         self.url = url
         self.timeout = timeout
         self.field = field
         self.max_age = max_age
+        self.feed_max_age = feed_max_age
         self._snapshot = {}
         self._fetched = 0.0
+        self._updated = 0.0
 
-    def _refresh(self, force=False):
-        if not force and time.time() - self._fetched < 2.0:
-            return
+    def refresh(self) -> None:
         import urllib.request
         with urllib.request.urlopen(self.url, timeout=self.timeout) as r:
             data = json.loads(r.read().decode())
         if not isinstance(data, dict):
             raise ValueError(f"{self.url} did not return an object")
+        meta = data.get("_meta") or {}
         self._snapshot = {k.lower(): v for k, v in data.items()}
         self._fetched = time.time()
+        self._updated = float(meta.get("updated") or 0) if isinstance(meta, dict) else 0.0
 
     def reference_price(self, symbol: str) -> float:
-        if time.time() - self._fetched > self.max_age:
-            self._refresh(force=True)
-        else:
-            self._refresh()
+        # No fetching from here. The round takes one snapshot and prices every
+        # market from it, so two markets in the same round cannot be signed
+        # against feeds that moved between them.
+        if not self._fetched:
+            raise ValueError(f"{self.url} has not been read yet")
+        age = time.time() - self._fetched
+        if self.max_age and age > self.max_age:
+            raise ValueError(
+                f"{self.url} was last read {int(age)}s ago (limit "
+                f"{int(self.max_age)}s); refusing to sign a stale snapshot")
+        if self.feed_max_age and self._updated:
+            fed = time.time() - self._updated
+            if fed > self.feed_max_age:
+                raise ValueError(
+                    f"{self.url} last updated its own prices {int(fed)}s ago "
+                    f"(limit {int(self.feed_max_age)}s); refusing to sign a "
+                    "stale feed")
         row = self._snapshot.get(symbol.lower())
         if row is None:
             raise KeyError(
@@ -358,10 +417,12 @@ class HttpPriceSource(PriceSource):
     one source of prices for fees and for loans means one thing to operate and
     one thing to be wrong."""
 
-    def __init__(self, url: str, timeout: float = 5.0, field: str = "price"):
+    def __init__(self, url: str, timeout: float = 5.0, field: str = "price",
+                 feed_max_age: float = 300.0):
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.field = field
+        self.feed_max_age = feed_max_age
         self._cache = {}
 
     def reference_price(self, symbol: str) -> float:
@@ -375,10 +436,47 @@ class HttpPriceSource(PriceSource):
             return float(data)
         if self.field not in data:
             raise KeyError(f"{url} returned no '{self.field}' field: {data}")
+        # A feed that dates its own answer is taken at its word: re-signing a
+        # price the feed itself says is hours old would put this oracle's
+        # signature and a fresh timestamp on a number nobody stands behind.
+        updated = data.get("updated")
+        if self.feed_max_age and updated:
+            age = time.time() - float(updated)
+            if age > self.feed_max_age:
+                raise ValueError(
+                    f"{url} was last updated {int(age)}s ago (limit "
+                    f"{int(self.feed_max_age)}s); refusing to sign a stale feed")
         return float(data[self.field])
 
 
 # ------------------------------------------------------------------- the log
+
+def _parse_line(line):
+    """One log line as an Attestation, or None if it is not one."""
+    if isinstance(line, bytes):
+        try:
+            line = line.decode()
+        except UnicodeDecodeError:
+            return None
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        d = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(d, dict) or "signature" not in d:
+        return None
+    try:
+        return Attestation.from_dict(d)
+    except TypeError:
+        return None
+
+
+def _line_timestamp(line):
+    att = _parse_line(line)
+    return None if att is None else int(att.timestamp)
+
 
 class AttestationLog:
     """An append-only record of everything the oracle has signed.
@@ -388,50 +486,282 @@ class AttestationLog:
     and a borrower liquidated on a bad attestation can point at the exact signed
     bytes. Kept as one JSON line per attestation so it can be tailed, diffed and
     served without a database.
+
+    Serving it must not cost what holding it costs. Six markets at a minute
+    apiece write a couple of megabytes a day and the file is never deleted, so
+    the recent view (`tail`, `latest`) is answered from memory and the digest is
+    carried forward as bytes are appended; neither reads the file after
+    start-up. Older attestations are still reachable -- an auditor checking a
+    liquidation from three weeks ago needs the exact line that justified it --
+    but by `at()` and `scan()`, which bisect the file by timestamp rather than
+    reading it whole.
+
+    `max_bytes` turns on self-rotation. It is off by default, because the log's
+    whole value is that it is one unbroken record; when it is on, the closed
+    file's digest is published beside it and seeded into the new file's running
+    hash, so the chain of `.sha256` files still pins every attestation ever
+    signed. Rotate only through this class -- an outside rename or truncate
+    (logrotate, an editor, a stray `>`) desynchronises the running hash and the
+    in-memory tail from what is on disk.
     """
 
-    def __init__(self, path):
+    # How much of an existing file start-up parses back into memory. Enough for
+    # a few hundred rounds of every market, which is what the recent view is
+    # for; the rest of the file is reached by `scan`.
+    TAIL_BYTES = 512 * 1024
+
+    def __init__(self, path, keep=1000, max_bytes=0):
         self.path = str(path)
+        self.keep = int(keep)
+        self.max_bytes = int(max_bytes)
+        self.chained_from = None
+        self._lock = threading.Lock()
+        self._all = collections.deque(maxlen=self.keep)
+        self._by_market = {}
+        self._hash = hashlib.sha256()
+        self._load()
+
+    # ------------------------------------------------------------- start-up
+
+    def _load(self):
+        try:
+            with open(self.path + ".chain") as f:
+                seed = f.read().strip()
+        except OSError:
+            seed = ""
+        if seed:
+            self.chained_from = seed
+            self._hash.update(seed.encode())
+        try:
+            with open(self.path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    self._hash.update(chunk)
+                size = f.tell()
+        except FileNotFoundError:
+            return
+        try:
+            with open(self.path, "rb") as f:
+                if size > self.TAIL_BYTES:
+                    f.seek(size - self.TAIL_BYTES)
+                    f.readline()          # drop the partial line at the seam
+                for line in f:
+                    att = _parse_line(line)
+                    if att is not None:
+                        self._push(att)
+        except OSError:
+            pass
+
+    def _push(self, att):
+        self._all.append(att)
+        d = self._by_market.get(att.market)
+        if d is None:
+            d = self._by_market[att.market] = collections.deque(maxlen=self.keep)
+        d.append(att)
+
+    # -------------------------------------------------------------- writing
 
     def append(self, att: Attestation) -> None:
-        with open(self.path, "a") as f:
-            f.write(att.to_json() + "\n")
+        data = att.to_json() + "\n"
+        with self._lock:
+            with open(self.path, "a") as f:
+                f.write(data)
+            self._hash.update(data.encode())
+            self._push(att)
+            if self.max_bytes and os.path.getsize(self.path) >= self.max_bytes:
+                self._rotate()
+
+    def _rotate(self):
+        """Close the current file and start a new one, chaining the digest.
+
+        The closed file's digest is written beside it and becomes the seed of
+        the new file's running hash, so `/v1/digest` still commits to every
+        attestation ever signed and a downloader can walk the chain backwards
+        file by file.
+        """
+        closed = self._hash.hexdigest()
+        stamp = int(time.time())
+        rotated = f"{self.path}.{stamp}"
+        n = 0
+        while os.path.exists(rotated):
+            n += 1
+            rotated = f"{self.path}.{stamp}-{n}"
+        os.replace(self.path, rotated)
+        with open(rotated + ".sha256", "w") as f:
+            f.write(closed + "\n")
+        with open(self.path + ".chain", "w") as f:
+            f.write(closed + "\n")
+        self.chained_from = closed
+        self._hash = hashlib.sha256()
+        self._hash.update(closed.encode())
+
+    # ------------------------------------------------------ the recent view
 
     def tail(self, n=50, market=None):
-        try:
-            with open(self.path) as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            return []
-        out = []
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if market and d.get("market") != market:
-                continue
-            out.append(Attestation.from_dict(d))
-            if len(out) >= n:
-                break
-        return list(reversed(out))
+        with self._lock:
+            src = self._by_market.get(market, ()) if market else self._all
+            return list(src)[-int(n):] if n else []
 
     def latest(self, market):
-        got = self.tail(1, market=market)
-        return got[0] if got else None
+        with self._lock:
+            d = self._by_market.get(market)
+            return d[-1] if d else None
 
     def digest(self) -> str:
         """A hash over the whole log, so an operator can publish a short value
         that pins every attestation ever made and a watcher can detect a log
-        that has been rewritten rather than appended to."""
-        h = hashlib.sha256()
+        that has been rewritten rather than appended to. Carried forward as
+        bytes are written, so it costs nothing to ask for."""
+        with self._lock:
+            return self._hash.copy().hexdigest()
+
+    # --------------------------------------------------------- the archive
+
+    def _bisect(self, f, size, ts):
+        """A line boundary at or before the first line timestamped >= `ts`.
+
+        Attestations are written in signing order, so the file is sorted by
+        timestamp and can be bisected: retrieving the attestation behind a
+        month-old liquidation reads a few kilobytes rather than the log. The
+        answer never overshoots -- a caller scans forward from it and drops
+        what is too early -- so a line the bisection could not parse costs a
+        little extra reading and nothing else.
+        """
+        lo, hi = 0, size
+        while lo < hi:
+            mid = (lo + hi) // 2
+            f.seek(mid)
+            if mid:
+                f.readline()          # the partial line belongs to the block before
+            start = f.tell()
+            line = f.readline()
+            got = _line_timestamp(line) if line else None
+            if got is not None and got < ts:
+                if start + len(line) <= mid:
+                    break             # no progress to be made; take what we have
+                lo = start + len(line)
+            else:
+                hi = mid
+        return lo
+
+    def scan(self, market=None, since=None, until=None, limit=200, cursor=None):
+        """A window of the CURRENT log file: (attestations, next_cursor).
+
+        `next_cursor` is a byte offset to pass back as `cursor` for the next
+        page, or None when the window ended at the last matching line. Closed
+        files are downloaded whole instead, by name, which is what an auditor
+        reconstructing a chain of digests wants anyway.
+        """
+        return self._scan_path(self.path, market, since, until, limit, cursor)
+
+    def _scan_path(self, path, market, since, until, limit, cursor):
+        limit = max(1, int(limit))
+        since = None if since is None else int(since)
+        until = None if until is None else int(until)
+        out, next_cursor = [], None
         try:
-            with open(self.path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                if cursor is not None:
+                    start = max(0, min(int(cursor), size))
+                elif since is not None:
+                    start = self._bisect(f, size, since)
+                else:
+                    start = 0
+                f.seek(start)
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    att = _parse_line(line)
+                    if att is None:
+                        continue
+                    if since is not None and att.timestamp < since:
+                        continue
+                    if until is not None and att.timestamp > until:
+                        break
+                    if market and att.market != market:
+                        continue
+                    out.append(att)
+                    if len(out) >= limit:
+                        next_cursor = f.tell()
+                        break
         except FileNotFoundError:
-            pass
-        return h.hexdigest()
+            return [], None
+        return out, next_cursor
+
+    def at(self, market, timestamp):
+        """The attestation signed for `market` at exactly `timestamp`, or None.
+
+        This is the auditor's question: a liquidation names the timestamp it was
+        built on, and this returns the signed bytes behind it. Rotated files are
+        searched too -- an attestation that justified a liquidation is exactly
+        the one old enough to have been rotated away.
+        """
+        ts = int(timestamp)
+        d = os.path.dirname(self.path) or "."
+        paths = [self.path] + [os.path.join(d, r["file"]) for r in self.files()
+                               if not r["current"]]
+        for path in paths:
+            got, _ = self._scan_path(path, market, ts, ts, 1, None)
+            if got:
+                return got[0]
+        return None
+
+    # ------------------------------------------------------------ the files
+
+    def files(self):
+        """Every file this log lives in, oldest first, with the digest each was
+        closed at. The current file's digest is the running one."""
+        d = os.path.dirname(self.path) or "."
+        base = os.path.basename(self.path)
+        rows = []
+        try:
+            names = os.listdir(d)
+        except OSError:
+            names = []
+        for name in names:
+            if not name.startswith(base + ".") or name.endswith(".sha256") \
+                    or name.endswith(".chain"):
+                continue
+            suffix = name[len(base) + 1:]
+            if not suffix.replace("-", "").isdigit():
+                continue
+            closed = None
+            try:
+                with open(os.path.join(d, name + ".sha256")) as f:
+                    closed = f.read().strip()
+            except OSError:
+                pass
+            rows.append({"file": name, "digest": closed,
+                         "bytes": _size(os.path.join(d, name)), "current": False})
+        rows.sort(key=lambda r: r["file"])
+        rows.append({"file": base, "digest": self.digest(),
+                     "bytes": _size(self.path), "current": True,
+                     "chained_from": self.chained_from})
+        return rows
+
+    def open_file(self, name=None):
+        """(handle, size) for a download of the current log or one of its
+        rotated files. `name` is matched against the files this log actually
+        has, so a request cannot name a path of its own."""
+        base = os.path.basename(self.path)
+        if name in (None, "", base):
+            target = self.path
+            if not os.path.exists(target):
+                # Between a rotation and the next attestation there is no file
+                # yet. The current log is empty, not missing.
+                return io.BytesIO(b""), 0
+        else:
+            known = {r["file"] for r in self.files()}
+            if name not in known:
+                raise FileNotFoundError(name)
+            target = os.path.join(os.path.dirname(self.path) or ".", name)
+        f = open(target, "rb")
+        return f, _size(target)
+
+
+def _size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0

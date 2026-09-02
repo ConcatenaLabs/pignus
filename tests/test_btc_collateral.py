@@ -12,7 +12,7 @@ wrong here.
 
 Proven:
 
-  PASS   the whole solvent path: the lender adaptor-signs the release, the
+  PASS   the whole solvent path: the lender signs the release, the
          borrower funds, repays on Sequentia, the lender claims and by claiming
          publishes `t`, and the borrower reclaims the BTC with it
   PASS   the borrower recovers `t` from the CHAIN, not from the lender
@@ -39,9 +39,10 @@ from pignus import adaptor as A          # noqa: E402
 from pignus import btcscript as B        # noqa: E402
 from pignus import dlc                   # noqa: E402
 from pignus import oracle as O           # noqa: E402
+from pignus import btc_collateral as BC
 from pignus.btc_collateral import (      # noqa: E402
-    BtcLoan, reclaim_tx, sighash_for, lender_release_adaptor,
-    check_release_adaptor, complete_reclaim, seize_tx, timeout_tx,
+    BtcLoan, reclaim_tx, sighash_for, lender_release,
+    check_release, complete_reclaim, seize_tx, timeout_tx,
     seize_is_justified, sha256,
 )
 from pignus.compat import load_covenant  # noqa: E402
@@ -93,12 +94,23 @@ class Ctx:
             recover_after=recover_after or (self.btc.getblockcount() + 20),
             debt_asset=self.D, debt=DEBT,
             repay_deadline=self.seq.getblockcount() + 100,
-            adaptor_point=A.point(t).hex(), payment_hash=h.hex())
+            adaptor_point=A.point(t).hex(), payment_hash=h.hex(),
+            # Both Sequentia legs pay a PINNED program, which is what lets them
+            # be settled with no signature at all -- and therefore from a
+            # browser, which cannot sign a covenant leaf.
+            borrower_prog=self.seq_prog(), borrower_ver=0,
+            lender_prog=self.seq_prog(), lender_ver=0)
 
-    def fund_bitcoin(self, loan, broadcast=True):
+    def seq_prog(self):
+        """A 20-byte payout program this wallet owns."""
+        spk = self.seq_spk()
+        assert spk[:2] == b"\x00\x14", spk.hex()
+        return spk[2:].hex()
+
+    def fund_bitcoin(self, loan, broadcast=True, spk=None):
         """Build (and optionally broadcast) the Bitcoin funding transaction.
 
-        Built without broadcasting first, because the lender's adaptor signature
+        Built without broadcasting first, because the lender's release
         has to commit to a reclaim transaction that spends this outpoint -- so
         the borrower must know the txid BEFORE the collateral is committed. A
         borrower who funds first and asks for the release signature afterwards
@@ -106,8 +118,8 @@ class Ctx:
         """
         # deriveaddresses insists on a descriptor checksum, so ask the node to
         # add one rather than carrying a bech32m encoder here for one string.
-        desc = self.btc.getdescriptorinfo(
-            f"raw({loan.funding_spk().hex()})")["descriptor"]
+        want = (spk or loan.funding_spk()).hex()
+        desc = self.btc.getdescriptorinfo(f"raw({want})")["descriptor"]
         addr = self.btc.deriveaddresses(desc)[0]
         raw = self.btc.createrawtransaction([], [{addr: BTC_COLLATERAL / COIN}])
         funded = self.btc.fundrawtransaction(raw, {"fee_rate": 5})
@@ -115,7 +127,7 @@ class Ctx:
         assert signed["complete"], signed
         dec = self.btc.decoderawtransaction(signed["hex"])
         vout = next(o["n"] for o in dec["vout"]
-                    if o["scriptPubKey"]["hex"] == loan.funding_spk().hex())
+                    if o["scriptPubKey"]["hex"] == want)
         if broadcast:
             self.btc.sendrawtransaction(signed["hex"])
             self.rig.btc_mine(1)
@@ -184,20 +196,28 @@ class Ctx:
         return self._seq_btc
 
     def spend_repayment(self, loan, outpoint, leaf, *, secret=None,
-                        sec=None, locktime=0, send=True):
-        """Spend the Sequentia repayment output: the lender's CLAIM (which must
-        reveal the preimage) or the borrower's REFUND."""
+                        sec=None, locktime=0, send=True, dest=None):
+        """Spend the Sequentia repayment output: the CLAIM that publishes the
+        preimage, or the REFUND after the deadline.
+
+        Neither takes a signature and neither can pay anyone but the party the
+        address names, so `sec` is accepted and ignored -- the callers below
+        pass it to say WHOSE exit they mean, which is still worth reading."""
         from test_framework.messages import (
             COutPoint, CTransaction, CTxIn, CTxInWitness, CTxOut, CTxOutAsset,
-            CTxOutValue, uint256_from_str, tx_from_hex,
+            CTxOutValue, tx_from_hex,
         )
-        from test_framework.script import TaprootSignatureHash
-        from test_framework.key import sign_schnorr
         tap, leaves = loan.repayment_tree()
         aout = lambda h: b"\x01" + bytes.fromhex(h)[::-1]   # noqa: E731
         btc = self.seq_fresh(1)
         btc_amt = int(round(float(btc["amount"]) * COIN))
-        dest = self.seq_spk()
+        # The covenant pins where each leaf pays: CLAIM to the lender, REFUND
+        # back to the borrower. Passing anything else in is how a test proves
+        # the pinning works, which the rejection cases below do.
+        prog = (loan.lender_prog if leaf == "claim" else loan.borrower_prog)
+        ver = (loan.lender_ver if leaf == "claim" else loan.borrower_ver)
+        pinned = dest or ((b"\x00\x14" if int(ver) == 0 else b"\x51\x20")
+                          + bytes.fromhex(prog))
         tx = CTransaction()
         tx.nVersion = 2
         tx.nLockTime = locktime
@@ -206,26 +226,17 @@ class Ctx:
                             nSequence=seq_no))
         tx.vin.append(CTxIn(COutPoint(int(btc["txid"], 16), btc["vout"]),
                             nSequence=seq_no))
-        tx.vout.append(CTxOut(CTxOutValue(DEBT), dest, CTxOutAsset(aout(self.D))))
+        tx.vout.append(CTxOut(CTxOutValue(DEBT), pinned,
+                              CTxOutAsset(aout(self.D))))
         tx.vout.append(CTxOut(CTxOutValue(btc_amt - SEQ_FEE), self.seq_spk(),
                               CTxOutAsset(aout(self.seq_bitcoin()))))
         tx.vout.append(CTxOut(CTxOutValue(SEQ_FEE),
                               nAsset=CTxOutAsset(aout(self.seq_bitcoin()))))
         partial = self.seq.signrawtransactionwithwallet(tx.serialize().hex())
         tx = tx_from_hex(partial["hex"])
-        spent = [
-            CTxOut(CTxOutValue(DEBT), bytes(tap.scriptPubKey),
-                   CTxOutAsset(aout(self.D))),
-            CTxOut(CTxOutValue(btc_amt), bytes.fromhex(btc["scriptPubKey"]),
-                   CTxOutAsset(aout(btc["asset"]))),
-        ]
-        genesis = uint256_from_str(bytes.fromhex(self.seq.getblockhash(0))[::-1])
-        msg = TaprootSignatureHash(tx, spent, 0, genesis, 0, scriptpath=True,
-                                   script=leaves[leaf])
-        sig = sign_schnorr(sec, msg)
         cb = (bytes([tap.leaves[leaf].version + tap.negflag])
               + tap.internal_pubkey + tap.leaves[leaf].merklebranch)
-        stack = ([sig, secret] if leaf == "claim" else [sig])
+        stack = ([secret] if secret is not None else [])
         while len(tx.wit.vtxinwit) < len(tx.vin):
             tx.wit.vtxinwit.append(CTxInWitness())
         tx.wit.vtxinwit[0].scriptWitness.stack = stack + [bytes(leaves[leaf]), cb]
@@ -236,10 +247,24 @@ class Ctx:
         return txid
 
 
-def expect_reject(fn, what):
+def expect_reject(fn, what, want):
+    """Refused, and refused for the reason it was aimed at.
+
+    A bare `except RpcError` passes on `min relay fee not met` or
+    `bad-txns-inputs-missingorspent` -- neither of which says anything about
+    the rule under test, and both of which are what a small mistake in the
+    test itself produces. `want` is one or more substrings, matched on the
+    reason rather than the prefix: sequentiad says
+    `mempool-script-verify-flag-failed` where bitcoind says
+    `mandatory-script-verify-flag-failed`.
+    """
+    wants = (want,) if isinstance(want, str) else tuple(want)
     try:
         fn()
     except RpcError as e:
+        if not any(w in e.message for w in wants):
+            raise AssertionError(
+                f"{what} was refused, but for the wrong reason: {e.message}")
         log(f"  refused, as it must be: {e.message[:80]}")
         return
     raise AssertionError(f"{what} was accepted and should not have been")
@@ -254,8 +279,8 @@ def scenario_solvent(ctx):
 
     dest = ctx.btc_dest()
     rtx = reclaim_tx(loan, txid, vout, dest, BTC_FEE)
-    asig = lender_release_adaptor(loan, ctx.lender_sec, rtx)
-    assert check_release_adaptor(loan, rtx, asig), "adaptor release did not verify"
+    release = lender_release(loan, ctx.lender_sec, rtx)
+    assert check_release(loan, rtx, release), "the release did not verify"
     log("  lender's release signature verifies, and is unusable without t")
 
     # Only NOW does the borrower part with the collateral.
@@ -263,17 +288,19 @@ def scenario_solvent(ctx):
     ctx.rig.btc_mine(1)
     log(f"  collateral funded: {txid}:{vout}")
 
-    # The borrower cannot leave yet: without t there is nothing to complete the
-    # lender's half with, and a guess produces a signature Bitcoin refuses.
+    # The borrower cannot leave yet. They hold a valid release and can sign
+    # their own half, but the leaf also demands the secret, and a guess fails
+    # the hash before either signature is looked at.
     bad = reclaim_tx(loan, txid, vout, dest, BTC_FEE)
-    wrong = A.decrypt(asig, A.new_secret())
     msg = sighash_for(loan, bad, "reclaim")
-    assert not A.verify(bytes.fromhex(loan.lender_x), msg, wrong)
-    bad.vin[0].witness = [wrong, A.sign(ctx.borrower_sec, msg),
+    bad.vin[0].witness = [release, A.sign(ctx.borrower_sec, msg),
+                          os.urandom(32),
                           loan.funding_tree().leaves["reclaim"],
                           loan.funding_tree().control_block("reclaim")]
     expect_reject(lambda: ctx.btc.sendrawtransaction(bad.hex()),
-                  "reclaim with the wrong secret")
+                  "reclaim with the wrong secret",
+                  ("Invalid Schnorr signature", "Script failed",
+                   "OP_EQUALVERIFY", "script-verify-flag-failed"))
 
     # Repay on Sequentia; the lender can only be paid by publishing t.
     rep = ctx.pay_repayment(loan)
@@ -282,14 +309,17 @@ def scenario_solvent(ctx):
                                      sec=ctx.lender_sec)
     log(f"  lender claimed it: {claim_txid}")
 
-    # The borrower reads t off the chain rather than being told it.
-    claim = ctx.seq.getrawtransaction(claim_txid, True)
-    revealed = bytes.fromhex(claim["vin"][0]["txinwitness"][1])
+    # The borrower reads t off the chain rather than being told it, and does it
+    # the way a node with no transaction index can: from the outpoint that was
+    # claimed, not from a transaction id.
+    revealed, spend_txid, _conf = BC.preimage_from_spend(
+        ctx.seq, rep[0], rep[1], expect_hash=loan.payment_hash)
     assert revealed == t, "the preimage on chain is not the secret"
+    assert spend_txid == claim_txid
     log("  borrower recovered t FROM THE CHAIN, not from the lender")
 
     final = complete_reclaim(loan, reclaim_tx(loan, txid, vout, dest, BTC_FEE),
-                             asig, revealed, ctx.borrower_sec)
+                             release, revealed, ctx.borrower_sec)
     got = ctx.btc.sendrawtransaction(final.hex())
     ctx.rig.btc_mine(1)
     log(f"  collateral reclaimed on Bitcoin: {got}")
@@ -306,7 +336,8 @@ def scenario_default(ctx):
     early = timeout_tx(loan, txid, vout, dest, BTC_FEE, ctx.lender_sec,
                        locktime=ctx.btc.getblockcount())
     expect_reject(lambda: ctx.btc.sendrawtransaction(early.hex()),
-                  "TIMEOUT before the deadline")
+                  "TIMEOUT before the deadline",
+                  ("Locktime requirement not satisfied", "non-final"))
 
     ctx.rig.btc_mine(loan.recover_after - ctx.btc.getblockcount() + 1)
     tx = timeout_tx(loan, txid, vout, dest, BTC_FEE, ctx.lender_sec)
@@ -329,7 +360,9 @@ def scenario_seize(ctx):
     solo.vin[0].witness = [b"", A.sign(ctx.lender_sec, msg),
                            tree.leaves["seize"], tree.control_block("seize")]
     expect_reject(lambda: ctx.btc.sendrawtransaction(solo.hex()),
-                  "SEIZE by the lender alone")
+                  "SEIZE by the lender alone",
+                  ("false/empty top stack element", "Invalid Schnorr signature",
+                   "script-verify-flag-failed"))
 
     # With the oracle's co-signature it works -- and the oracle is expected to
     # publish the attestation that justified it, so the seizure is checkable.
@@ -359,7 +392,8 @@ def scenario_lender_stalls(ctx):
     early = ctx.spend_repayment(loan, rep, "refund", sec=ctx.borrower_sec,
                                 locktime=ctx.seq.getblockcount(), send=False)
     expect_reject(lambda: ctx.seq.sendrawtransaction(early.serialize().hex()),
-                  "REFUND before the deadline")
+                  "REFUND before the deadline",
+                  ("Locktime requirement not satisfied", "non-final"))
 
     ctx.rig.seq_mine(deadline - ctx.seq.getblockcount() + 1)
     got = ctx.spend_repayment(loan, rep, "refund", sec=ctx.borrower_sec,
@@ -370,7 +404,9 @@ def scenario_lender_stalls(ctx):
 def scenario_dlc(ctx):
     log("\n== the maturity path as a DLC: the oracle never sees this loan ==")
     t, loan = ctx.loan()
-    txid, vout, _ = ctx.fund_bitcoin(loan)
+    # A DLC-settled loan funds the settlement output, not the loan vault: the
+    # vault's reclaim leaf wants a secret that maturity settlement never has.
+    txid, vout, _ = ctx.fund_bitcoin(loan, spk=dlc.funding_spk(loan))
 
     buckets = dlc.price_buckets(10_000 * PRICE_SCALE, 60_000 * PRICE_SCALE, 5)
     nonce = A.new_secret()

@@ -135,7 +135,10 @@ class Rig:
         if not sequentiad or not os.path.exists(sequentiad):
             raise SystemExit("cannot find sequentiad; set SEQUENTIAD")
         if not os.path.exists(bitcoind):
-            raise SystemExit(f"cannot find bitcoind at {bitcoind}; set BITCOIND")
+            raise SystemExit(
+                f"cannot find bitcoind at {bitcoind}; set PIGNUS_BITCOIND (not "
+                "BITCOIND, which names the SEQUENTIA binary for the node's test "
+                "framework)")
 
         btc = Daemon("bitcoind", bitcoind, os.path.join(self.root, "btc"),
                      ["-regtest", "-fallbackfee=0.0002", "-txindex=1",

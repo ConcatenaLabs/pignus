@@ -20,7 +20,8 @@ import * as repo from "./repurchase.js";
 import * as btc from "./btc.js";
 import * as badaptor from "./adaptor.js";
 import * as btcborrow from "./btcborrow.js";
-import { Wallet, payoutProgram, WalletError } from "./wallet.js";
+import { Wallet, payoutProgram, programFromScriptPubKey, programFromAddress,
+         scriptPubKeyFor, WalletError } from "./wallet.js";
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
@@ -29,19 +30,29 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c =>
 const shortHex = (h, n = 10) => h ? esc(String(h).slice(0, n)) + "…" : "—";
 const big = (x) => (typeof x === "bigint" ? x : BigInt(x));
 
-const DEFAULT_BLOCK_SECONDS = 60;          // overridden by the daemon's /healthz
+const DEFAULT_BLOCK_SECONDS = 60;          // overridden by the daemon (/v1/markets)
 const blockSeconds = () => state.blockSeconds || DEFAULT_BLOCK_SECONDS;
 const blocksPerDay = () => 86400 / blockSeconds();
 const RECOVER_GAP_DAYS = 30;               // the lender's backstop, after maturity
 const BONUS = 5;                            // liquidation bonus, percent
+// Where a transaction id can be looked at. The book overrides both from its
+// own configuration; these defaults match the testnet host's layout.
+const DEFAULT_TX_URL = "/explorer/tx/{txid}";
+const DEFAULT_BTC_TX_URL = "/testnet4/tx/{txid}";
+// How deep a Bitcoin claim must be before this page reads the preimage off it
+// and hands the collateral back. Sequentia follows Bitcoin reorgs in real time,
+// so a secret read from a shallow claim can still be undone.
+const CLAIM_DEPTH = 6;
 
 const state = {
-  wallet: null, account: null, utxos: [], balances: {},
+  wallet: null, account: null, utxos: [], balances: {}, mine: null,
   markets: [], assets: {}, fees: { rates: {}, vsize: {} },
-  offers: [], loans: [], oracleX: null, oracles: [], height: 0, healthy: null,
-  payout: null, pinned: 0, loansFilter: "live",
+  offers: [], loans: [], oracleX: null, oracles: [], height: null, healthy: null,
+  payout: null, payoutWhy: "", pinned: 0, loansFilter: "live",
   reference: "USDX", blockSeconds: DEFAULT_BLOCK_SECONDS,
-  offersFilter: "open",
+  offersFilter: "open", minDepth: 2, bookDownSince: null,
+  txUrl: DEFAULT_TX_URL, btcTxUrl: DEFAULT_BTC_TX_URL,
+  btcOffers: [], btcLoans: [], btcHeight: null, details: new Set(),
 };
 
 async function api(p) {
@@ -73,6 +84,35 @@ function busy(on, what = "") {
   $("#busy").style.display = on ? "block" : "none";
   $("#busy").textContent = what;
 }
+
+/**
+ * Write a block of markup only when it has actually changed, and put the
+ * keyboard back where it was.
+ *
+ * The page refreshes itself every half minute; replacing a table that has not
+ * changed would take the focus out from under whoever is reading it with the
+ * keyboard.
+ */
+const _painted = new Map();
+function paint(sel, html, wire) {
+  const el = $(sel);
+  if (!el) return;
+  if (_painted.get(sel) === html) return;
+  const active = document.activeElement;
+  const key = el.contains(active) ? active.getAttribute("data-focus") : null;
+  _painted.set(sel, html);
+  el.innerHTML = html;
+  if (wire) wire(el);
+  if (key) {
+    try {
+      const back = el.querySelector(`[data-focus="${CSS.escape(key)}"]`);
+      if (back) back.focus();
+    } catch { /* the row is gone; leave the focus where the browser put it */ }
+  }
+}
+
+const txLink = (txid, isBtc = false) =>
+  esc((isBtc ? state.btcTxUrl : state.txUrl).replace("{txid}", String(txid)));
 
 // ------------------------------------------------------------ formatting
 
@@ -124,24 +164,96 @@ function money(n, digits = 2) {
   return Number(n).toLocaleString(undefined, { maximumFractionDigits: digits });
 }
 
+/**
+ * A locktime as a date, with the height beside it.
+ *
+ * With no node the book cannot say what the tip is, and a date computed from a
+ * height of zero is worse than no date at all -- so the height is shown bare
+ * until a tip is known.
+ */
 function whenBlock(h) {
-  const dt = (Number(h) - state.height) * blockSeconds() * 1000;
+  const n = Number(h);
+  if (state.height == null) return `block ${n.toLocaleString()}`;
+  const dt = (n - state.height) * blockSeconds() * 1000;
   const d = new Date(Date.now() + dt);
-  const rel = Math.abs(dt) < 3600e3 ? `${Math.round(dt / 60e3)} min`
-    : Math.abs(dt) < 86400e3 * 2 ? `${(dt / 3600e3).toFixed(1)} h`
-    : `${(dt / 86400e3).toFixed(1)} d`;
-  return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ` +
-    `${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}` +
-    ` <span class="small">(${dt < 0 ? rel.replace("-", "") + " ago" : "in " + rel}, block ${Number(h).toLocaleString()})</span>`;
+  const ms = Math.abs(dt);
+  const rel = ms < 3600e3 ? `${Math.round(ms / 60e3)} min`
+    : ms < 86400e3 * 2 ? `${(ms / 3600e3).toFixed(1)} h`
+    : `${(ms / 86400e3).toFixed(1)} d`;
+  const far = ms > 180 * 86400e3;
+  const date = d.toLocaleDateString(undefined, far
+    ? { year: "numeric", month: "short", day: "numeric" }
+    : { month: "short", day: "numeric" });
+  const time = far ? ""
+    : ` ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`;
+  const stale = state.bookDownSince ? ", stale" : "";
+  return `${date}${time} <span class="small">(${dt < 0 ? rel + " ago" : "in " + rel}` +
+         `${stale}, block ${n.toLocaleString()})</span>`;
+}
+
+/** The same, as plain text for a summary line. */
+function whenText(h) {
+  return whenBlock(h).replace(/<[^>]*>/g, "");
 }
 
 // ------------------------------------------------------------------ fees
 
 /** What the wallet holds, as {asset: atoms}. */
-function holdings() {
+function holdings(explicitOnly = false) {
   const h = {};
-  for (const u of state.utxos) h[u.asset] = (h[u.asset] || 0n) + big(u.value);
+  for (const u of state.utxos) {
+    if (explicitOnly && u.explicit === false) continue;
+    h[u.asset] = (h[u.asset] || 0n) + big(u.value);
+  }
   return h;
+}
+
+/**
+ * The size the book prices this kind of transaction at.
+ *
+ * A flow the book publishes no size for is a page and a book that disagree
+ * about what this site composes. Rather than invent a number, take the largest
+ * size the book does publish -- which over-pays rather than under-pays, so the
+ * transaction still relays -- and mark it, so the confirmation can say the fee
+ * rests on an estimate instead of quietly charging for a guess.
+ */
+function feeVsize(flow) {
+  const table = state.fees.vsize || {};
+  if (table[flow]) return { vsize: Number(table[flow]), estimated: false };
+  const sizes = Object.values(table).map(Number).filter(n => n > 0);
+  if (!sizes.length) return null;
+  return { vsize: Math.max(...sizes), estimated: true };
+}
+
+/**
+ * The reference-unit fee this flow pays, before it is priced in an asset.
+ *
+ * The rate comes from the book, which takes it from its node, and it has no
+ * sensible stand-in: a made-up feerate composes a transaction the network may
+ * never relay. So when it is missing the page says so rather than guessing.
+ */
+function feeRfa(flow) {
+  const perKvb = state.fees.feerate_rfa_per_kvb;
+  const s = feeVsize(flow);
+  if (!perKvb || !s)
+    throw new WalletError(
+      "the book has published no fee rate for this chain, so the page cannot " +
+      "price a network fee. That usually means its node is unreachable; try " +
+      "again shortly.");
+  return (BigInt(perKvb) * BigInt(s.vsize) + 999n) / 1000n;
+}
+
+/** Atoms per whole unit, the scale the node's exchange rates are quoted at. */
+function rateScale() {
+  return BigInt(state.fees.rate_scale || 100000000);
+}
+
+/** The fee for `flow`, in atoms of `asset`, or null if the book prices none. */
+function feeAtoms(flow, asset) {
+  const rate = state.fees.rates?.[asset];
+  if (!rate) return null;
+  const atoms = (feeRfa(flow) * rateScale() + BigInt(rate) - 1n) / BigInt(rate);
+  return atoms < 1n ? 1n : atoms;
 }
 
 /**
@@ -150,28 +262,100 @@ function holdings() {
  * Sequentia has an open fee market and no privileged coin: a fee is committed
  * in whatever asset pays it and re-valued through the exchange rate, so a more
  * valuable asset pays fewer atoms. The asset already being spent is preferred
- * because it makes the smallest transaction.
+ * because it makes the smallest transaction -- and `committed` says how much of
+ * each asset the flow already needs, so a wallet holding exactly the debt does
+ * not pick the debt asset and then come up short.
+ *
+ * The choice is only a default; the confirm step lets it be changed.
  */
-function feeFor(flow, prefer = []) {
-  const vsize = state.fees.vsize?.[flow] || 2000;
-  const ratePerKvb = BigInt(state.fees.feerate_rfa_per_kvb || 2000);
-  const rfa = (ratePerKvb * BigInt(vsize) + 999n) / 1000n;
-  const have = holdings();
+function feeFor(flow, prefer = [], committed = {}) {
+  if (!Object.keys(state.fees.rates || {}).length)
+    throw new WalletError(
+      "the book has no fee exchange rates right now (its node is " +
+      "unreachable); try again shortly");
+  const have = holdings(true);
   const order = [...prefer.filter(Boolean), ...Object.keys(have)];
   const seen = new Set();
   for (const asset of order) {
     if (seen.has(asset) || !(asset in have)) continue;
     seen.add(asset);
-    const rate = state.fees.rates?.[asset];
-    if (!rate) continue;
-    const atoms = (rfa * 100000000n + BigInt(rate) - 1n) / BigInt(rate);
-    const need = atoms < 1n ? 1n : atoms;
-    if (have[asset] >= need) return { asset, atoms: need };
+    const need = feeAtoms(flow, asset);
+    if (!need) continue;
+    if (have[asset] - big(committed[asset] || 0n) >= need) return { asset, atoms: need };
   }
   throw new WalletError(
     "this wallet holds nothing the network will take a fee in. Sequentia " +
     "has an open fee market, so any asset with a published rate will do — " +
-    "but you need some of one.");
+    "but you need some of one, over and above what this transaction spends.");
+}
+
+/** The fee for `flow` in one named asset, chosen by the user. */
+function feeInAsset(flow, asset) {
+  const atoms = feeAtoms(flow, asset);
+  if (!atoms)
+    throw new WalletError(
+      `the book publishes no exchange rate for ${meta(asset).ticker}, so it ` +
+      "cannot price a fee in it");
+  return { asset, atoms };
+}
+
+/** Every asset this wallet could pay this flow's fee in. */
+function feeChoices(flow, committed = {}) {
+  const have = holdings(true);
+  return Object.keys(have).filter(a => {
+    const need = feeAtoms(flow, a);
+    return need && have[a] - big(committed[a] || 0n) >= need;
+  }).sort((x, y) => meta(x).ticker.localeCompare(meta(y).ticker));
+}
+
+// The node's dust policy, in the numbers pignus/fees.py carries beside it:
+// DUST_RELAY_TX_FEE is 100 rfa per kvB, and GetDustThreshold charges an
+// explicit output's own 78 bytes plus a 67-byte estimate of the input that
+// will one day spend it. A book that publishes its node's own figures
+// overrides both.
+const DUST_RELAY_RFA_PER_KVB = 100n;
+const DUST_OUTPUT_VSIZE = 145n;
+
+/**
+ * Below how many atoms of the fee asset a change output would be dust.
+ *
+ * The node refuses an explicit output in the fee asset below its dust
+ * threshold, so those atoms go to the fee instead. The threshold is per asset:
+ * 15 atoms of an asset at rate 1e8, 15,000 of one at 1e5. A fixed number is
+ * wrong in both directions, so it is computed from the fee asset's own rate --
+ * the same arithmetic as fees.dust_atoms, because a change output the two
+ * composers disagree about is a transaction one of them cannot send. Without a
+ * rate for the asset both fall back to the same constant.
+ */
+function dustFor(asset) {
+  const rate = state.fees.rates?.[asset];
+  if (!rate) return flows.DUST_FOLD;
+  const perKvb = BigInt(state.fees.dust_relay_rfa_per_kvb || DUST_RELAY_RFA_PER_KVB);
+  const bytes = BigInt(state.fees.dust_output_vsize || DUST_OUTPUT_VSIZE);
+  const rfa = (perKvb * bytes + 999n) / 1000n;
+  const atoms = (rfa * rateScale() + BigInt(rate) - 1n) / BigInt(rate);
+  return atoms < 1n ? 1n : atoms;
+}
+
+/** A composition failure in the asset's own units, rather than in atoms. */
+function explain(e) {
+  if (e?.asset && e.need != null) {
+    const t = esc(meta(e.asset).ticker);
+    const hidden = e.confidential && e.confidential > 0n
+      ? ` ${units(e.confidential, e.asset)} ${t} of it sits in confidential ` +
+        "coins, which one of these transactions cannot spend: send that " +
+        "amount to your own unblinded address first."
+      : "";
+    return `You need ${units(e.need, e.asset)} ${t} for this and the wallet ` +
+           `holds ${units(e.have, e.asset)} ${t} (short ` +
+           `${units(e.short, e.asset)} ${t}).${hidden}`;
+  }
+  if (e?.asset && e.short != null) {
+    const t = esc(meta(e.asset).ticker);
+    return `The transaction is short ${units(e.short, e.asset)} ${t}; reload ` +
+           "the balances and try again.";
+  }
+  return esc(e?.message || String(e));
 }
 
 // ------------------------------------------------------------------ startup
@@ -204,35 +388,84 @@ async function pinCovenant() {
   $("#pinned").className = "tag ok";
 }
 
+const FEEDS = ["markets", "assets", "fees", "offers", "loans", "oracle",
+               "oracles", "health"];
+
+/**
+ * Reload everything the page shows.
+ *
+ * Each endpoint stands on its own: one that fails leaves its part of the page
+ * at the last thing that worked, and says so, rather than blanking a page whose
+ * other half arrived perfectly well.
+ */
 async function refresh() {
-  const [m, a, f, o, l, or, ors, hz] = await Promise.all([
-    api("v1/markets"), api("v1/assets"), api("v1/fees"), api("v1/offers?status=all"),
-    api("v1/loans"), api("v1/oracle"), api("v1/oracles").catch(() => ({ oracles: [] })),
-    api("healthz"),
+  const r = await Promise.allSettled([
+    api("v1/markets"), api("v1/assets"), api("v1/fees"),
+    api("v1/offers?status=all"), api("v1/loans"), api("v1/oracle"),
+    api("v1/oracles"), api("healthz"),
   ]);
-  state.height = hz.height ?? m.height ?? 0;
-  state.healthy = hz;
-  state.markets = m.markets;
-  state.assets = a.assets || {};
-  state.fees = f;
-  state.offers = o.offers;
-  state.loans = l.loans;
-  state.oracleX = or.oracle_x;
-  state.oracles = ors.oracles || [];
-  try { state.btcOffers = (await api("v1/btc/offers")).offers || []; } catch { state.btcOffers = []; }
-  state.reference = m.reference_ticker || "USDX";
-  if (m.block_seconds) state.blockSeconds = m.block_seconds;
-  $("#chain").textContent = `block ${Number(state.height).toLocaleString()}`;
-  $("#chain").className = "tag " + (hz.node ? "ok" : "dim");
-  $("#daemon").textContent = hz.ok ? `book live · ${hz.offers} open offer${hz.offers === 1 ? "" : "s"} · ${hz.loans} loan${hz.loans === 1 ? "" : "s"}`
-    : `book degraded: ${hz.error || "unknown"}`;
-  $("#daemon").className = "tag " + (hz.ok ? "ok" : "bad");
+  const val = (i) => (r[i].status === "fulfilled" ? r[i].value : null);
+  const m = val(0), a = val(1), f = val(2), o = val(3), l = val(4),
+        or = val(5), ors = val(6), hz = val(7);
+  if (hz) {
+    state.healthy = hz;
+    state.height = hz.height ?? null;
+    state.minDepth = hz.min_depth ?? state.minDepth;
+    // A self-hosted book is not behind the testnet's reverse proxy, so it can
+    // say where its explorer and its oracle actually live.
+    if (hz.explorer_url) $("#crumb").href = hz.explorer_url;
+    if (hz.oracle_public_url) $("#oraclelog").href = hz.oracle_public_url;
+  }
+  if (m) {
+    state.markets = m.markets;
+    if (state.height == null) state.height = m.height ?? null;
+    state.reference = m.reference_ticker || "USDX";
+    if (m.block_seconds) state.blockSeconds = m.block_seconds;
+    if (m.min_depth != null) state.minDepth = m.min_depth;
+    state.txUrl = m.explorer_tx_url || DEFAULT_TX_URL;
+    state.btcTxUrl = m.btc_explorer_tx_url || DEFAULT_BTC_TX_URL;
+  }
+  if (a) state.assets = a.assets || {};
+  if (f) state.fees = f;
+  if (o) state.offers = o.offers;
+  if (l) state.loans = l.loans;
+  if (or) state.oracleX = or.oracle_x;
+  if (ors) state.oracles = ors.oracles || [];
+  try { state.btcOffers = (await api("v1/btc/offers")).offers || []; } catch { /* keep */ }
+  // The Bitcoin height, for the half of a cross-chain loan's deadlines that
+  // this chain cannot see. A book without a Bitcoin node publishes none, and
+  // the page then refuses to originate rather than check half the timelocks.
+  state.btcHeight = hz?.btc_height ?? m?.btc_height ?? state.btcHeight;
+
+  const failed = r.map((x, i) => x.status === "rejected"
+    ? `${FEEDS[i]}: ${x.reason?.message || x.reason}` : null).filter(Boolean);
+  if (failed.length) {
+    state.bookDownSince = state.bookDownSince || Date.now();
+    $("#daemon").textContent =
+      `book unreachable since ${new Date(state.bookDownSince).toLocaleTimeString()}` +
+      ` · ${failed[0]}`;
+    $("#daemon").className = "tag bad";
+  } else {
+    state.bookDownSince = null;
+    $("#daemon").textContent = hz.ok
+      ? `book live · ${hz.offers} open offer${hz.offers === 1 ? "" : "s"} · ${hz.loans} loan${hz.loans === 1 ? "" : "s"}`
+      : `book degraded: ${hz.error || "unknown"}`;
+    $("#daemon").className = "tag " + (hz.ok ? "ok" : "bad");
+  }
+  const node = hz ? hz.node : state.healthy?.node;
+  $("#chain").textContent = node && state.height != null
+    ? `block ${Number(state.height).toLocaleString()}`
+    : "no node: heights unknown";
+  $("#chain").className = "tag " + (node && state.height != null ? "ok" : "dim");
+  renderIntro();
   renderMarkets();
   renderOffers();
   renderBtcOffers();
   renderLoans();
+  renderAlerts();
   renderLendForm();
   renderWallet();
+  renderBtcLoans().catch(() => {});
 }
 
 // ------------------------------------------------------------------ wallet
@@ -247,21 +480,75 @@ async function connect() {
     note("Wallet connected. Pignus never sees your keys: it composes " +
          "transactions and your wallet signs them.", "ok");
   } catch (e) {
-    note(esc(e.message), "bad");
-  } finally { busy(false); renderWallet(); renderOffers(); renderLoans(); }
+    note(explain(e), "bad");
+  } finally {
+    busy(false); renderWallet(); renderOffers(); renderLoans(); renderAlerts();
+    renderBtcLoans().catch(() => {});
+  }
 }
 
+/**
+ * Read the wallet: coins, balances, and the program a covenant should pay.
+ *
+ * A wallet with nothing in it is a normal state, not a failure: the payout
+ * address then comes from the account address instead, and if even that cannot
+ * be read the page says so rather than half-connecting.
+ */
 async function loadWallet() {
   state.utxos = await state.wallet.utxos();
   state.balances = await state.wallet.balances();
-  state.payout = await payoutProgram(state.wallet, state.utxos);
+  try {
+    state.payout = await payoutProgram(state.wallet, state.utxos);
+    state.payoutWhy = "";
+  } catch (e) {
+    state.payout = null;
+    state.payoutWhy = e.message;
+  }
+  rebuildMine();
+}
+
+/**
+ * Every payout program this wallet can be paid at.
+ *
+ * A loan's exits are rendered against this set rather than against one coin's
+ * program: the extension hands out fresh addresses and sorts its coins by
+ * value, so "the first utxo" is a different program from one day to the next --
+ * and a borrower whose Repay button vanished has no other way to repay.
+ */
+function rebuildMine() {
+  const s = new Set();
+  for (const u of state.utxos) {
+    try { s.add(programFromScriptPubKey(u.scriptPubkey).prog); }
+    catch { /* not a program a payout can name */ }
+  }
+  if (state.payout) s.add(state.payout.prog);
+  if (state.account?.address) {
+    try { s.add(programFromAddress(state.account.address).prog); }
+    catch { /* an address this page cannot decode tells us nothing */ }
+  }
+  state.mine = s;
+}
+
+function forgetWallet() {
+  state.account = null;
+  state.utxos = [];
+  state.balances = {};
+  state.payout = null;
+  state.payoutWhy = "";
+  state.mine = null;
+  state.btcLoans = [];
+}
+
+function btcNetworkName() {
+  return state.account?.btc_network || state.account?.network || "testnet4";
 }
 
 function renderWallet() {
   const el = $("#wallet");
   if (!state.account) {
     el.innerHTML = `<div class="row"><button id="connect" class="primary">Connect wallet</button>
-      <span class="hint" style="margin:0">The Sequentia browser extension. Pignus signs nothing itself.</span></div>`;
+      <span class="hint" style="margin:0">Ambra for Chromium, the Sequentia browser
+      extension. Pignus signs nothing itself.</span></div>`;
     $("#connect").onclick = connect;
     return;
   }
@@ -271,46 +558,99 @@ function renderWallet() {
     .sort((x, y) => meta(x[0]).ticker.localeCompare(meta(y[0]).ticker))
     .map(([a, v]) => `<span class="bal"><b>${units(v, a)}</b> ${esc(meta(a).ticker)}
       <span class="ref">${ref(v, a)}</span></span>`);
-  const btc = state.balances?.btc;
-  if (btc != null && big(btc) > 0n) {
+  const bal = state.balances?.btc;
+  if (bal != null && big(bal) > 0n) {
     const m = state.markets.find(x => x.cross_chain && x.unit_price != null);
-    const v = m ? `≈ ${money(Number(big(btc)) / 1e8 * Number(m.unit_price))} ${esc(refUnit())}` : "";
-    rows.unshift(`<span class="bal"><b>${(Number(big(btc)) / 1e8).toLocaleString(undefined,
-      { maximumFractionDigits: 8 })}</b> BTC <span class="ref">Bitcoin testnet4 · ${v}</span></span>`);
+    const v = m ? `≈ ${money(Number(big(bal)) / 1e8 * Number(m.unit_price))} ${esc(refUnit())}` : "";
+    rows.unshift(`<span class="bal"><b>${(Number(big(bal)) / 1e8).toLocaleString(undefined,
+      { maximumFractionDigits: 8 })}</b> BTC <span class="ref">Bitcoin ${esc(btcNetworkName())} · ${v}</span></span>`);
   }
+  const payout = state.payout
+    ? `<span class="small">pays out to v${state.payout.ver}
+        <span class="mono">${shortHex(state.payout.prog, 12)}</span></span>`
+    : `<span class="small" style="color:var(--warn)">no payout address yet:
+        ${esc(state.payoutWhy || "receive something first")}</span>`;
   el.innerHTML = `<div class="row">
       <span class="tag ok">connected</span>
       <span class="mono">${esc(state.account.address)}</span>
-      <span class="small">pays out to v${state.payout.ver}
-        <span class="mono">${shortHex(state.payout.prog, 12)}</span></span>
+      ${payout}
       <span class="spacer" style="flex:1"></span>
       <button class="sm" id="reload">Reload balances</button>
     </div><div class="bals">${rows.join("") || '<span class="hint">no balance yet: receive something first</span>'}</div>`;
-  $("#reload").onclick = async () => { await loadWallet(); renderWallet(); renderOffers(); renderLoans(); };
+  $("#reload").onclick = async () => {
+    try { await loadWallet(); } catch (e) { note(explain(e), "bad"); }
+    renderWallet(); renderOffers(); renderLoans(); renderAlerts();
+  };
 }
 
 function needWallet() {
   if (!state.account) { note("Connect a wallet first.", "warn"); return true; }
+  if (!state.payout) {
+    note("This wallet has no output to take a payout address from yet, and its " +
+         "address could not be read: receive any asset first, then reload the " +
+         "balances.", "warn");
+    return true;
+  }
   return false;
 }
 
 // ------------------------------------------------------------------ render
 
+function renderIntro() {
+  const el = $("#intro_markets");
+  if (!el) return;
+  const lendable = state.markets.filter(m => m.lendable);
+  if (!lendable.length) return;
+  const uniq = (xs) => [...new Set(xs.filter(Boolean))];
+  const debts = uniq(lendable.map(m => m.debt_ticker));
+  const cols = uniq(lendable.map(m => m.collateral_ticker));
+  const list = (xs) => xs.length === 1 ? esc(xs[0])
+    : esc(xs.slice(0, -1).join(", ")) + " or " + esc(xs[xs.length - 1]);
+  // Only the covenant tiers belong in this sentence: the one after it says
+  // what the network enforces, and that claim is false on the parent chain.
+  // Native Bitcoin has its own sentence, which stays put.
+  el.innerHTML = `Borrow ${list(debts)} against ${list(cols)}.`;
+}
+
+/** How old a market's newest verified attestation is, in plain words. */
+function priceAge(m) {
+  const s = Number(m.age_seconds);
+  if (!Number.isFinite(s)) return "an unknown age";
+  return s < 120 ? `${Math.round(s)} seconds old`
+    : s < 7200 ? `${Math.round(s / 60)} minutes old`
+    : `${(s / 3600).toFixed(1)} hours old`;
+}
+
 function renderMarkets() {
-  $("#markets").innerHTML = state.markets.map(m => {
-    const fresh = m.age_seconds != null && m.age_seconds < 600;
+  paint("#markets", state.markets.map(m => {
+    // The book decides what counts as fresh, from its own configured window;
+    // the age comparison here is only for a book that does not say.
+    const fresh = m.stale != null ? !m.stale
+      : (m.age_seconds != null && m.age_seconds < 600);
+    const tags = [];
+    if (m.cross_chain) tags.push('<span class="tag dim">cross-chain</span>');
+    else if (m.lendable) tags.push('<span class="tag ok">lendable</span>');
+    else if (m.stale) tags.push('<span class="tag warn" title="the newest ' +
+      'attestation this book could verify for this market is ' + esc(priceAge(m)) +
+      ', which is past the age it will lend on. Nothing can be borrowed or ' +
+      'lent here until the oracle catches up.">stale price</span>');
+    else tags.push('<span class="tag dim" title="this ticker has no asset id in the registry or the node\'s labels, so it cannot be lent against here">not in the registry</span>');
+    // The oracle quotes a price at assumed decimals. If they are not the
+    // registry's, the number is right and means something else.
+    if (m.precision_mismatch)
+      tags.push('<span class="tag bad" title="the oracle quotes this market at ' +
+        'different asset precisions than the registry gives, so its price does ' +
+        'not mean what it appears to; nothing is lent against it">precision mismatch</span>');
     return `<div class="card m">
       <div class="row" style="justify-content:space-between">
         <span class="mk">${esc(m.collateral_ticker)} / ${esc(m.debt_ticker)}</span>
-        ${m.cross_chain ? '<span class="tag dim">cross-chain</span>'
-          : m.lendable ? '<span class="tag ok">lendable</span>'
-          : '<span class="tag dim">no asset id</span>'}
+        ${tags.join(" ")}
       </div>
       <div class="px">${m.unit_price == null ? "—" : money(m.unit_price, m.unit_price < 10 ? 4 : 2)}</div>
       <div class="meta">${m.price == null ? "no attestation"
         : `${esc(m.debt_ticker)} per ${esc(m.collateral_ticker)} · signed ${fresh ? `${m.age_seconds}s ago` : `<span style="color:var(--bad)">${Math.round(m.age_seconds / 60)} min ago</span>`}`}</div>
     </div>`;
-  }).join("") || '<div class="empty">no markets</div>';
+  }).join("") || '<div class="empty">no markets</div>');
 }
 
 function marketFor(terms) {
@@ -320,82 +660,395 @@ function marketFor(terms) {
 }
 
 function mine(prog) {
-  return !!state.payout && prog === state.payout.prog;
+  return !!prog && !!state.mine && state.mine.has(prog);
+}
+
+/** The oracle keys a loan or offer names, and whether this book quotes them. */
+function oracleKeys(t) {
+  return (t.oracles && t.oracles.length) ? t.oracles
+    : (t.oracle_x ? [t.oracle_x] : []);
+}
+
+function unknownOracles(t) {
+  const known = new Set([state.oracleX, ...state.oracles].filter(Boolean));
+  if (!known.size) return [];
+  return oracleKeys(t).filter(k => !known.has(k));
+}
+
+function oracleTags(t) {
+  const keys = oracleKeys(t);
+  let out = "";
+  if (t.oracles && t.oracles.length)
+    out = ` <span class="tag dim" title="${esc(t.oracles.join("\n"))}">${esc(t.oracle_threshold)}-of-${t.oracles.length} oracles</span>`;
+  else if (keys.length)
+    out = ` <span class="tag dim" title="${esc(keys[0])}">oracle ${shortHex(keys[0], 8)}</span>`;
+  const odd = unknownOracles(t);
+  if (odd.length)
+    out += ` <span class="tag bad" title="${esc(odd.join("\n"))}">unknown oracle</span>`;
+  return out;
+}
+
+function warnTag(warnings) {
+  const w = warnings || [];
+  if (!w.length) return "";
+  return ` <span class="tag warn" title="${esc(w.join("\n"))}">${w.length} warning${w.length === 1 ? "" : "s"}</span>`;
+}
+
+const detKey = (kind, id) => `${kind}:${id}`;
+
+// Deriving an address is a taproot tweak, and the tables redraw every half
+// minute. A coin's terms never change, so one derivation each is enough.
+const _spk = new Map();
+function derived(key, fn) {
+  if (_spk.has(key)) return _spk.get(key);
+  let v;
+  try { v = pig._internals.bytesToHex(fn()); }
+  catch (e) { v = "cannot derive: " + e.message; }
+  _spk.set(key, v);
+  return v;
+}
+
+function detailsRow(key, cols, body) {
+  const open = state.details.has(key);
+  return `<tr class="det"${open ? "" : " hidden"} data-det-row="${esc(key)}">
+    <td colspan="${cols}" data-label="details">${body}</td></tr>`;
+}
+
+/** The whole of what a person is asked to trust, in one block they can copy. */
+function detailsBlock({ idLabel, id, outpoint, spk, terms, t, warnings, extra = "" }) {
+  const keys = oracleKeys(t);
+  const odd = new Set(unknownOracles(t));
+  const oracleRows = keys.length
+    ? keys.map(k => `<span class="mono">${esc(k)}</span>${odd.has(k)
+        ? ' <span class="tag bad">this book does not quote that key</span>' : ""}`).join("<br>")
+    : "—";
+  const warnRows = (warnings || []).length
+    ? `<span class="k">Warnings</span><span>${(warnings || []).map(esc).join("<br>")}</span>`
+    : "";
+  const notBefore = t.not_before
+    ? new Date(Number(t.not_before) * 1000).toLocaleString() : "—";
+  return `<div class="kv">
+      <span class="k">${esc(idLabel)}</span><span class="mono">${esc(id)}</span>
+      <span class="k">Outpoint</span><span class="mono">${esc(outpoint || "—")}</span>
+      <span class="k">Address these terms compile to</span><span class="mono">${esc(spk)}</span>
+      <span class="k">Price feed</span><span class="mono">${esc(t.market || "")} · ${esc(pig._internals.bytesToHex(pig.feedId(t.market || "")))}</span>
+      <span class="k">Oracle key${keys.length === 1 ? "" : "s"}</span><span>${oracleRows}</span>
+      <span class="k">Attestations valid from</span><span>${esc(notBefore)}</span>
+      <span class="k">Matures</span><span>${whenBlock(t.maturity)}</span>
+      <span class="k">Lender may sweep without an oracle</span><span>${whenBlock(t.recover_after)}</span>
+      ${warnRows}${extra}
+    </div>
+    <pre>${esc(terms)}</pre>
+    <div class="row" style="margin-top:8px">
+      <button class="sm" data-copy="${esc(id)}">Copy terms</button>
+      <span class="hint" style="margin:0">Check it yourself:
+      <code>pignus-cli verify --terms terms.json --txid &lt;txid&gt;</code></span>
+    </div>`;
+}
+
+function wireCopy(box, textFor) {
+  box.querySelectorAll("[data-copy]").forEach(b => {
+    b.onclick = async () => {
+      const text = textFor(b.dataset.copy);
+      try {
+        await navigator.clipboard.writeText(text);
+        b.textContent = "Copied";
+        setTimeout(() => { b.textContent = "Copy terms"; }, 2000);
+      } catch {
+        note("This browser would not let the page copy for you; the terms are " +
+             "in the details block, ready to select.", "warn");
+      }
+    };
+  });
+}
+
+function wireDetails(box) {
+  box.querySelectorAll("[data-det]").forEach(b => {
+    b.onclick = () => {
+      const key = b.dataset.det;
+      const row = box.querySelector(`[data-det-row="${CSS.escape(key)}"]`);
+      const open = state.details.has(key);
+      if (open) state.details.delete(key); else state.details.add(key);
+      if (row) row.hidden = open;
+      b.setAttribute("aria-expanded", open ? "false" : "true");
+    };
+  });
+}
+
+// -------------------------------------------------------- how a loan ended
+
+/**
+ * The account of a closed loan, read back off the closing transaction.
+ *
+ * A borrower who has been liquidated is owed the evidence, not a state tag.
+ * All of it is on chain: the leaf the spender had to reveal names the exit, a
+ * seizure's witness carries the oracle's own price, timestamp and signature,
+ * and the outputs say what was actually paid. So this shows the price they
+ * were closed at, whether it verifies against the key their own vault bakes
+ * in, and what that price should have bought against what it did.
+ */
+function exitBlock(x, t) {
+  const c = t.collateral_asset, d = t.debt_asset;
+  const scale = x.price_scale || t.price_scale || 100000;
+  const px = (p) => `${money(unitPrice(p, scale, c, d), 4)} ${esc(meta(d).ticker)}`;
+  // An amount the book could not read -- a blinded output, or one paying
+  // somewhere the terms do not name -- is reported as unreadable rather than
+  // as a zero, which would read as "you were paid nothing".
+  const at = (v, asset) => (v == null ? '<span class="small">not readable</span>'
+                                      : amount(v, asset));
+  const rows = [];
+  rows.push(`<span class="k">Exit</span><span>${esc(x.exit)}${x.height
+    ? ` · block ${Number(x.height).toLocaleString()}`
+    : ' · <span class="small">not in a block yet</span>'}</span>`);
+  for (const a of x.attestations || []) {
+    if (!a.present) {
+      rows.push(`<span class="k">Oracle ${shortHex(a.oracle_x, 10)}</span>` +
+                '<span><span class="tag dim" title="the covenant allows an oracle to abstain, and this one did">abstained</span></span>');
+      continue;
+    }
+    const when = a.timestamp
+      ? new Date(Number(a.timestamp) * 1000).toLocaleString() : "—";
+    rows.push(`<span class="k">Oracle ${shortHex(a.oracle_x, 10)}</span><span>` +
+      `${a.price == null ? "—" : px(a.price)} <span class="small">signed ${esc(when)}</span> ` +
+      (a.verified
+        ? '<span class="tag ok" title="checked here against the key baked into this vault\'s own address">signature verified</span>'
+        : '<span class="tag bad" title="this signature does not check out against the key baked into this vault\'s address">signature does NOT verify</span>') +
+      "</span>");
+  }
+  if (x.price_used != null)
+    rows.push(`<span class="k">Price it closed at</span><span>${px(x.price_used)}` +
+      `<span class="small"> · the strike was ${px(x.strike)}</span></span>`);
+  if (x.seize_expected != null || x.seize_paid != null)
+    rows.push(`<span class="k">Seized</span><span>${at(x.seize_paid, c)}` +
+      `<span class="small"> · that price buys ${at(x.seize_expected, c)}</span></span>`);
+  if (x.surplus_expected != null || x.surplus_paid != null)
+    rows.push(`<span class="k">Back to the borrower</span><span>${at(x.surplus_paid, c)}` +
+      `<span class="small"> · that price leaves ${at(x.surplus_expected, c)}</span></span>`);
+  if (x.lender_paid != null)
+    rows.push(`<span class="k">Paid to the lender</span><span>${at(x.lender_paid, d)}` +
+      `<span class="small"> · the debt was ${at(x.debt, d)}</span></span>`);
+  const problems = (x.problems || []).length
+    ? `<div class="note bad" style="margin:8px 0 0">${(x.problems || [])
+        .map(p => esc(p)).join("<br>")}</div>`
+    : "";
+  return `<div class="kv">${rows.join("")}</div>${problems}` +
+    `<div class="small" style="margin-top:6px">Every line above is read out of ` +
+    `<a href="${txLink(x.spent_by)}" class="mono">${shortHex(x.spent_by, 12)}</a>` +
+    `, and each signature is checked against the key this vault's own address commits to.</div>`;
+}
+
+// One fetch per closed loan. The tables redraw every half minute and a closing
+// transaction never changes, so the answer is worth keeping.
+const _exits = new Map();
+
+function wireExits(box, rows) {
+  const targets = Array.from(box.querySelectorAll("[data-exit]"));
+  if (!targets.length) return;
+  const fill = async (el) => {
+    const id = el.dataset.exit;
+    if (el.dataset.done) return;
+    el.dataset.done = "1";
+    if (_exits.has(id)) { el.innerHTML = _exits.get(id); return; }
+    el.innerHTML = '<span class="small">reading the closing transaction…</span>';
+    const l = rows.find(r => (r.loan_id || r.txid) === id);
+    if (!l) { el.innerHTML = ""; return; }   // the list moved under the fetch
+    try {
+      const html = exitBlock(await api(`v1/loans/${encodeURIComponent(id)}/exit`),
+                             JSON.parse(l.terms));
+      _exits.set(id, html);
+      el.innerHTML = html;
+    } catch (e) {
+      // Not cached: a book that was unreachable, or a close still in the
+      // mempool, can answer perfectly well the next time it is asked.
+      el.dataset.done = "";
+      el.innerHTML = `<span class="small">This book cannot account for that ` +
+        `exit yet: ${esc(e.message)}</span>`;
+    }
+  };
+  const fillOpen = () => targets.forEach(el => {
+    const row = el.closest("tr.det");
+    if (row && !row.hidden) fill(el);
+  });
+  fillOpen();
+  // wireDetails has already put the toggle on these buttons; chain onto it so
+  // the fetch happens when a row is actually opened, and not before.
+  box.querySelectorAll("[data-det]").forEach(b => {
+    const toggle = b.onclick;
+    b.onclick = (ev) => { if (toggle) toggle(ev); fillOpen(); };
+  });
+}
+
+// --------------------------------------------------------------- offers
+
+function pendingOffers() {
+  try {
+    const m = JSON.parse(localStorage.getItem("pignus.pending") || "{}");
+    return Object.values(m);
+  } catch { return []; }
+}
+
+function rememberPending(rec) {
+  try {
+    const m = JSON.parse(localStorage.getItem("pignus.pending") || "{}");
+    m[rec.txid] = rec;
+    localStorage.setItem("pignus.pending", JSON.stringify(m));
+  } catch { /* private mode: the note below still names the outpoint */ }
+}
+
+function forgetPending(txid) {
+  try {
+    const m = JSON.parse(localStorage.getItem("pignus.pending") || "{}");
+    delete m[txid];
+    localStorage.setItem("pignus.pending", JSON.stringify(m));
+  } catch { /* nothing to forget */ }
+}
+
+/** A funded-but-unlisted offer, shaped like the rows the book serves. */
+function pendingView(p) {
+  const t = JSON.parse(p.terms);
+  return { ...p, unlisted: true, status: "unlisted", offer_id: null,
+    lender_prog: t.lender_prog ?? t.lender_x,
+    collateral_ticker: meta(t.collateral_asset).ticker,
+    debt_ticker: meta(t.debt_asset).ticker,
+    expired: state.height != null && state.height >= Number(p.expiry_locktime),
+    lots_left: null };
+}
+
+function offersView() {
+  // Every offer the book carries is a funded one: its coin was checked on
+  // chain before the listing was accepted, and nothing publishes any other
+  // kind.
+  const book = state.offers;
+  const onChain = new Set(book.map(o => String(o.outpoint)));
+  const pend = [];
+  for (const p of pendingOffers()) {
+    if (onChain.has(String(p.outpoint))) { forgetPending(p.txid); continue; }
+    try { pend.push(pendingView(p)); } catch { /* a record we cannot read */ }
+  }
+  if (state.offersFilter === "mine")
+    return [...pend, ...book.filter(o => mine(o.lender_prog) || manageToken(o.offer_id))];
+  if (state.offersFilter === "all") return [...pend, ...book];
+  return book.filter(o => (o.status || "open") === "open");
 }
 
 function renderOffers() {
-  const b = $("#offers");
-  const funded = state.offers.filter(o => o.kind === "funded");
-  const open = funded.filter(o => (o.status || "open") === "open");
-  const view = state.offersFilter === "mine"
-    ? funded.filter(o => mine(o.lender_prog) || manageToken(o.offer_id))
-    : state.offersFilter === "all" ? funded : open;
+  const view = offersView();
   if (!view.length) {
-    b.innerHTML = `<div class="empty">${state.offersFilter === "mine"
+    paint("#offers", `<div class="empty">${state.offersFilter === "mine"
       ? "No offers from this wallet." : state.offersFilter === "all"
       ? "No offers yet." : "No open offers. Publish one from the Lend tab and a "
-      + "borrower can take it while you are offline."}</div>`;
+      + "borrower can take it while you are offline."}</div>`);
     return;
   }
-  b.innerHTML = `<table><tr><th>market</th><th>borrow</th><th>repay</th>
-      <th>collateral to lock</th><th>liquidation price</th><th>matures</th><th>left</th><th></th></tr>` +
+  const html = `<table><thead><tr><th>market</th><th>borrow</th><th>repay</th>
+      <th>collateral to lock</th><th>liquidation price</th><th>matures</th>
+      <th>left</th><th>taken</th><th></th></tr></thead><tbody>` +
     view.map((o, i) => {
       const t = JSON.parse(o.terms);
       const m = marketFor(t);
       const rate = (Number(big(t.debt)) / Number(big(t.principal)) - 1) * 100;
       const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
       const now = m?.unit_price != null ? Number(m.unit_price) : null;
-      const drop = now ? ((1 - liq / now) * 100).toFixed(0) : null;
-      const isMine = mine(o.lender_prog);
+      const drop = now ? (1 - liq / now) * 100 : null;
+      const isMine = mine(o.lender_prog) || o.unlisted;
       const canCancel = manageToken(o.offer_id);
-      const action = isMine
-        ? (o.expired ? `<button data-withdraw="${i}" class="sm">Withdraw</button>`
-             : `<span class="tag gold">your offer</span>${canCancel ? ` <button data-cancel="${i}" class="sm">Cancel listing</button>` : ""}`)
-        : o.expired ? `<span class="tag dim">expired</span>`
-        : `<button data-borrow="${i}" class="primary sm">Borrow</button>`;
-      const st = (o.status && o.status !== "open")
-        ? `<span class="tag ${o.status === "ghost" ? "bad" : "dim"}">${esc(o.status)}</span>` : "";
-      const oracle = (t.oracles && t.oracles.length)
-        ? ` <span class="tag dim">${t.oracle_threshold}-of-${t.oracles.length} oracles</span>` : "";
+      const matured = state.height != null && Number(t.maturity) <= state.height;
+      const verOk = !state.payout || (t.borrower_ver ?? 1) === state.payout.ver;
+      const status = o.status || "open";
+      const key = detKey("offer", o.offer_id || o.outpoint || i);
+      const acts = [];
+      if (o.unlisted) {
+        acts.push(`<button data-list="${i}" data-focus="list:${esc(o.txid)}" class="primary sm">List</button>`);
+        if (o.expired)
+          acts.push(`<button data-withdraw="${i}" data-focus="wd:${esc(o.outpoint)}" class="sm">Withdraw</button>`);
+      } else if (o.expired) {
+        // The refund leaf pays the lender's pinned program whoever signs, so
+        // anyone may send an expired offer home.
+        acts.push(`<button data-withdraw="${i}" data-focus="wd:${esc(o.outpoint)}" class="sm"` +
+          (isMine ? "" : ' title="the refund leaf pays the lender\'s pinned address, whoever builds it"') +
+          `>${isMine ? "Withdraw" : "Return to lender"}</button>`);
+      } else if (status !== "open") {
+        acts.push(`<button class="sm" disabled title="this offer is ${esc(status)}">Borrow</button>`);
+      } else if ((o.lots_left ?? 1) <= 0) {
+        acts.push('<button class="sm" disabled title="nothing left: every lot has been taken">Borrow</button>');
+      } else if (matured) {
+        acts.push('<span class="tag dim" title="these loans matured before the offer expired; a loan taken now could be called at once">matured</span>');
+      } else if (!verOk) {
+        acts.push(`<button class="sm" disabled title="this offer pays witness-v${t.borrower_ver} borrowers and your wallet pays out at v${state.payout.ver}">Borrow</button>`);
+      } else if (!isMine) {
+        acts.push(`<button data-borrow="${i}" data-focus="bo:${esc(o.outpoint)}" class="primary sm">Borrow</button>`);
+      }
+      if (isMine && !o.unlisted && !o.expired && status === "open")
+        acts.push('<span class="tag gold">your offer</span>');
+      if (canCancel && status === "open" && !o.expired)
+        acts.push(`<button data-cancel="${i}" data-focus="ca:${esc(o.offer_id)}" class="sm">Cancel listing</button>`);
+      acts.push(`<button class="sm" data-det="${esc(key)}" data-focus="det:${esc(key)}" aria-expanded="${state.details.has(key)}">Details</button>`);
+      const st = status !== "open"
+        ? `<span class="tag ${status === "ghost" ? "bad" : "dim"}" title="${status === "unlisted"
+            ? "funded on chain, but this book has no listing for it yet" : ""}">${esc(status)}</span>` : "";
+      const spk = derived(`offer:${o.outpoint}`, () => offer.offerTree({
+        terms: t, principal: big(o.principal || t.principal),
+        collateral: big(o.collateral || t.collateral_amount),
+        expiryLocktime: o.expiry_locktime }).scriptPubKey);
       return `<tr>
-        <td data-label="market">${esc(o.collateral_ticker)} / ${esc(o.debt_ticker)}${oracle}${st}</td>
+        <td data-label="market">${esc(o.collateral_ticker)} / ${esc(o.debt_ticker)}${oracleTags(t)}${warnTag(o.warnings)}${st}</td>
         <td data-label="borrow"><b>${amount(t.principal, t.debt_asset)}</b></td>
-        <td data-label="repay">${amount(t.debt, t.debt_asset)}<span class="sub2">+${rate.toFixed(2)}% over the term</span></td>
+        <td data-label="repay">${amount(t.debt, t.debt_asset)}<span class="sub2">+${rate.toFixed(2)}% to maturity</span></td>
         <td data-label="collateral">${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}${o.open_ltv != null ? ` · LTV ${(o.open_ltv * 100).toFixed(0)}%` : ""}</span></td>
-        <td data-label="liquidation">${money(liq, liq < 10 ? 4 : 2)} ${esc(o.debt_ticker)}<span class="sub2">${drop != null ? `${drop}% below now` : ""}</span></td>
-        <td data-label="matures">${whenBlock(t.maturity)}<span class="sub2">offer expires ${o.expiry_locktime ? whenBlock(o.expiry_locktime).replace(/<span.*span>/, "") : "—"}</span></td>
+        <td data-label="liquidation">${money(liq, liq < 10 ? 4 : 2)} ${esc(o.debt_ticker)}<span class="sub2">${drop == null ? ""
+          : drop < 0 ? "above the price now — liquidatable immediately" : `${drop.toFixed(0)}% below now`}</span></td>
+        <td data-label="matures">${whenBlock(t.maturity)}<span class="sub2">offer expires ${o.expiry_locktime ? whenText(o.expiry_locktime) : "—"}</span></td>
         <td data-label="left">${o.lots_left ?? "?"}</td>
-        <td data-label="">${action}</td></tr>`;
-    }).join("") + "</table>";
-  b.querySelectorAll("[data-borrow]").forEach(btn => {
-    btn.onclick = () => borrow(view[Number(btn.dataset.borrow)]);
-  });
-  b.querySelectorAll("[data-withdraw]").forEach(btn => {
-    btn.onclick = () => withdraw(view[Number(btn.dataset.withdraw)]);
-  });
-  b.querySelectorAll("[data-cancel]").forEach(btn => {
-    btn.onclick = () => cancelListing(view[Number(btn.dataset.cancel)]);
+        <td data-label="taken">${o.taken ?? "—"}</td>
+        <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>` +
+      detailsRow(key, 9, detailsBlock({
+        idLabel: "offer id", id: o.offer_id || "not listed in this book",
+        outpoint: o.outpoint, spk, terms: o.terms, t, warnings: o.warnings }));
+    }).join("") + "</tbody></table>";
+  paint("#offers", html, (b) => {
+    const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
+      btn.onclick = () => fn(view[Number(btn.dataset[attr])]);
+    });
+    hook("borrow", borrow);
+    hook("withdraw", withdraw);
+    hook("cancel", cancelListing);
+    hook("list", listPending);
+    wireDetails(b);
+    wireCopy(b, (id) => (view.find(o => (o.offer_id || "not listed in this book") === id) || {}).terms || "");
   });
 }
+
+// ---------------------------------------------------------------- loans
 
 const STATE_CLS = { LIVE: "ok", UNCONFIRMED: "warn", REPAID: "dim", LIQUIDATED: "bad",
                     DEFAULTED: "bad", RECOVERED: "bad", GHOST: "bad", SPENT_UNKNOWN: "dim" };
 
+const STATE_WHY = {
+  LIVE: "the funding is buried deep enough for this book to treat the loan as open",
+  UNCONFIRMED: "the funding is on chain but not yet buried; treat the loan as provisional",
+  REPAID: "the borrower paid the debt and took the collateral back",
+  LIQUIDATED: "someone closed it under the strike; the surplus went back to the borrower",
+  DEFAULTED: "it was called after maturity",
+  RECOVERED: "the lender swept the vault with the oracle-liveness backstop",
+  GHOST: "the funding was undone by a Bitcoin reorg. The collateral is back in the borrower's wallet and the loan has to be taken again — Sequentia follows Bitcoin, which is what makes this chain's finality mean anything",
+  SPENT_UNKNOWN: "the vault was spent by a transaction this book cannot account for",
+};
+
 function renderLoans() {
-  const b = $("#loans");
   let rows = state.loans;
   if (state.loansFilter === "live")
     rows = rows.filter(l => l.state === "LIVE" || l.state === "UNCONFIRMED");
   if (state.loansFilter === "mine")
     rows = rows.filter(l => mine(l.borrower_prog) || mine(l.lender_prog));
   if (!rows.length) {
-    b.innerHTML = `<div class="empty">${state.loansFilter === "mine"
+    paint("#loans", `<div class="empty">${state.loansFilter === "mine"
       ? (state.account ? "No loans involve this wallet." : "Connect a wallet to see your loans.")
-      : state.loansFilter === "live" ? "No live loans." : "No loans yet."}</div>`;
+      : state.loansFilter === "live" ? "No live loans." : "No loans yet."}</div>`);
     return;
   }
-  b.innerHTML = `<table><tr><th>loan</th><th>market</th><th>owed</th><th>collateral</th>
-      <th>price / liquidation</th><th>health</th><th>matures</th><th>state</th><th></th></tr>` +
+  const html = lenderSummary(rows) +
+    `<table><thead><tr><th>loan</th><th>market</th><th>owed</th><th>collateral</th>
+      <th>price / liquidation</th><th>health</th><th>matures</th><th>state</th><th></th></tr></thead><tbody>` +
     rows.map((l, i) => {
       const t = JSON.parse(l.terms);
       const h = l.health != null ? Number(l.health) : null;
@@ -404,38 +1057,119 @@ function renderLoans() {
       const m = marketFor(t);
       const now = m?.unit_price != null ? Number(m.unit_price) : null;
       const live = l.state === "LIVE";
-      const role = mine(l.borrower_prog) ? '<span class="tag gold">you borrow</span>'
+      const yours = mine(l.borrower_prog);
+      const key = detKey("loan", l.loan_id || l.txid);
+      const role = yours ? '<span class="tag gold">you borrow</span>'
         : mine(l.lender_prog) ? '<span class="tag gold">you lend</span>' : "";
       const acts = [];
-      if (live && mine(l.borrower_prog))
-        acts.push(`<button data-repay="${i}" class="primary sm">Repay</button>`);
+      // Repaying is permissionless and both destinations are pinned in the
+      // vault address, so anyone may do it and it can only help the borrower.
+      if (live)
+        acts.push(`<button data-repay="${i}" data-focus="rp:${esc(l.txid)}" class="${yours ? "primary " : ""}sm"` +
+          (yours ? "" : ' title="permissionless: this pays the lender and the borrower at the addresses baked into the vault"') +
+          `>${yours ? "Repay" : "Repay for the borrower"}</button>`);
       if (live && l.liquidatable)
-        acts.push(`<button data-liq="${i}" class="warnbtn sm">Liquidate</button>`);
+        acts.push(`<button data-liq="${i}" data-focus="lq:${esc(l.txid)}" class="warnbtn sm">Liquidate</button>`);
       if (live && l.past_maturity)
-        acts.push(`<button data-default="${i}" class="warnbtn sm">Call default</button>`);
+        acts.push(`<button data-default="${i}" data-focus="df:${esc(l.txid)}" class="warnbtn sm">Call default</button>`);
       if (live && l.recover_open)
-        acts.push(`<button data-recover="${i}" class="sm">Recover</button>`);
-      const closed = l.spent_by ? `<a class="small" href="/tx/${esc(l.spent_by)}">closing tx</a>` : "";
+        acts.push(`<button data-recover="${i}" data-focus="rc:${esc(l.txid)}" class="sm">Recover</button>`);
+      acts.push(`<button class="sm" data-det="${esc(key)}" data-focus="det:${esc(key)}" aria-expanded="${state.details.has(key)}">Details</button>`);
+      const closed = l.spent_by ? `<a class="small" href="${txLink(l.spent_by)}">closing tx</a>` : "";
+      const depth = l.min_depth ?? state.minDepth;
+      // A close is as provisional as a funding until it is buried: Sequentia
+      // follows Bitcoin, so a shallow closing transaction can still be undone
+      // and the loan come back. Show its depth rather than a settled tag.
+      const closedConf = l.closed_confirmations != null
+        ? Number(l.closed_confirmations)
+        : (state.height != null && l.spent_height
+            ? state.height - Number(l.spent_height) + 1 : 0);
+      const shallow = l.spent_by && closedConf < depth
+        ? ` <span class="small" title="the closing transaction is not buried yet; until it is, this loan can come back">${closedConf}/${depth}</span>`
+        : "";
       const oracle = (t.oracles && t.oracles.length)
         ? `<span class="sub2">${esc(l.oracle || "")} oracles</span>` : "";
+      const spk = derived(`vault:${l.txid}:${l.vout}`, () => l.single_leaf
+        ? offer.offerVaultScriptPubKey(t) : pig.vaultScriptPubKey(t));
       return `<tr>
-        <td data-label="loan" class="mono"><a href="/tx/${esc(l.txid)}" style="color:inherit;text-decoration:none">${shortHex(l.txid, 10)}</a>${role ? "<br>" + role : ""}</td>
+        <td data-label="loan" class="mono"><a href="${txLink(l.txid)}" style="color:inherit;text-decoration:none">${shortHex(l.txid, 10)}</a>${role ? "<br>" + role : ""}</td>
         <td data-label="market">${esc(l.collateral_ticker)} / ${esc(l.debt_ticker)}${oracle}</td>
         <td data-label="owed">${amount(t.debt, t.debt_asset)}<span class="sub2">borrowed ${units(t.principal, t.debt_asset)}</span></td>
         <td data-label="collateral">${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}</span></td>
         <td data-label="price / liq.">${now != null ? money(now, now < 10 ? 4 : 2) : "—"} / ${money(liq, liq < 10 ? 4 : 2)}<span class="sub2">${esc(l.debt_ticker)} per ${esc(l.collateral_ticker)}${l.ltv != null ? ` · LTV ${(l.ltv * 100).toFixed(0)}%` : ""}</span></td>
         <td data-label="health"><span class="tag health ${cls}">${h == null ? "no price" : h.toFixed(3)}</span></td>
         <td data-label="matures">${whenBlock(t.maturity)}</td>
-        <td data-label="state"><span class="tag ${STATE_CLS[l.state] || "dim"}">${esc(l.state)}</span>${l.state === "UNCONFIRMED" && l.confirmations != null ? ` <span class="small">${l.confirmations}/2</span>` : ""}<br>${closed}</td>
-        <td data-label="" class="row" style="gap:6px">${acts.join("")}</td></tr>`;
-    }).join("") + "</table>";
-  const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
-    btn.onclick = () => fn(rows[Number(btn.dataset[attr])]);
+        <td data-label="state"><span class="tag ${STATE_CLS[l.state] || "dim"}" title="${esc(STATE_WHY[l.state] || "")}">${esc(l.state)}</span>${l.state === "UNCONFIRMED" && l.confirmations != null ? ` <span class="small">${l.confirmations}/${depth}</span>` : ""}${shallow}${l.note ? `<span class="sub2">${esc(l.note)}</span>` : ""}<br>${closed}</td>
+        <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>` +
+      detailsRow(key, 9, detailsBlock({
+        idLabel: "loan id", id: l.loan_id || l.txid,
+        outpoint: `${l.txid}:${l.vout}`, spk, terms: l.terms, t,
+        extra: `<span class="k">Vault</span><span>${l.single_leaf
+          ? "single leaf (taken from a funded offer)" : "four leaves (originated directly)"}</span>`
+          + (l.spent_by ? `<span class="k">How it ended</span><span data-exit="${esc(l.loan_id || l.txid)}">…</span>` : "") }));
+    }).join("") + "</tbody></table>";
+  paint("#loans", html, (b) => {
+    const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
+      btn.onclick = () => fn(rows[Number(btn.dataset[attr])]);
+    });
+    hook("repay", repay);
+    hook("liq", l => seize(l, false));
+    hook("default", l => seize(l, true));
+    hook("recover", recover);
+    wireDetails(b);
+    wireExits(b, rows);
+    wireCopy(b, (id) => (rows.find(l => (l.loan_id || l.txid) === id) || {}).terms || "");
   });
-  hook("repay", repay);
-  hook("liq", l => seize(l, false));
-  hook("default", l => seize(l, true));
-  hook("recover", recover);
+}
+
+/** What this wallet has lent, been repaid, earned and seized. */
+function lenderSummary(rows) {
+  if (state.loansFilter !== "mine" || !state.mine) return "";
+  const lent = rows.filter(l => mine(l.lender_prog));
+  if (!lent.length) return "";
+  const byAsset = {};
+  for (const l of lent) {
+    const t = JSON.parse(l.terms);
+    const a = (byAsset[t.debt_asset] = byAsset[t.debt_asset]
+      || { principal: 0n, interest: 0n, live: 0n });
+    a.principal += big(t.principal);
+    if (l.state === "REPAID") a.interest += big(t.debt) - big(t.principal);
+    if (l.state === "LIVE" || l.state === "UNCONFIRMED") a.live += big(t.principal);
+  }
+  const seized = lent.filter(l => ["LIQUIDATED", "DEFAULTED", "RECOVERED"].includes(l.state)).length;
+  const parts = Object.entries(byAsset).map(([a, v]) =>
+    `${units(v.principal, a)} ${esc(meta(a).ticker)} lent across ${lent.length} loan${lent.length === 1 ? "" : "s"}` +
+    ` · ${units(v.live, a)} still out · ${units(v.interest, a)} interest earned`);
+  return `<div class="hint" style="margin:0 0 10px">${parts.join("<br>")}` +
+         (seized ? `<br>${seized} closed by seizure` : "") + "</div>";
+}
+
+/** A borrower's own loans, when they are close to the strike. */
+function renderAlerts() {
+  const risky = state.loans.filter(l => l.state === "LIVE" && mine(l.borrower_prog)
+    && l.health != null && Number(l.health) < 1.15);
+  const html = risky.map((l, i) => {
+    const t = JSON.parse(l.terms);
+    const h = Number(l.health);
+    const m = marketFor(t);
+    const now = m?.unit_price != null ? Number(m.unit_price) : null;
+    const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
+    const { c, d } = tickers(t);
+    const what = h < 1
+      ? "liquidatable now"
+      : `liquidatable if ${esc(c)} falls below ${money(liq, liq < 10 ? 4 : 2)} ${esc(d)}` +
+        (now != null ? ` (now ${money(now, now < 10 ? 4 : 2)})` : "");
+    return `<div class="note ${h < 1 ? "bad" : "warn"}">
+      Your ${esc(c)}/${esc(d)} loan <span class="mono">${shortHex(l.txid, 10)}</span>
+      is at health ${h.toFixed(3)}: ${what}. Repay it to close it.
+      <button class="sm" data-alert-repay="${i}" style="margin-left:8px">Repay</button>
+    </div>`;
+  }).join("");
+  paint("#alerts", html, (box) => {
+    box.querySelectorAll("[data-alert-repay]").forEach(b => {
+      b.onclick = () => repay(risky[Number(b.dataset.alertRepay)]);
+    });
+  });
 }
 
 // -------------------------------------------------------------- lend form
@@ -452,16 +1186,52 @@ function lendInputs() {
   };
 }
 
+/**
+ * Every market this book could lend against, price or no price.
+ *
+ * A market whose oracle has gone quiet is still a market: dropping it out of
+ * the form leaves a lender staring at a list that grew shorter for no stated
+ * reason. It stays, and the preview says why nothing can be built on it yet.
+ */
+function lendableMarkets() {
+  return state.markets.filter(m => !m.cross_chain && m.collateral_asset
+                                   && m.debt_asset);
+}
+
 /** The terms a lend form describes, in atoms, or a reason it cannot be built. */
 function lendTerms() {
   const i = lendInputs();
   const m = i.m;
   if (!m) throw new Error("pick a market");
-  if (!m.lendable) throw new Error(`${m.market} cannot be lent against here`);
+  if (!m.lendable) {
+    // The strike and the collateral both come off the attested price, so an
+    // offer built on a stale one is priced against a market that has moved.
+    if (m.stale)
+      throw new Error(`${m.market} has no fresh price: the newest attestation ` +
+        `this book could verify is ${priceAge(m)}. An offer takes its ` +
+        `collateral and its strike from that number, so nothing can be built ` +
+        `on it until the oracle catches up.`);
+    if (m.precision_mismatch)
+      throw new Error(`${m.market}'s oracle quotes it at different asset ` +
+        "precisions than the registry gives, so its price does not mean what " +
+        "it appears to; nothing can be lent against it until the two agree");
+    if (m.price == null)
+      throw new Error(`${m.market} has no attestation at all yet, so there is ` +
+        "no price to set a strike against");
+    throw new Error(`${m.market} cannot be lent against here`);
+  }
   if (!(i.principal > 0)) throw new Error("enter an amount to lend");
   if (!(i.openLtv > 0 && i.openLtv < i.liqLtv && i.liqLtv <= 1))
     throw new Error("the opening loan-to-value must be below the liquidation one, and both under 100%");
   if (!(i.termDays > 0) || !(i.offerDays > 0)) throw new Error("term and offer days must be positive");
+  if (i.offerDays > i.termDays)
+    throw new Error("the offer would still be open after its loans mature; " +
+                    "keep 'offer open for' at or below the maturity");
+  // Every locktime here is a height, so an offer cannot be built without one.
+  if (state.height == null || !state.healthy?.node)
+    throw new Error("the book has no node right now, so it cannot place a " +
+                    "maturity or an expiry; try again when the chain tag shows " +
+                    "a block height");
   const dp = m.debt_precision ?? 8;
   const scale = BigInt(m.price_scale || 100000);
   const price = BigInt(m.price);
@@ -487,10 +1257,13 @@ function lendTerms() {
   const oMode = ($("#oraclesel") || {}).value || "single";
   let oracle_x = state.oracleX, oracles = [], oracle_threshold = 0;
   if (oMode !== "single") {
-    const m = Number(oMode);
-    if (!(state.oracles.length >= m && m >= 2))
+    const n = Number(oMode);
+    if (!(state.oracles.length >= n && n >= 2))
       throw new Error("that oracle set is no longer available");
-    oracle_x = ""; oracles = state.oracles.slice(); oracle_threshold = m;
+    oracle_x = ""; oracles = state.oracles.slice(); oracle_threshold = n;
+  } else if (!state.oracleX) {
+    throw new Error("the book has no oracle key right now (its oracle is " +
+                    "unreachable); an offer cannot be built without one");
   }
   const terms = {
     collateral_asset: m.collateral_asset, debt_asset: m.debt_asset,
@@ -510,19 +1283,26 @@ function lendTerms() {
 function renderLendForm() {
   const sel = $("#marketsel");
   const cur = sel.value;
-  sel.innerHTML = state.markets.filter(m => m.lendable).map(m =>
-    `<option value="${esc(m.market)}">${esc(m.collateral_ticker)} / ${esc(m.debt_ticker)}</option>`).join("");
-  if (cur) sel.value = cur;
+  const opts = lendableMarkets().map(m =>
+    `<option value="${esc(m.market)}">${esc(m.collateral_ticker)} / ${esc(m.debt_ticker)}` +
+    `${m.lendable ? "" : " — no fresh price"}</option>`).join("");
+  if (sel.innerHTML !== opts) {          // leave an open dropdown alone
+    sel.innerHTML = opts;
+    if (cur) sel.value = cur;
+  }
   // Oracle-set choices: the single default, plus an m-of-n for every m>=2 the
   // book can actually reach right now (a threshold you cannot meet is a trap).
   const osel = $("#oraclesel");
   const n = state.oracles.length;
   const ocur = osel.value;
-  const opts = ['<option value="single">Single oracle (default)</option>'];
+  const oopts = ['<option value="single">Single oracle (default)</option>'];
   for (let m = 2; m <= n; m++)
-    opts.push(`<option value="${m}">Require ${m} of ${n} oracles</option>`);
-  osel.innerHTML = opts.join("");
-  if (ocur) osel.value = ocur;
+    oopts.push(`<option value="${m}">Require ${m} of ${n} oracles</option>`);
+  const ohtml = oopts.join("");
+  if (osel.innerHTML !== ohtml) {
+    osel.innerHTML = ohtml;
+    if (ocur) osel.value = ocur;
+  }
   $("#oracle_count").textContent = n > 1
     ? `${n} independent oracles available` : "";
   renderPreview();
@@ -536,36 +1316,118 @@ function renderPreview() {
   $("#lend_unit").textContent = `(${m.debt_ticker})`;
   const liq = unitPrice(t.strike, t.price_scale, t.collateral_asset, t.debt_asset);
   const now = Number(m.unit_price);
+  const drop = (1 - liq / now) * 100;
   const total = x.principal * BigInt(x.lots);
   out.innerHTML = `<div class="kv">
     <span class="k">You lock</span><span><b>${amount(total, t.debt_asset)}</b> in an offer covenant${x.lots > 1 ? `, takeable ${x.lots} times` : ""}; untaken principal comes back to you after ${whenBlock(x.expiry)}</span>
     <span class="k">Each borrower locks</span><span><b>${amount(t.collateral_amount, t.collateral_asset)}</b> <span class="k">${ref(t.collateral_amount, t.collateral_asset)} at today's price, ${(x.i.openLtv * 100).toFixed(0)}% loan-to-value</span></span>
     <span class="k">and repays</span><span><b>${amount(t.debt, t.debt_asset)}</b> <span class="k">by ${whenBlock(t.maturity)}</span></span>
-    <span class="k">Liquidation</span><span>if ${esc(m.collateral_ticker)} falls below <b>${money(liq, liq < 10 ? 4 : 2)} ${esc(m.debt_ticker)}</b> <span class="k">(${((1 - liq / now) * 100).toFixed(0)}% below now); whoever liquidates keeps a ${BONUS}% bonus and the rest of the collateral goes back to the borrower</span></span>
+    <span class="k">Liquidation</span><span>if ${esc(m.collateral_ticker)} falls below <b>${money(liq, liq < 10 ? 4 : 2)} ${esc(m.debt_ticker)}</b> <span class="k">(${drop < 0 ? "above the price now — a loan would be liquidatable immediately"
+      : `${drop.toFixed(0)}% below now`}); whoever liquidates keeps a ${BONUS}% bonus and the rest of the collateral goes back to the borrower</span></span>
     <span class="k">After maturity</span><span class="k">anyone may call the loan at any price; ${RECOVER_GAP_DAYS} days later you can sweep the vault without an oracle</span>
   </div>`;
 }
 
 // ------------------------------------------------------------------ actions
 
-async function confirmAndSend(label, built, fee, extra = []) {
+/**
+ * Show what a transaction will do, let the fee asset be changed, and ask for a
+ * signature only once the person has read it and said go.
+ *
+ * `make(fee)` composes the transaction for a fee in `fee.asset`. The wallet's
+ * approval opens in a tab of its own, so the summary has to be readable BEFORE
+ * that happens -- the wallet shows per-asset deltas and cannot know a vault
+ * address or a strike.
+ */
+async function confirmAndSend(label, make, opts = {}) {
+  const { flow, prefer = [], committed = {} } = opts;
+  let fee = feeFor(flow, prefer, committed);
+  let built = make(fee);                       // a first failure is the caller's
+  const choices = feeChoices(flow, committed);
+
+  const draw = (problem) => {
+    const lines = built
+      ? [...built.summary,
+         `Network fee: ${amount(built.fee ?? fee.atoms, fee.asset)} ${ref(built.fee ?? fee.atoms, fee.asset)}` +
+         (built.folded > 0n ? ` (includes ${units(built.folded, fee.asset)} of change too small to keep)` : ""),
+         ...(built.extra || [])].map(l => `<li>${esc(l)}</li>`).join("")
+      : "";
+    const options = choices.map(a =>
+      `<option value="${esc(a)}"${a === fee.asset ? " selected" : ""}>${esc(meta(a).ticker)}</option>`).join("");
+    note(`<b>${esc(label)}</b><ul>${lines}</ul>
+      <div class="row" style="margin-top:10px">
+        <label for="feeasset" class="small">Pay the network fee in</label>
+        <select id="feeasset"${choices.length > 1 ? "" : " disabled"}>${options}</select>
+        <span class="small">any asset the network prices; nothing here is privileged</span>
+      </div>
+      ${feeVsize(flow)?.estimated ? `<div class="hint" style="margin:8px 0 0">This
+      book publishes no size estimate for this kind of transaction, so the fee
+      above is priced at the largest size it does publish. It over-pays rather
+      than risking a transaction the network will not relay.</div>` : ""}
+      ${problem ? `<div class="hint" style="color:var(--bad);margin:8px 0 0">${problem}</div>` : ""}
+      <div class="hint" style="margin:8px 0 0">Your wallet will show its own view of this
+      before you approve it. If the two disagree, reject it.</div>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" id="go"${built ? "" : " disabled"}>Continue to wallet</button>
+        <button id="nogo">Cancel</button>
+      </div>`, "info");
+  };
+
+  const answer = await new Promise((resolve) => {
+    const wire = () => {
+      const sel = $("#feeasset");
+      if (sel) sel.onchange = () => {
+        const wasFee = fee, wasBuilt = built;
+        try {
+          fee = feeInAsset(flow, sel.value);
+          built = make(fee);
+          draw();
+        } catch (e) {
+          // Keep the composition that worked, so Continue stays honest about
+          // what it would send.
+          fee = wasFee; built = wasBuilt;
+          draw(explain(e));
+        }
+        wire();
+      };
+      const go = $("#go");
+      if (go) go.onclick = () => {
+        go.disabled = true;
+        $("#nogo").disabled = true;
+        resolve(true);
+      };
+      $("#nogo").onclick = () => resolve(false);
+    };
+    draw();
+    wire();
+  });
+  if (!answer) {
+    note(`<b>${esc(label)} — cancelled.</b> Nothing was signed or sent.`, "info");
+    return null;
+  }
+
   const lines = [...built.summary,
-    `Network fee: ${amount(fee.atoms, fee.asset)} ${ref(fee.atoms, fee.asset)}`, ...extra]
+    `Network fee: ${amount(built.fee ?? fee.atoms, fee.asset)}`]
     .map(l => `<li>${esc(l)}</li>`).join("");
-  note(`<b>${esc(label)}</b><ul>${lines}</ul>
-    <div class="hint" style="margin:8px 0 0">Your wallet will show its own view of this
-    before you approve it. If the two disagree, reject it.</div>`, "info");
+  let txid;
   busy(true, "waiting for your approval in the wallet…");
   try {
     const signed = await state.wallet.signPset(built.pset);
     busy(true, "broadcasting…");
-    const txid = await state.wallet.broadcast({ pset: signed });
-    note(`<b>${esc(label)} — sent.</b> <a href="/tx/${esc(txid)}" class="mono">${esc(txid)}</a>`, "ok");
+    txid = await state.wallet.broadcast({ pset: signed });
+  } finally { busy(false); }
+  // Everything past the broadcast is bookkeeping. It must not be able to turn a
+  // sent transaction into a reported failure.
+  note(`<b>${esc(label)} — sent.</b> <a href="${txLink(txid)}" class="mono">${esc(txid)}</a><ul>${lines}</ul>`, "ok");
+  try {
     await loadWallet();
     renderWallet();
-    setTimeout(refresh, 2500);
-    return txid;
-  } finally { busy(false); }
+  } catch (e) {
+    note(`<b>${esc(label)} — sent.</b> <a href="${txLink(txid)}" class="mono">${esc(txid)}</a><ul>${lines}</ul>` +
+         `<div class="hint">Balances could not be refreshed: ${explain(e)}</div>`, "ok");
+  }
+  setTimeout(() => refresh().catch(() => {}), 2500);
+  return txid;
 }
 
 function tickers(t) {
@@ -590,13 +1452,33 @@ async function cancelListing(o) {
     "to you on the offer's own expiry.", "warn"); return; }
   busy(true, "cancelling the listing…");
   try {
-    const r = await fetch(`v1/offers/${encodeURIComponent(o.offer_id)}?token=${encodeURIComponent(token)}`,
-                          { method: "DELETE" });
+    // The token goes in a header, never in the query string: the daemon logs
+    // every request line, and a secret in a log is a secret given away.
+    const r = await fetch(`v1/offers/${encodeURIComponent(o.offer_id)}`,
+                          { method: "DELETE", headers: { "X-Manage-Token": token } });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `DELETE -> ${r.status}`);
     note("Listing removed. Your principal is untouched in the offer covenant " +
          "and returns to you after the expiry.", "ok");
-    refresh();
-  } catch (e) { note(esc(e.message), "bad"); } finally { busy(false); }
+    refresh().catch(() => {});
+  } catch (e) { note(explain(e), "bad"); } finally { busy(false); }
+}
+
+/** List an offer whose coin is already locked but whose listing never landed. */
+async function listPending(rec) {
+  busy(true, "listing the offer…");
+  try {
+    const r = await post("v1/offers", {
+      terms: rec.terms, kind: "funded", outpoint: rec.outpoint,
+      principal: rec.principal, collateral: rec.collateral,
+      expiry_locktime: rec.expiry_locktime });
+    if (r.manage_token && r.offer_id) rememberToken(r.offer_id, r.manage_token);
+    forgetPending(rec.txid);
+    note("Offer listed. A borrower can take it now, with you offline.", "ok");
+    refresh().catch(() => {});
+  } catch (e) {
+    note(`The book still will not list it: ${explain(e)} Your principal is safe ` +
+         "in the offer covenant either way, and comes back to you at the expiry.", "bad");
+  } finally { busy(false); renderOffers(); }
 }
 
 async function borrow(o) {
@@ -606,40 +1488,74 @@ async function borrow(o) {
     if ((t.borrower_ver ?? 1) !== state.payout.ver)
       throw new Error(`this offer is for witness-v${t.borrower_ver} borrowers and ` +
                       `your wallet pays out at v${state.payout.ver}`);
+    if (state.height != null && Number(t.maturity) <= state.height)
+      throw new Error("this offer's loans have already matured: one taken now " +
+                      "could be called at any price immediately");
     const [txid, vout] = String(o.outpoint).split(":");
     const out = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
     if (!out) throw new Error(
       "cannot see that offer on chain right now; it may just have been taken");
-    const fee = feeFor("take", [t.collateral_asset, t.debt_asset]);
-    const built = flows.buildTakeOffer({
-      terms: t, offerOutpoint: { txid, vout: Number(vout), scriptPubkey: out.scriptPubKey },
-      offerValue: out.value, principal: big(o.principal || t.principal),
-      collateral: big(o.collateral || t.collateral_amount),
-      expiryLocktime: o.expiry_locktime,
-      borrowerProg: state.payout.prog, borrowerVer: state.payout.ver,
-      utxos: state.utxos, changeSpk: state.payout.spk,
-      feeAsset: fee.asset, feeAmount: fee.atoms,
-    });
+    // The offer's ADDRESS pins the terms but not what the coin holds. Its
+    // value is a remainder and can be anything a whole lot fits in, but the
+    // asset can only be the debt asset: the TAKE leaf pays the principal out
+    // of this coin, so an offer funded in something else pays nothing.
+    if (out.asset !== t.debt_asset)
+      throw new Error(out.asset
+        ? "that offer's coin does not hold the asset it promises to lend"
+        : "that offer's coin has a blinded asset, so nothing can be checked " +
+          "about what it would actually lend you");
+    const collateral = big(o.collateral || t.collateral_amount);
     const { c, d } = tickers(t);
-    built.summary = [
-      `Borrow ${units(t.principal, t.debt_asset)} ${d}`,
-      `Lock ${units(t.collateral_amount, t.collateral_asset)} ${c} as collateral ${ref(t.collateral_amount, t.collateral_asset)}`,
-      `Repay ${units(t.debt, t.debt_asset)} ${d} any time before block ${Number(t.maturity).toLocaleString()} to get it back`,
-      `Liquidatable if ${c} falls below ${money(unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset), 4)} ${d}`,
-    ];
-    const sent = await confirmAndSend("Borrow", built, fee, [
-      `The vault this creates: ${built.vaultScriptPubKey.slice(0, 24)}… — derived here, from these terms; the offer's own script refuses anything else.`,
-    ]);
+    const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
+    const gapDays = ((Number(t.recover_after) - Number(t.maturity)) / blocksPerDay()).toFixed(0);
+    const soon = state.height != null &&
+      (Number(t.maturity) - state.height) < blocksPerDay();
+    const odd = unknownOracles(t);
+    let vaultTerms = null;          // the terms the vault address came from
+    const sent = await confirmAndSend("Borrow", (fee) => {
+      const built = flows.buildTakeOffer({
+        terms: t, offerOutpoint: { txid, vout: Number(vout), scriptPubkey: out.scriptPubKey },
+        offerValue: out.value, principal: big(o.principal || t.principal),
+        collateral,
+        expiryLocktime: o.expiry_locktime,
+        borrowerProg: state.payout.prog, borrowerVer: state.payout.ver,
+        utxos: state.utxos, changeSpk: state.payout.spk,
+        feeAsset: fee.asset, feeAmount: fee.atoms, dustAtoms: dustFor(fee.asset),
+      });
+      vaultTerms = built.terms;
+      built.summary = [
+        ...(soon ? ["This loan matures in under a day"] : []),
+        `Borrow ${units(t.principal, t.debt_asset)} ${d}`,
+        `Lock ${units(collateral, t.collateral_asset)} ${c} as collateral ${ref(collateral, t.collateral_asset)}`,
+        `Repay ${units(t.debt, t.debt_asset)} ${d} by ${whenText(t.maturity)} to get it back`,
+        `Liquidatable if ${c} falls below ${money(liq, 4)} ${d}`,
+        "After maturity anyone may call the loan at any price",
+        `The lender may sweep the vault without an oracle after ${whenText(t.recover_after)}, ${gapDays} days past maturity`,
+        ...(o.warnings || []).map(w => `Warning: ${w}`),
+        ...(odd.length ? [`Warning: this offer's liquidation oracle ${odd[0].slice(0, 12)}… ` +
+          "is not one this book quotes; whoever holds that key can attest any " +
+          "price and liquidate you at the strike"] : []),
+      ];
+      built.extra = [
+        `The vault this creates: ${built.vaultScriptPubKey.slice(0, 24)}… — derived here, from these terms; the offer's own script refuses anything else.`,
+      ];
+      return built;
+    }, { flow: "take", prefer: [t.collateral_asset, t.debt_asset],
+         committed: { [t.collateral_asset]: collateral } });
     if (sent) {
-      await post("v1/loans", { terms: JSON.stringify(built.terms), txid: sent, vout: 0,
-                               single_leaf: true, offer_id: o.offer_id }).catch(e =>
+      await post("v1/loans", { terms: JSON.stringify(vaultTerms), txid: sent,
+        vout: 0, single_leaf: true, offer_id: o.offer_id }).catch(e =>
         note(`Sent, but the book did not register it yet (${esc(e.message)}); ` +
              "it discovers vaults from the chain on its own.", "warn"));
       state.loansFilter = "mine";
-      $$("[data-lf]").forEach(x => x.classList.toggle("on", x.dataset.lf === "mine"));
-      refresh();
+      $$("[data-lf]").forEach(x => {
+        const on = x.dataset.lf === "mine";
+        x.classList.toggle("on", on);
+        x.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      refresh().catch(() => {});
     }
-  } catch (e) { note(esc(e.message), "bad"); }
+  } catch (e) { note(explain(e), "bad"); }
 }
 
 async function withdraw(o) {
@@ -649,23 +1565,53 @@ async function withdraw(o) {
     const [txid, vout] = String(o.outpoint).split(":");
     const out = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
     if (!out) throw new Error("that offer's coin is gone already");
-    const fee = feeFor("withdraw", [t.debt_asset]);
-    const built = flows.buildWithdrawOffer({
-      terms: t, offerOutpoint: { txid, vout: Number(vout), scriptPubkey: out.scriptPubKey },
-      offerValue: out.value, principal: big(o.principal || t.principal),
-      collateral: big(o.collateral || t.collateral_amount),
-      expiryLocktime: o.expiry_locktime, utxos: state.utxos,
-      changeSpk: state.payout.spk, feeAsset: fee.asset, feeAmount: fee.atoms,
-    });
-    built.summary = [`Return ${amount(out.value, t.debt_asset)} to your wallet`,
-                     "The offer expired; this is its only remaining exit"];
-    await confirmAndSend("Withdraw offer", built, fee);
-  } catch (e) { note(esc(e.message), "bad"); }
+    if (out.asset !== t.debt_asset)
+      throw new Error("that offer's coin does not hold the debt asset the " +
+                      "refund leaf pays out, so there is nothing to return");
+    const sent = await confirmAndSend("Withdraw offer", (fee) => {
+      const built = flows.buildWithdrawOffer({
+        terms: t, offerOutpoint: { txid, vout: Number(vout), scriptPubkey: out.scriptPubKey },
+        offerValue: out.value, principal: big(o.principal || t.principal),
+        collateral: big(o.collateral || t.collateral_amount),
+        expiryLocktime: o.expiry_locktime, utxos: state.utxos,
+        changeSpk: state.payout.spk, feeAsset: fee.asset, feeAmount: fee.atoms,
+        dustAtoms: dustFor(fee.asset),
+      });
+      built.summary = [
+        `Return ${amount(out.value, t.debt_asset)} to the lender's pinned address`,
+        "The offer expired; this is its only remaining exit"];
+      return built;
+    }, { flow: "withdraw", prefer: [t.debt_asset] });
+    if (sent) { forgetPending(txid); renderOffers(); }
+  } catch (e) { note(explain(e), "bad"); }
 }
 
-function vaultArgs(l, t) {
-  return { terms: t, vaultOutpoint: { txid: l.txid, vout: l.vout, scriptPubkey: l.vault_address },
-           collateralAmount: big(t.collateral_amount), singleLeaf: !!l.single_leaf,
+/**
+ * The arguments a vault spend needs, taken from the CHAIN.
+ *
+ * The book derives `vault_address` from the same terms this page holds, so
+ * checking one against the other proves nothing. The coin itself is the only
+ * thing worth comparing against -- and its real value, not the terms' idea of
+ * it, is what the spend has to pay out.
+ */
+async function vaultArgs(l, t) {
+  const out = await api(`v1/outpoint/${l.txid}/${l.vout}`).catch(() => null);
+  if (!out) throw new Error(
+    "that vault is already spent, or the book's node cannot see it; refresh " +
+    "the list");
+  // Both halves matter. An asset the book cannot see is a blinded one, and
+  // every leaf here compares assets, so a spend composed against a coin whose
+  // asset nobody can read is a spend nobody can settle.
+  if (!out.asset)
+    throw new Error("the asset at that outpoint is not visible (a blinded " +
+                    "output); a vault must hold an explicit amount of an " +
+                    "asset anyone can check");
+  if (out.asset !== t.collateral_asset)
+    throw new Error("the coin at that outpoint does not hold this loan's " +
+                    "collateral asset");
+  return { terms: t,
+           vaultOutpoint: { txid: l.txid, vout: l.vout, scriptPubkey: out.scriptPubKey },
+           collateralAmount: big(out.value), singleLeaf: !!l.single_leaf,
            utxos: state.utxos, changeSpk: state.payout.spk };
 }
 
@@ -673,14 +1619,19 @@ async function repay(l) {
   if (needWallet()) return;
   try {
     const t = JSON.parse(l.terms);
-    const fee = feeFor(l.single_leaf ? "repay" : "repay4", [t.debt_asset]);
-    const built = flows.buildRepay({ ...vaultArgs(l, t), feeAsset: fee.asset, feeAmount: fee.atoms });
+    const args = await vaultArgs(l, t);
     const { c, d } = tickers(t);
-    built.summary = [`Pay ${units(t.debt, t.debt_asset)} ${d} to the lender`,
-                     `Take back all ${units(t.collateral_amount, t.collateral_asset)} ${c}`,
-                     "No oracle and no signature: this exit is always open to you"];
-    await confirmAndSend("Repay", built, fee);
-  } catch (e) { note(esc(e.message), "bad"); }
+    await confirmAndSend("Repay", (fee) => {
+      const built = flows.buildRepay({ ...args, feeAsset: fee.asset,
+        feeAmount: fee.atoms, dustAtoms: dustFor(fee.asset) });
+      built.summary = [
+        `Pay ${units(t.debt, t.debt_asset)} ${d} to the lender`,
+        `Take back all ${units(args.collateralAmount, t.collateral_asset)} ${c}`,
+        "No oracle and no signature: this exit is always open to you"];
+      return built;
+    }, { flow: l.single_leaf ? "repay" : "repay4", prefer: [t.debt_asset],
+         committed: { [t.debt_asset]: big(t.debt) } });
+  } catch (e) { note(explain(e), "bad"); }
 }
 
 async function seize(l, atMaturity) {
@@ -689,14 +1640,18 @@ async function seize(l, atMaturity) {
     const t = JSON.parse(l.terms);
     const market = t.market.replace("/", "_");
     const isThreshold = !!(t.oracles && t.oracles.length);
+    const scale = big(t.price_scale || 100000);
     let single = null, set = null;
     if (isThreshold) {
       // A threshold loan is closed with several oracles' attestations, one
       // per key; the book aggregates them, and each is verified here against
-      // the key THIS LOAN names before it is used.
+      // the key THIS LOAN names before it is used. An attestation quoted at
+      // another price scale is dropped with them: the scale is baked into the
+      // leaf and signed by nobody, so the same number is a different price.
       const got = await api(`v1/attestations/${market}`);
       set = (got.attestations || []).filter(a =>
         t.oracles.includes(a.oracle_x) &&
+        (a.price_scale == null || big(a.price_scale) === scale) &&
         pig.verifySchnorr(a.oracle_x,
           pig.attestationMessage(pig.feedId(t.market), a.timestamp, a.price),
           a.signature));
@@ -704,36 +1659,68 @@ async function seize(l, atMaturity) {
         throw new Error("none of this loan's oracles have a verifiable " +
                         "attestation right now; the covenant would refuse it.");
     } else {
-      single = await api(`v1/attestation/${market}`);
-      // Verify the SIGNATURE against the key THIS LOAN bakes in. The oracle is
-      // trusted for a number and never for the transport that carried it, and a
-      // loan only accepts the oracle it named.
+      // Ask for THIS LOAN'S oracle by name. Unqualified, the book serves
+      // whichever key it currently calls primary, and a loan baked to an
+      // older key -- which is every loan taken before a rotation -- would be
+      // handed an attestation its own covenant will not accept.
+      single = await api(`v1/attestation/${market}` +
+        (t.oracle_x ? `?oracle=${encodeURIComponent(t.oracle_x)}` : ""));
+      // Verify the SIGNATURE against the key THIS LOAN bakes in, and the price
+      // SCALE against the one it computes at. The oracle is trusted for a
+      // number and never for the transport that carried it, a loan only
+      // accepts the oracle it named, and a number quoted at another scale is
+      // one the covenant would read as a different price entirely.
       if (!pig.verifyAttestation(t, single))
         throw new Error("that attestation does not verify against the oracle this " +
-                        "loan names, so the covenant would refuse it. Refusing to build it.");
+                        "loan names, or is quoted at another price scale, so the " +
+                        "covenant would misread it. Refusing to build it.");
     }
+    // A seizure takes somebody's collateral, and the covenant will accept any
+    // attestation its own key signed however old it is. So a stale price is
+    // refused here, which is the only place it can be.
+    const mk = marketFor(t);
+    const staleAge = single?.age != null ? `${Number(single.age)} seconds old`
+      : mk ? priceAge(mk) : "of an unknown age";
+    if (single?.stale ?? mk?.stale)
+      throw new Error(
+        `the newest attestation this book can verify for ${t.market} is ` +
+        `${staleAge}, past the age it treats as current. Closing a position ` +
+        "on a price the market has moved away from splits the collateral at " +
+        "the wrong number, so this page refuses it until the oracle catches " +
+        "up. pignus-cli will build it against a stale price with --allow-stale.");
+    const args = await vaultArgs(l, t);
     const flow = (atMaturity ? "default" : "liquidate") + (l.single_leaf ? "" : "4");
-    const fee = feeFor(flow, [t.debt_asset]);
-    const built = flows.buildLiquidate({ ...vaultArgs(l, t),
-      attestation: single, attestations: set, atMaturity,
-      takerSpk: state.payout.spk, feeAsset: fee.asset, feeAmount: fee.atoms });
     const { c, d } = tickers(t);
-    built.summary = [`Pay ${units(t.debt, t.debt_asset)} ${d} to the lender`,
-      `Keep ${units(big(t.collateral_amount) - built.surplus, t.collateral_asset)} ${c} ${ref(big(t.collateral_amount) - built.surplus, t.collateral_asset)}`,
-      built.surplus > 0n ? `Return ${units(built.surplus, t.collateral_asset)} ${c} to the borrower — the covenant enforces this`
-        : "This position is under water: there is no surplus to return"];
-    await confirmAndSend(atMaturity ? "Call default" : "Liquidate", built, fee);
-  } catch (e) { note(esc(e.message), "bad"); }
+    await confirmAndSend(atMaturity ? "Call default" : "Liquidate", (fee) => {
+      const built = flows.buildLiquidate({ ...args,
+        attestation: single, attestations: set, atMaturity,
+        takerSpk: state.payout.spk, feeAsset: fee.asset, feeAmount: fee.atoms,
+        dustAtoms: dustFor(fee.asset) });
+      built.summary = [`Pay ${units(t.debt, t.debt_asset)} ${d} to the lender`,
+        `Keep ${units(args.collateralAmount - built.surplus, t.collateral_asset)} ${c} ${ref(args.collateralAmount - built.surplus, t.collateral_asset)}`,
+        built.surplus > 0n
+          ? `Return ${units(built.surplus, t.collateral_asset)} ${c} to the borrower — the covenant enforces this`
+          : "This position is under water: there is no surplus to return"];
+      return built;
+    }, { flow, prefer: [t.debt_asset], committed: { [t.debt_asset]: big(t.debt) } });
+  } catch (e) { note(explain(e), "bad"); }
 }
 
 async function recover(l) {
   if (needWallet()) return;
   try {
     const t = JSON.parse(l.terms);
-    const fee = feeFor(l.single_leaf ? "recover" : "recover4", [t.debt_asset]);
-    const built = flows.buildRecover({ ...vaultArgs(l, t), feeAsset: fee.asset, feeAmount: fee.atoms });
-    await confirmAndSend("Recover", built, fee);
-  } catch (e) { note(esc(e.message), "bad"); }
+    const args = await vaultArgs(l, t);
+    const { c } = tickers(t);
+    await confirmAndSend("Recover", (fee) => {
+      const built = flows.buildRecover({ ...args, feeAsset: fee.asset,
+        feeAmount: fee.atoms, dustAtoms: dustFor(fee.asset) });
+      built.summary = [
+        `Sweep all ${units(args.collateralAmount, t.collateral_asset)} ${c} to the lender's pinned address`,
+        `Open since ${whenText(t.recover_after)}: the oracle-liveness backstop`];
+      return built;
+    }, { flow: l.single_leaf ? "recover" : "recover4", prefer: [t.debt_asset] });
+  } catch (e) { note(explain(e), "bad"); }
 }
 
 async function lend(ev) {
@@ -741,72 +1728,352 @@ async function lend(ev) {
   if (needWallet()) return;
   try {
     const x = lendTerms();
-    const fee = feeFor("fund", [x.terms.debt_asset]);
-    const built = flows.buildFundOffer({
-      terms: x.terms, principal: x.principal, collateral: x.collateral,
-      expiryLocktime: x.expiry, lots: x.lots, utxos: state.utxos,
-      changeSpk: state.payout.spk, feeAsset: fee.asset, feeAmount: fee.atoms,
-    });
+    const total = x.principal * BigInt(x.lots);
     const { c, d } = tickers(x.terms);
-    built.summary = [
-      `Lock ${units(x.principal * BigInt(x.lots), x.terms.debt_asset)} ${d} in an offer covenant, takeable ${x.lots} time(s) at ${units(x.principal, x.terms.debt_asset)} each`,
-      `Each borrower locks ${units(x.collateral, x.terms.collateral_asset)} ${c} and repays ${units(x.debt, x.terms.debt_asset)} ${d}`,
-      `Anything untaken returns to you after block ${x.expiry.toLocaleString()}`,
-    ];
-    const txid = await confirmAndSend("Publish a funded offer", built, fee, [
-      `Offer address: ${built.offerScriptPubKey.slice(0, 24)}…`]);
-    if (txid) {
-      const rec = await post("v1/offers", {
-        terms: JSON.stringify(x.terms), kind: "funded", outpoint: `${txid}:0`,
-        principal: String(x.principal), collateral: String(x.collateral),
-        expiry_locktime: x.expiry });
+    const txid = await confirmAndSend("Publish a funded offer", (fee) => {
+      const built = flows.buildFundOffer({
+        terms: x.terms, principal: x.principal, collateral: x.collateral,
+        expiryLocktime: x.expiry, lots: x.lots, utxos: state.utxos,
+        changeSpk: state.payout.spk, feeAsset: fee.asset, feeAmount: fee.atoms,
+        dustAtoms: dustFor(fee.asset),
+      });
+      built.summary = [
+        `Lock ${units(total, x.terms.debt_asset)} ${d} in an offer covenant, takeable ${x.lots} time(s) at ${units(x.principal, x.terms.debt_asset)} each`,
+        `Each borrower locks ${units(x.collateral, x.terms.collateral_asset)} ${c} and repays ${units(x.debt, x.terms.debt_asset)} ${d}`,
+        `Anything untaken returns to you after ${whenText(x.expiry)}`,
+      ];
+      built.extra = [`Offer address: ${built.offerScriptPubKey.slice(0, 24)}…`];
+      return built;
+    }, { flow: "fund", prefer: [x.terms.debt_asset],
+         committed: { [x.terms.debt_asset]: total } });
+    if (!txid) return;
+    // The coin is locked the moment that broadcast lands. Remember it BEFORE
+    // asking the book to list it: a listing that fails must not leave a funded
+    // offer nobody can see and nobody can withdraw.
+    const rec = { txid, terms: JSON.stringify(x.terms),
+                  principal: String(x.principal), collateral: String(x.collateral),
+                  expiry_locktime: x.expiry, kind: "funded",
+                  outpoint: `${txid}:0`, listed: false, created: Date.now() };
+    rememberPending(rec);
+    try {
+      const listed = await post("v1/offers", {
+        terms: rec.terms, kind: "funded", outpoint: rec.outpoint,
+        principal: rec.principal, collateral: rec.collateral,
+        expiry_locktime: rec.expiry_locktime });
       // The manage token lets this browser cancel the LISTING later without a
       // key. It is shown once by the daemon; keep it locally, per offer.
-      if (rec.manage_token && rec.offer_id) rememberToken(rec.offer_id, rec.manage_token);
+      if (listed.manage_token && listed.offer_id)
+        rememberToken(listed.offer_id, listed.manage_token);
+      forgetPending(txid);
       $$("[data-tab]")[0].click();
-      refresh();
+      refresh().catch(() => {});
+    } catch (e) {
+      note(`<b>Offer funded, but not listed.</b> Your principal is locked in the ` +
+        `offer covenant at <span class="mono">${esc(rec.outpoint)}</span>. The book ` +
+        `did not accept the listing (${esc(e.message)}), so no borrower can see it ` +
+        `yet. It is in your offers under "Mine", where you can list it again or, ` +
+        `after the expiry, withdraw it. <button class="sm" id="retrylist">Retry listing</button>`,
+        "warn");
+      const b = $("#retrylist");
+      if (b) b.onclick = () => listPending(rec);
+      renderOffers();
     }
-  } catch (e) { note(esc(e.message), "bad"); }
+  } catch (e) { note(explain(e), "bad"); }
+}
+// ------------------------------------------------------------ BTC collateral
+//
+// The Bitcoin side of a loan lives in btcborrow.js, which derives and checks
+// every address itself. What belongs here is the page around it: the wallet,
+// the book, the heights both chains are at, and a fee this user chose.
+
+/**
+ * How deep a Sequentia transaction is, read off the chain.
+ *
+ * The relay says which transaction published the secret; it must not also be
+ * the one that says how buried it is. The whole reason for waiting is that a
+ * Bitcoin reorg can undo it, and a relay that could report the depth could
+ * report six.
+ *
+ * The book's node keeps no transaction index, so a transaction is found
+ * through an output it still holds: `v1/outpoint` answers for any unspent one,
+ * mempool included, and every output of one transaction is the same depth. A
+ * transaction whose outputs have all been spent again answers nothing and
+ * reads as zero, which keeps a borrower waiting rather than spending Bitcoin
+ * on a secret that could still be undone.
+ */
+async function confirmations(txid, maxVout = 4) {
+  if (!/^[0-9a-f]{64}$/i.test(String(txid || ""))) return 0;
+  for (let vout = 0; vout < maxVout; vout++) {
+    const got = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
+    if (got) return Number(got.confirmations || 0);
+  }
+  return 0;
 }
 
-// ------------------------------------------------------------ repurchase
+/**
+ * What btcborrow.js needs from the page.
+ *
+ * `flow` picks the fee estimate, and `prefer`/`committed` keep the choice
+ * honest: the asset the payment is already spending is preferred, and what the
+ * payment itself needs is set aside before the fee is priced.
+ */
+function btcUi({ flow = "btcrepay", prefer = [], committed = {} } = {}) {
+  return {
+    esc, units, ticker: (a) => meta(a).ticker,
+    atomsToBtc: (n) => (Number(BigInt(n)) / 1e8)
+      .toLocaleString(undefined, { maximumFractionDigits: 8 }),
+    blockTime: (h) => whenBlock(h),
+    busy, api, post,
+    poll: async (path, pick, { tries = 40, gap = 2000 } = {}) => {
+      for (let i = 0; i < tries; i++) {
+        const got = await api(path).catch(() => null);
+        const v = got ? pick(got) : null;
+        if (v) return v;
+        await new Promise(r => setTimeout(r, gap));
+      }
+      return null;
+    },
+    payoutProgram: async () => state.payout,
+    heights: async () => ({ btc: state.btcHeight, seq: state.height }),
+    confirmations,
+    btcHrp: btcHrp(),
+    addressToSpk: async (addr) => programFromAddress(addr).spk,
+    utxos: async () => state.utxos,
+    changeSpk: async () => state.payout.spk,
+    feeRates: async () => {
+      const f = feeFor(flow, prefer, committed);
+      // `estimated` says the book publishes no size for this flow and the fee
+      // was priced at the largest size it does publish, so a screen that draws
+      // its own confirmation can say so rather than charging for a guess in
+      // silence.
+      return { asset: f.asset, atoms: f.atoms, dust: dustFor(f.asset),
+               estimated: !!feeVsize(flow)?.estimated };
+    },
+  };
+}
 
 function renderBtcOffers() {
   const box = document.querySelector("#btcoffers"); if (!box) return;
-  btcborrow.renderOffers(box, state.btcOffers || [], {
-    esc, units, ticker: (a) => meta(a).ticker,
-    atomsToBtc: (n) => (Number(BigInt(n)) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 }),
-  }, (offer) => runBtcBorrow(offer));
+  btcborrow.renderOffers(box, state.btcOffers || [], btcUi(),
+                         (off) => runBtcBorrow(off));
 }
-async function runBtcBorrow(offer) {
+
+/**
+ * A Bitcoin-collateral loan binds deadlines on two chains, and this page can
+ * only see one of them. Rather than check half of it, refuse.
+ */
+function needBtcHeight() {
+  if (state.btcHeight != null) return false;
+  note("This book does not publish a Bitcoin height, so the page cannot check " +
+       "that the two chains' deadlines leave you enough time to repay and " +
+       "reclaim. Take the offer with <code>pignus-cli btc-take</code>, which " +
+       "reads a Bitcoin node directly.", "warn");
+  return true;
+}
+
+async function runBtcBorrow(off) {
+  if (needWallet() || needBtcHeight()) return;
+  // The Bitcoin code derives the address real collateral is sent to. If it
+  // could not reproduce the golden vectors, it does not get to say where.
+  if (!state.btcPinned) {
+    note("This page could not check its own Bitcoin code against the vectors "
+         + "the node's builders emit"
+         + (state.btcWhy ? ` (${esc(state.btcWhy)})` : "")
+         + ", so it will not tell your wallet where to send collateral. "
+         + "Reload; if it persists, this deployment is broken and "
+         + "<code>pignus-cli btc-offer-take</code> is the way in.", "bad");
+    return;
+  }
+  try {
+    const l = off.loan;
+    const principal = BigInt(l.principal || 0) || BigInt(l.debt);
+    const d = esc(meta(l.debt_asset).ticker);
+    const out = await btcborrow.borrow(state.wallet, off, btcUi());
+    busy(false);
+    note("<b>Collateral committed.</b> <a href=\"" + txLink(out.ftxid, true) +
+      "\" class=\"mono\">" + esc(out.ftxid) + "</a><br>" +
+      "It waits in a pre-vault until you take the principal: claiming " +
+      units(principal.toString(), l.debt_asset) + " " + d + " is what starts " +
+      "the loan, and until then you can take the collateral back. Your loan is " +
+      "under \"Your BTC-collateral loans\" below.", "ok");
+    await renderBtcLoans();
+  } catch (e) { busy(false); note(explain(e), "bad"); }
+}
+
+async function loadBtcLoans() {
+  if (state.wallet && state.account && await btcborrow.walletCanBtc(state.wallet)) {
+    state.btcLoans = await btcborrow.recoverLoans(state.wallet, btcUi())
+      .catch(() => btcborrow.savedLoans());
+  } else {
+    state.btcLoans = btcborrow.savedLoans();
+  }
+  state.btcLoans = state.btcLoans.filter(r => r && r.loan && r.take_id);
+}
+
+async function renderBtcLoans() {
+  const box = $("#btcloans");
+  if (!box) return;
+  await loadBtcLoans().catch(() => { state.btcLoans = btcborrow.savedLoans(); });
+  const rows = state.btcLoans;
+  if (!rows.length) {
+    paint("#btcloans", `<div class="empty">${state.account
+      ? "No Bitcoin-collateral loans for this wallet yet."
+      : "Connect a wallet to see your Bitcoin-collateral loans."}</div>`);
+    return;
+  }
+  const heights = { btc: state.btcHeight, seq: state.height };
+  const html = `<table><thead><tr><th>collateral</th><th>you owe</th>
+      <th>repay by</th><th>lender sweep</th><th>where it stands</th><th></th>
+      </tr></thead><tbody>` +
+    rows.map((rec, i) => {
+      const l = rec.loan;
+      const step = btcborrow.nextStep(rec, heights);
+      const d = esc(meta(l.debt_asset).ticker);
+      const acts = [];
+      if (step.action)
+        acts.push(`<button data-btcstep="${i}" class="primary sm">${esc(step.label)}</button>`);
+      if (step.action === "reclaim")
+        acts.push(`<button data-btcforce="${i}" class="sm" title="Sequentia follows Bitcoin reorgs in real time, so a secret read from a shallow claim can still be undone">Reclaim anyway</button>`);
+      if (btcborrow.canAbort(rec, heights))
+        acts.push(`<button data-btcabort="${i}" class="warnbtn sm">Take the collateral back</button>`);
+      // The repayment's own REFUND leaf: if the lender never took the money,
+      // it comes home after the deadline, and needs no signature from them.
+      if (rec.status === "repaid" && rec.repay_txid && state.height != null
+          && state.height >= Number(l.repay_deadline))
+        acts.push(`<button data-btcunpay="${i}" class="sm" title="the lender never claimed it, so the repayment's refund leaf is open">Take the repayment back</button>`);
+      const funded = rec.prevault_txid || rec.funding_txid;
+      return `<tr>
+        <td data-label="collateral">${(Number(BigInt(l.btc_amount)) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })} BTC
+          ${funded ? `<span class="sub2"><a href="${txLink(funded, true)}" class="mono">${shortHex(funded, 12)}</a></span>` : ""}</td>
+        <td data-label="you owe">${units(l.debt, l.debt_asset)} ${d}</td>
+        <td data-label="repay by">${whenBlock(l.repay_deadline)}</td>
+        <td data-label="lender sweep">Bitcoin block ${Number(l.recover_after).toLocaleString()}</td>
+        <td data-label="where it stands">${esc(rec.status || "funded")}${step.note ? `<span class="sub2">${esc(step.note)}</span>` : ""}</td>
+        <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>`;
+    }).join("") + "</tbody></table>" +
+    `<p class="hint" style="margin:10px 0 0">Repaying pays a hashlocked output the
+     lender can only open by publishing the secret that releases your Bitcoin.
+     This page waits until that claim is ${CLAIM_DEPTH} blocks deep before it
+     spends on the secret, because Sequentia follows Bitcoin reorgs in real
+     time.</p>`;
+  paint("#btcloans", html, (b) => {
+    b.querySelectorAll("[data-btcstep]").forEach(btn => {
+      btn.onclick = () => btcStep(rows[Number(btn.dataset.btcstep)], false);
+    });
+    b.querySelectorAll("[data-btcforce]").forEach(btn => {
+      btn.onclick = () => btcStep(rows[Number(btn.dataset.btcforce)], true);
+    });
+    b.querySelectorAll("[data-btcabort]").forEach(btn => {
+      btn.onclick = () => btcAbort(rows[Number(btn.dataset.btcabort)]);
+    });
+    b.querySelectorAll("[data-btcunpay]").forEach(btn => {
+      btn.onclick = () => btcRefundRepayment(rows[Number(btn.dataset.btcunpay)]);
+    });
+  });
+}
+
+/** Do whatever this loan is waiting for: claim, repay, or reclaim. */
+async function btcStep(rec, force) {
+  if (needWallet()) return;
+  const l = rec.loan;
+  const step = btcborrow.nextStep(rec, { btc: state.btcHeight, seq: state.height });
+  const principal = (BigInt(l.principal || 0) || BigInt(l.debt)).toString();
+  const d = esc(meta(l.debt_asset).ticker);
+  try {
+    if (step.action === "claim") {
+      const ui = btcUi({ flow: "btcclaim", prefer: [l.debt_asset] });
+      const txid = await btcborrow.claimPrincipal(state.wallet, rec, ui);
+      note(`<b>Principal claimed.</b> ${units(principal, l.debt_asset)} ${d} is ` +
+        `yours (<a href="${txLink(txid)}" class="mono">${esc(txid)}</a>), and ` +
+        "claiming it is what moved your collateral into the loan vault. Repay " +
+        `by ${whenText(l.repay_deadline)} to get the Bitcoin back.`, "ok");
+    } else if (step.action === "repay") {
+      const ui = btcUi({ flow: "btcrepay", prefer: [l.debt_asset],
+                         committed: { [l.debt_asset]: big(l.debt) } });
+      const txid = await btcborrow.repay(state.wallet, rec, ui);
+      note(`<b>Debt paid.</b> <a href="${txLink(txid)}" class="mono">${esc(txid)}</a>. ` +
+        "The lender can only take it by publishing the secret that releases " +
+        "your Bitcoin; once that claim is buried, reclaim from here.", "ok");
+    } else if (step.action === "reclaim") {
+      const txid = await btcborrow.reclaim(state.wallet, rec, btcUi(),
+                                           { minDepth: CLAIM_DEPTH, force });
+      note(`<b>Collateral reclaimed.</b> <a href="${txLink(txid, true)}" class="mono">${esc(txid)}</a>`, "ok");
+    } else {
+      note("There is nothing to do with that loan right now.", "info");
+      return;
+    }
+    try { await loadWallet(); renderWallet(); } catch { /* balances lag */ }
+    await renderBtcLoans();
+  } catch (e) { note(explain(e), "bad"); } finally { busy(false); }
+}
+
+/**
+ * Take a repayment back that the lender never claimed.
+ *
+ * The output's REFUND leaf pays the borrower's own pinned program after the
+ * deadline, with no preimage and no signature from anyone, so the page can
+ * build it alone -- and it can only ever pay the borrower.
+ */
+async function btcRefundRepayment(rec) {
   if (needWallet()) return;
   try {
-    const out = await btcborrow.borrow(state.wallet, offer,
-      { busy, api, post, esc, units, ticker: (a) => meta(a).ticker,
-        seqSpk: state.payout?.spk });
-    const t = offer.loan;
-    const principal = BigInt(t.principal || t.debt);
-    note("<b>Collateral funded.</b> <span class=\"mono\">" + esc(out.ftxid) + "</span><br>" +
-      "Waiting for the lender to disburse " + units(principal, t.debt_asset) + " " +
-      esc(meta(t.debt_asset).ticker) + " once your collateral confirms…", "ok");
-    busy(true, "waiting for the principal to arrive…");
-    const dtxid = await btcborrow.awaitDisbursement({ api }, out.take_id).catch(() => null);
-    busy(false);
-    if (dtxid !== null) {
-      await loadWallet(); renderWallet();
-      note("<b>Loan open.</b> You received " + units(principal, t.debt_asset) + " " +
-        esc(meta(t.debt_asset).ticker) +
-        (dtxid ? " (<a href=\"/tx/" + esc(dtxid) + "\" class=\"mono\">disbursement</a>)" : "") +
-        ". Repay " + units(t.debt, t.debt_asset) + " to <span class=\"mono\">" +
-        esc(out.repaySpk) + "</span> before block " + Number(t.repay_deadline).toLocaleString() +
-        ", then reclaim your Bitcoin.", "ok");
-    } else {
-      note("<b>Collateral funded, principal pending.</b> The lender has not " +
-        "disbursed yet; it arrives once your collateral confirms and their " +
-        "responder is online. Your loan is saved in this browser.", "warn");
+    const l = rec.loan;
+    const tree = pig.hashlockTaptree({
+      preimageHash: l.payment_hash, asset: l.debt_asset,
+      payeeProg: l.lender_prog, payeeVer: l.lender_ver,
+      refundAfter: l.repay_deadline,
+      refundProg: l.borrower_prog, refundVer: l.borrower_ver });
+    const vout = Number(rec.repay_vout || 0);
+    const out = await api(`v1/outpoint/${rec.repay_txid}/${vout}`).catch(() => null);
+    if (!out) throw new Error(
+      "that repayment is already spent: the lender has claimed it, which " +
+      "publishes the secret that releases your Bitcoin — reclaim the " +
+      "collateral instead");
+    const d = meta(l.debt_asset).ticker;
+    const txid = await confirmAndSend("Take the repayment back", (fee) =>
+      flows.buildHashlockClaim({
+        tree, leaf: "refund", preimage: null,
+        outpoint: { txid: rec.repay_txid, vout, scriptPubkey: out.scriptPubKey },
+        value: out.value, asset: l.debt_asset,
+        payeeSpk: scriptPubKeyFor(l.borrower_ver, l.borrower_prog),
+        utxos: state.utxos, changeSpk: state.payout.spk,
+        feeAsset: fee.asset, feeAmount: fee.atoms, dustAtoms: dustFor(fee.asset),
+        locktime: Number(l.repay_deadline),
+        summary: [
+          `Take back ${units(out.value, l.debt_asset)} ${d} the lender never claimed`,
+          "The refund leaf pays your own pinned address and nobody else's",
+          "Your Bitcoin collateral stays where it is: the lender can still sweep it after their own deadline",
+        ] }),
+      { flow: "btcclaim", prefer: [l.debt_asset] });
+    if (txid) {
+      btcborrow.rememberLoan({ ...rec, status: "refunded", refund_txid: txid });
+      await renderBtcLoans();
     }
-  } catch (e) { busy(false); note(esc(e.message), "bad"); }
+  } catch (e) { note(explain(e), "bad"); }
 }
+
+async function btcAbort(rec) {
+  if (needWallet() || needBtcHeight()) return;
+  try {
+    const txid = await btcborrow.abort(state.wallet, rec, btcUi());
+    note(`<b>Collateral taken back.</b> <a href="${txLink(txid, true)}" class="mono">${esc(txid)}</a>. ` +
+      "The principal never came, so the loan never started.", "ok");
+    await renderBtcLoans();
+  } catch (e) { note(explain(e), "bad"); } finally { busy(false); }
+}
+
+function btcHrp() {
+  const n = String(btcNetworkName()).toLowerCase();
+  return n.includes("main") ? "bc" : "tb";
+}
+
+/** The address prefix this Sequentia wallet uses, read off its own address. */
+function seqHrp() {
+  const a = String(state.account?.address || "");
+  const i = a.lastIndexOf("1");
+  return i > 0 ? a.slice(0, i) : "tb";
+}
+
 async function checkBtc(ev) {
   ev.preventDefault();
   const out = $("#btcout");
@@ -821,43 +2088,135 @@ async function checkBtc(ev) {
   try { loan = JSON.parse($("#btcticket").value); }
   catch (e) { say("bad", "That ticket is not valid JSON: " + esc(e.message)); return; }
   try {
+    let filled = "";
+    if (!loan.borrower_x && state.wallet
+        && await btcborrow.walletCanBtc(state.wallet)) {
+      loan.borrower_x = (await state.wallet.request("getBtcPublicKey", {})).pubkey_x;
+      filled = "<p class=\"hint\">The ticket carried no <code>borrower_x</code>, so " +
+               "this used your wallet's own Bitcoin key.</p>";
+    }
+    // `payment_hash` is the whole of the cross-chain binding: the same hash
+    // stands in the Bitcoin vault's RECLAIM leaf and in the Sequentia
+    // repayment output, so the secret that pays the lender here is the secret
+    // that releases the collateral there. A ticket without it describes
+    // nothing that can be checked.
     const need = ["btc_amount", "lender_x", "oracle_x", "recover_after",
-                  "debt_asset", "debt", "repay_deadline", "adaptor_point",
-                  "payment_hash", "borrower_x"];
-    const missing = need.filter(k => loan[k] === undefined);
+                  "debt_asset", "debt", "repay_deadline", "payment_hash",
+                  "borrower_x", "lender_prog", "borrower_prog"];
+    // An empty string counts as missing: a ticket at the proposed stage
+    // carries the borrower's fields as blanks, and a blank program would
+    // derive an address rather than fail, which is the worse outcome.
+    const missing = need.filter(k => loan[k] === undefined || loan[k] === null
+                                     || loan[k] === "");
     if (missing.length)
       throw new Error("the ticket is missing: " + missing.join(", ") +
                       (missing.includes("borrower_x")
-                        ? " (your wallet's Bitcoin key fills borrower_x once the "
-                          + "extension exposes it; until then paste a fully "
-                          + "prepared ticket)" : ""));
+                        ? " — paste a prepared ticket (from pignus-cli " +
+                          "btc-prepare), or connect your wallet and this page " +
+                          "reads your Bitcoin key itself" : "") +
+                      (missing.includes("payment_hash")
+                        ? " — the hash both chains commit to only exists once " +
+                          "the lender has drawn this loan's secret, so a ticket " +
+                          "that has not been back to them yet cannot be checked "
+                          + "here" : ""));
     const fundingSpk = pig._internals.bytesToHex(btc.fundingSpk(loan));
     const repaySpk = pig._internals.bytesToHex(btc.repaymentSpk(loan));
-    let lines = `<p><strong>These terms compile to:</strong></p><div class="kv">
-      <span class="k">Bitcoin funding output</span><span><code>${fundingSpk}</code></span>
-      <span class="k">Sequentia repayment output</span><span><code>${repaySpk}</code></span>
+    const fundingAddr = btc.fundingAddress(loan, btcHrp());
+    const repayAddr = btc.segwitAddress(1, pig._internals.hexToBytes(repaySpk.slice(4)),
+                                        seqHrp());
+    const rdOk = state.height == null || Number(loan.repay_deadline) > state.height;
+    // Collateral is never paid into the vault by hand. It goes into the
+    // PRE-VAULT, which the borrower alone can take back after `abort_after`,
+    // and it moves on only when claiming the principal publishes `w`. A ticket
+    // that describes that origination gets both addresses, in the order they
+    // are used, so nobody funds the second one.
+    let preAddr = "", preSpk = "", preValue = 0n, principalAddr = "";
+    try {
+      preSpk = pig._internals.bytesToHex(btc.prevaultSpk(loan));
+      preAddr = btc.prevaultAddress(loan, btcHrp());
+      preValue = btc.prevaultValue(loan);
+    } catch { /* an older ticket with no abortable origination */ }
+    try {
+      if (loan.h_w && loan.d_refund)
+        principalAddr = btc.segwitAddress(1, btc.disbursementSpk(loan).slice(2),
+                                          seqHrp());
+    } catch { /* the principal's own address needs the abort deadlines too */ }
+    // The vault's outpoint is not a fact to be taken from the ticket: it
+    // follows from the pre-vault the collateral goes into and from the terms
+    // themselves. Derive it, and if the ticket also states one, they must
+    // agree -- a ticket that names some other vault is one the lender's
+    // release does not cover.
+    let vaultTxid = "";
+    if (loan.prevault_txid)
+      try { vaultTxid = btc.upgradeTx(loan, loan.prevault_txid,
+                                      Number(loan.prevault_vout || 0)).txid(); }
+      catch { /* not enough of a ticket to name the vault */ }
+    // The same checks the automated path makes before it commits any Bitcoin:
+    // what the offer says on its face, and whether its two chains' deadlines
+    // leave everybody the time they need.
+    const problems = btcborrow.offerProblems(loan).concat(
+      state.btcHeight != null && state.height != null
+        ? btcborrow.timelockProblems(loan, state.btcHeight, state.height) : []);
+    if (vaultTxid && loan.vault_txid && loan.vault_txid !== vaultTxid)
+      problems.push("this ticket's vault does not follow from its own " +
+                    "pre-vault and terms, so something in it has been altered " +
+                    "since it was prepared.");
+    let lines = filled;
+    if (problems.length)
+      lines += `<p class="tag bad">Do not fund this.</p><ul>` +
+               problems.map(x => `<li>${esc(x)}</li>`).join("") + "</ul>";
+    else if (state.btcHeight == null)
+      lines += `<p class="hint">This book publishes no Bitcoin height, so the
+        deadlines below could not be checked against the Bitcoin chain; compare
+        them yourself in a Bitcoin explorer.</p>`;
+    lines += `<p><strong>These terms compile to:</strong></p><div class="kv">
+      ${preAddr ? `<span class="k">Bitcoin pre-vault — pay this one</span><span>${esc(preAddr)}<br><span class="mono">${preSpk}</span><br><span class="small">exactly ${(Number(preValue)/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC: the collateral plus the fee for the one transaction that moves it on. Yours alone to take back after Bitcoin block ${Number(loan.abort_after).toLocaleString()}.</span></span>` : ""}
+      <span class="k">Bitcoin loan vault</span><span>${esc(fundingAddr)}<br><span class="mono">${fundingSpk}</span>${preAddr
+        ? '<br><span class="small">Do NOT pay this address. The collateral reaches it only through the pre-vault, when claiming the principal publishes the secret that releases it.</span>' : ""}</span>
+      ${principalAddr ? `<span class="k">Where the principal waits</span><span>${esc(principalAddr)}<br><span class="small">claiming it is what starts the loan; until you do, nothing is lent and nothing is locked.</span></span>` : ""}
+      <span class="k">Sequentia repayment address</span><span>${esc(repayAddr)}<br><span class="mono">${repaySpk}</span></span>
       <span class="k">Collateral</span><span>${(Number(BigInt(loan.btc_amount))/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC</span>
       <span class="k">Debt</span><span>${units(loan.debt, loan.debt_asset)} ${esc(meta(loan.debt_asset).ticker)}</span>
-      <span class="k">Repay by</span><span>Sequentia block ${Number(loan.repay_deadline).toLocaleString()}</span>
-      <span class="k">Lender sweep after</span><span>Bitcoin block ${Number(loan.recover_after).toLocaleString()}</span>
-      </div>`;
-    // If the ticket has a funding outpoint + reclaim dest + the lender's
-    // adaptor sig, check the release the borrower would rely on.
-    if (loan.funding_txid && loan.reclaim_dest && loan.adaptor_sig) {
+      <span class="k">Both chains' shared secret</span><span class="mono">${esc(loan.payment_hash)}</span>
+      <span class="k">Repay deadline</span><span>Sequentia block ${Number(loan.repay_deadline).toLocaleString()}${state.height == null ? ""
+        : rdOk ? ` — in the future (now block ${Number(state.height).toLocaleString()})`
+        : ` — <b>ALREADY PAST</b> (now block ${Number(state.height).toLocaleString()}): the lender's Sequentia refund is open, so do not fund`}</span>
+      <span class="k">Lender sweep</span><span>Bitcoin block ${Number(loan.recover_after).toLocaleString()} — this page cannot see the Bitcoin height; confirm in a Bitcoin explorer that it is well after your repayment deadline</span>
+      </div>
+      <p class="hint">That one hash stands in the Bitcoin vault's reclaim leaf and
+      in the Sequentia repayment output above. It is the whole of the binding
+      between the two chains: the secret that pays the lender their money is the
+      secret that hands your Bitcoin back.</p>`;
+    // The release the lender hands over at origination is an ordinary
+    // signature now, so it can be checked outright rather than taken on trust.
+    // It commits to one exact reclaim transaction spending the VAULT, whose
+    // outpoint is fixed before any Bitcoin moves. The DERIVED vault is checked
+    // against first: a release that only verifies against the ticket's own
+    // claim about where the collateral will sit verifies nothing.
+    const release = loan.release_sig || loan.adaptor_sig;
+    const against = vaultTxid || loan.vault_txid || loan.funding_txid || "";
+    if (against && loan.reclaim_dest && release) {
       const sh = pig._internals.bytesToHex(btc.reclaimSighash(loan,
-        loan.funding_txid, loan.funding_vout || 0,
+        against, vaultTxid ? 0 : (loan.vault_vout ?? loan.funding_vout ?? 0),
         pig._internals.hexToBytes(loan.reclaim_dest), loan.reclaim_fee || 3000));
-      const ok = state.adaptorPinned && badaptor.verifyAdaptor(
-        loan.lender_x, sh, loan.adaptor_point, loan.adaptor_sig);
+      const ok = state.adaptorPinned
+        && badaptor.verifySchnorr(loan.lender_x, sh, release);
       lines += ok
-        ? `<p class="tag ok" style="margin-top:10px">The lender's release signature verifies: once you know t you can always reclaim the collateral. Safe to fund.</p>`
+        ? `<p class="tag ${rdOk ? "ok" : "bad"}" style="margin-top:10px">The lender's release signature verifies for this reclaim: once the lender takes your repayment, the secret they publish completes it and the collateral comes back to the address in <code>reclaim_dest</code>.</p>` +
+          (rdOk
+            ? `<p class="hint">This page cannot see Bitcoin. Before funding, confirm in a Bitcoin explorer that your funding transaction pays ${preAddr
+                ? `exactly ${(Number(preValue)/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC to the pre-vault address above`
+                : `exactly ${(Number(BigInt(loan.btc_amount))/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC to the vault address above`}, and that the lender's sweep height is well after your repayment deadline. The lender pays the principal only after your collateral confirms.</p>`
+            : `<p class="hint">The repayment deadline has already passed, so do not fund this whatever else checks out.</p>`)
         : `<p class="tag bad" style="margin-top:10px">The lender's release signature does NOT verify. Do not fund — the release could be worthless.</p>`;
     } else {
-      lines += `<p class="hint" style="margin-top:10px">Add <code>funding_txid</code>, <code>reclaim_dest</code> and the lender's <code>adaptor_sig</code> to also check the release before you fund.</p>`;
+      lines += `<p class="hint" style="margin-top:10px">Add <code>prevault_txid</code> (or <code>vault_txid</code>), <code>reclaim_dest</code> and the lender's <code>release_sig</code> to also check the release before you fund.</p>`;
     }
-    say("ok", lines);
+    say(rdOk && !problems.length ? "ok" : "bad", lines);
   } catch (e) { say("bad", "<strong>Cannot verify.</strong> " + esc(e.message)); }
 }
+
+// ------------------------------------------------------------ repurchase
 
 async function checkRepurchase(ev) {
   ev.preventDefault();
@@ -873,34 +2232,112 @@ async function checkRepurchase(ev) {
   let terms;
   try { terms = JSON.parse($("#repoterms").value); }
   catch (e) { say("bad", "Those terms are not valid JSON: " + esc(e.message)); return; }
-  let spk, words;
+  let spk, words, atoms;
   try {
     spk = pig._internals.bytesToHex(repo.repurchaseScriptPubKey(terms));
-    words = repo.describe(terms);
+    // Nobody reads a quantity in atoms or an asset by twelve hex characters,
+    // so the sentence is rendered in tickers and units -- and the atoms it was
+    // built from are put underneath, because that is what the covenant reads
+    // and what a second tool would be checked against.
+    words = repo.describe(terms, (a, x) => `${units(a, x)} ${meta(x).ticker}`);
+    atoms = repoAtoms(terms);
   } catch (e) {
     say("bad", "These terms do not describe a repurchase this page will compose: " + esc(e.message));
     return;
   }
+  const said = `<p>${esc(words)}</p><p class="mono">${esc(atoms)}</p>`;
   const txid = $("#repotxid").value.trim();
   if (!txid) {
     say("ok", `<p><strong>These terms compile to</strong><br><code>${spk}</code></p>` +
-        `<p>${esc(words)}</p><p class="hint">Give the funding txid to check the coin itself.</p>`);
+        said + `<p class="hint">Give the funding txid to check the coin itself.</p>`);
     return;
   }
   busy(true, "reading the chain");
   try {
     const vout = parseInt($("#repovout").value || "0", 10);
     const o = await api(`v1/outpoint/${txid}/${vout}`);
-    repo.verifyRepurchaseFunding(terms, o.scriptPubKey, o.value);
-    say("ok", `<p><strong>This is the repurchase you were shown.</strong> The coin at ` +
-        `<code>${esc(txid)}:${vout}</code> pays the address these terms compile to, ` +
-        `and holds exactly the bond they name.</p><p>${esc(words)}</p>`);
+    // The address pins neither the money terms nor the asset, so the funded
+    // AMOUNT and the funded ASSET are the whole of what can catch a lie about
+    // them. A coin whose asset the book cannot see settles nothing: a bond in
+    // some cheap asset sits at the right address in the right quantity and is
+    // worth nothing to the borrower, because RETURN and FORFEIT both pay out
+    // the debt asset.
+    if (!o.asset)
+      throw new Error("the coin's asset is not visible (blinded output, or " +
+                      "the book did not report it); a repurchase bond must be " +
+                      "explicit, because the covenant compares its value");
+    repo.verifyRepurchaseFunding(terms, o.scriptPubKey, o.value, o.asset);
+    const conf = Number(o.confirmations || 0);
+    if (conf < state.minDepth) {
+      say("ok", `<p><span class="tag warn">funded, not yet buried</span> ` +
+          `<strong>The coin at <code>${esc(txid)}:${vout}</code> pays the address ` +
+          `these terms compile to and holds exactly the bond they name, in the bond ` +
+          `asset, but it has ${conf}/${state.minDepth} confirmations.</strong> Do not ` +
+          `transfer the asset yet: an unconfirmed bond can be replaced, and Sequentia ` +
+          `reorgs when Bitcoin reorgs. Check again once it is buried.</p>` + said);
+    } else {
+      say("ok", `<p><strong>This is the repurchase you were shown.</strong> The coin at ` +
+          `<code>${esc(txid)}:${vout}</code> pays the address these terms compile to, ` +
+          `and holds exactly the bond they name, in the bond asset. It is buried ` +
+          `${conf} block${conf === 1 ? "" : "s"} deep.</p>` + said);
+    }
   } catch (e) {
     say("bad", "<strong>REFUSED.</strong> " + esc(e.message));
   } finally { busy(false); }
 }
 
+/** The same quantities in atoms, which is what the covenant actually reads. */
+function repoAtoms(terms) {
+  const r = repo.normaliseRepurchase(terms);
+  return `${r.debt} atoms sold · ${r.principal} paid now · ${r.moneyDebt} to ` +
+         `buy it back · ${r.bond} bond · collateral valued at ` +
+         `${r.collateralValue}`;
+}
+
 // ------------------------------------------------------------------ boot
+
+function wireTabs() {
+  const tabs = $$("[data-tab]");
+  const show = (b) => {
+    tabs.forEach(x => {
+      const on = x === b;
+      x.classList.toggle("on", on);
+      x.setAttribute("aria-selected", on ? "true" : "false");
+      x.tabIndex = on ? 0 : -1;
+    });
+    $$("[data-panel]").forEach(p => { p.hidden = p.dataset.panel !== b.dataset.tab; });
+  };
+  tabs.forEach((b, i) => {
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", b.classList.contains("on") ? "true" : "false");
+    b.tabIndex = b.classList.contains("on") ? 0 : -1;
+    b.onclick = () => show(b);
+    b.onkeydown = (e) => {
+      const to = e.key === "ArrowRight" ? (i + 1) % tabs.length
+        : e.key === "ArrowLeft" ? (i - 1 + tabs.length) % tabs.length
+        : e.key === "Home" ? 0
+        : e.key === "End" ? tabs.length - 1 : null;
+      if (to === null) return;
+      e.preventDefault();
+      show(tabs[to]);
+      tabs[to].focus();
+    };
+  });
+}
+
+function wireFilters(attr, set) {
+  $$(`[data-${attr}]`).forEach(b => {
+    b.setAttribute("aria-pressed", b.classList.contains("on") ? "true" : "false");
+    b.onclick = () => {
+      set(b.dataset[attr]);
+      $$(`[data-${attr}]`).forEach(x => {
+        const on = x === b;
+        x.classList.toggle("on", on);
+        x.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+    };
+  });
+}
 
 async function boot() {
   try {
@@ -919,43 +2356,41 @@ async function boot() {
   $("#lendform").oninput = renderPreview;
   $("#repoform").onsubmit = checkRepurchase;
   $("#btcform").onsubmit = checkBtc;
-  $("#refresh").onclick = () => refresh().catch(e => note(esc(e.message), "bad"));
-  $$("[data-tab]").forEach(b => {
-    b.setAttribute("role", "tab");
-    b.setAttribute("aria-selected", b.classList.contains("on") ? "true" : "false");
-    b.onclick = () => {
-      $$("[data-tab]").forEach(x => {
-        const on = x === b;
-        x.classList.toggle("on", on);
-        x.setAttribute("aria-selected", on ? "true" : "false");
-      });
-      $$("[data-panel]").forEach(p =>
-        p.style.display = p.dataset.panel === b.dataset.tab ? "" : "none");
-    };
-  });
-  $$("[data-lf]").forEach(b => {
-    b.onclick = () => {
-      state.loansFilter = b.dataset.lf;
-      $$("[data-lf]").forEach(x => x.classList.toggle("on", x === b));
-      renderLoans();
-    };
-  });
-  $$("[data-of]").forEach(b => {
-    b.onclick = () => {
-      state.offersFilter = b.dataset.of;
-      $$("[data-of]").forEach(x => x.classList.toggle("on", x === b));
-      renderOffers();
-    };
-  });
+  $("#refresh").onclick = () => refresh().catch(e => note(explain(e), "bad"));
+  wireTabs();
+  wireFilters("lf", (v) => { state.loansFilter = v; renderLoans(); });
+  wireFilters("of", (v) => { state.offersFilter = v; renderOffers(); });
   // resume a prior connection without prompting
   try {
     state.wallet = await Wallet.open();
-    if (await state.wallet.resume()) {
-      state.account = await state.wallet.resume();
-      await loadWallet(); renderWallet(); renderOffers(); renderLoans(); renderPreview();
+    const account = await state.wallet.resume();
+    if (account) {
+      state.account = account;
+      await loadWallet();
+      renderWallet(); renderOffers(); renderLoans(); renderAlerts(); renderPreview();
+      renderBtcLoans().catch(() => {});
     }
-    state.wallet.on("accountsChanged", () => { state.account = null; renderWallet(); });
+    const gone = () => {
+      forgetWallet();
+      renderWallet(); renderOffers(); renderLoans(); renderAlerts();
+      renderBtcLoans().catch(() => {});
+    };
+    state.wallet.on("accountsChanged", gone);
+    state.wallet.on("disconnect", gone);
   } catch { /* no wallet installed; the page still reads */ }
+  // An offer funded in an earlier session whose listing never landed: try once,
+  // quietly. It shows up under "Mine" with a List button either way.
+  for (const rec of pendingOffers()) {
+    post("v1/offers", { terms: rec.terms, kind: "funded", outpoint: rec.outpoint,
+      principal: rec.principal, collateral: rec.collateral,
+      expiry_locktime: rec.expiry_locktime })
+      .then(r => {
+        if (r.manage_token && r.offer_id) rememberToken(r.offer_id, r.manage_token);
+        forgetPending(rec.txid);
+        refresh().catch(() => {});
+      })
+      .catch(() => { /* it stays listed here, with a button */ });
+  }
   setInterval(() => refresh().catch(() => {}), 30000);
 }
 

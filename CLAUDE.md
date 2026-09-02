@@ -1,9 +1,11 @@
 # Working on Pignus
 
-Pignus is non-custodial collateralised lending on Sequentia. Borrow USDX against
-GOLD, SILVR, OILX, tSEQ, native BTC or any other unrestricted issued asset; the
-loan's terms are compiled into a covenant and enforced by the script interpreter
-rather than by an operator.
+Pignus is non-custodial collateralised lending on Sequentia. Borrow one issued
+asset against another, or against native Bitcoin on the parent chain, with the
+loan's terms compiled into a covenant and enforced by the script interpreter
+rather than by an operator. No asset is privileged: the testnet quotes its
+markets against USDX because a borrower wants a number they recognise, not
+because anything in the code knows about it.
 
 ## The one thing to understand before changing anything
 
@@ -23,7 +25,10 @@ import Python -- `web/pignus.js` for the browser is one, and it pins itself to
 the same vectors.
 
 So this repo needs a Sequentia **source** checkout. Set `SEQUENTIA_SRC`, or keep
-one at `../Sequentia` or `~/Sequentia`.
+one at `../Sequentia`, `~/Sequentia` or `vendor/sequentia` (git-ignored). An
+explicit `SEQUENTIA_SRC` is treated as a decision, not a hint: a wrong one is
+reported rather than silently falling back to another checkout whose covenant
+may differ.
 
 ## Regenerating the vectors
 
@@ -41,12 +46,13 @@ node-repo covenant change means someone has broken the pinning.
     tests/cli_drill.sh          offline, no node, ~2s -- run this first
     tests/run-tests.sh          everything, including the node integration tests
 
-`tests/test_platform.py` and `tests/test_btc_collateral.py` run on the node's
-functional-test framework but live here, because they test this library rather
-than the node. They need `SEQUENTIA_SRC` and a built `sequentiad`;
-`test_btc_collateral.py` also needs a Bitcoin Core `bitcoind` (`PIGNUS_BITCOIND`,
-default `~/bitcoin-28.0/bin/bitcoind`), and the `tests/*.mjs` browser checks need
-Node.
+`tests/test_platform.py` runs on the node's functional-test framework, so it
+needs a built checkout's `test/config.ini` and is skipped without one. The other
+chain tests start their own `sequentiad` -- and, for the BTC ones, a Bitcoin
+Core `bitcoind` -- through `tests/rig.py`, which needs only the binaries. All of
+them need `SEQUENTIA_SRC` and a built `sequentiad`; the Bitcoin ones read
+`PIGNUS_BITCOIND` (default `~/bitcoin-28.0/bin/bitcoind`), and the `tests/*.mjs`
+browser checks need Node.
 
 `tests/test_lifecycle.py` is the one to run after touching the daemon, the
 watcher, the CLI or `pignus/vault.py`: it drives the CLI through a whole
@@ -111,6 +117,10 @@ source on the box, never copy binaries onto it.
 - Design and security analysis: `docs/pignus-design.md` here. It is the
   authority on the trust surface, the replay window, the 64-bit bound and the
   collateral tiers; this repo's README summarises it.
+- `docs/api.md`: every HTTP endpoint `pignusd` and `pignus-oracle` serve, with
+  request and response shapes. A route added or changed in `bin/pignusd` or
+  `bin/pignus-oracle` is not finished until it is right there too -- the page,
+  the CLI, the responder and the liquidator are all clients of it.
 - `openamp-design.md` and `opendamp-design.md` (restricted assets, Tiers C and
   D) in the node repository's `doc/sequentia/`, and
   `simplicity-dex-covenant-offers-design.md` (where the output-map and
@@ -190,28 +200,58 @@ branch left on one laptop is invisible to every other machine and to the box.
 Tier B (borrow a Sequentia asset against real Bitcoin) is NOT a covenant loan
 and does not behave like one. Bitcoin has no introspection, so none of the loan
 covenant runs there: the collateral is a plain Bitcoin taproot UTXO, the debt is
-on Sequentia, and the two are bound by a BIP340 adaptor signature. Consequences
-worth keeping straight:
+on Sequentia, and the two are bound by **one hash carried in both chains'
+scripts**. The Bitcoin vault's RECLAIM leaf is `SHA256 <h> EQUALVERIFY
+<borrower> CHECKSIGVERIFY <lender> CHECKSIG`, and `h` is the same hash the
+Sequentia repayment output uses, so the lender can only take the repayment by
+publishing the secret that also releases the collateral. That hash IS the
+binding, and it is deliberately not an adaptor signature: nothing a borrower can
+run proves that `SHA256(t) = h` and `t·G = T` are about the same `t`, so a
+lender who published an unrelated `h` would take the repayment and keep the
+collateral. The lender's half of RECLAIM is handed over at origination as an
+ordinary signature the borrower verifies; do not turn it back into an adaptor
+one. Consequences worth keeping straight:
 
 - **The lender cannot be offline.** A funded covenant offer lets the lender walk
   away because the script reconstructs everything; the Bitcoin side cannot, so
-  origination is a two-party handshake (the ticket in `pignus/btc_collateral.py`)
-  and liquidation needs the oracle to co-sign a Bitcoin transaction. This is why
-  Tier B is CLI-first: a two-party interactive protocol is what a CLI is for.
-- **The browser does the keyless half.** `web/btc.js` (Bitcoin taproot: address,
-  BIP341 sighash, witness) and `web/adaptor.js` (adaptor verify + decrypt) are
-  faithful ports of `pignus/btcscript.py` and `pignus/adaptor.py`, pinned
-  byte-for-byte to `web/btc_vectors.json` / `web/adaptor_vectors.json` (emitted
-  by the proven Python) before they derive anything. A borrower can rebuild the
-  funding and repayment addresses and verify the lender's release entirely in
-  the page. Regenerate the vectors only when the Python changes, in the same
-  commit, and re-run `test_btc_web.mjs` / `test_adaptor_web.mjs`.
-- **The SWK wasm's `adaptorSign` is a DIFFERENT scheme** (the DEX swap spec),
-  not interoperable with `pignus/adaptor.py`. Do not wire it into the Pignus
-  flow. A browser LENDER (adaptor-sign + the Sequentia claim) would need either
-  Pignus's adaptor added to the wasm or the CLI; the borrower path needs only a
-  plain BIP340 signer, which the current bundled wasm does not expose either --
-  exposing Bitcoin signing to dapps is a wasm rebuild, tracked separately.
+  origination is a two-party handshake and liquidation needs the oracle to
+  co-sign a Bitcoin transaction. The lender's half therefore runs as a process
+  (`pignus-cli btc-respond`, `deploy/pignus-btc-responder.service`); the
+  borrower's half is the page.
+- **A borrower does all of it in the browser.** `web/btc.js` (Bitcoin taproot:
+  address, BIP341 sighash, witness, the pre-vault) and `web/adaptor.js` (BIP340
+  verification, which is what the borrow flow uses, plus the adaptor verify and
+  decrypt that mirror the Python) are faithful ports of `pignus/btcscript.py`
+  and `pignus/adaptor.py`, pinned
+  byte-for-byte to `web/btc_vectors.json` / `web/adaptor_vectors.json` before
+  they derive anything. Regenerate those with `tests/gen_web_vectors.py`, only
+  when the Python changes, in the same commit, and re-run `test_btc_web.mjs` /
+  `test_adaptor_web.mjs`.
+- **Both Sequentia legs are signature-free**, and that is load-bearing rather
+  than elegant. The principal and the repayment are paid into
+  `build_hashlock_leaf` outputs: a pinned payee, opened by publishing a secret.
+  The wallet extension can sign its own inputs and a Bitcoin sighash, but no
+  covenant leaf -- so a leg that needed one could not be settled from a browser
+  at all. Keep it that way.
+- **Adaptor signatures live in `pignus/dlc.py` only**, the maturity-settlement
+  path, which funds its own two-leaf output and is wired into no command and no
+  page. The loan path has none. The SWK wasm's `adaptorSign` is a DIFFERENT
+  scheme again (the DEX swap spec), not interoperable with `pignus/adaptor.py`;
+  do not wire it into anything here. A browser LENDER would still need the CLI:
+  the lender draws the secrets, and drawing a secret in a page means storing it
+  in a browser.
+- **The handshake is ask, hash, pre-sign, release, fund, and that order is
+  forced.** The vault's address commits to `h`, so the borrower cannot sign the
+  move out of the pre-vault until the lender has drawn the secret, and the
+  lender will not release until that signature exists. Anything that derives a
+  vault address before the hash is known is wrong -- there is no vault yet, and
+  the builders refuse rather than guess.
+- **Origination is atomic, and the order is the whole argument.** The collateral
+  goes into a pre-vault the borrower can abort; the lender pays the principal
+  into an output only the borrower can open; opening it publishes `w`, which is
+  what moves the collateral into the vault. Never "simplify" that back into
+  fund-then-pay: a lender who simply waits would end up with collateral they
+  never paid for, and nothing on the borrower's side could detect it in advance.
 - **`anchor_safe` before acting on a revealed `t`.** The claim that reveals `t`
   is a Sequentia transaction, and Sequentia reorgs when Bitcoin reorgs; a
   borrower must not spend BTC on the strength of a `t` that a reorg could undo.

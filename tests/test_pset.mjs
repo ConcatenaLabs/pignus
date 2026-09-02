@@ -94,9 +94,13 @@ async function main() {
       (decoded.tx?.vin?.[0]?.txid ?? decoded.inputs[0].previous_txid) === u.txid,
       JSON.stringify(decoded.inputs?.[0]?.previous_txid ?? decoded.tx?.vin?.[0]));
     check("it sees three outputs", decoded.outputs?.length === 3);
-    check("the fee output is recognised as the fee",
-      String(decoded.fees?.bitcoin ?? decoded.fee ?? "") !== "" ||
-      decoded.outputs.some(o => !o.script?.hex && !o.script),
+    // The node's OWN accounting, not "there is an output with no script" --
+    // which is true of what the encoder just wrote whether the node read it as
+    // a fee or not.
+    const reported = decoded.fees?.bitcoin ?? decoded.fees?.[btc] ?? decoded.fee;
+    check("the node accounts the fee output as exactly the fee we put in",
+      reported !== undefined &&
+      BigInt(Math.round(Number(reported) * 1e8)) === fee,
       JSON.stringify(decoded.fees ?? decoded.fee));
   }
 
@@ -121,8 +125,6 @@ async function main() {
   // a non-empty witness. An anyone-can-spend `OP_1` would need no witness at
   // all, and would prove nothing about whether the field survived.
   const witnessScript = "7551";                  // OP_DROP OP_1
-  const wsHash = await rpc("getdescriptorinfo", [`raw(${witnessScript})`])
-    .then(() => null).catch(() => null);
   const anyoneSpk = "0020" + (await sha256Hex(witnessScript));
   const fundIn = (await rpc("listunspent")).find(
     x => x.asset === btc && x.spendable && Number(x.amount) > 3);

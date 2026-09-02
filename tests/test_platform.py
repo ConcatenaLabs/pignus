@@ -18,7 +18,9 @@ real story end to end against a node:
     covenant would reject, and then a real price drop liquidates the position
     with the surplus going home;
   * a second loan is repaid, a third is called at maturity, and a fourth is
-    swept by the lender's backstop.
+    swept by the lender's backstop;
+  * and a vault funded one atom heavy returns ALL of it, to a segwit v0 payout
+    -- the covenant pays out what is locked, not what the document says.
 
 If this passes, the platform works; if only feature_pignus_vault.py passes, only
 the covenant does.
@@ -181,6 +183,7 @@ class PignusPlatformTest(BitcoinTestFramework):
 
         self.verification_case()
         self.repay_case()
+        self.overfunded_case()
         self.liquidate_case()
         self.threshold_case()
         self.default_case()
@@ -246,6 +249,62 @@ class PignusPlatformTest(BitcoinTestFramework):
         self.watcher.poll()
         assert_equal(v.state, State.REPAID)
         self.log.info("  watcher named the exit from the witness leaf: %s", v.state)
+
+    def overfunded_case(self):
+        """A vault holding more than the terms name, paid out at a v0 address.
+
+        The address commits to the terms and NOT to the amount, so a funding can
+        be an atom heavy -- by accident, or on purpose to see what a composer
+        does with it. The covenant returns what is LOCKED, so a spender that
+        sized the output from the document would leave that atom behind and the
+        transaction would not balance; and there is no signature on this leaf to
+        stop anyone trying. The borrower's payout is at segwit v0 here because
+        that is what every browser wallet actually hands out, and the four-leaf
+        path is otherwise only ever exercised at v1.
+        """
+        node = self.nodes[0]
+        self.log.info("PASS: an over-funded vault, returned whole to a v0 payout")
+        spk = self.wallet_spk()
+        assert spk[:2] == bytes.fromhex("0014"), spk.hex()
+        prog = spk[2:].hex()
+        terms = self.terms_for(borrower_ver=0, borrower_prog=prog)
+        vault_spk = terms.script_pubkey()
+        addr = node.deriveaddresses(node.getdescriptorinfo(
+            f"raw({vault_spk.hex()})")["descriptor"])[0]
+        heavy = COLLATERAL + 1
+        txid = node.sendtoaddress(address=addr,
+                                  amount=str(Decimal(heavy) / COIN),
+                                  assetlabel=self.C,
+                                  fee_asset_label=BITCOIN_ASSET)
+        self.generate(node, 2)
+        found = None
+        for i in range(8):
+            o = node.gettxout(txid, i, True)
+            if o and o["scriptPubKey"]["hex"] == vault_spk.hex():
+                found = (i, o)
+                break
+        assert found is not None, "the funding did not pay the vault address"
+        vout, o = found
+        assert_equal(satoshi_round(o["value"]) * COIN, Decimal(heavy))
+        vault = Outpoint(txid, vout, heavy, self.C)
+
+        v = self.watcher.track(terms.loan_id(), terms, vault.txid, vault.vout)
+        self.watcher.poll()
+        assert_equal(v.state, State.LIVE)
+
+        funding = [self.fresh(DEBT // COIN + 10, self.D), self.fresh(1)]
+        raw = VaultSpender(node, terms, BITCOIN_ASSET, FEE).repay(
+            vault, funding, self.wallet_spk())
+        rtxid = node.sendrawtransaction(raw)
+        self.generate(node, 1)
+        assert_equal(node.gettxout(rtxid, 1)["scriptPubKey"]["hex"],
+                     "0014" + prog)
+        assert_equal(satoshi_round(node.gettxout(rtxid, 1)["value"]) * COIN,
+                     Decimal(heavy))
+        self.watcher.poll()
+        assert_equal(v.state, State.REPAID)
+        self.log.info("  all %d atoms came home to a v0 address, not the %d the "
+                      "terms name", heavy, COLLATERAL)
 
     def liquidate_case(self):
         node = self.nodes[0]
@@ -422,7 +481,9 @@ class PignusPlatformTest(BitcoinTestFramework):
         for v in self.watcher.vaults.values():
             by_state[v.state.value] = by_state.get(v.state.value, 0) + 1
         self.log.info("watcher final ledger: %s", by_state)
-        assert_equal(by_state, {"REPAID": 1, "LIQUIDATED": 2,
+        # Two repayments: the ordinary one, and the over-funded vault that had
+        # to return more than its terms named.
+        assert_equal(by_state, {"REPAID": 2, "LIQUIDATED": 2,
                                 "DEFAULTED": 1, "RECOVERED": 1})
 
 

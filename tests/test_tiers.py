@@ -80,9 +80,11 @@ def refuses(name, fn, want=""):
 def tier_c():
     print("Tier C: the pledge authorisation message")
 
-    # The vector the Go test signs. Recomputed here from first principles rather
-    # than copied from the Python, so the two implementations are compared and
-    # not merely one of them repeated.
+    # The digest shared with openampd/internal/server/pledge_test.go. Written
+    # out here from the agreed string rather than read back from the Python, so
+    # what is compared is the construction and not one implementation with
+    # itself -- but note this is still Python against Python until the Go test
+    # pins the same fixed digest.
     want = hashlib.sha256(b"openamp-pledge|release|pl-7|deadbeef").digest()
     check("the pledge message matches the Go server's construction",
           OA.pledge_message("release", "pl-7", "deadbeef") == want)
@@ -127,6 +129,61 @@ def tier_d_pure():
             lambda: settlement_shape(False), "Consolidate first")
     check("the settlement shape names the fee asset",
           "debt asset" in settlement_shape(True)["fee_asset"])
+
+    import json as _json
+    t = RepurchaseTerms(
+        collateral_asset="aa" * 32, collateral_amount=100 * COIN,
+        debt_asset="bb" * 32, principal=700 * COIN, debt=750 * COIN,
+        collateral_value=1000 * COIN, borrower_cu="cc" * 32,
+        borrower_prog="dd" * 32, lender_prog="ee" * 32, forfeit_after=200_000)
+    # A document written by `repo-propose` carries derived fields -- the bond,
+    # the address, what kind of thing it is -- so reading one back has to ignore
+    # what it did not put there. Constructing from the whole document is how
+    # `repo-show` used to fail with a TypeError on its own output.
+    doc = dict(_json.loads(t.to_json()), bond=t.bond(), product="repurchase",
+               address_program=t.script_pubkey().hex())
+    check("a repurchase document round-trips through the fields it describes",
+          RepurchaseTerms.from_json(doc) == t)
+
+    alter = lambda **kw: RepurchaseTerms(**{**t.__dict__, **kw})    # noqa: E731
+    refuses("a repurchase selling nothing is refused",
+            lambda: alter(collateral_amount=0).sanity_check(),
+            "collateral_amount")
+    refuses("a repurchase paying nothing is refused",
+            lambda: alter(principal=0).sanity_check(), "principal")
+    refuses("a lender payout at a witness version no wallet can pay is refused",
+            lambda: alter(lender_ver=2).sanity_check(), "no wallet can pay")
+    refuses("and so is a borrower payout at one",
+            lambda: alter(borrower_ver=2).sanity_check(), "no wallet can pay")
+
+    # No transaction index on the committee nodes, so the bond has to be found
+    # through the utxo set. A verifier that reached for getrawtransaction would
+    # work on a developer's -txindex node and fail everywhere it matters.
+    class NoTxIndex:
+        """A node that answers gettxout and refuses getrawtransaction."""
+        asked = []
+
+        def getblockcount(self):
+            return 100
+
+        def getrawtransaction(self, *a, **k):
+            NoTxIndex.asked.append("getrawtransaction")
+            raise RuntimeError(
+                "No such mempool transaction. Use -txindex or provide a block "
+                "hash to enable blockchain transaction queries.")
+
+        def gettxout(self, txid, vout, mempool=True):
+            if int(vout) != 1:
+                return None
+            return {"scriptPubKey": {"hex": t.script_pubkey().hex()},
+                    "asset": t.debt_asset, "value": t.bond() / COIN,
+                    "confirmations": 12}
+
+    out = t.verify_funding(NoTxIndex(), "ab" * 32)
+    check("verify_funding finds the bond through the utxo set alone",
+          out is not None and out.get("n") == 1, str(out))
+    check("and never asks for a transaction by id",
+          "getrawtransaction" not in NoTxIndex.asked, str(NoTxIndex.asked))
 
 
 def tier_d_chain():
@@ -282,23 +339,43 @@ def tier_d_chain():
         op2 = Outpoint(txid2, vout2, bond, money)
         sp2 = RepurchaseSpender(n, t2, btc)
 
-        def rejected(name, build):
+        def rejected(name, build, want):
+            """The NODE must refuse this, for one of the reasons in `want`.
+
+            A bare `except Exception` here would pass on a coin-selection
+            shortfall, a wrong wallet or a typo in the builder -- none of which
+            says anything about the covenant. So a construction-time failure is
+            reported as a failure of this test rather than counted as the
+            refusal, and the node's own message has to name the rule that
+            stopped it.
+            """
             try:
                 h = build()
-            except Exception:
-                check(name, True)
+            except Exception as e:                        # noqa: BLE001
+                check(name, False,
+                      f"the composer refused before the node saw it: {e}"[:200])
                 return
             try:
                 n.sendrawtransaction(h)
-            except Exception:
-                check(name, True)
+            except Exception as e:                        # noqa: BLE001
+                msg = getattr(e, "message", None) or str(e)
+                check(name, any(w in msg for w in want),
+                      f"refused for the wrong reason: {msg}"[:200])
                 return
             check(name, False, "the node accepted it")
+
+        # The prefix differs between chains, so match on the reason and not on
+        # the prefix: sequentiad says `mempool-script-verify-flag-failed` where
+        # bitcoind says `mandatory-script-verify-flag-failed`.
+        BAD_SCRIPT = ("script-verify-flag-failed", "Script failed",
+                      "Script evaluated without error but finished with a "
+                      "false/empty top stack element")
+        TOO_EARLY = ("non-final", "Locktime requirement not satisfied")
 
         rejected("FORFEIT before the deadline is refused",
                  lambda: sp2.forfeit(op2, funding_for(
                      btc, 0, exclude=[(op2.txid, op2.vout)]), change,
-                     locktime=t2.forfeit_after))
+                     locktime=t2.forfeit_after), TOO_EARLY)
 
         _, wrong_prog, wrong_ver = prog()
         t_wrong = RepurchaseTerms(**{**t2.__dict__, "borrower_prog": wrong_prog,
@@ -306,7 +383,7 @@ def tier_d_chain():
         rejected("FORFEIT paying anyone but the borrower is refused",
                  lambda: RepurchaseSpender(n, t_wrong, btc).forfeit(
                      op2, funding_for(btc, 0, exclude=[(op2.txid, op2.vout)]),
-                     change, locktime=t2.forfeit_after))
+                     change, locktime=t2.forfeit_after), BAD_SCRIPT + TOO_EARLY)
 
         t_bad_cu = RepurchaseTerms(
             **{**t2.__dict__,
@@ -315,7 +392,8 @@ def tier_d_chain():
                  "is refused",
                  lambda: RepurchaseSpender(n, t_bad_cu, btc).settle(
                      op2, funding_for(coll, t2.collateral_amount,
-                                      exclude=[(op2.txid, op2.vout)]), change))
+                                      exclude=[(op2.txid, op2.vout)]), change),
+                 BAD_SCRIPT)
 
         # --- FORFEIT, once the deadline really has passed --------------------
         while n.getblockcount() <= t2.forfeit_after:
@@ -363,12 +441,18 @@ def main():
     tier_c()
     tier_d_pure()
     tier_d_vectors()
-    if os.environ.get("PIGNUS_SKIP_CHAIN"):
+    skipped = bool(os.environ.get("PIGNUS_SKIP_CHAIN"))
+    if skipped:
         print("\n(chain tests skipped: PIGNUS_SKIP_CHAIN set)")
     else:
         tier_d_chain()
     print(f"\n{PASS} checks passed, {FAIL} failed")
-    return 1 if FAIL else 0
+    if FAIL:
+        return 1
+    # A skip is not a pass: RETURN and FORFEIT on a chain, verify_funding
+    # against a real coin and every node-side refusal did not run, and a runner
+    # that saw 0 would print "ok" for a group that tested half of itself.
+    return 2 if skipped else 0
 
 
 if __name__ == "__main__":

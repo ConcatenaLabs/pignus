@@ -1,0 +1,29 @@
+{
+  "_comment": "The lender's side of a Bitcoin-collateral loan. This file holds credentials: keep it 0600, and never in a repository.",
+  "lender_key": "/root/sequentia/pignus-data/lender.key",
+  "state": "/root/sequentia/pignus-data/responder-state.json",
+  "book": "http://127.0.0.1:8741",
+  "interval": 5,
+  "_depth_note": "disburse_conf is how deep the borrower's collateral must be before the principal is paid; claim_depth is how deep the borrower's claim of that principal must be before the collateral is moved into the loan. Both are the lender's own exposure to a reorg on the other chain, so both are configuration.",
+  "disburse_conf": 1,
+  "claim_depth": 6,
+  "_scan_note": "Seconds between chain scans for a repayment whose borrower never told the relay where it landed. The borrower's report only saves this scan; nothing waits on it.",
+  "scan_interval": 300,
+  "_state_note": "What this responder has already done. It is written BEFORE a send and completed after, so a crash between the two is reported rather than retried blind: this file is what stops a principal being paid twice. Back it up with the key, and never delete it while a loan is open.",
+  "fee_asset": "",
+  "_fee_asset_note": "Empty means the debt asset, which is what the lender is already moving. Any asset the node publishes a rate for is allowed; there is no privileged fee coin.",
+  "rpc": {
+    "url": "http://127.0.0.1:18200",
+    "user": "",
+    "password": "",
+    "cookie": "",
+    "wallet": ""
+  },
+  "btc_rpc": {
+    "url": "http://127.0.0.1:48332",
+    "user": "",
+    "password": "",
+    "cookie": "",
+    "wallet": ""
+  }
+}

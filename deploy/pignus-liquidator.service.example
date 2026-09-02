@@ -1,0 +1,86 @@
+[Unit]
+Description=Pignus liquidator (Sequentia testnet)
+Documentation=https://github.com/ConcatenaLabs/pignus
+After=network-online.target pignusd.service
+Wants=network-online.target
+
+# Nothing about this bot is privileged. The covenant does not know which
+# liquidator wins, every racer must pay the lender in full and return the
+# borrower's surplus, and the bonus is what prices the race -- so this unit is
+# one participant among however many choose to run one. Copy it to
+# /etc/systemd/system/pignus-liquidator.service and edit the paths, the taker
+# address and the oracles.
+#
+# Run it by hand with --dry-run first, against the book it will watch:
+#
+#   bin/pignus-liquidator --book http://127.0.0.1:8741 \
+#       --oracle http://127.0.0.1:8740 --taker-address <addr> \
+#       --rpc-wallet liquidator --once --dry-run
+#
+# It prints every loan it would close and the profit each one leaves, and moves
+# nothing. Only once that reads the way you expect is it worth installing.
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/sequentia/pignus
+Environment=SEQUENTIA_SRC=/root/sequentia/Sequentia
+Environment=PYTHONUNBUFFERED=1
+# The node's credentials come from the environment or a cookie file, never from
+# the command line: `ps` is readable by every user on the box, and this process
+# runs for the life of the book.
+# The url is the one pignusd already talks to; the cookie is the .cookie file
+# in the node's own data directory -- replace the path below with it. A
+# placeholder with a space in it is not one: systemd splits an Environment=
+# value on whitespace and drops the line with a warning, and the bot then looks
+# for the node's cookie in the wrong place.
+Environment=PIGNUS_RPC_URL=http://127.0.0.1:18200
+Environment=PIGNUS_RPC_COOKIE=/path/to/the/node/datadir/.cookie
+#
+# --book is where the live loans come from, re-read every round, so a loan taken
+#   while this runs is watched too.
+# --oracle names an oracle directly and may be REPEATED: a loan is judged
+#   against the key it bakes, so name every oracle whose loans this should
+#   close. Loans naming a key that is neither watched here nor aggregated by the
+#   book are skipped, with a line saying so.
+# --taker-address receives the seized collateral. It must be a wallet address
+#   you control; the surplus goes back to the borrower whatever this says.
+# --min-profit is in debt-asset atoms and defaults to 0, which never takes a
+#   seizure at a loss. Raise it to cover the fee and the risk of losing a race.
+# --max-attestation-age refuses a price signed longer ago than that. The
+#   covenant cannot see a clock, so this is the only place recency is checked.
+ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignus-liquidator \
+    --book http://127.0.0.1:8741 \
+    --oracle http://127.0.0.1:8740 \
+    --taker-address <your address> \
+    --rpc-wallet liquidator \
+    --min-profit 0 \
+    --max-attestation-age 600 \
+    --interval 30
+# A round that fails is a round skipped, so the process stays up through a node
+# restart or a book that blinked. What does end it is a start-up it cannot
+# honour: exit 1 for a wallet, book or oracle it cannot reach or a taker address
+# the node will not resolve, and exit 3 for a covenant builder that has drifted
+# from the golden vectors. Both keep restarting here, so the failure stays
+# visible in the journal rather than in a stopped unit nobody looks at.
+Restart=always
+RestartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+# ProtectSystem=full leaves /root untouched, and /root is where the checkout,
+# the node source and the node's cookie file live, so on its own it protects
+# nothing this bot reaches for. /root is mounted read-only instead, and NO
+# directory has to stay writable: the bot keeps no state of its own, holds no
+# key, and every coin it moves is signed by the node wallet over RPC. So there
+# is no ReadWritePaths here, and adding one would only widen it.
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

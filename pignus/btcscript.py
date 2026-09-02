@@ -271,3 +271,24 @@ def timelocked_single(locktime, key_x):
     """<n> CLTV DROP <K> CHECKSIG."""
     return ser_script([locktime, OP_CHECKLOCKTIMEVERIFY, OP_DROP,
                        key_x, OP_CHECKSIG])
+
+
+def hashlocked_two_of_two(h, a_x, b_x):
+    """SHA256 <h> EQUALVERIFY <A> CHECKSIGVERIFY <B> CHECKSIG.
+
+    A preimage AND both signatures. The preimage is what carries a fact across
+    the chain boundary -- whoever learns it on Sequentia can finish a Bitcoin
+    spend that was signed in advance -- and requiring both keys is what stops
+    either party using it alone.
+
+    Both halves matter. Without the second signature the party who chose the
+    preimage could spend on their own, whenever they liked, so the output would
+    commit them to nothing. Without the preimage the other party could spend as
+    soon as they held the first signature, before the thing the preimage is
+    supposed to prove had happened at all.
+
+    Witness: [B_sig, A_sig, preimage, leaf, control] -- the stack is consumed
+    from the top, and SHA256 runs first.
+    """
+    return ser_script([OP_SHA256, h, OP_EQUALVERIFY,
+                       a_x, OP_CHECKSIGVERIFY, b_x, OP_CHECKSIG])

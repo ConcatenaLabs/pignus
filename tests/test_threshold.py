@@ -139,6 +139,7 @@ def main():
                                "logfile": os.path.join(rig.root, f"o{i}.log"),
                                "listen": f"127.0.0.1:{port}", "interval": 1,
                                "price_scale": 100000, "markets": ["GOLD/USDX"],
+                               "precisions": {"GOLD": 8, "USDX": 8},
                                "source": {"type": "http_bulk", "url": feed + "/prices"}}, f)
                 procs.append(subprocess.Popen(
                     [sys.executable, os.path.join(BIN, "pignus-oracle"),
@@ -198,8 +199,36 @@ def main():
 
             # drop the price and liquidate with the assembled 2-of-3 witness
             FEED["GOLD"] = 1800.0
-            wait_for(lambda: get(f"{book}/v1/loan/{loan['loan_id']}")
-                     .get("liquidatable"), seconds=90)
+            lq = wait_for(lambda: get(f"{book}/v1/loan/{loan['loan_id']}")
+                          .get("liquidatable")
+                          and get(f"{book}/v1/loan/{loan['loan_id']}"),
+                          seconds=90)
+            # Without this the next line fails as "liquidate exited 1" and the
+            # reader has to work out that the price never dropped.
+            check("after the price drops the book flags the 2-of-3 loan "
+                  "liquidatable", bool(lq),
+                  json.dumps(get(f"{book}/v1/loan/{loan['loan_id']}"))[:300])
+            if not lq:
+                return 1
+
+            # The unattended bot has to reach the same conclusion from the same
+            # three keys, and reach it without touching anything.
+            bot = subprocess.run(
+                [sys.executable, os.path.join(BIN, "pignus-liquidator"),
+                 "--once", "--dry-run", "--book", book,
+                 "--taker-address", n.getnewaddress(),
+                 "--rpc", f"http://127.0.0.1:{rig.seq_rpcport}",
+                 "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS,
+                 "--rpc-wallet", "pignus"], capture_output=True, text=True)
+            check("the liquidation bot reads a threshold loan's price from the "
+                  "book's own attestation set", bot.returncode == 0,
+                  bot.stderr[-300:])
+            # The bot names a loan by its TERMS -- the hash of the vault
+            # scriptPubKey -- while the book keys by outpoint.
+            check("and names it as a target",
+                  f"liquidate: {lv['terms_id'][:16]}" in bot.stderr,
+                  bot.stderr[-300:])
+
             before = bw.getbalances()["mine"]["trusted"].get(c, 0)
             cli("liquidate", "--loan", loan["loan_id"], wallet="pignus", rig=rig,
                 book=book)

@@ -52,8 +52,21 @@ for (const c of cases) {
   check(`${c.name}: the bond is the equity`,
         String(repo.bondAtoms(c.terms.collateral_value, c.terms.debt))
           === String(c.bond));
-  check(`${c.name}: verifyRepurchaseFunding accepts its own address and bond`,
-        repo.verifyRepurchaseFunding(c.terms, c.script_pubkey, c.bond) === true);
+  // With the asset, which is the argument that makes the check whole: a coin
+  // at the right address holding the wrong asset is not a bond, and the
+  // address does not commit to what it holds.
+  check(`${c.name}: verifyRepurchaseFunding accepts its own address, bond and `
+        + `asset`,
+        repo.verifyRepurchaseFunding(c.terms, c.script_pubkey, c.bond,
+                                     c.terms.debt_asset) === true);
+  check(`${c.name}: an asset id is compared as an id, not as a string`,
+        repo.verifyRepurchaseFunding(
+          c.terms, c.script_pubkey, c.bond,
+          "0x" + String(c.terms.debt_asset).toUpperCase()) === true);
+  refuses(`${c.name}: a bond funded in the asset being sold is refused`,
+          () => repo.verifyRepurchaseFunding(c.terms, c.script_pubkey, c.bond,
+                                             c.terms.collateral_asset),
+          "not the bond asset");
 }
 
 // The whole point of the pinning: selfTest is what the page calls, and it must
@@ -102,6 +115,25 @@ refuses("the wrong address is refused even with the right bond",
         () => repo.verifyRepurchaseFunding(good, "51" + "20" + "11".repeat(32),
                                            cases[0].bond),
         "not the one being funded");
+refuses("an address with no funded amount at all is refused, not passed",
+        () => repo.verifyRepurchaseFunding(good, cases[0].script_pubkey),
+        "does not pin the money terms");
+
+// Amounts and versions that compile to an address nobody can use. Each of these
+// produces a perfectly good scriptPubKey, which is exactly why they have to be
+// caught here rather than by the node.
+refuses("a repurchase selling nothing is refused",
+        () => repo.repurchaseLeaves(alter({ collateral_amount: 0 })),
+        "collateral_amount must be positive");
+refuses("a repurchase paying nothing is refused",
+        () => repo.repurchaseLeaves(alter({ principal: 0 })),
+        "principal must be positive");
+refuses("a lender payout at a witness version no wallet can pay is refused",
+        () => repo.repurchaseLeaves(alter({ lender_ver: 2 })),
+        "no wallet can pay");
+refuses("and so is a borrower payout at one",
+        () => repo.repurchaseLeaves(alter({ borrower_ver: 2 })),
+        "no wallet can pay");
 
 // The words. A borrower who reads "loan" and signs a sale has been misled.
 const words = repo.describe(good);

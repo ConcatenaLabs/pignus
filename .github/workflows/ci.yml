@@ -1,0 +1,129 @@
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
+#
+# The offline half of tests/run-tests.sh, on every push and pull request.
+#
+# Pignus derives every vault address from the covenant builder that lives in the
+# node repository and is proven there by feature_pignus_vault.py. So the first
+# thing this checks out is a Sequentia SOURCE tree, and SEQUENTIA_SRC points at
+# it: pignus/compat.py imports test/functional/pignus_covenant.py from there and
+# rebuilds every golden vector against it before it will derive anything. No
+# node is built and none is run -- the builder is pure Python.
+#
+# The chain tests (tests/test_platform.py and everything below it in
+# run-tests.sh) are deliberately NOT here. Each one starts a sequentiad, and
+# tests/test_btc_collateral.py starts a Bitcoin Core regtest beside it; that
+# means a built node and a Bitcoin Core release on the runner, and ten to twenty
+# minutes per run. They are run before a merge on a machine that has both
+# binaries. What this workflow buys is the fast half: a drift between the
+# browser composer and the Python one, a broken CLI argument, a JSON typo in
+# deploy/, or a regenerated vector file, caught in about a minute.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: offline suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: check out pignus
+        uses: actions/checkout@v4
+        with:
+          path: pignus
+
+      # The covenant, from the repository that owns it. A shallow checkout of
+      # the default branch: the test/functional sources are all that is read,
+      # and pinning a commit here would silently stop testing against the node
+      # the network actually runs.
+      - name: check out the Sequentia node sources
+        uses: actions/checkout@v4
+        with:
+          repository: ConcatenaLabs/Sequentia
+          ref: master
+          path: Sequentia
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: the covenant tripwire
+        working-directory: pignus
+        env:
+          SEQUENTIA_SRC: ${{ github.workspace }}/Sequentia
+        run: bin/pignus-cli selftest
+
+      - name: CLI drill (offline)
+        working-directory: pignus
+        env:
+          SEQUENTIA_SRC: ${{ github.workspace }}/Sequentia
+        run: bash tests/cli_drill.sh
+
+      - name: service drill (offline)
+        working-directory: pignus
+        env:
+          SEQUENTIA_SRC: ${{ github.workspace }}/Sequentia
+        run: bash tests/service_drill.sh
+
+      - name: units, oracle service, watcher, liquidator, OpenAMP
+        working-directory: pignus
+        env:
+          SEQUENTIA_SRC: ${{ github.workspace }}/Sequentia
+        run: |
+          set -e
+          python3 tests/test_units.py
+          python3 tests/test_openamp.py
+          python3 tests/test_watcher.py
+          python3 tests/test_oracle_service.py
+          python3 tests/test_liquidator.py
+
+      # The browser and the CLI must derive the same bytes from the same terms.
+      # These are the pins that say so, and they are why a change to web/*.js
+      # cannot land alone. Named one by one rather than globbed: test_pset.mjs
+      # and test_flows.mjs are driven by their Python counterparts because they
+      # need a node behind them, and belong with the chain tests.
+      - name: browser composers against the vectors
+        working-directory: pignus
+        run: |
+          set -e
+          for f in test_web test_offer_web test_repurchase_web test_btc_web \
+                   test_adaptor_web test_btcborrow_web; do
+            echo "== $f"
+            node "tests/$f.mjs"
+          done
+
+      # The page, in a real browser. It needs a headless Chromium, and skips
+      # with a message rather than failing when the runner has none -- so this
+      # step is honest about what it checked either way.
+      - name: install a headless browser
+        run: npx --yes playwright@1.49.0 install --with-deps chromium
+        continue-on-error: true
+
+      - name: the page, in a real browser
+        working-directory: pignus
+        env:
+          SEQUENTIA_SRC: ${{ github.workspace }}/Sequentia
+        run: |
+          CHROME=$(find "$HOME/.cache/ms-playwright" -name chrome -type f 2>/dev/null | head -1)
+          if [ -n "$CHROME" ]; then export PIGNUS_CHROME="$CHROME"; fi
+          bash tests/page_check.sh
+
+      - name: the BTC relay's authorisation rules
+        working-directory: pignus
+        env:
+          SEQUENTIA_SRC: ${{ github.workspace }}/Sequentia
+        run: |
+          set -e
+          python3 tests/test_btc_relay.py
+          python3 tests/test_btc_relay_auth.py

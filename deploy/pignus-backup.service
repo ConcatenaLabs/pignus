@@ -1,0 +1,47 @@
+[Unit]
+# One archive of everything Pignus keeps that is not on a chain: the oracle
+# keys and their attestation logs, the lender key, the responder's state file,
+# the book, and the config files beside them. What each piece costs to lose is in
+# deploy/DEPLOY.md; the short version is that the keys and the state file are
+# the ones nobody can reconstruct.
+Description=Pignus backup
+Documentation=https://github.com/ConcatenaLabs/pignus
+
+[Service]
+Type=oneshot
+User=root
+# Everything in the archive is a secret, so the archive is one too: 0077 makes
+# it 0600, and it must stay that way wherever it is copied to.
+UMask=0077
+# The oracle appends to its attestation log every interval, so tar routinely
+# finds a file it is reading has grown and exits 1 -- "some files differ", a
+# warning. The archived copy is a valid prefix of an append-only log, which is
+# what a backup of a live log can be, so that is a success here. A fatal error
+# is exit 2 and still fails the unit.
+SuccessExitStatus=1
+ExecStart=/bin/sh -c 'exec tar czf /root/backups/pignus-$(date +%%F).tgz \
+    /root/sequentia/pignus-data \
+    /root/sequentia/pignusd.json \
+    /root/sequentia/pignus-oracle*.json \
+    /root/sequentia/pignus-responder.json'
+NoNewPrivileges=true
+PrivateTmp=true
+# /root is where both the source and the destination live, so ProtectSystem=
+# full protects nothing here either. /root is mounted read-only and the one
+# directory that has to stay WRITABLE is handed back: /root/backups. Everything
+# under /root/sequentia is only read.
+#
+# /root/backups has to EXIST before this unit runs -- First install creates it.
+# The mount namespace is built before the first command in the unit, so a
+# ReadWritePaths= naming a directory that is not there fails the unit with a
+# namespace error, and no ExecStartPre= can get in front of it to create one.
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/root/backups
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

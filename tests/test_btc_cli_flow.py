@@ -3,10 +3,14 @@
 # Distributed under the MIT software license.
 """The BTC-collateral CLI, driven the way two people would, on a real rig.
 
-Runs the actual `pignus-cli btc-*` binary through the whole solvent handshake --
-keygen, propose, prepare (unbroadcast), adaptor, originate, repay, claim,
-reclaim -- passing the ticket JSON between the two roles, then the default path
-(timeout). Proves the ticket wiring and the RPC plumbing, not just the library.
+Runs the actual `pignus-cli btc-*` binary through a whole loan, passing the
+ticket JSON between the two roles the way two people would pass it: propose,
+prepare, adaptor, originate, disburse, claim the principal, upgrade, repay,
+claim, reclaim -- and then the endings, a borrower aborting a loan whose
+principal never came and a lender sweeping one nobody repaid.
+
+It proves the wiring and the RPC plumbing rather than the library: every command
+here is the one an operator types, with the arguments the help text names.
 """
 
 import json
@@ -68,32 +72,88 @@ def main():
         check("three party keys generated",
               all("pubkey_x" in x for x in (lender, borrower, oracle)))
 
+        def prog():
+            """A payout program each side owns on Sequentia."""
+            a = n.getaddressinfo(n.getnewaddress("", "bech32"))["unconfidential"]
+            spk = n.getaddressinfo(a)["scriptPubKey"]
+            assert spk.startswith("0014"), spk
+            return spk[4:]
+
+        lender_prog, borrower_prog = prog(), prog()
+
+        def terms(**over):
+            btc_tip, seq_tip = rig.btc.getblockcount(), n.getblockcount()
+            d = {"--oracle-x": oracle["pubkey_x"], "--btc-amount": str(COIN),
+                 "--debt-asset": D, "--debt": str(30000 * COIN),
+                 "--principal": str(29000 * COIN),
+                 # Deadlines that leave both sides the margin timelocks_sane
+                 # insists on, converted at each chain's own block time: a
+                 # Bitcoin block is ten minutes, a Sequentia block one.
+                 "--recover-after": str(btc_tip + 4_600),
+                 "--repay-deadline": str(seq_tip + 43_200),
+                 "--abort-after": str(btc_tip + 400),
+                 "--d-refund": str(seq_tip + 1_440),
+                 "--lender-prog": lender_prog, "--market": "BTC/USDX",
+                 "--strike": "4200000000"}
+            d.update(over)
+            out = []
+            for k, v in d.items():
+                out += [k, v]
+            return out
+
         ticket = os.path.join(root, "loan.json")
-        recover_after = rig.btc.getblockcount() + 30
-        repay_deadline = n.getblockcount() + 100
-        run("btc-propose", "--lender-key", lk, "--borrower-x", borrower["pubkey_x"],
-            "--oracle-x", oracle["pubkey_x"], "--btc-amount", str(COIN),
-            "--debt-asset", D, "--debt", str(30000 * COIN),
-            "--recover-after", str(recover_after), "--repay-deadline",
-            str(repay_deadline), "--out", ticket)
+        run("btc-propose", "--lender-key", lk, *terms(), "--out", ticket)
         check("the lender proposed a loan ticket", os.path.exists(ticket))
 
-        run("btc-prepare", ticket, *btc)
+        run("btc-prepare", ticket, "--borrower-key", bk,
+            "--borrower-prog", borrower_prog, *seq, *btc)
         tk = json.load(open(ticket))
-        check("the borrower prepared funding (unbroadcast) and reclaim",
-              tk.get("funding_txid") and tk.get("_stage") == "prepared"
-              and rig.btc.gettxout(tk["funding_txid"], tk["funding_vout"]) is None,
-              "funding should NOT be on chain yet")
+        check("the borrower prepared the pre-vault funding, unbroadcast",
+              tk.get("prevault_txid") and tk.get("_stage") == "prepared"
+              and rig.btc.gettxout(tk["prevault_txid"], tk["prevault_vout"]) is None,
+              "the funding should NOT be on chain yet")
 
         run("btc-adaptor", ticket, "--lender-key", lk)
         tk = json.load(open(ticket))
-        check("the lender adaptor-signed the reclaim", bool(tk.get("adaptor_sig")))
+        check("the lender drew this loan's secret and signed the release",
+              bool(tk.get("release_sig")) and bool(tk.get("payment_hash")))
+        check("which fixes the vault both chains' scripts now name",
+              bool(tk.get("vault_txid")))
+        check("the secret is stored beside the key, per loan",
+              os.path.exists(f"{lk}.t.{tk['h_w'][:16]}"))
 
-        run("btc-originate", ticket, *btc)
+        run("btc-originate", ticket, "--borrower-key", bk, *btc)
         rig.btc_mine(1)
         tk = json.load(open(ticket))
-        check("the borrower verified the release and funded Bitcoin",
-              rig.btc.gettxout(tk["funding_txid"], tk["funding_vout"]) is not None)
+        check("the borrower verified the release and committed the collateral",
+              rig.btc.gettxout(tk["prevault_txid"], tk["prevault_vout"]) is not None)
+        check("and signed the move into the vault it names",
+              bool(tk.get("upgrade_presig")))
+
+        state = run("btc-check", ticket, *seq, *btc)
+        check("btc-check says the collateral is committed and whose move it is",
+              state["prevault"]["committed"] and "disburse" in state["next"],
+              json.dumps(state)[:200])
+
+        run("btc-disburse", ticket, *seq, *btc)
+        rig.seq_mine(1)
+        tk = json.load(open(ticket))
+        check("the lender paid the principal into the hashlock",
+              n.gettxout(tk["disbursement_txid"],
+                         tk["disbursement_vout"]) is not None)
+
+        run("btc-claim-principal", ticket, "--borrower-key", bk, *seq)
+        rig.seq_mine(2)
+        tk = json.load(open(ticket))
+        check("the borrower took the principal, publishing their secret",
+              bool(tk.get("principal_claim_txid")))
+
+        run("btc-upgrade", ticket, "--lender-key", lk, "--min-depth", "1",
+            *seq, *btc)
+        rig.btc_mine(1)
+        tk = json.load(open(ticket))
+        check("the lender read the secret off the chain and started the loan",
+              rig.btc.gettxout(tk["upgrade_txid"], 0) is not None)
 
         run("btc-repay", ticket, *seq)
         rig.seq_mine(1)
@@ -104,7 +164,8 @@ def main():
         run("btc-claim", ticket, "--lender-key", lk, *seq)
         rig.seq_mine(2)
         tk = json.load(open(ticket))
-        check("the lender claimed, forcing t onto the chain", bool(tk.get("claim_txid")))
+        check("the lender claimed it, forcing the secret onto the chain",
+              bool(tk.get("claim_txid")))
 
         out = run("btc-reclaim", ticket, "--borrower-key", bk, "--min-depth", "1",
                   *seq, *btc)
@@ -114,19 +175,40 @@ def main():
               and rig.btc.gettxout(out["reclaim_txid"], 0) is not None,
               json.dumps(out)[:160])
 
-        # ---- default: propose, fund, never repay, TIMEOUT -------------------
-        ticket2 = os.path.join(root, "loan2.json")
-        ra2 = rig.btc.getblockcount() + 3
-        run("btc-propose", "--lender-key", lk, "--borrower-x", borrower["pubkey_x"],
-            "--oracle-x", oracle["pubkey_x"], "--btc-amount", str(COIN),
-            "--debt-asset", D, "--debt", str(30000 * COIN),
-            "--recover-after", str(ra2), "--repay-deadline",
-            str(n.getblockcount() + 100), "--out", ticket2)
-        run("btc-prepare", ticket2, *btc)
-        run("btc-adaptor", ticket2, "--lender-key", lk)
-        run("btc-originate", ticket2, *btc)
+        # ---- the principal never comes: the borrower aborts ------------------
+        t2 = os.path.join(root, "loan2.json")
+        btc_tip = rig.btc.getblockcount()
+        run("btc-propose", "--lender-key", lk,
+            *terms(**{"--abort-after": str(btc_tip + 3)}), "--out", t2)
+        run("btc-prepare", t2, "--borrower-key", bk,
+            "--borrower-prog", borrower_prog, "--force", *seq, *btc)
+        run("btc-adaptor", t2, "--lender-key", lk)
+        run("btc-originate", t2, "--borrower-key", bk, *btc)
         rig.btc_mine(5)
-        out = run("btc-timeout", ticket2, "--lender-key", lk, *btc)
+        out = run("btc-abort", t2, "--borrower-key", bk, *btc)
+        rig.btc_mine(1)
+        check("a borrower whose principal never came took the collateral back",
+              out.get("stage") == "aborted"
+              and rig.btc.gettxout(out["abort_txid"], 0) is not None,
+              json.dumps(out)[:160])
+
+        # ---- nobody repays: the lender sweeps at the timeout -----------------
+        t3 = os.path.join(root, "loan3.json")
+        btc_tip = rig.btc.getblockcount()
+        run("btc-propose", "--lender-key", lk,
+            *terms(**{"--recover-after": str(btc_tip + 8)}), "--out", t3)
+        run("btc-prepare", t3, "--borrower-key", bk,
+            "--borrower-prog", borrower_prog, "--force", *seq, *btc)
+        run("btc-adaptor", t3, "--lender-key", lk)
+        run("btc-originate", t3, "--borrower-key", bk, *btc)
+        rig.btc_mine(1)
+        run("btc-disburse", t3, *seq, *btc)
+        rig.seq_mine(1)
+        run("btc-claim-principal", t3, "--borrower-key", bk, *seq)
+        rig.seq_mine(2)
+        run("btc-upgrade", t3, "--lender-key", lk, "--min-depth", "1", *seq, *btc)
+        rig.btc_mine(10)
+        out = run("btc-timeout", t3, "--lender-key", lk, *btc)
         rig.btc_mine(1)
         check("the lender swept on TIMEOUT after the term",
               out.get("stage") == "timed-out"

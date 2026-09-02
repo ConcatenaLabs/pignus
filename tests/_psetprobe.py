@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
 """Learn the exact Elements PSET v2 encoding from a real node.
 
 Not a test: a probe. It builds a funded PSET with the node, dumps the raw

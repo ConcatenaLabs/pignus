@@ -35,7 +35,7 @@ word the UI must use, and nothing here will build a repurchase while calling it
 a loan.
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 import json
 
 from .compat import load_covenant
@@ -49,6 +49,19 @@ TIER = "D"
 # settlement with one more input or one more output cannot confirm.
 DAMP_MAX_INPUTS = 4
 DAMP_MAX_OUTPUTS = 6
+
+# Where the bond vault sits in a settlement, and it is forced rather than
+# chosen. OpenDAMP puts the verifier output at input 0, and the covenant credits
+# at output 2k and returns at 2k+1 for a vault at input k, so the vault takes
+# the lowest index left and its two outputs land at 2 and 3. At input 2 they
+# would land at 4 and 5, which are the borrower's change and the fee -- and a
+# fee output may not carry the regulated asset at all.
+SETTLEMENT_VAULT_INDEX = 1
+
+# How deep both halves of a repurchase must be buried before it is live. The
+# same depth the loan watcher uses, because a repurchase confirmed to a shallower
+# depth than a loan would be a different promise made in the same words.
+BURIAL_DEPTH = 2
 
 
 def bond_atoms(collateral_value: int, debt: int) -> int:
@@ -72,6 +85,50 @@ def bond_atoms(collateral_value: int, debt: int) -> int:
             f"would have nothing to protect and the lender would be financing "
             f"more than the asset is worth")
     return collateral_value - debt
+
+
+# --- reading a coin off the chain ---------------------------------------------
+#
+# `gettxout` and never `getrawtransaction`. A node without txindex answers
+# getrawtransaction only for transactions its own wallet authored, and the
+# borrower is precisely the party who did not author the bond funding -- the
+# lender did -- so the check this module exists for would fail for the person it
+# exists for. gettxout answers for any unspent output on any node, which is also
+# the right question: a bond that has already been spent is not a funded bond.
+
+_SCAN_VOUTS = 16        # a settlement has six outputs; nothing here has sixteen
+
+
+def _gettxout(node, txid, vout):
+    """One unspent output, normalised, or None if there is nothing there."""
+    got = node.gettxout(txid, vout, True)
+    if got is None:
+        return None
+    o = dict(got)
+    o["n"] = vout                    # gettxout does not carry its own index
+    o.setdefault("confirmations", 0)
+    return o
+
+
+def _find_output(node, txid, vout, matches):
+    """The output of `txid` to check: the one named, or the first that matches.
+
+    Raises when a named output is not there at all, and returns None when a scan
+    finds nothing -- the caller says what a miss means, because "this coin is
+    gone" and "this transaction never paid that address" are different answers.
+    """
+    if vout is not None:
+        o = _gettxout(node, txid, vout)
+        if o is None:
+            raise ValueError(
+                f"there is no unspent output at {txid}:{vout}; it has already "
+                f"been spent, or was never funded")
+        return o
+    for i in range(_SCAN_VOUTS):
+        o = _gettxout(node, txid, i)
+        if o is not None and matches(o):
+            return o
+    return None
 
 
 @dataclass(frozen=True)
@@ -122,6 +179,11 @@ class RepurchaseTerms:
                 f"got {len(cu)} bytes")
         for name, prog, ver in (("borrower_prog", self.borrower_prog, self.borrower_ver),
                                 ("lender_prog", self.lender_prog, self.lender_ver)):
+            if ver not in (0, 1):
+                raise ValueError(
+                    f"{name} is at witness version {ver}; a payout is segwit v0 "
+                    f"or v1, and an address at any other version is one no "
+                    f"wallet can pay")
             b = bytes.fromhex(prog)
             want = 32 if ver == 1 else 20
             if len(b) != want:
@@ -170,25 +232,45 @@ class RepurchaseTerms:
 
     @staticmethod
     def from_json(text) -> "RepurchaseTerms":
+        """Read a terms document back, keeping only what is a term.
+
+        A proposal is written for a person to read as well as for a command to
+        act on, so it carries the bond, the vault program, the product name and
+        the confirmation sentence beside the terms themselves. Those are all
+        DERIVED: every command recomputes them and none trusts the document for
+        them, which is the whole reason it is safe to hand one round. So they
+        are dropped here rather than refused -- a document that cannot be read
+        back by the tool that wrote it is a document nobody can use.
+        """
         d = json.loads(text) if isinstance(text, str) else text
-        return RepurchaseTerms(**d)
+        names = {f.name for f in fields(RepurchaseTerms)}
+        return RepurchaseTerms(**{k: v for k, v in d.items() if k in names})
 
     # --- what a user is told -------------------------------------------------
 
-    def describe(self) -> str:
+    def describe(self, fmt=None) -> str:
         """The sentence the confirmation screen must show, in the words it uses.
 
         Not decoration. A borrower who reads "loan" and signs a sale has been
         misled by the interface, and this is the interface's one chance to say
         what is happening.
+
+        `fmt(atoms, asset) -> str` renders an amount for somebody who knows the
+        asset's ticker and precision. Without one the sentence falls back to
+        atoms and a truncated asset id, which is exact and unreadable; the two
+        must stay word for word the same as `describe` in web/repurchase.js, so
+        the browser and the command line say the same thing.
         """
         b = self.bond()
+        show = fmt or (lambda atoms, asset: f"{atoms} atoms of {asset[:12]}...")
         return (
-            f"REPURCHASE, not a loan. You are SELLING {self.collateral_amount} "
-            f"atoms of {self.collateral_asset[:12]}... to the lender now, for "
-            f"{self.principal} atoms of {self.debt_asset[:12]}..., and you may "
-            f"buy it back for {self.debt} at any time. If the lender never sells "
-            f"it back, you take a bond of {b} atoms after height "
+            f"REPURCHASE, not a loan. You are SELLING "
+            f"{show(self.collateral_amount, self.collateral_asset)} to the "
+            f"lender now, for {show(self.principal, self.debt_asset)}, and you "
+            f"may buy it back for {show(self.debt, self.debt_asset)} whenever "
+            f"the lender co-signs the settlement, at any time before height "
+            f"{self.forfeit_after}. If the lender never sells it back, you take "
+            f"a bond of {show(b, self.debt_asset)} after height "
             f"{self.forfeit_after}, which is what the asset was worth today minus "
             f"what you would have paid. You do NOT get the asset's later gains: "
             f"you are made whole at today's price, not the price on the day.")
@@ -211,31 +293,33 @@ class RepurchaseTerms:
         first written and what a test caught.
         """
         want_spk = self.script_pubkey().hex()
-        raw = node.getrawtransaction(txid, True)
-        outs = raw["vout"] if vout is None else [raw["vout"][vout]]
-        for o in outs:
-            if o["scriptPubKey"]["hex"] != want_spk:
-                continue
-            got_asset = o.get("asset")
-            if got_asset != self.debt_asset:
-                raise ValueError(
-                    f"the vault at the right address holds {got_asset}, not the "
-                    f"bond asset {self.debt_asset}")
-            atoms = int(round(float(o["value"]) * 100_000_000)) \
-                if "value" in o else None
-            if atoms is None:
-                raise ValueError(
-                    "the bond output is blinded; a repurchase bond must be "
-                    "explicit, because the covenant compares its value")
-            if atoms != self.bond():
-                raise ValueError(
-                    f"the vault holds {atoms} atoms but these terms make the "
-                    f"bond exactly {self.bond()}; the repurchase you were shown "
-                    f"is not the one being funded")
-            return o
-        raise ValueError(
-            "no output of this transaction pays the address these terms compile "
-            "to; the repurchase you were shown is not the one being funded")
+        o = _find_output(node, txid, vout,
+                         lambda got: got["scriptPubKey"]["hex"] == want_spk)
+        if o is None:
+            raise ValueError(
+                "no unspent output of this transaction pays the address these "
+                "terms compile to; the repurchase you were shown is not the one "
+                "being funded")
+        if o["scriptPubKey"]["hex"] != want_spk:
+            raise ValueError(
+                f"the coin at {txid}:{o['n']} does not pay the address these "
+                f"terms compile to; the repurchase you were shown is not the "
+                f"one being funded")
+        if "asset" not in o or "value" not in o:
+            raise ValueError(
+                "the bond output is blinded; a repurchase bond must be "
+                "explicit, because the covenant compares its value")
+        if o["asset"] != self.debt_asset:
+            raise ValueError(
+                f"the vault at the right address holds {o['asset']}, not the "
+                f"bond asset {self.debt_asset}")
+        atoms = int(round(float(o["value"]) * 100_000_000))
+        if atoms != self.bond():
+            raise ValueError(
+                f"the vault holds {atoms} atoms but these terms make the "
+                f"bond exactly {self.bond()}; the repurchase you were shown "
+                f"is not the one being funded")
+        return o
 
 
 def settlement_shape(consolidated_debt_input: bool) -> dict:
@@ -246,6 +330,14 @@ def settlement_shape(consolidated_debt_input: bool) -> dict:
     directions, so a composer that quietly adds a fee input or a second change
     output produces a transaction that cannot confirm, and it should find that
     out here rather than from the node.
+
+    Two rules fix every position, and between them they leave one arrangement.
+    OpenDAMP wants its verifier output at input 0 and returned whole to output 0
+    (opendamp-design.md 2.1 check 3, 2.2 checks 1 and 2). The covenant maps a
+    vault at input k to output 2k for the credit and 2k+1 for the return. So the
+    bond vault takes input 1 and pays the asset to C_U(borrower) at output 2 and
+    the bond to the lender at output 3; anywhere lower is the verifier's and
+    anywhere higher puts the covenant's outputs past the sixth.
     """
     if not consolidated_debt_input:
         raise ValueError(
@@ -255,18 +347,21 @@ def settlement_shape(consolidated_debt_input: bool) -> dict:
     return {
         "inputs": [
             "0: the OpenDAMP verifier output",
-            "1: C_U(lender), holding the asset",
-            "2: the bond vault",
+            "1: the bond vault",
+            "2: C_U(lender), holding the asset",
             "3: the borrower's single debt-asset UTXO",
         ],
         "outputs": [
             "0: the verifier output, returned",
-            "1: the asset, to C_U(borrower)",
-            "2: the bond, to the lender",
-            "3: the debt, to the lender",
+            "1: the debt, to the lender",
+            "2: the asset, to C_U(borrower)",
+            "3: the bond, to the lender",
             "4: the borrower's change",
             "5: the fee, in the debt asset",
         ],
+        "vault_index": SETTLEMENT_VAULT_INDEX,
+        "covenant_outputs": [2 * SETTLEMENT_VAULT_INDEX,
+                             2 * SETTLEMENT_VAULT_INDEX + 1],
         "max_inputs": DAMP_MAX_INPUTS,
         "max_outputs": DAMP_MAX_OUTPUTS,
         "fee_asset": "the debt asset -- a separate fee input would not fit",
@@ -287,36 +382,68 @@ def check_settlement(n_inputs: int, n_outputs: int):
 
 
 def verify_leg_one(node, txid, cu_lender_spk_hex, collateral_asset, atoms,
-                   min_confirmations=1):
+                   min_confirmations=BURIAL_DEPTH, vout=None):
     """Leg one really happened: the asset is at the lender's C_U, confirmed.
 
     A repurchase whose collateral leg never confirmed is a lender holding a bond
     against nothing, so the platform must not treat the vault as live until this
     passes. Confirmations rather than mempool presence, deliberately: the whole
-    instrument rests on the lender actually holding the asset.
+    instrument rests on the lender actually holding the asset. The C_U output
+    stays unspent until settlement, so an unspent-output lookup is enough and is
+    what works on a node without txindex.
     """
-    raw = node.getrawtransaction(txid, True)
-    confs = int(raw.get("confirmations") or 0)
+    o = _find_output(node, txid, vout,
+                     lambda got: got["scriptPubKey"]["hex"] == cu_lender_spk_hex
+                     and got.get("asset") == collateral_asset)
+    if o is None:
+        raise ValueError(
+            "this transaction pays no such amount of the collateral asset to "
+            "the lender's C_U address; leg one has not happened")
+    if o["scriptPubKey"]["hex"] != cu_lender_spk_hex:
+        raise ValueError(
+            f"the coin at {txid}:{o['n']} does not pay the lender's C_U "
+            f"address; leg one has not happened")
+    if o.get("asset") != collateral_asset:
+        raise ValueError(
+            f"the coin at {txid}:{o['n']} carries {o.get('asset')}, not the "
+            f"collateral asset {collateral_asset}; leg one has not happened")
+    confs = int(o.get("confirmations") or 0)
     if confs < min_confirmations:
         raise ValueError(
             f"the collateral transfer has {confs} confirmations, needs "
             f"{min_confirmations}: until it confirms the lender holds nothing")
-    for o in raw["vout"]:
-        if o["scriptPubKey"]["hex"] != cu_lender_spk_hex:
-            continue
-        if o.get("asset") != collateral_asset:
-            continue
-        if "value" not in o:
-            raise ValueError(
-                "the collateral output is blinded, so the platform cannot "
-                "confirm the lender received the amount agreed")
-        got = int(round(float(o["value"]) * 100_000_000))
-        if got < atoms:
-            raise ValueError(f"the lender received {got} atoms, not {atoms}")
-        return o
-    raise ValueError(
-        "this transaction pays no such amount of the collateral asset to the "
-        "lender's C_U address; leg one has not happened")
+    if "value" not in o:
+        raise ValueError(
+            "the collateral output is blinded, so the platform cannot "
+            "confirm the lender received the amount agreed")
+    got = int(round(float(o["value"]) * 100_000_000))
+    if got < atoms:
+        raise ValueError(f"the lender received {got} atoms, not {atoms}")
+    return o
+
+
+def repurchase_state(terms, height, bond=None, leg_one=None, bond_spent=False,
+                     min_confirmations=BURIAL_DEPTH) -> str:
+    """One word for where a repurchase stands, from the two halves checked.
+
+    `bond` and `leg_one` are what `verify_funding` and `verify_leg_one`
+    returned, or None where the check did not pass or was not run. A repurchase
+    with only one half checked is `bond-only` and never `live`: a bond against a
+    collateral leg nobody looked at secures nothing, and calling that "ok" is
+    the failure this exists to prevent.
+    """
+    if bond_spent:
+        return "settled"
+    if bond is None:
+        return "not-funded"
+    if leg_one is None:
+        return "bond-only"
+    if min(int(bond.get("confirmations") or 0),
+           int(leg_one.get("confirmations") or 0)) < min_confirmations:
+        return "funded-unburied"
+    if height >= terms.forfeit_after:
+        return "forfeitable"
+    return "live"
 
 
 # --- spending the bond vault --------------------------------------------------
@@ -355,8 +482,20 @@ class RepurchaseSpender:
         v.tap, v.leaves = self.tap, self.leaves
         return v
 
+    def _return_witness(self):
+        """The RETURN witness, which both settlement paths attach."""
+        return [bytes(self.leaves["return"]),
+                self.cov.control_block(self.tap, "return")]
+
     def settle(self, vault, funding, change_spk):
         """RETURN: deliver the asset to the borrower's C_U, take the bond.
+
+        This puts the bond vault at input 0 and its two covenant outputs at 0
+        and 1, which is a shape only an UNRESTRICTED collateral asset can have:
+        an OpenDAMP transfer must spend the verifier output at input 0, so a
+        settlement against the asset Tier D exists for cannot look like this.
+        Use `compose_settlement` for that; this exit is for a bond vault whose
+        asset moves without a verifier, which is what the test rig has.
 
         The borrower's payment of `debt` is NOT enforced here and must not be:
         the covenant's two output slots are already spent on the asset and the
@@ -375,10 +514,13 @@ class RepurchaseSpender:
             (held, lender_spk, t.debt_asset),                    # 1: the bond to the lender
         ]
         v = self._spender()
-        outs += v._change(funding, {t.collateral_asset: t.collateral_amount}, change_spk)
-        witness = [bytes(self.leaves["return"]),
-                   self.cov.control_block(self.tap, "return")]
-        return v._assemble(vault, funding, outs, witness)
+        # `_change` returns the fee as well as the outputs: a spender that kept
+        # it on itself would carry one transaction's folded dust into the next.
+        change, fee = v._change(funding, {t.collateral_asset: t.collateral_amount},
+                                change_spk)
+        outs += change
+        return v._assemble(vault, funding, outs, self._return_witness(),
+                           fee_amount=fee)
 
     def forfeit(self, vault, funding, change_spk, locktime=None):
         """FORFEIT: after the deadline, sweep the bond to the borrower.
@@ -392,7 +534,110 @@ class RepurchaseSpender:
         lt = t.forfeit_after if locktime is None else locktime
         outs = [(vault.amount or t.bond(), borrower_spk, t.debt_asset)]
         v = self._spender()
-        outs += v._change(funding, {}, change_spk)
+        change, fee = v._change(funding, {}, change_spk)
+        outs += change
         witness = [bytes(self.leaves["forfeit"]),
                    self.cov.control_block(self.tap, "forfeit")]
-        return v._assemble(vault, funding, outs, witness, locktime=lt)
+        return v._assemble(vault, funding, outs, witness, locktime=lt,
+                           fee_amount=fee)
+
+    # --- settlement against a real OpenDAMP asset ----------------------------
+
+    def compose_settlement(self, vault, verifier, verifier_spk, cu_lender,
+                           debt_input, change_spk):
+        """The whole settlement, in `settlement_shape()`'s order, unsigned.
+
+        Four inputs, in this order and no other: the OpenDAMP verifier output,
+        the bond vault, `C_U(lender)` holding the asset, and the borrower's
+        single debt-asset UTXO. `verifier_spk` is the verifier covenant's own
+        script, because output 0 returns its q of the verifier asset whole to
+        the address it came from.
+
+        The caller must already have checked that `vault` pays the script these
+        terms compile to -- `RepurchaseTerms.verify_funding` is that check, and
+        composing against a coin nobody verified is composing against a vault
+        somebody else chose.
+
+        What comes back carries no witness at all. Input 0 and input 2 are
+        Simplicity spends this repository does not build (the OpenDAMP transfer
+        tool does), input 3 is the borrower's, and the covenant witness goes on
+        with `attach_return_witness` once every party has signed -- last,
+        because a wallet rewrites the witness structure when it signs, which is
+        the same order `vault.VaultSpender._assemble` uses.
+        """
+        t = self.terms
+        if self.fee_asset != t.debt_asset:
+            raise ValueError(
+                f"a settlement pays its fee in the debt asset "
+                f"{t.debt_asset[:12]}..., not {str(self.fee_asset)[:12]}...: "
+                f"all four inputs OpenDAMP allows are spoken for, so there is "
+                f"no input a fee in another asset could come from")
+        for what, coin, asset in (("C_U(lender)", cu_lender, t.collateral_asset),
+                                  ("the borrower's debt input", debt_input,
+                                   t.debt_asset)):
+            if coin.asset != asset:
+                raise ValueError(
+                    f"{what} carries {str(coin.asset)[:12]}..., not "
+                    f"{asset[:12]}...; that is a different coin from the one "
+                    f"this settlement spends")
+        if verifier.asset in (t.collateral_asset, t.debt_asset):
+            raise ValueError(
+                "the verifier output carries the repurchase's own asset, so it "
+                "is not a verifier output: OpenDAMP's verifier asset is a "
+                "distinct asset of the issuer's")
+        if cu_lender.amount != t.collateral_amount:
+            raise ValueError(
+                f"C_U(lender) holds {cu_lender.amount} atoms and the repurchase "
+                f"is for {t.collateral_amount}: a surplus needs a change output "
+                f"in the regulated asset, and every output slot is taken")
+        change = debt_input.amount - t.debt - self.fee_amount
+        if change < 0:
+            raise ValueError(
+                f"the borrower's debt input holds {debt_input.amount} atoms, "
+                f"{-change} short of the debt {t.debt} plus the fee "
+                f"{self.fee_amount}")
+
+        cu_spk, lender_spk, _ = self._spks()
+        # The covenant demands the vault's WHOLE input value back, so an
+        # overfunded vault pays out what it actually holds.
+        held = vault.amount or t.bond()
+        ins = [verifier, vault, cu_lender, debt_input]
+        outs = [
+            (verifier.amount, verifier_spk, verifier.asset),      # 0 verifier home
+            (t.debt, lender_spk, t.debt_asset),                   # 1 the debt
+            (t.collateral_amount, cu_spk, t.collateral_asset),    # 2 the asset (2k)
+            (held, lender_spk, t.debt_asset),                     # 3 the bond (2k+1)
+        ]
+        if change > 0:
+            outs.append((change, change_spk, t.debt_asset))       # 4 the change
+        # A borrower whose debt input needs no change leaves five outputs, which
+        # a narrower OpenDAMP shape accepts. Six is the ceiling either way.
+        check_settlement(len(ins), len(outs) + 1)                 # +1 for the fee
+
+        from .vault import _tf, asset_out
+        m, _ = _tf()
+        tx = m.CTransaction()
+        tx.nVersion = 2
+        for o in ins:
+            tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout)))
+        for amount, spk, asset in outs:
+            tx.vout.append(m.CTxOut(nValue=m.CTxOutValue(amount), scriptPubKey=spk,
+                                    nAsset=m.CTxOutAsset(asset_out(asset))))
+        tx.vout.append(m.CTxOut(m.CTxOutValue(self.fee_amount),
+                                nAsset=m.CTxOutAsset(asset_out(t.debt_asset))))
+        return tx.serialize().hex()
+
+    def attach_return_witness(self, tx_hex,
+                              vault_index=SETTLEMENT_VAULT_INDEX):
+        """Put the RETURN witness on the signed settlement, at the vault's input."""
+        from .vault import _tf
+        m, _ = _tf()
+        tx = m.tx_from_hex(tx_hex)
+        if vault_index >= len(tx.vin):
+            raise ValueError(
+                f"this transaction has {len(tx.vin)} inputs; the bond vault was "
+                f"said to be at index {vault_index}")
+        while len(tx.wit.vtxinwit) < len(tx.vin):
+            tx.wit.vtxinwit.append(m.CTxInWitness())
+        tx.wit.vtxinwit[vault_index].scriptWitness.stack = self._return_witness()
+        return tx.serialize().hex()

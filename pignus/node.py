@@ -9,7 +9,9 @@ that comes from the terms and the covenant, which is the whole point.
 
 import base64
 import json
+import urllib.error
 import urllib.request
+from decimal import Decimal
 
 
 class RpcError(RuntimeError):
@@ -21,7 +23,13 @@ class RpcError(RuntimeError):
 
 class Node:
     """Minimal JSON-RPC proxy. `node.getblockcount()` and friends work by
-    __getattr__, so this tracks the node's RPC surface without listing it."""
+    __getattr__, so this tracks the node's RPC surface without listing it.
+
+    Cookie auth is read lazily and re-read on a 401, so the client follows node
+    restarts without being restarted itself. Amounts come back as `Decimal`, not
+    float: a coin above about 90 million units does not survive a float, and a
+    covenant transaction that is a couple of atoms out is simply rejected.
+    """
 
     def __init__(self, url="http://127.0.0.1:18443", user=None, password=None,
                  wallet=None, timeout=60, cookie_path=None):
@@ -29,14 +37,27 @@ class Node:
         if wallet:
             self.url += "/wallet/" + wallet
         self.timeout = timeout
-        if cookie_path and not user:
-            with open(cookie_path) as f:
-                user, password = f.read().strip().split(":", 1)
+        self._cookie_path = cookie_path if (cookie_path and not user) else None
         self._auth = None
         if user is not None:
             token = base64.b64encode(f"{user}:{password or ''}".encode()).decode()
             self._auth = "Basic " + token
         self._id = 0
+
+    def _load_cookie(self):
+        """Read the node's current cookie. A node writes a new one every start,
+        so this is deliberately not done once at construction: a client that
+        baked the credentials in would 401 forever after a node restart, and one
+        constructed while the node is down would not start at all."""
+        try:
+            with open(self._cookie_path) as f:
+                user, password = f.read().strip().split(":", 1)
+        except OSError as e:
+            raise RpcError(-1, f"cannot read the RPC cookie at "
+                               f"{self._cookie_path} ({e.strerror}); is the "
+                               "node running?") from None
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        self._auth = "Basic " + token
 
     def for_wallet(self, wallet):
         """A proxy scoped to a named wallet, without re-reading credentials."""
@@ -59,24 +80,34 @@ class Node:
         self._id += 1
         body = json.dumps({"jsonrpc": "2.0", "id": self._id, "method": method,
                            "params": named or list(params)}).encode()
+        if self._auth is None and self._cookie_path:
+            self._load_cookie()
+        payload = self._post(body, reauth=bool(self._cookie_path))
+        if payload.get("error"):
+            err = payload["error"]
+            raise RpcError(err.get("code", -1), err.get("message", str(err)))
+        return payload["result"]
+
+    def _post(self, body, reauth):
         headers = {"Content-Type": "application/json"}
         if self._auth:
             headers["Authorization"] = self._auth
         req = urllib.request.Request(self.url, data=body, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                payload = json.loads(r.read().decode())
+                return json.loads(r.read().decode(), parse_float=Decimal)
         except urllib.error.HTTPError as e:
+            if e.code == 401 and reauth:
+                # A cookie that stops working almost always means the node
+                # restarted and wrote a new one, so read it and try once more.
+                self._load_cookie()
+                return self._post(body, reauth=False)
             # A node returns the JSON-RPC error body with a 500, which carries a
             # far more useful message than the HTTP status.
             try:
-                payload = json.loads(e.read().decode())
+                return json.loads(e.read().decode(), parse_float=Decimal)
             except Exception:
                 raise RpcError(e.code, e.reason) from None
-        if payload.get("error"):
-            err = payload["error"]
-            raise RpcError(err.get("code", -1), err.get("message", str(err)))
-        return payload["result"]
 
     def __getattr__(self, name):
         if name.startswith("_"):

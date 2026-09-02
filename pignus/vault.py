@@ -16,7 +16,9 @@ it did not mean to.
 """
 
 from dataclasses import dataclass
+from decimal import Decimal
 
+from . import COIN, atoms
 from .compat import load_covenant
 
 
@@ -30,9 +32,6 @@ def _tf():
     return m, s
 
 
-COIN = 100_000_000
-
-
 @dataclass(frozen=True)
 class Outpoint:
     txid: str
@@ -42,8 +41,7 @@ class Outpoint:
 
     @classmethod
     def from_utxo(cls, u):
-        return cls(u["txid"], u["vout"],
-                   int(round(float(u["amount"]) * COIN)), u.get("asset", ""))
+        return cls(u["txid"], u["vout"], atoms(u["amount"]), u.get("asset", ""))
 
 
 def asset_out(display_hex: str) -> bytes:
@@ -66,12 +64,40 @@ def payout_spk(ver, prog_hex) -> bytes:
 
 
 def taproot_spk(xonly_hex) -> bytes:
-    """A v1 taproot scriptPubKey from an x-only key. The payout programs baked
-    into the covenant are x-only keys, so this is how a baked program becomes an
-    address the covenant will accept."""
+    """A v1 taproot scriptPubKey from an x-only key.
+
+    Not for covenant payouts, which carry a witness version of their own: use
+    `payout_spk`, or a v0 party is paid at an address nobody can spend.
+    """
     _, s = _tf()
     x = bytes.fromhex(xonly_hex) if isinstance(xonly_hex, str) else xonly_hex
     return bytes(s.CScript([s.OP_1, x]))
+
+
+FEE = object()      # marker in an output list: "the fee output goes here"
+
+# Fee-asset change below this is folded into the fee. Used only when the caller
+# gives no rate for the fee asset; the node's own threshold is per asset and
+# rate-dependent (see fees.dust_atoms).
+DUST_FOLD_FALLBACK = 200
+
+
+def _check_signing(signed, tx):
+    """Raise on any input the wallet failed to sign except the covenant one.
+
+    `complete` is always false for a covenant spend -- input 0 carries no
+    signature by design -- so the wallet's `errors` list is the only signal that
+    a FUNDING input could not be signed (a coin from another wallet, a
+    watch-only descriptor, a locked coin). Dropped, it becomes a broadcast that
+    fails with a script error naming nothing.
+    """
+    covenant = tx.vin[0].prevout
+    skip = ("%064x" % covenant.hash, covenant.n)
+    bad = [e for e in signed.get("errors") or []
+           if (e.get("txid"), e.get("vout")) != skip]
+    if bad:
+        raise ValueError("the wallet could not sign " + "; ".join(
+            f"{e.get('txid')}:{e.get('vout')} ({e.get('error')})" for e in bad))
 
 
 class VaultSpender:
@@ -83,12 +109,26 @@ class VaultSpender:
     so the two formats share every line here except `_witness`.
     """
 
-    def __init__(self, node, terms, fee_asset, fee_amount=5000,
-                 single_leaf=False):
+    # A class default, so an instance borrowed with __new__ for its assembly and
+    # change logic alone -- which pignus.repurchase does -- still has one.
+    dust_fold = DUST_FOLD_FALLBACK
+
+    def __init__(self, node, terms, fee_asset, fee_amount,
+                 single_leaf=False, dust_fold=None):
+        """`fee_amount` is in atoms OF THE FEE ASSET and has no default: what a
+        fee costs depends entirely on which asset pays it, so a number carried
+        over from another asset is either forty dollars or below the relay
+        floor. `pignus.fees` prices one from the node's own rates.
+
+        `dust_fold` is the change below which fee-asset change is given to the
+        producer instead of being paid out; `fees.dust_atoms(rate)` is the
+        node's own threshold for that asset.
+        """
         self.node = node
         self.terms = terms
         self.fee_asset = fee_asset          # display hex
-        self.fee_amount = fee_amount
+        self.fee_amount = int(fee_amount)
+        self.dust_fold = int(dust_fold) if dust_fold else DUST_FOLD_FALLBACK
         self.cov = load_covenant()
         self.single_leaf = bool(single_leaf)
         # The four-leaf tree is always built: the witness DATA (signatures,
@@ -115,45 +155,16 @@ class VaultSpender:
 
     # -------------------------------------------------------------- internals
 
-    def _out(self, amount, spk, asset_display):
-        m, _ = _tf()
-        return m.CTxOut(nValue=m.CTxOutValue(amount), scriptPubKey=spk,
-                        nAsset=m.CTxOutAsset(asset_out(asset_display)))
-
-    def _fee_out(self, amount):
-        m, _ = _tf()
-        return m.CTxOut(m.CTxOutValue(amount),
-                        nAsset=m.CTxOutAsset(asset_out(self.fee_asset)))
-
-    FEE = object()      # marker: "the fee output goes here"
-
-    def _assemble(self, vault, funding, outs, witness, locktime=0):
+    def _assemble(self, vault, funding, outs, witness, locktime=0,
+                  fee_amount=None):
         """vault: Outpoint of the covenant utxo. funding: [Outpoint] the spender
         brings. outs: [(amount, spk, asset_display)] with at most one `FEE`
         marker naming where the fee output sits (last, if absent). witness: the
         covenant witness stack. Returns the fully-signed transaction hex."""
-        m, _ = _tf()
-        seq = 0xfffffffe if locktime else 0xffffffff
-        tx = m.CTransaction()
-        tx.nVersion = 2
-        tx.nLockTime = locktime
-        tx.vin.append(m.CTxIn(m.COutPoint(int(vault.txid, 16), vault.vout), nSequence=seq))
-        for o in funding:
-            tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout), nSequence=seq))
-        if not any(o is self.FEE for o in outs):
-            outs = list(outs) + [self.FEE]
-        for o in outs:
-            if o is self.FEE:
-                tx.vout.append(self._fee_out(self.fee_amount))
-            else:
-                tx.vout.append(self._out(*o))
-
-        signed = self.node.signrawtransactionwithwallet(tx.serialize().hex())
-        tx = m.tx_from_hex(signed["hex"])
-        while len(tx.wit.vtxinwit) < len(tx.vin):
-            tx.wit.vtxinwit.append(m.CTxInWitness())
-        tx.wit.vtxinwit[0].scriptWitness.stack = witness
-        return tx.serialize().hex()
+        fee_amount = self.fee_amount if fee_amount is None else int(fee_amount)
+        tx = _raw_tx([vault] + list(funding), outs, self.fee_asset, fee_amount,
+                     locktime)
+        return _sign_with_witness(self.node, tx, witness)
 
     def _pinned(self):
         """The two scriptPubKeys the covenant will insist on.
@@ -177,14 +188,36 @@ class VaultSpender:
         asset; whatever is left over goes to `change_spk`.
         """
         t = self.terms
+        held = self._held(vault)
         lender_spk, borrower_spk = self._pinned()
         outs = [
             (t.debt, lender_spk, t.debt_asset),                 # 0 lender credit
-            (t.collateral_amount, borrower_spk, t.collateral_asset),  # 1 collateral home
+            (held, borrower_spk, t.collateral_asset),           # 1 collateral home
         ]
-        outs += self._change(funding, {t.debt_asset: t.debt}, change_spk)
+        change, fee = self._change(funding, {t.debt_asset: t.debt}, change_spk)
+        outs += change
         return self._assemble(vault, funding, outs, self._witness(
-            "repay", self.cov.repay_witness(self.tap, self.leaves)))
+            "repay", self.cov.repay_witness(self.tap, self.leaves)),
+            fee_amount=fee)
+
+    def _usable_attestation(self, att):
+        """Refuse an attestation that cannot mean what this vault will read.
+
+        The price is a ratio scaled by `price_scale`, and the scale is baked
+        into the leaf rather than signed: a price quoted at 1e5 presented to a
+        vault built at 1e3 is a hundredfold error in the seizure, and the
+        covenant has no way to notice. A zero price is refused here too --
+        `seizure_at` would divide by it, and so would OP_DIV64 on chain.
+        """
+        scale = getattr(att, "price_scale", None)
+        if scale is not None and int(scale) != self.terms.price_scale:
+            raise ValueError(
+                f"this attestation quotes at price scale {scale} and the vault "
+                f"was built at {self.terms.price_scale}; the same number means "
+                "different prices at the two scales, so it cannot be used here")
+        if int(getattr(att, "price", 0)) < 1:
+            raise ValueError("an attested price of zero cannot open any leaf: "
+                             "the seizure arithmetic divides by the price")
 
     def _oracle_evidence(self, evidence, leaf):
         """Normalise what the caller brought into (witness price, witness maker).
@@ -196,6 +229,9 @@ class VaultSpender:
         """
         from . import oracle as O
         t = self.terms
+        for att in (evidence.values() if isinstance(evidence, dict)
+                    else [evidence]):
+            self._usable_attestation(att)
         if isinstance(evidence, dict):
             if not t.oracles:
                 raise ValueError("this loan names ONE oracle; pass its "
@@ -264,13 +300,14 @@ class VaultSpender:
     def _seizure(self, vault, funding, evidence, taker_spk, change_spk,
                  leaf, locktime):
         t = self.terms
+        held = self._held(vault)
         price, make_witness = self._oracle_evidence(evidence, leaf)
         lender_spk, borrower_spk = self._pinned()
         seize = t.seizure_at(price)
-        surplus = t.collateral_amount - seize
+        surplus = held - seize
         outs = [(t.debt, lender_spk, t.debt_asset)]                    # 0 credit
-        change = self._change(funding, {t.debt_asset: t.debt},
-                              change_spk or taker_spk)
+        change, fee = self._change(funding, {t.debt_asset: t.debt},
+                                   change_spk or taker_spk)
         if surplus > 0:
             outs.append((surplus, borrower_spk, t.collateral_asset))   # 1 surplus
             outs.append((seize, taker_spk, t.collateral_asset))
@@ -282,7 +319,7 @@ class VaultSpender:
             # a change output in another asset when the fee is paid in the
             # collateral asset itself.
             if self.fee_asset != t.collateral_asset:
-                outs.append(self.FEE)
+                outs.append(FEE)
             else:
                 filler = next((c for c in change if c[2] != t.collateral_asset),
                               None)
@@ -293,10 +330,11 @@ class VaultSpender:
                         "asset, or bring change in one")
                 change.remove(filler)
                 outs.append(filler)
-            outs.append((t.collateral_amount, taker_spk, t.collateral_asset))
+            outs.append((held, taker_spk, t.collateral_asset))
         outs += change
         witness = self._witness(leaf, make_witness(self.tap, self.leaves))
-        return self._assemble(vault, funding, outs, witness, locktime)
+        return self._assemble(vault, funding, outs, witness, locktime,
+                              fee_amount=fee)
 
     def recover(self, vault, funding, change_spk, locktime=None):
         """RECOVER: the oracle-liveness backstop.
@@ -312,29 +350,50 @@ class VaultSpender:
             raise ValueError(
                 f"locktime {locktime} is below recover_after {t.recover_after}")
         lender_spk, _ = self._pinned()
-        outs = [(t.collateral_amount, lender_spk, t.collateral_asset)]
-        outs += self._change(funding, {}, change_spk)
+        outs = [(self._held(vault), lender_spk, t.collateral_asset)]
+        change, fee = self._change(funding, {}, change_spk)
+        outs += change
         return self._assemble(vault, funding, outs, self._witness(
             "recover", self.cov.recover_witness(self.tap, self.leaves)),
-            locktime)
+            locktime, fee_amount=fee)
 
     # ------------------------------------------------------------- accounting
 
-    def _spk_of(self, o: Outpoint) -> bytes:
-        tx = self.node.getrawtransaction(o.txid, True)
-        return bytes.fromhex(tx["vout"][o.vout]["scriptPubKey"]["hex"])
+    def _held(self, vault: Outpoint) -> int:
+        """What the vault coin actually holds, which is what every leaf reads.
+
+        The covenant compares against the INPUT's value (OP_INSPECTINPUTVALUE),
+        not against the terms: `returned >= C`, `required_return = C - seize`,
+        `swept >= locked`. A vault funded with MORE than the terms state -- legal,
+        and what any taker who did not use this composer may leave -- can only be
+        exited by paying out what it holds, so composing from the terms would
+        build a transaction the interpreter rejects.
+        """
+        held = int(vault.amount)
+        if held < self.terms.collateral_amount:
+            raise ValueError(
+                f"vault {vault.txid}:{vault.vout} holds {held} atoms but the "
+                f"terms say {self.terms.collateral_amount}; refusing to compose "
+                "an exit no leaf would accept")
+        return held
 
     def _change(self, funding, spent_by_asset, change_spk):
-        """Return change outputs so the transaction balances per asset.
+        """Return (change outputs, the fee this transaction pays).
 
         `spent_by_asset` is what the covenant outputs already consume of each
         funding asset; the fee is added here because every spend pays one.
         Raises rather than silently building an unbalanced transaction, which
         the node would reject with an error that says nothing about which asset
         was short.
+
+        The fee is RETURNED rather than added to `self.fee_amount`: a spender
+        reused for a second transaction -- a retry after a rejected broadcast,
+        or liquidate-then-default -- would otherwise carry the last one's folded
+        dust and pay an ever larger fee.
         """
+        fee_amount = self.fee_amount
         need = dict(spent_by_asset)
-        need[self.fee_asset] = need.get(self.fee_asset, 0) + self.fee_amount
+        need[self.fee_asset] = need.get(self.fee_asset, 0) + fee_amount
         have = {}
         for o in funding:
             if not o.asset:
@@ -349,16 +408,16 @@ class VaultSpender:
                     f"(need {amount}, supplied {supplied})")
         for asset, supplied in have.items():
             rest = supplied - need.get(asset, 0)
-            if 0 < rest < DUST_FOLD and asset == self.fee_asset:
-                self.fee_amount += rest          # dust: let the producer have it
+            if 0 < rest < self.dust_fold and asset == self.fee_asset:
+                fee_amount += rest               # dust: let the producer have it
             elif rest > 0:
                 outs.append((rest, change_spk, asset))
-        return outs
+        return outs, fee_amount
 
 
 def build_origination(node, terms, collateral, principal, borrower_change_spk,
-                      lender_change_spk, fee_asset, fee_amount=5000,
-                      fee_inputs=()):
+                      lender_change_spk, fee_asset, fee_amount,
+                      fee_inputs=(), fee_change_spk=None):
     """The origination transaction: one atomic step, no escrow.
 
       inputs   the borrower's collateral, the lender's principal, fee input(s)
@@ -367,7 +426,10 @@ def build_origination(node, terms, collateral, principal, borrower_change_spk,
     Both parties sign the finished transaction; either can walk away first and
     neither is ever exposed to the other. The vault at output 0 is built from
     `terms`, and the borrower MUST call `terms.verify_funding()` on it before
-    signing -- `PignusError` here is cheap, a mis-derived vault address is not.
+    signing -- a ValueError here is cheap, a mis-derived vault address is not.
+
+    `fee_inputs` are the lender's unless `fee_change_spk` names where their
+    change goes.
     """
     m, _ = _tf()
     tx = m.CTransaction()
@@ -382,7 +444,11 @@ def build_origination(node, terms, collateral, principal, borrower_change_spk,
 
     tx.vout.append(_out(terms.collateral_amount, bytes(tap.scriptPubKey),
                         terms.collateral_asset))                       # 0 the vault
-    tx.vout.append(_out(terms.principal, taproot_spk(terms.borrower_x),
+    # The borrower's PROGRAM and version, not their key: a browser-originated
+    # loan is paid at segwit v0, and paying it at v1 would leave the borrower
+    # with collateral locked in a valid vault and no way to reach the money.
+    tx.vout.append(_out(terms.principal,
+                        payout_spk(terms.borrower_ver, terms.payout_programs[1]),
                         terms.debt_asset))                             # 1 the principal
 
     c_in = sum(o.amount for o in collateral)
@@ -403,7 +469,8 @@ def build_origination(node, terms, collateral, principal, borrower_change_spk,
     if f_in < fee_amount:
         raise ValueError(f"fee inputs supply {f_in}, fee is {fee_amount}")
     if f_in > fee_amount:
-        tx.vout.append(_out(f_in - fee_amount, lender_change_spk, fee_asset))
+        tx.vout.append(_out(f_in - fee_amount,
+                            fee_change_spk or lender_change_spk, fee_asset))
     tx.vout.append(m.CTxOut(m.CTxOutValue(fee_amount),
                             nAsset=m.CTxOutAsset(asset_out(fee_asset))))
     return tx.serialize().hex()
@@ -411,12 +478,11 @@ def build_origination(node, terms, collateral, principal, borrower_change_spk,
 
 # ------------------------------------------------------------ coin selection
 
-DUST_FOLD = 200      # fee-asset change below this is folded into the fee
 PREP_MIN = 1000      # never prepare an explicit coin smaller than this
 
 
 def _atoms(u):
-    return int(round(float(u["amount"]) * COIN))
+    return atoms(u["amount"])
 
 
 def _explicit_utxos(node, exclude=()):
@@ -431,7 +497,7 @@ def _explicit_utxos(node, exclude=()):
     return out
 
 
-def prepare_explicit(node, wants, fee_asset=None):
+def prepare_explicit(node, wants, fee_asset):
     """Give the wallet EXPLICIT coins for `wants` ({asset: atoms}).
 
     A covenant reads the amounts it checks, so every input of a covenant
@@ -441,28 +507,55 @@ def prepare_explicit(node, wants, fee_asset=None):
     what is needed: that output is explicit, spendable at zero confirmations,
     and sized so the covenant transaction has no change in that asset at all.
     Returns the txids of the preparing transactions.
+
+    `fee_asset` is required. The preparing send pays a fee like any other
+    transaction, and there is no default fee asset on this chain: picking one
+    here would spend an asset the caller never chose.
     """
+    if not fee_asset:
+        raise ValueError("prepare_explicit needs the asset its own sends pay "
+                         "their fee in; there is no default fee asset here")
     txids = []
     for asset, amount in wants.items():
         amount = max(int(amount), PREP_MIN)
         addr = node.getnewaddress("", "bech32")
         info = node.getaddressinfo(addr)
         addr = info.get("unconfidential") or addr
-        # The preparing send needs its OWN fee asset named -- this chain has no
-        # default fee asset. Prefer one the caller is not preparing; fall back
-        # to the policy asset, which every wallet on this chain can hold.
-        kw = dict(address=addr, amount=f"{amount / COIN:.8f}", assetlabel=asset,
-                  fee_asset_label=fee_asset or "bitcoin")
+        kw = dict(address=addr,
+                  amount=str((Decimal(amount) / COIN).quantize(Decimal("0.00000001"))),
+                  assetlabel=asset, fee_asset_label=fee_asset)
         txids.append(node.sendtoaddress(**kw))
     return txids
 
 
-def select_funding(node, wants, exclude=(), prepare=True):
+def _holdings(node):
+    """{asset: atoms} the wallet can spend, blinded coins included: a preparing
+    send is an ordinary wallet spend and can use them."""
+    have = {}
+    for u in node.listunspent(0):
+        if u.get("spendable") and u.get("asset"):
+            have[u["asset"]] = have.get(u["asset"], 0) + _atoms(u)
+    return have
+
+
+def select_funding(node, wants, exclude=(), prepare=True, prep_fee_asset=None,
+                   on_prepare=None):
     """Pick explicit wallet utxos covering `wants` ({asset: atoms}).
 
     Exact-size coins first (a prepared coin leaves no change), then largest
     first. When the explicit coins fall short and `prepare` is set, the wallet
-    makes itself some (see `prepare_explicit`) and the selection runs again.
+    pays itself the FULL amount of each short asset (see `prepare_explicit`) and
+    the selection runs again -- the full amount, not the deficit, so the second
+    pass finds one coin of exactly what is needed and the covenant transaction
+    has no change in that asset.
+
+    The preparing sends need a fee asset of their own. `prep_fee_asset` names
+    it; otherwise it is chosen from what the wallet holds and what the node
+    publishes a rate for, preferring the assets already being spent. Nothing
+    falls back to a privileged asset: there isn't one. `on_prepare(asset,
+    wants, txids)` is called when coins were prepared, so a caller can say which
+    asset paid for it.
+
     Raises naming the asset that is short, because the node's own error for an
     unbalanced transaction does not.
     """
@@ -490,10 +583,30 @@ def select_funding(node, wants, exclude=(), prepare=True):
 
     chosen, short = pick()
     if short and prepare:
-        # A fee asset for the PREPARING sends: one that is not itself short (so
-        # preparing it does not need preparing), else the policy asset.
-        fee_asset = next((a for a in want if a not in short), None)
-        prepare_explicit(node, short, fee_asset)
+        from . import fees as F
+        # The caller's own fee asset first, then an asset that is NOT itself
+        # short -- preparing one of those does not need preparing. Anything else
+        # the node prices and the wallet holds is still allowed, because there
+        # is no privileged asset to fall back to.
+        asset, _atoms_needed = F.pick_fee(
+            F.fee_table(node), _holdings(node), "fund",
+            prefer=[prep_fee_asset] + [a for a in want if a not in short])
+        full = {a: want[a] for a in short}
+        # A preparing send selects from every spendable coin, so it can swallow
+        # the explicit coins already counted for the OTHER assets and leave the
+        # second pass short again. Locked coins are still listed, so pick() sees
+        # them; sendtoaddress does not spend them.
+        locks = [{"txid": c.txid, "vout": c.vout}
+                 for c in chosen if c.asset not in short]
+        if locks:
+            node.lockunspent(False, locks)
+        try:
+            txids = prepare_explicit(node, full, asset)
+        finally:
+            if locks:
+                node.lockunspent(True, locks)
+        if on_prepare:
+            on_prepare(asset, full, txids)
         chosen, short = pick()
     if short:
         raise ValueError("wallet cannot fund this: short "
@@ -518,6 +631,8 @@ def wallet_payout(node):
 # ------------------------------------------------------------ funded offers
 
 def _raw_tx(inputs, outs, fee_asset, fee_amount, locktime=0):
+    """`outs` is [(amount, spk, asset)] with at most one `FEE` marker naming
+    where the fee output sits; without one it goes last."""
     m, _ = _tf()
     seq = 0xfffffffe if locktime else 0xffffffff
     tx = m.CTransaction()
@@ -525,11 +640,16 @@ def _raw_tx(inputs, outs, fee_asset, fee_amount, locktime=0):
     tx.nLockTime = locktime
     for o in inputs:
         tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout), nSequence=seq))
-    for (amt, spk, asset) in outs:
-        tx.vout.append(m.CTxOut(nValue=m.CTxOutValue(amt), scriptPubKey=spk,
-                                nAsset=m.CTxOutAsset(asset_out(asset))))
-    tx.vout.append(m.CTxOut(m.CTxOutValue(fee_amount),
-                            nAsset=m.CTxOutAsset(asset_out(fee_asset))))
+    if not any(o is FEE for o in outs):
+        outs = list(outs) + [FEE]
+    for o in outs:
+        if o is FEE:
+            tx.vout.append(m.CTxOut(m.CTxOutValue(fee_amount),
+                                    nAsset=m.CTxOutAsset(asset_out(fee_asset))))
+        else:
+            amt, spk, asset = o
+            tx.vout.append(m.CTxOut(nValue=m.CTxOutValue(amt), scriptPubKey=spk,
+                                    nAsset=m.CTxOutAsset(asset_out(asset))))
     return tx
 
 
@@ -538,6 +658,7 @@ def _sign_with_witness(node, tx, witness):
     0, which the wallet cannot sign and leaves alone."""
     m, _ = _tf()
     signed = node.signrawtransactionwithwallet(tx.serialize().hex())
+    _check_signing(signed, tx)
     tx = m.tx_from_hex(signed["hex"])
     while len(tx.wit.vtxinwit) < len(tx.vin):
         tx.wit.vtxinwit.append(m.CTxInWitness())
@@ -557,11 +678,26 @@ def _change_outs(funding, need, change_spk):
             for a in have if have[a] - need.get(a, 0) > 0]
 
 
-def _fold_dust(outs, fee_asset, fee_amount):
-    """Fee-asset change too small to be worth an output goes to the fee."""
+def _dust_limit(fee_rate):
+    """The fee asset's own dust threshold, or None when no rate was given."""
+    if not fee_rate:
+        return None
+    from . import fees as F
+    return F.dust_atoms(fee_rate)
+
+
+def _fold_dust(change, fee_asset, fee_amount, dust_fold=None):
+    """Fee-asset CHANGE too small to be worth an output goes to the fee.
+
+    Change only, and before anything is placed at a fixed index: run over a
+    finished output list this would drop a pinned covenant output, or the filler
+    the offer's TAKE leaf reads at index 1, and shift every later output into a
+    position the covenant means something else by.
+    """
+    fold_below = int(dust_fold) if dust_fold else DUST_FOLD_FALLBACK
     kept = []
-    for amt, spk, asset in outs:
-        if asset == fee_asset and amt < DUST_FOLD:
+    for amt, spk, asset in change:
+        if asset == fee_asset and amt < fold_below:
             fee_amount += amt
         else:
             kept.append((amt, spk, asset))
@@ -574,48 +710,48 @@ def _need(*pairs):
     asset already being spent -- and silently under-funds the transaction, so
     every requirement is accumulated here instead."""
     out = {}
-    for asset, atoms in pairs:
-        out[asset] = out.get(asset, 0) + int(atoms)
+    for asset, n in pairs:
+        out[asset] = out.get(asset, 0) + int(n)
     return out
 
 
-def _offer_tree(terms, principal, collateral, expiry_locktime):
-    from .offers import _offer_module, _vault_kwargs
-    off = _offer_module()
-    kw = _vault_kwargs(terms)
-    tap, leaves = off.offer_taptree(
-        asset_c=kw["asset_c"], asset_d=kw["asset_d"], principal=int(principal),
-        collateral=int(collateral), vault_kwargs=kw,
-        expiry_locktime=int(expiry_locktime))
-    return off, tap, leaves
-
-
 def fund_offer(node, terms, principal, collateral, expiry_locktime, lots,
-               fee_asset, fee_amount, change_spk):
+               fee_asset, fee_amount, change_spk, fee_rate=None):
     """Lock `lots` principals in an offer covenant. Returns (txhex, spk).
 
     The offer address is derived HERE from the terms being funded: a lender who
     pays an address somebody else computed is trusting them about what the money
     can be spent on. The offer is output 0.
+
+    `fee_rate` is the fee asset's exchange rate, used only to fold change the
+    node would call dust; without it a conservative fixed threshold is used.
     """
-    _off, tap, _leaves = _offer_tree(terms, principal, collateral, expiry_locktime)
+    from .offers import offer_tree
+    _off, tap, _leaves = offer_tree(terms, principal, collateral, expiry_locktime)
     spk = bytes(tap.scriptPubKey)
     total = int(principal) * int(lots)
     need = _need((terms.debt_asset, total), (fee_asset, fee_amount))
-    funding = select_funding(node, need)
-    outs = [(total, spk, terms.debt_asset)]
-    outs += _change_outs(funding, need, change_spk)
-    outs, fee_amount = _fold_dust(outs, fee_asset, fee_amount)
+    funding = select_funding(node, need, prep_fee_asset=fee_asset)
+    change = _change_outs(funding, need, change_spk)
+    change, fee_amount = _fold_dust(change, fee_asset, fee_amount,
+                                    _dust_limit(fee_rate))
+    outs = [(total, spk, terms.debt_asset)] + change
     tx = _raw_tx(funding, outs, fee_asset, fee_amount)
     signed = node.signrawtransactionwithwallet(tx.serialize().hex())
     if not signed.get("complete"):
-        raise ValueError("the wallet could not sign every input")
+        # Every input here is the lender's own, so the wallet naming one it
+        # could not sign is the whole diagnosis: quote it rather than let the
+        # broadcast fail with a script error that names nothing.
+        errs = "; ".join(f"{e.get('txid')}:{e.get('vout')} ({e.get('error')})"
+                         for e in signed.get("errors") or [])
+        raise ValueError("the wallet could not sign every input"
+                         + (f": {errs}" if errs else ""))
     return signed["hex"], spk
 
 
 def take_offer(node, terms, offer, offer_value, principal, collateral,
                expiry_locktime, fee_asset, fee_amount, borrower_spk,
-               change_spk):
+               change_spk, fee_rate=None):
     """Draw one principal from a funded offer and lock the collateral.
 
     `terms` carries the BORROWER's program already. The offer input sits at
@@ -624,8 +760,8 @@ def take_offer(node, terms, offer, offer_value, principal, collateral,
     principal to the borrower and any change follow, then the fee.
     Returns (txhex, vault_spk).
     """
-    from .offers import offer_vault_taptree
-    off, tap, leaves = _offer_tree(terms, principal, collateral, expiry_locktime)
+    from .offers import offer_tree, offer_vault_taptree
+    off, tap, leaves = offer_tree(terms, principal, collateral, expiry_locktime)
     offer_spk = bytes(tap.scriptPubKey)
     vault_tap, _leaf = offer_vault_taptree(terms)
     vault_spk = bytes(vault_tap.scriptPubKey)
@@ -634,22 +770,31 @@ def take_offer(node, terms, offer, offer_value, principal, collateral,
         raise ValueError("this offer no longer holds a whole principal")
 
     need = _need((terms.collateral_asset, int(collateral)), (fee_asset, fee_amount))
-    funding = select_funding(node, need, exclude=[(offer.txid, offer.vout)])
+    funding = select_funding(node, need, exclude=[(offer.txid, offer.vout)],
+                             prep_fee_asset=fee_asset)
     change = _change_outs(funding, need, change_spk)
+    change, fee_amount = _fold_dust(change, fee_asset, fee_amount,
+                                    _dust_limit(fee_rate))
     outs = [(int(collateral), vault_spk, terms.collateral_asset)]
     if remainder > 0:
         outs.append((remainder, offer_spk, terms.debt_asset))
+    elif fee_asset != terms.debt_asset:
+        # Drawing the LAST lot: the TAKE leaf reads any debt-asset output at
+        # index 1 as a remainder claim, so something else has to sit there. The
+        # fee output is always available and costs nothing extra -- and the
+        # coins for an exact take are often prepared, leaving no change at all.
+        outs.append(FEE)
     else:
         filler = next((c for c in change if c[2] != terms.debt_asset), None)
         if filler is None:
-            raise ValueError("taking the whole offer needs an output at index 1 "
-                             "that is not the debt asset; the wallet produced no "
-                             "collateral or fee change to put there")
-        outs.append(filler)
+            raise ValueError(
+                "taking the whole offer needs an output at index 1 that is not "
+                "the debt asset, and the fee is in the debt asset; pay the fee "
+                "in another asset (--fee-asset)")
         change.remove(filler)
+        outs.append(filler)
     outs.append((int(principal), borrower_spk, terms.debt_asset))
     outs += change
-    outs, fee_amount = _fold_dust(outs, fee_asset, fee_amount)
     tx = _raw_tx([offer] + funding, outs, fee_asset, fee_amount)
     borrower_prog = bytes.fromhex(terms.payout_programs[1])
     witness = off.take_witness(tap, leaves, borrower_prog, vault_tap)
@@ -657,16 +802,20 @@ def take_offer(node, terms, offer, offer_value, principal, collateral,
 
 
 def withdraw_offer(node, terms, offer, offer_value, principal, collateral,
-                   expiry_locktime, fee_asset, fee_amount, change_spk):
+                   expiry_locktime, fee_asset, fee_amount, change_spk,
+                   fee_rate=None):
     """Return an expired offer's remaining principal to the lender's pinned
     program. Anyone may build this; it can only pay the lender."""
-    off, tap, leaves = _offer_tree(terms, principal, collateral, expiry_locktime)
+    from .offers import offer_tree
+    off, tap, leaves = offer_tree(terms, principal, collateral, expiry_locktime)
     lender_spk = payout_spk(terms.lender_ver, terms.payout_programs[0])
     funding = select_funding(node, {fee_asset: fee_amount},
-                             exclude=[(offer.txid, offer.vout)])
-    outs = [(int(offer_value), lender_spk, terms.debt_asset)]
-    outs += _change_outs(funding, {fee_asset: fee_amount}, change_spk)
-    outs, fee_amount = _fold_dust(outs, fee_asset, fee_amount)
+                             exclude=[(offer.txid, offer.vout)],
+                             prep_fee_asset=fee_asset)
+    change = _change_outs(funding, {fee_asset: fee_amount}, change_spk)
+    change, fee_amount = _fold_dust(change, fee_asset, fee_amount,
+                                    _dust_limit(fee_rate))
+    outs = [(int(offer_value), lender_spk, terms.debt_asset)] + change
     tx = _raw_tx([offer] + funding, outs, fee_asset, fee_amount,
                  locktime=int(expiry_locktime))
     return _sign_with_witness(node, tx, off.offer_refund_witness(tap, leaves))

@@ -1,0 +1,54 @@
+[Unit]
+# A second, third, nth oracle. The book quotes an m-of-n loan against several
+# independent oracles, and independence is of KEYS: three instances sharing one
+# keyfile are a 1-of-1 wearing a 2-of-3 label. Each instance therefore reads its
+# own config, at /root/sequentia/pignus-oracle-<n>.json, naming its own keyfile,
+# logfile and port -- deploy/oracle2.example.json and oracle3.example.json are
+# those two files ready to copy.
+#
+#   cp deploy/oracle2.example.json /root/sequentia/pignus-oracle-2.json
+#   cp deploy/oracle3.example.json /root/sequentia/pignus-oracle-3.json
+#   systemctl enable --now pignus-oracle@2 pignus-oracle@3
+#
+# The primary oracle keeps its own unit, pignus-oracle.service: its key is the
+# one the book hands lenders, so it is named rather than numbered.
+Description=Pignus price oracle %i (Sequentia testnet)
+Documentation=https://github.com/ConcatenaLabs/pignus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/sequentia/pignus
+Environment=SEQUENTIA_SRC=/root/sequentia/Sequentia
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignus-oracle --config /root/sequentia/pignus-oracle-%i.json
+Restart=always
+RestartSec=5
+# This instance's key is the whole of its authority, and a loan that named it
+# cannot be liquidated without it.
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+# ProtectSystem=full leaves /root untouched, and /root is where all of this
+# lives, so on its own it protects nothing this service reaches for. /root is
+# mounted read-only instead and the one directory that has to stay WRITABLE is
+# handed back: /root/sequentia/pignus-data, which holds this instance's keyfile,
+# its attestation log, the log's rotated files and their .chain, and its seizure
+# log.
+#
+# Do not reach for ProtectHome=yes or ProtectSystem=strict without extending
+# ReadWritePaths to match. The oracle then fails at start on a key it can
+# neither read nor create, which looks like a lost key and is not.
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/root/sequentia/pignus-data
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target
