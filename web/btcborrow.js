@@ -150,7 +150,8 @@ export function renderOffers(box, offers, ui, onBorrow) {
     return;
   }
   box.innerHTML = '<table><tr><th>collateral</th><th>you receive</th>' +
-    '<th>you repay</th><th>repay by</th><th>lender sweep</th><th></th></tr>' +
+    '<th>you repay</th><th>seized below</th><th>repay by</th>' +
+    '<th>lender sweep</th><th></th></tr>' +
     open.map((o, i) => {
       const l = o.loan;
       const principal = BigInt(l.principal || 0) || BigInt(l.debt);
@@ -160,6 +161,11 @@ export function renderOffers(box, offers, ui, onBorrow) {
         ' ' + ui.esc(ui.ticker(l.debt_asset)) + '</td>' +
       '<td data-label="you repay">' + ui.units(l.debt, l.debt_asset) + ' ' +
         ui.esc(ui.ticker(l.debt_asset)) + '</td>' +
+      // The one number this tier's trust rests on. A seizure here is the
+      // lender and the oracle signing together, with no price test in any
+      // script, so the price it is meant to be justified below is the only
+      // thing a borrower can hold them to afterwards.
+      '<td data-label="seized below">' + ui.esc(seizePrice(l, ui)) + '</td>' +
       '<td data-label="repay by">' + ui.blockTime(l.repay_deadline) + '</td>' +
       '<td data-label="lender sweep">Bitcoin block ' +
         Number(l.recover_after).toLocaleString() + '</td>' +
@@ -188,6 +194,17 @@ export function renderOffers(box, offers, ui, onBorrow) {
  *
  * Anything that fails leaves the borrower with nothing committed.
  */
+/** The price a seizure of this loan would be judged against, per whole
+ *  Bitcoin, which is the way a borrower reads a price. */
+function seizePrice(loan, ui) {
+  const strike = BigInt(loan.strike || 0);
+  if (strike <= 0n) return "not stated";
+  const scale = BigInt(loan.price_scale || 100000);
+  const perBtc = (strike * 100000000n) / scale;
+  return ui.units(perBtc.toString(), loan.debt_asset) + " " +
+         ui.ticker(loan.debt_asset);
+}
+
 export async function borrow(wallet, offer, ui) {
   const caps = await wallet.capabilities();
   const missing = missingMethods(caps);
