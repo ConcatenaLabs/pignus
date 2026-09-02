@@ -39,6 +39,7 @@ from pignus import adaptor as A          # noqa: E402
 from pignus import btcscript as B        # noqa: E402
 from pignus import dlc                   # noqa: E402
 from pignus import oracle as O           # noqa: E402
+from pignus import btc_collateral as BC
 from pignus.btc_collateral import (      # noqa: E402
     BtcLoan, reclaim_tx, sighash_for, lender_release_adaptor,
     check_release_adaptor, complete_reclaim, seize_tx, timeout_tx,
@@ -93,7 +94,18 @@ class Ctx:
             recover_after=recover_after or (self.btc.getblockcount() + 20),
             debt_asset=self.D, debt=DEBT,
             repay_deadline=self.seq.getblockcount() + 100,
-            adaptor_point=A.point(t).hex(), payment_hash=h.hex())
+            adaptor_point=A.point(t).hex(), payment_hash=h.hex(),
+            # Both Sequentia legs pay a PINNED program, which is what lets them
+            # be settled with no signature at all -- and therefore from a
+            # browser, which cannot sign a covenant leaf.
+            borrower_prog=self.seq_prog(), borrower_ver=0,
+            lender_prog=self.seq_prog(), lender_ver=0)
+
+    def seq_prog(self):
+        """A 20-byte payout program this wallet owns."""
+        spk = self.seq_spk()
+        assert spk[:2] == b"\x00\x14", spk.hex()
+        return spk[2:].hex()
 
     def fund_bitcoin(self, loan, broadcast=True):
         """Build (and optionally broadcast) the Bitcoin funding transaction.
@@ -184,20 +196,28 @@ class Ctx:
         return self._seq_btc
 
     def spend_repayment(self, loan, outpoint, leaf, *, secret=None,
-                        sec=None, locktime=0, send=True):
-        """Spend the Sequentia repayment output: the lender's CLAIM (which must
-        reveal the preimage) or the borrower's REFUND."""
+                        sec=None, locktime=0, send=True, dest=None):
+        """Spend the Sequentia repayment output: the CLAIM that publishes the
+        preimage, or the REFUND after the deadline.
+
+        Neither takes a signature and neither can pay anyone but the party the
+        address names, so `sec` is accepted and ignored -- the callers below
+        pass it to say WHOSE exit they mean, which is still worth reading."""
         from test_framework.messages import (
             COutPoint, CTransaction, CTxIn, CTxInWitness, CTxOut, CTxOutAsset,
-            CTxOutValue, uint256_from_str, tx_from_hex,
+            CTxOutValue, tx_from_hex,
         )
-        from test_framework.script import TaprootSignatureHash
-        from test_framework.key import sign_schnorr
         tap, leaves = loan.repayment_tree()
         aout = lambda h: b"\x01" + bytes.fromhex(h)[::-1]   # noqa: E731
         btc = self.seq_fresh(1)
         btc_amt = int(round(float(btc["amount"]) * COIN))
-        dest = self.seq_spk()
+        # The covenant pins where each leaf pays: CLAIM to the lender, REFUND
+        # back to the borrower. Passing anything else in is how a test proves
+        # the pinning works, which the rejection cases below do.
+        prog = (loan.lender_prog if leaf == "claim" else loan.borrower_prog)
+        ver = (loan.lender_ver if leaf == "claim" else loan.borrower_ver)
+        pinned = dest or ((b"\x00\x14" if int(ver) == 0 else b"\x51\x20")
+                          + bytes.fromhex(prog))
         tx = CTransaction()
         tx.nVersion = 2
         tx.nLockTime = locktime
@@ -206,26 +226,17 @@ class Ctx:
                             nSequence=seq_no))
         tx.vin.append(CTxIn(COutPoint(int(btc["txid"], 16), btc["vout"]),
                             nSequence=seq_no))
-        tx.vout.append(CTxOut(CTxOutValue(DEBT), dest, CTxOutAsset(aout(self.D))))
+        tx.vout.append(CTxOut(CTxOutValue(DEBT), pinned,
+                              CTxOutAsset(aout(self.D))))
         tx.vout.append(CTxOut(CTxOutValue(btc_amt - SEQ_FEE), self.seq_spk(),
                               CTxOutAsset(aout(self.seq_bitcoin()))))
         tx.vout.append(CTxOut(CTxOutValue(SEQ_FEE),
                               nAsset=CTxOutAsset(aout(self.seq_bitcoin()))))
         partial = self.seq.signrawtransactionwithwallet(tx.serialize().hex())
         tx = tx_from_hex(partial["hex"])
-        spent = [
-            CTxOut(CTxOutValue(DEBT), bytes(tap.scriptPubKey),
-                   CTxOutAsset(aout(self.D))),
-            CTxOut(CTxOutValue(btc_amt), bytes.fromhex(btc["scriptPubKey"]),
-                   CTxOutAsset(aout(btc["asset"]))),
-        ]
-        genesis = uint256_from_str(bytes.fromhex(self.seq.getblockhash(0))[::-1])
-        msg = TaprootSignatureHash(tx, spent, 0, genesis, 0, scriptpath=True,
-                                   script=leaves[leaf])
-        sig = sign_schnorr(sec, msg)
         cb = (bytes([tap.leaves[leaf].version + tap.negflag])
               + tap.internal_pubkey + tap.leaves[leaf].merklebranch)
-        stack = ([sig, secret] if leaf == "claim" else [sig])
+        stack = ([secret] if secret is not None else [])
         while len(tx.wit.vtxinwit) < len(tx.vin):
             tx.wit.vtxinwit.append(CTxInWitness())
         tx.wit.vtxinwit[0].scriptWitness.stack = stack + [bytes(leaves[leaf]), cb]
@@ -282,10 +293,13 @@ def scenario_solvent(ctx):
                                      sec=ctx.lender_sec)
     log(f"  lender claimed it: {claim_txid}")
 
-    # The borrower reads t off the chain rather than being told it.
-    claim = ctx.seq.getrawtransaction(claim_txid, True)
-    revealed = bytes.fromhex(claim["vin"][0]["txinwitness"][1])
+    # The borrower reads t off the chain rather than being told it, and does it
+    # the way a node with no transaction index can: from the outpoint that was
+    # claimed, not from a transaction id.
+    revealed, spend_txid, _conf = BC.preimage_from_spend(
+        ctx.seq, rep[0], rep[1], expect_hash=loan.payment_hash)
     assert revealed == t, "the preimage on chain is not the secret"
+    assert spend_txid == claim_txid
     log("  borrower recovered t FROM THE CHAIN, not from the lender")
 
     final = complete_reclaim(loan, reclaim_tx(loan, txid, vout, dest, BTC_FEE),

@@ -23,6 +23,19 @@ after a lender has seen it. A vault whose funding has vanished is GHOST, and a
 lender who treated it as security was wrong to. That is not a Pignus caveat, it
 is `doc/sequentia/03-bitcoin-anchoring.md`, and a watcher that reported LIVE
 here would be lying.
+
+The same principle cuts the other way, and is the easier half to forget: a reorg
+can undo a CLOSE as well as a funding. Anything this watcher read out of a block
+was read out of a block that can be replaced, so it remembers which block each
+height was, notices when the chain it scanned is no longer the chain, and puts
+back what it read out of the blocks that went. Until an exit is buried it stays
+provisional, because a spend seen only in the mempool can be replaced by another.
+
+GHOST is a narrow word here and worth keeping narrow: it means the funding was
+undone. An output that vanishes with no spender anyone can find, from a funding
+block that is still in the chain, is SPENT_UNKNOWN -- an exit out of reach, not
+a reorg. Reporting a reorg that did not happen is as much a lie as hiding one
+that did.
 """
 
 import json
@@ -60,8 +73,23 @@ _EXIT_BY_NAME = {
     "repay": State.REPAID, "liquidate": State.LIQUIDATED,
     "default": State.DEFAULTED, "recover": State.RECOVERED,
 }
-_EXIT_BY_SELECTOR = {"": "repay", "01": "liquidate", "02": "default",
-                     "03": "recover"}
+# The single leaf's selector: 0 REPAY, 1 LIQUIDATE, 2 DEFAULT, ANYTHING ELSE
+# recover. The default is not tidiness -- the leaf's last branch is an `else`,
+# so a lender who sweeps with selector 04 spends by RECOVER, and a mapping that
+# only knew 03 would call a perfectly ordinary sweep unidentifiable.
+_EXIT_BY_SELECTOR = {"": "repay", "01": "liquidate", "02": "default"}
+
+
+def _le8(h):
+    """One of the covenant's 8-byte little-endian numbers, as a witness carries
+    it. None if the push is not one, which is a spender's answer, not a crash."""
+    try:
+        b = bytes.fromhex(h)
+    except (ValueError, TypeError):
+        return None
+    if len(b) != 8:
+        return None
+    return int.from_bytes(b, "little", signed=True)
 
 
 @dataclass
@@ -76,6 +104,15 @@ class Vault:
     spent_height: int = 0
     note: str = ""
     single_leaf: bool = False
+    # The block that buried the funding. When the output later vanishes with no
+    # spender to be found, this pair is what tells a reorg from an exit out of
+    # reach: if the block at that height is no longer this block, the chain
+    # dropped the funding; if it still is, the funding stands and something we
+    # cannot see spent it. Without the pair the two are indistinguishable.
+    funding_height: int = 0
+    funding_block: str = ""
+    last_seen_height: int = 0   # tip when the node last showed the output
+    scanned_back_to: int = 0    # lowest height already walked for this outpoint
 
     def to_dict(self):
         d = {k: v for k, v in self.__dict__.items() if k != "terms"}
@@ -96,9 +133,14 @@ class Offer:
     expiry: int
     value: int = 0
     confirmations: int = 0
-    status: str = "open"    # open | taken | withdrawn | gone
+    status: str = "open"    # open | taken | withdrawn | gone | ghost
     leaves: dict = field(default_factory=dict)   # {"take": hex, "refund": hex}
     spk: str = ""
+    last_seen_height: int = 0
+    scanned_back_to: int = 0
+    # Where the coin rested before each move, so a reorg that removes the block
+    # a take was in can put the offer back where it was.
+    history: list = field(default_factory=list)
 
 
 class VaultWatcher:
@@ -110,34 +152,73 @@ class VaultWatcher:
     heuristic, and no dependence on the node retaining a spent output. A spend
     that happened while nobody was watching is found by a bounded walk back
     from the tip, and by reading the mempool, before being given up on.
+
+    The backward walk is the expensive half, so it is rationed: each outpoint
+    remembers how far back it has already looked and never looks there twice,
+    every poll fetches at most `back_scan_cap` blocks in total, and blocks are
+    shared between searches within a poll. A search that runs out of budget
+    resumes where it stopped. Nothing walks back for a GHOST at all -- the node
+    does not know that output, so there is no spender to find.
     """
 
-    def __init__(self, node, min_depth=2, rescan_depth=1500):
+    def __init__(self, node, min_depth=2, rescan_depth=1500, back_scan_cap=200):
         self.node = node
         self.min_depth = min_depth
         self.rescan_depth = rescan_depth
+        self.back_scan_cap = back_scan_cap
         self.vaults = {}          # loan_id -> Vault
         self.offers = {}          # offer_id -> Offer
         self._by_outpoint = {}    # (txid, vout) -> loan_id
         self._by_offer = {}       # (txid, vout) -> offer_id
         self.scanned_height = None
+        self.scanned_hash = None
         self.events = []          # offer events since the last drain
+        self._seen_hashes = {}    # height -> the block hash we scanned there
+        self._block_cache = {}    # height -> block, for the current poll only
+        self._blocks_fetched = 0
+        self._mempool_txs = None
 
     # --------------------------------------------------------------- tracking
 
-    def track(self, loan_id, terms, txid, vout, single_leaf=False):
+    def track(self, loan_id, terms, txid, vout, single_leaf=False,
+              state=State.UNCONFIRMED, confirmations=0, spent_by="",
+              spent_height=0, note="", funding_height=0, funding_block=""):
+        """Watch a vault.
+
+        The optional fields are what a caller already knew. A book re-tracking
+        its loans after a restart must hand them back: a vault started from
+        scratch has no confirmations and no funding block, which is exactly what
+        a funding that was never buried looks like, so every loan closed longer
+        ago than the backward walk reaches would be relabelled a reorg it never
+        suffered.
+        """
+        try:
+            st = State(state)
+        except ValueError:
+            st = State.UNCONFIRMED      # an unreadable record is not a claim
         v = Vault(loan_id=loan_id, terms=terms, txid=txid, vout=int(vout),
-                  single_leaf=bool(single_leaf))
+                  single_leaf=bool(single_leaf), state=st,
+                  confirmations=int(confirmations or 0),
+                  spent_by=str(spent_by or ""),
+                  spent_height=int(spent_height or 0), note=str(note or ""),
+                  funding_height=int(funding_height or 0),
+                  funding_block=str(funding_block or ""))
         self.vaults[loan_id] = v
         self._by_outpoint[(txid, int(vout))] = loan_id
         return v
 
     def track_offer(self, offer_id, terms, txid, vout, principal, collateral,
-                    expiry):
+                    expiry, confirmations=0, status="open", value=0):
+        """Watch a funded offer's coin. `confirmations` and `status` are what a
+        caller persisted, for the same reason as `track`: an offer re-tracked at
+        zero confirmations looks like one that never buried, and a take that
+        happened while the daemon was down would be reported as a reorg."""
         from .offers import offer_address, offer_leaves
         o = Offer(offer_id=offer_id, terms=terms, txid=txid, vout=int(vout),
                   principal=int(principal), collateral=int(collateral),
-                  expiry=int(expiry))
+                  expiry=int(expiry), value=int(value or 0),
+                  confirmations=int(confirmations or 0),
+                  status=str(status or "open"))
         o.spk = offer_address(terms, principal, collateral, expiry).hex()
         o.leaves = offer_leaves(terms, principal, collateral, expiry)
         self.offers[offer_id] = o
@@ -156,6 +237,27 @@ class VaultWatcher:
         _tap, leaves = terms.build()
         return {bytes(script).hex(): name for name, script in leaves.items()}
 
+    def rescan_from(self, height):
+        """Read the chain again from `height`, forwards.
+
+        The backward walk is bounded, so a watcher that was down for longer than
+        it reaches cannot name what happened while it was away; the forward scan
+        has no such limit and is exact. An operator points this at the height
+        the gap starts and every take and exit since is discovered again, a
+        capped number of blocks per poll.
+        """
+        h = max(0, int(height) - 1)
+        self.scanned_height = h
+        self.scanned_hash = self._seen_hashes.get(h)
+        for v in self.vaults.values():
+            v.scanned_back_to = 0
+        for o in self.offers.values():
+            o.scanned_back_to = 0
+            if o.status == "gone":
+                # "gone" is an admission that the watcher could not see what
+                # happened to the coin. Curing that is what this is for.
+                o.status = "open"
+
     # ------------------------------------------------------------------ poll
 
     def poll(self):
@@ -163,6 +265,9 @@ class VaultWatcher:
         so a caller can act on transitions rather than diffing the whole set.
         Offer events are queued on `self.events`."""
         changed = []
+        self._block_cache = {}
+        self._blocks_fetched = 0
+        self._mempool_txs = None
         tip = self.node.getblockcount()
         self._scan_new_blocks(tip, changed)
         for v in self.vaults.values():
@@ -170,7 +275,9 @@ class VaultWatcher:
                 changed.append(v)
         for o in list(self.offers.values()):
             self._refresh_offer(o, tip)
-        self.scanned_height = tip
+        self._forget_below(tip - self.rescan_depth)
+        self._block_cache = {}
+        self._mempool_txs = None
         seen, out = set(), []
         for v in changed:
             if v.loan_id not in seen:
@@ -178,22 +285,193 @@ class VaultWatcher:
                 out.append(v)
         return out
 
+    # ---------------------------------------------------------- node reading
+
+    def _block(self, h):
+        """One verbose block, remembered for the rest of this poll so several
+        searches over the same range fetch it once.
+
+        None means "not this poll", never "not there": either the node would not
+        answer or this poll has already fetched as many blocks as it may. Every
+        caller has to treat it as a reason to come back, not as an answer.
+        """
+        block = self._block_cache.get(h)
+        if block is not None:
+            return block
+        if self._blocks_fetched >= self.back_scan_cap:
+            return None
+        try:
+            block = self.node.getblock(self.node.getblockhash(h), 2)
+        except RpcFailure:
+            return None
+        self._blocks_fetched += 1
+        self._block_cache[h] = block
+        return block
+
+    def _hash_at(self, h):
+        try:
+            return self.node.getblockhash(h)
+        except RpcFailure:
+            return None
+
+    def _txout(self, txid, vout):
+        """(output or None, answered). "The node could not be asked" is not the
+        same answer as "the output is not there", and reading it as one is how a
+        watcher invents a reorg out of an RPC timeout."""
+        try:
+            return self.node.gettxout(txid, int(vout), True), True   # w/ mempool
+        except RpcFailure:
+            return None, False
+
+    def _mempool(self):
+        """The mempool, decoded once per poll.
+
+        `getrawtransaction` by id is safe HERE and only here: these ids come from
+        `getrawmempool`, and a node answers for what is in its mempool without a
+        transaction index. Asking it about a mined transaction is what needs
+        `-txindex`, which the committee nodes do not run.
+        """
+        if self._mempool_txs is None:
+            txs = {}
+            try:
+                for cand in self.node.getrawmempool():
+                    try:
+                        txs[cand] = self.node.getrawtransaction(cand, True)
+                    except RpcFailure:
+                        continue
+            except RpcFailure:
+                pass
+            self._mempool_txs = txs
+        return self._mempool_txs
+
+    def _mempool_spender(self, txid, vout):
+        for tx in self._mempool().values():
+            for k, vin in enumerate(tx.get("vin", [])):
+                if vin.get("txid") == txid and vin.get("vout") == vout:
+                    return tx, k, 0
+        return None
+
+    # ---------------------------------------------------------- forward scan
+
     def _scan_new_blocks(self, tip, changed):
         if self.scanned_height is None:
             # First poll: nothing to walk forward over. Spends that already
-            # happened are caught by _refresh, which looks back a bounded way
-            # before falling back to SPENT_UNKNOWN.
-            self.scanned_height = tip
+            # happened are caught by _refresh, which reads the mempool and looks
+            # a bounded way back before giving up on naming them.
+            self._mark_scanned(tip)
             return
+        self._rewind_if_reorged(tip, changed)
         if not self._by_outpoint and not self._by_offer:
+            self._mark_scanned(tip)
             return
         for h in range(self.scanned_height + 1, tip + 1):
-            try:
-                block = self.node.getblock(self.node.getblockhash(h), 2)
-            except RpcFailure:
-                continue
+            block = self._block(h)
+            if block is None:
+                # One RPC hiccup must not lose a block. Stop here, leaving
+                # scanned_height at h-1, so the next poll retries this height
+                # rather than scanning past spends nobody ever looked at.
+                return
             for tx in block.get("tx", []):
                 self._inspect_tx(tx, h, changed)
+            self.scanned_height = h
+            self.scanned_hash = block.get("hash")
+            self._seen_hashes[h] = block.get("hash")
+
+    def _mark_scanned(self, h):
+        self.scanned_height = h
+        self.scanned_hash = self._hash_at(h)
+        if self.scanned_hash:
+            self._seen_hashes[h] = self.scanned_hash
+
+    def _rewind_if_reorged(self, tip, changed):
+        """Put back whatever was read out of blocks that are no longer there.
+
+        Sequentia reorgs when Bitcoin reorgs, so a block this watcher already
+        scanned can be replaced. Everything it read out of one -- which exit
+        closed a vault, which take moved an offer -- was read out of a block
+        that no longer exists, and a book that keeps it shows a loan settled
+        while its collateral is unspent again, which is exactly the position a
+        liquidator would act on.
+        """
+        seen = self._seen_hashes.get(self.scanned_height)
+        if seen is None:
+            return                      # nothing to compare against
+        if tip >= self.scanned_height:
+            got = self._hash_at(self.scanned_height)
+            if got is None or got == seen:
+                # Either nothing was replaced, or the node would not say. A
+                # rewind on a failed RPC would reopen every closed loan in the
+                # book on one timeout, which is a worse lie than a late answer.
+                return
+        start = min(self.scanned_height, tip)
+        floor = max(0, start - self.rescan_depth)
+        ancestor = start
+        while ancestor > floor:
+            seen = self._seen_hashes.get(ancestor)
+            if seen is not None and self._hash_at(ancestor) == seen:
+                break
+            ancestor -= 1
+        self._undo_above(ancestor, changed)
+        self.scanned_height = ancestor
+        self.scanned_hash = self._seen_hashes.get(ancestor)
+        for h in [h for h in self._seen_hashes if h > ancestor]:
+            del self._seen_hashes[h]
+
+    def _undo_above(self, ancestor, changed):
+        for v in self.vaults.values():
+            touched = False
+            if v.spent_height > ancestor:
+                v.spent_by, v.spent_height = "", 0
+                v.state = State.UNCONFIRMED
+                v.note = ("the closing transaction was in a block that is no "
+                          "longer in the chain")
+                touched = True
+            if v.funding_height > ancestor:
+                # The block that buried this funding is gone, so the funding is
+                # a ghost -- unless the transaction is in the replacement chain
+                # as well, which _refresh asks the node in this same poll and
+                # reverses. Clearing the pair here rather than keeping it is
+                # what lets that answer record the new block.
+                v.funding_height, v.funding_block = 0, ""
+                v.state = State.GHOST
+                v.confirmations = 0
+                v.note = ("the block that funded this vault is no longer in "
+                          "the chain: a Bitcoin-driven reorg undid the funding")
+                touched = True
+            if touched:
+                v.scanned_back_to = 0
+                changed.append(v)
+        for o in self.offers.values():
+            moved = False
+            while o.history and o.history[-1]["height"] > ancestor:
+                prev = o.history.pop()
+                self._by_offer.pop((o.txid, o.vout), None)
+                o.txid, o.vout = prev["txid"], prev["vout"]
+                o.value, o.confirmations = prev["value"], 0
+                o.status = prev["status"]
+                o.scanned_back_to = 0
+                self._by_offer[(o.txid, o.vout)] = o.offer_id
+                moved = True
+            if moved:
+                self.events.append({
+                    "offer_id": o.offer_id, "kind": o.status, "txid": "",
+                    "height": 0, "input_index": -1,
+                    "outpoint": f"{o.txid}:{o.vout}",
+                    "funded_value": str(o.value),
+                    "note": ("the transaction that spent this offer was in a "
+                             "block that is no longer in the chain")})
+
+    def _forget_below(self, height):
+        """Drop what can no longer be rewound to: a reorg deeper than the walk
+        reaches is not something this watcher can undo anyway."""
+        for h in [h for h in self._seen_hashes if h < height]:
+            del self._seen_hashes[h]
+        for o in self.offers.values():
+            if o.history:
+                # A move seen only in the mempool (height 0) is kept: it has not
+                # been anywhere a reorg could put it out of reach yet.
+                o.history = [e for e in o.history
+                             if e["height"] == 0 or e["height"] >= height]
 
     def _inspect_tx(self, tx, height, changed):
         """Apply one transaction's inputs to whatever it spends of ours."""
@@ -202,7 +480,11 @@ class VaultWatcher:
             loan_id = self._by_outpoint.get(key)
             if loan_id is not None:
                 v = self.vaults[loan_id]
-                if v.state not in CLOSED:
+                # A settled vault is one whose exit is already in a block. One
+                # closed from the mempool is not settled: this is where the
+                # height is filled in, and where a replacement that closed it
+                # differently is read instead of the one that was replaced.
+                if not self._settled(v):
                     v.spent_by = tx["txid"]
                     v.spent_height = height
                     v.state = self._name_exit(v, vin.get("txinwitness") or [])
@@ -222,7 +504,7 @@ class VaultWatcher:
         if vault.single_leaf:
             if name != "vault" or len(witness) < 3:
                 return State.SPENT_UNKNOWN
-            name = _EXIT_BY_SELECTOR.get(witness[-3])
+            name = _EXIT_BY_SELECTOR.get(witness[-3], "recover")
         return _EXIT_BY_NAME.get(name, State.SPENT_UNKNOWN)
 
     # ---------------------------------------------------------------- offers
@@ -231,6 +513,10 @@ class VaultWatcher:
         """An offer's coin moved. Name the spend, and follow the remainder."""
         if o.status != "open":
             return
+        # Where the coin was before this transaction, so a reorg that takes the
+        # block away can put the offer back on the shelf it came off.
+        o.history.append({"txid": o.txid, "vout": o.vout, "value": o.value,
+                          "status": o.status, "height": height})
         self._by_offer.pop((o.txid, o.vout), None)
         leaf = witness[-2] if len(witness) >= 2 else None
         outs = tx.get("vout", [])
@@ -262,65 +548,151 @@ class VaultWatcher:
         self.events.append(ev)
 
     def _refresh_offer(self, o, tip):
-        if o.status != "open":
+        if o.status not in ("open", "ghost"):
             return
-        try:
-            got = self.node.gettxout(o.txid, o.vout, True)
-        except RpcFailure:
+        got, answered = self._txout(o.txid, o.vout)
+        if not answered:
             return
         if got is not None:
             o.value = int(round(float(got["value"]) * 100_000_000))
             o.confirmations = int(got.get("confirmations", 0) or 0)
+            o.last_seen_height = tip
+            o.scanned_back_to = 0
+            if o.status == "ghost":
+                # The funding came back. A book that left this a ghost would be
+                # hiding a coin anyone can take.
+                o.status = "open"
+                self.events.append({
+                    "offer_id": o.offer_id, "kind": "open", "txid": "",
+                    "height": 0, "input_index": -1,
+                    "outpoint": f"{o.txid}:{o.vout}",
+                    "funded_value": str(o.value),
+                    "note": "funding reappeared after a reorg"})
+            return
+        if o.status == "ghost":
+            # A ghost's outpoint is not known to the node at all, so there is no
+            # spender to look for. The only move left to it is the funding
+            # coming back, and the gettxout above is the whole of that question.
             return
         # Spent, and the forward scan did not see it: look for the spender in
-        # the mempool, then a bounded way back, before giving up on it.
-        found = self._find_spender(o.txid, o.vout, tip)
-        if found is None:
-            # No coin and no spender. If the offer had buried, it was taken or
-            # withdrawn by a transaction we cannot see; if it never buried, a
-            # Bitcoin-driven reorg undid its funding -- the same first principle
-            # the vault side calls GHOST. An offer that never buried had
-            # confirmations 0.
-            reorg = o.confirmations == 0
-            o.status = "ghost" if reorg else "gone"
-            self.events.append({
-                "offer_id": o.offer_id, "kind": o.status,
-                "txid": "", "height": 0, "input_index": -1,
-                "note": ("funding undone by a Bitcoin-driven reorg before it "
-                         "buried" if reorg else
-                         "outpoint spent by a transaction this watcher could "
-                         "not find")})
+        # the mempool, then a bounded way back, before giving up on it. An offer
+        # this watcher saw unburied skips the walk for the same reason a vault
+        # does -- a coin that was never in a block was not spent in one.
+        unburied = bool(o.last_seen_height) and o.confirmations < self.min_depth
+        found = (self._mempool_spender(o.txid, o.vout) if unburied
+                 else self._spender(o, tip))
+        if found is not None:
+            tx, k, height = found
+            self._offer_spent(o, tx, k, tx["vin"][k].get("txinwitness") or [],
+                              height)
             return
-        tx, k, height = found
-        self._offer_spent(o, tx, k, tx["vin"][k].get("txinwitness") or [],
-                          height)
+        if not unburied and not self._search_exhausted(o, tip):
+            return          # the walk has further to go; ask again next poll
+        # No coin and no spender anywhere we can reach. If the offer never
+        # buried, a Bitcoin-driven reorg undid its funding -- the same first
+        # principle the vault side calls GHOST, and a ghost can come back. If it
+        # HAD buried, it was taken or withdrawn out of the walk's reach.
+        reorg = o.confirmations < self.min_depth
+        o.status = "ghost" if reorg else "gone"
+        self.events.append({
+            "offer_id": o.offer_id, "kind": o.status,
+            "txid": "", "height": 0, "input_index": -1,
+            "note": ("funding undone by a Bitcoin-driven reorg before it "
+                     "buried" if reorg else
+                     f"spent by a transaction outside the last "
+                     f"{self.rescan_depth} blocks this watcher walked")})
 
-    def _find_spender(self, txid, vout, tip):
-        """(tx, input_index, height) of whatever spent an outpoint, or None."""
-        try:
-            for cand in self.node.getrawmempool():
-                tx = self.node.getrawtransaction(cand, True)
-                for k, vin in enumerate(tx.get("vin", [])):
-                    if vin.get("txid") == txid and vin.get("vout") == vout:
-                        return tx, k, 0
-        except RpcFailure:
-            pass
-        for h in range(tip, max(0, tip - self.rescan_depth), -1):
-            try:
-                block = self.node.getblock(self.node.getblockhash(h), 2)
-            except RpcFailure:
-                continue
+    # --------------------------------------------------------- finding spends
+
+    def _search_exhausted(self, item, tip):
+        """The backward walk for this outpoint has been as far as it goes."""
+        floor = max(1, tip - self.rescan_depth + 1)
+        return bool(item.scanned_back_to) and item.scanned_back_to <= floor
+
+    def _spender(self, item, tip):
+        """Whatever spent an item's outpoint: (tx, input index, height), or None.
+
+        The mempool first, then blocks the forward scan never covered, walking
+        down from where the last poll stopped -- so no height is ever read twice
+        and no single poll spends more than its share of block fetches here.
+        """
+        hit = self._mempool_spender(item.txid, item.vout)
+        if hit is not None:
+            return hit
+        if self._search_exhausted(item, tip):
+            return None
+        found, walked_to = self._walk_back(item.txid, item.vout, tip,
+                                           item.scanned_back_to)
+        item.scanned_back_to = walked_to
+        return found
+
+    def _walk_back(self, txid, vout, tip, back_to):
+        """Look for a spender below where this outpoint has already been walked.
+
+        Returns (found, walked_to). `walked_to` is the lowest height now
+        covered; reaching the floor is how a caller tells a finished search from
+        one that merely ran out of budget for this poll.
+        """
+        floor = max(1, tip - self.rescan_depth + 1)
+        hi = min(tip, (back_to or tip + 1) - 1)
+        for h in range(hi, floor - 1, -1):
+            block = self._block(h)
+            if block is None:
+                return None, h + 1      # out of budget, or a hiccup: resume here
             for tx in block.get("tx", []):
                 for k, vin in enumerate(tx.get("vin", [])):
                     if vin.get("txid") == txid and vin.get("vout") == vout:
-                        return tx, k, h
-        return None
+                        return (tx, k, h), h
+        return None, floor
 
     # ---------------------------------------------------------------- vaults
 
+    def _settled(self, v):
+        """A closed vault whose exit is in a block. Only a reorg can move it,
+        and the rewind handles that."""
+        return (v.state in CLOSED and v.state is not State.GHOST
+                and v.spent_height > 0)
+
+    def _final(self, v, tip):
+        """A closed vault this watcher can stop asking about: its exit is not
+        merely in a block but buried. Until then the exit is provisional -- a
+        spend seen in the mempool can be replaced, and a shallow one can be
+        reorged out -- and the vault is worth another gettxout each poll."""
+        return (self._settled(v)
+                and (tip - v.spent_height + 1) >= self.min_depth)
+
+    def _record_funding(self, v, tip):
+        """Remember which block buried the funding, once. The height and the
+        hash are stored as a PAIR, so the later question -- is this still the
+        block at this height? -- is answerable even if the height was off by
+        one because a block arrived mid-poll."""
+        if v.funding_block or v.confirmations < 1:
+            return
+        h = tip - v.confirmations + 1
+        if h < 1:
+            return
+        got = self._hash_at(h)
+        if got:
+            v.funding_height, v.funding_block = h, got
+
+    def _funding_reorged(self, v, tip):
+        """True if the block that buried this vault has left the chain, False if
+        it is still there, None when there is nothing to compare -- a vault this
+        watcher never saw confirmed, or a node that would not answer. Only a
+        definite True is worth calling a reorg: asserting one because an RPC
+        failed would invent the very event this file exists to report."""
+        if not (v.funding_block and v.funding_height):
+            return None
+        if tip < v.funding_height:
+            return True                 # the chain is shorter than the funding
+        got = self._hash_at(v.funding_height)
+        if got is None:
+            return None
+        return got != v.funding_block
+
     def _refresh(self, v, tip):
         """Update one vault's confirmations, and catch a funding that has been
-        reorged away. Returns True if the state changed.
+        reorged away -- or a close that has. Returns True if the state changed.
 
         Reads liveness from `gettxout`, not `getrawtransaction`: a node without
         `-txindex` cannot look up a mined transaction by id once it leaves the
@@ -329,48 +701,279 @@ class VaultWatcher:
         and how deep" without an index, which is exactly the question.
         """
         before = (v.state, v.confirmations)
-        if v.state in CLOSED and v.state is not State.GHOST:
+        if self._final(v, tip):
             return False
 
-        out = None
-        try:
-            out = self.node.gettxout(v.txid, v.vout, True)   # include mempool
-        except RpcFailure:
-            out = None
+        out, answered = self._txout(v.txid, v.vout)
+        if not answered:
+            return False                # ask again rather than guess
 
         if out is not None:
             v.confirmations = int(out.get("confirmations", 0) or 0)
-            if v.state is State.GHOST and v.confirmations >= 0:
+            v.last_seen_height = tip
+            v.scanned_back_to = 0
+            self._record_funding(v, tip)
+            if v.state is State.GHOST:
                 v.note = "funding reappeared after a reorg"
+            elif v.state in CLOSED:
+                # The coin is back: whatever we recorded as closing this loan
+                # did not, or did not stay closed.
+                v.note = ("the closing transaction was dropped or reorged out; "
+                          "the vault is unspent again")
+                v.spent_by, v.spent_height = "", 0
             v.state = (State.LIVE if v.confirmations >= self.min_depth
                        else State.UNCONFIRMED)
             return before != (v.state, v.confirmations)
 
+        if v.state is State.GHOST:
+            # A ghost is an output the node does not know at all. There is no
+            # spender to find, and looking for one is what let a handful of
+            # ghosts pin this watcher to its RPC: the only transition open to a
+            # ghost is the funding coming back, which is the gettxout above.
+            return False
+
+        if v.state in CLOSED:
+            # A close that is not buried yet. Its spender is known, so nothing
+            # needs walking for; the one thing that can change is a replacement
+            # taking a different exit, which the mempool shows and a block
+            # settles.
+            hit = self._mempool_spender(v.txid, v.vout)
+            if hit is not None and hit[0]["txid"] != v.spent_by:
+                tx, k, _h = hit
+                v.spent_by, v.spent_height = tx["txid"], 0
+                v.state = self._name_exit(
+                    v, tx["vin"][k].get("txinwitness") or [])
+            return before != (v.state, v.confirmations)
+
         # The output is not there: spent by an exit, or its funding was undone.
-        # A spend in a block we walked forward over is already CLOSED above;
+        # A spend in a block we walked forward over is already closed above;
         # this catches one that happened before we started watching, or in the
-        # mempool, via a bounded search.
-        found = self._find_spender(v.txid, v.vout, tip)
+        # mempool, via a bounded search. A vault this watcher itself saw
+        # unburied needs no such search: nothing that was never in a block can
+        # have been spent in one, so the mempool is the whole of the question.
+        unburied = bool(v.last_seen_height) and v.confirmations < self.min_depth
+        found = (self._mempool_spender(v.txid, v.vout) if unburied
+                 else self._spender(v, tip))
         if found is not None:
             tx, k, h = found
             v.spent_by, v.spent_height = tx["txid"], h
             v.state = self._name_exit(v, tx["vin"][k].get("txinwitness") or [])
             return before != (v.state, v.confirmations)
 
-        # No output and no spender. If the funding had never buried, this is the
-        # reorg the chain's first principle warns about: a funding a lender may
-        # have seen, undone by a Bitcoin-driven reorg. If it HAD buried, it was
-        # spent by an exit we simply cannot name without an index.
-        if before[0] in (State.UNCONFIRMED, State.GHOST):
+        # No output and no spender. The funding block settles which of two very
+        # different things this is, and calling either one the other is a lie:
+        # a funding undone by a Bitcoin-driven reorg (GHOST, and it may come
+        # back), or an exit spent out of the walk's reach (SPENT_UNKNOWN).
+        reorged = self._funding_reorged(v, tip)
+        never_buried = reorged is None and v.confirmations < self.min_depth
+        decided = reorged is True or (never_buried and v.last_seen_height)
+        if not decided and not self._search_exhausted(v, tip):
+            return before != (v.state, v.confirmations)     # still looking
+        if reorged is True:
             v.state = State.GHOST
             v.confirmations = 0
-            v.note = ("funding is no longer known to the node and never buried; "
-                      "a Bitcoin-driven reorg undid it")
+            v.note = ("the block that funded this vault is no longer in the "
+                      "chain: a Bitcoin-driven reorg undid the funding")
+        elif never_buried:
+            v.state = State.GHOST
+            v.confirmations = 0
+            v.note = ("funding is no longer known to the node and never "
+                      "buried; a Bitcoin-driven reorg undid it")
         else:
             v.state = State.SPENT_UNKNOWN
-            v.note = ("spent by a transaction this watcher could not find; "
-                      "re-scan from the funding height to name the exit")
+            v.note = ("spent by a transaction outside the last "
+                      f"{self.rescan_depth} blocks this watcher walked; only a "
+                      "rescan of the blocks since the funding can name the exit")
         return before != (v.state, v.confirmations)
+
+    # ------------------------------------------------------ explaining a close
+
+    def explain_exit(self, vault, tx, input_index):
+        """Read a closing transaction back: which exit was taken, on what
+        attested price, and whether the outputs are the ones that price buys.
+
+        A liquidated borrower is owed the evidence, not a state tag. All of it is
+        in the transaction: the leaf the spender had to reveal names the exit,
+        and a seizure's witness carries the oracle's own price, timestamp and
+        signature. So the account can be rebuilt with nothing privileged and
+        nothing taken on trust -- the signature is checked against the key baked
+        into the vault address itself, and the amounts against what the terms
+        say that price buys.
+
+        `tx` is the verbose spending transaction and `input_index` the input
+        that spends the vault. Returns a plain dict; `problems` is empty when
+        everything the covenant enforces is visible and agrees.
+        """
+        t = vault.terms
+        vins = tx.get("vin", [])
+        witness = (vins[input_index].get("txinwitness") or []
+                   if 0 <= input_index < len(vins) else [])
+        state = self._name_exit(vault, witness)
+        out = {
+            "loan_id": vault.loan_id,
+            "exit": state.value,
+            "spent_by": tx.get("txid", ""),
+            "input_index": int(input_index),
+            "height": int(vault.spent_height or 0),
+            "market": t.market,
+            "strike": t.strike,
+            "price_scale": t.price_scale,
+            "not_before": t.not_before,
+            "maturity": t.maturity,
+            "debt": t.debt,
+            "collateral": t.collateral_amount,
+            "attestations": [],
+            "price_used": None,
+            "seize_expected": None, "seize_paid": None,
+            "surplus_expected": None, "surplus_paid": None,
+            "lender_paid": None,
+            "problems": [],
+        }
+        if state in (State.LIQUIDATED, State.DEFAULTED):
+            data = witness[:-3] if vault.single_leaf else witness[:-2]
+            out["attestations"] = self._read_attestations(t, data)
+            prices = [a["price"] for a in out["attestations"]
+                      if a["verified"] and a["price"] is not None]
+            if prices:
+                # The covenant carries the MAXIMUM of the accepted prices into
+                # the seizure, which is the borrower-favourable choice; anything
+                # else here would report a seizure the script never allowed.
+                out["price_used"] = max(prices)
+            for a in out["attestations"]:
+                if a["present"] and not a["verified"]:
+                    out["problems"].append(
+                        f"the attestation for oracle {a['oracle_x'][:8]} does "
+                        "not verify against the key this vault was built with")
+                elif a["verified"] and a["timestamp"] < t.not_before:
+                    out["problems"].append(
+                        f"the attestation for oracle {a['oracle_x'][:8]} is "
+                        f"timestamped {a['timestamp']}, before this loan's "
+                        f"not_before of {t.not_before}")
+            n_ok = sum(1 for a in out["attestations"] if a["verified"])
+            if n_ok < t.threshold:
+                out["problems"].append(
+                    f"{n_ok} of the {t.threshold} attestations this vault "
+                    "requires verify")
+            if out["price_used"] is None:
+                out["problems"].append(
+                    "no verified price: the exit cannot be checked")
+            elif state is State.LIQUIDATED and out["price_used"] >= t.strike:
+                out["problems"].append(
+                    f"the price used, {out['price_used']}, is not under the "
+                    f"strike of {t.strike}")
+        self._read_payouts(out, t, tx, input_index, state)
+        return out
+
+    @staticmethod
+    def _read_attestations(terms, data):
+        """The oracle evidence out of a seizure's witness.
+
+        A single-key vault takes the flat `[sig, price, ts]`; a threshold vault
+        takes one `(price, ts, sig)` slot per key, pushed in reverse because the
+        leaf reads slot 0 first. An absent signature is an abstention, which the
+        covenant allows and this reports rather than treats as a failure.
+        """
+        from .oracle import Attestation, verify as verify_att
+        from .terms import feed_id
+        keys = [str(k) for k in terms.oracle_keys]
+        rows = []
+
+        def row(key, price, ts, sig):
+            verified = False
+            if sig and price is not None and ts is not None:
+                att = Attestation(market=terms.market,
+                                  feed_id=feed_id(terms.market).hex(),
+                                  timestamp=ts, price=price,
+                                  price_scale=terms.price_scale, signature=sig)
+                try:
+                    verified = bool(verify_att(key, att))
+                except Exception:       # noqa: BLE001
+                    # A key or signature that is not even the right shape is an
+                    # unverified attestation, which is the answer being asked
+                    # for; it is not a reason to fail the whole explanation.
+                    verified = False
+            return {"oracle_x": key, "price": price, "timestamp": ts,
+                    "signature": sig, "present": bool(sig), "verified": verified}
+
+        if len(keys) == 1 and terms.threshold == 1:
+            if len(data) >= 3:
+                rows.append(row(keys[0], _le8(data[1]), _le8(data[2]), data[0]))
+            return rows
+        n = len(keys)
+        if len(data) < 3 * n:
+            return rows
+        for i, k in enumerate(keys):
+            base = (n - 1 - i) * 3
+            rows.append(row(k, _le8(data[base]), _le8(data[base + 1]),
+                            data[base + 2]))
+        return rows
+
+    @staticmethod
+    def _read_payouts(out, terms, tx, k, state):
+        """What the closing transaction actually paid, against what the terms
+        say it had to. Output 2k credits the lender and 2k+1 returns collateral
+        to the borrower; under water there is no 2k+1, so a missing one is a
+        possible answer rather than a missing field."""
+        from .vault import payout_spk
+        outs = tx.get("vout", [])
+
+        def paid(index, spk, asset):
+            if index >= len(outs):
+                return 0
+            o = outs[index]
+            if o.get("scriptPubKey", {}).get("hex") != spk.hex():
+                return None
+            if o.get("asset") != asset:
+                return None
+            value = o.get("value")
+            if value is None:           # blinded: nothing to read
+                return None
+            return int(round(float(value) * 100_000_000))
+
+        lender = payout_spk(terms.lender_ver, terms.payout_programs[0])
+        borrower = payout_spk(terms.borrower_ver, terms.payout_programs[1])
+        if state is State.RECOVERED:
+            # RECOVER is a sweep: the whole collateral to the lender at 2k, and
+            # no return to the borrower at all, so it is credited in the
+            # COLLATERAL asset rather than the debt one.
+            swept = paid(2 * k, lender, terms.collateral_asset)
+            out["lender_paid"] = swept
+            out["seize_paid"] = swept
+            out["seize_expected"] = terms.collateral_amount
+            out["surplus_paid"] = 0
+            out["surplus_expected"] = 0
+            if swept is None or swept < terms.collateral_amount:
+                out["problems"].append(
+                    "the sweep does not pay the whole collateral to the "
+                    "lender's pinned payout")
+            return
+        if state not in (State.REPAID, State.LIQUIDATED, State.DEFAULTED):
+            return              # an exit we cannot name pins no expectations
+        out["lender_paid"] = paid(2 * k, lender, terms.debt_asset)
+        surplus = paid(2 * k + 1, borrower, terms.collateral_asset)
+        out["surplus_paid"] = surplus if surplus is not None else 0
+        if surplus is not None:
+            out["seize_paid"] = terms.collateral_amount - surplus
+        if state is State.REPAID:
+            out["surplus_expected"] = terms.collateral_amount
+            out["seize_expected"] = 0
+        elif out.get("price_used") is not None:
+            price = out["price_used"]
+            out["seize_expected"] = terms.seizure_at(price)
+            out["surplus_expected"] = terms.surplus_at(price)
+        if out["lender_paid"] is None:
+            out["problems"].append(
+                "the output that credits the lender is not where the covenant "
+                "puts it, or is not readable")
+        elif out["lender_paid"] < terms.debt:
+            out["problems"].append(
+                f"the lender was paid {out['lender_paid']}, less than the debt "
+                f"of {terms.debt}")
+        if out["surplus_expected"] is not None \
+                and out["surplus_paid"] < out["surplus_expected"]:
+            out["problems"].append(
+                f"the borrower was returned {out['surplus_paid']}, less than "
+                f"the {out['surplus_expected']} this price leaves them")
 
     # -------------------------------------------------------------- reporting
 

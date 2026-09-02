@@ -1,0 +1,25 @@
+{
+  "_comment": "The lender's side of a Bitcoin-collateral loan. This file holds credentials: keep it 0600, and never in a repository.",
+  "lender_key": "/root/sequentia/pignus-btc-keys/lender.key",
+  "state": "/root/sequentia/pignus-btc-keys/responder-state.json",
+  "book": "http://127.0.0.1:8741",
+  "interval": 5,
+  "disburse_conf": 1,
+  "claim_depth": 6,
+  "fee_asset": "",
+  "_fee_asset_note": "Empty means the debt asset, which is what the lender is already moving. Any asset the node publishes a rate for is allowed; there is no privileged fee coin.",
+  "rpc": {
+    "url": "http://127.0.0.1:18200",
+    "user": "",
+    "password": "",
+    "cookie": "",
+    "wallet": ""
+  },
+  "btc_rpc": {
+    "url": "http://127.0.0.1:48332",
+    "user": "",
+    "password": "",
+    "cookie": "",
+    "wallet": ""
+  }
+}

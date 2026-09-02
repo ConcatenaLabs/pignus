@@ -1,0 +1,30 @@
+[Unit]
+Description=Pignus cross-chain lender responder (Sequentia testnet)
+Documentation=https://github.com/ConcatenaLabs/pignus
+After=network-online.target pignusd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/sequentia/pignus
+Environment=SEQUENTIA_SRC=/root/sequentia/Sequentia
+Environment=PYTHONUNBUFFERED=1
+# The configuration file carries the node credentials and the path to the
+# lender's key, so nothing secret appears on the command line -- a command line
+# is readable by every user on the box, and `ps` is not a place for a wallet
+# password.
+ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignus-cli btc-respond \
+    --config /root/sequentia/pignus-responder.json --watch
+Restart=always
+RestartSec=10
+# The lender's adaptor key IS the lender's side of every open loan: keep what
+# this service writes unreadable to anyone else, and keep the process away from
+# what it does not need.
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -95,10 +95,17 @@ def describe(pledge: dict) -> str:
 
 
 class PledgeError(RuntimeError):
-    """The issuer's server refused. Carries its own words, which are the useful part."""
+    """The issuer's server refused, or could not be asked at all.
+
+    A refusal carries the issuer's own words, which are the useful part. Status
+    0 means the request never reached an issuer, and that must not read as a
+    refusal: "the server is not there" and "the issuer said no" call for
+    entirely different next steps from whoever is holding the terminal.
+    """
 
     def __init__(self, status, message):
-        super().__init__(f"issuer refused ({status}): {message}")
+        super().__init__(f"issuer refused ({status}): {message}" if status
+                         else message)
         self.status = status
         self.message = message
 
@@ -126,7 +133,7 @@ class PledgeClient:
             req.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read().decode() or "{}")
+                status, raw = r.status, r.read().decode() or "{}"
         except urllib.error.HTTPError as e:
             raw = e.read().decode() or "{}"
             try:
@@ -134,6 +141,24 @@ class PledgeClient:
             except ValueError:
                 msg = raw
             raise PledgeError(e.code, msg) from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            # A refused connection, a name that does not resolve and a read that
+            # times out are all "there is nobody there", and none of them is the
+            # issuer's decision. Raised as a PledgeError so one caller-side
+            # handler covers every way this call can fail.
+            raise PledgeError(0, f"cannot reach the issuer at {self.base}: "
+                                 f"{getattr(e, 'reason', e)}") from None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            # A reverse proxy answering with an HTML page is the common case,
+            # and "Expecting value: line 1 column 1" tells the operator nothing
+            # about which of their two servers is wrong. Status 0 because no
+            # issuer decision reached us, whatever the HTTP code said.
+            raise PledgeError(
+                0, f"the issuer at {self.base} answered {status} with something "
+                   f"that is not JSON, so it is not openampd: "
+                   f"{raw[:120]!r}") from None
 
     # --- reads ---------------------------------------------------------------
 

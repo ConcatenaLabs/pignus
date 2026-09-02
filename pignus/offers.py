@@ -13,10 +13,14 @@ the same golden vectors. Here it is the loan book's job, so a fabricated offer
 never reaches a borrower's screen at all.
 """
 
+from . import atoms
 from .compat import load_covenant
 
 
 def _offer_module():
+    # load_covenant() arms the golden-vector tripwire on its first call, and
+    # that rebuilds the offer cases as well as the vault ones -- so an offer
+    # address is never derived from a builder that has drifted.
     load_covenant()
     import pignus_offer
     return pignus_offer
@@ -34,18 +38,28 @@ def _vault_kwargs(terms):
     # different offer address from the browser for every v0 lender, and refuse
     # every real offer as "does not hold".
     # `max_price` is passed as None when unset, which the builders accept
-    return {k: v for k, v in kw.items() if k != "recover_after"} | {
-        "recover_after": terms.recover_after}
+    return kw
+
+
+def offer_tree(terms, principal, collateral, expiry_locktime):
+    """(module, taproot, leaves) for the offer these terms rest at.
+
+    One place builds it, so the address the book checks, the address the CLI
+    funds and the tree a take is composed against cannot drift apart.
+    """
+    off = _offer_module()
+    kw = _vault_kwargs(terms)
+    tap, leaves = off.offer_taptree(
+        asset_c=kw["asset_c"], asset_d=kw["asset_d"],
+        principal=int(principal), collateral=int(collateral),
+        vault_kwargs=kw, expiry_locktime=int(expiry_locktime))
+    return off, tap, leaves
 
 
 def offer_address(terms, principal, collateral, expiry_locktime) -> bytes:
     """The scriptPubKey a funded offer on these terms must sit at."""
-    off = _offer_module()
-    kw = _vault_kwargs(terms)
-    tap, _leaves = off.offer_taptree(
-        asset_c=kw["asset_c"], asset_d=kw["asset_d"],
-        principal=int(principal), collateral=int(collateral),
-        vault_kwargs=kw, expiry_locktime=int(expiry_locktime))
+    _off, tap, _leaves = offer_tree(terms, principal, collateral,
+                                    expiry_locktime)
     return bytes(tap.scriptPubKey)
 
 
@@ -66,12 +80,8 @@ def offer_vault_address(terms) -> bytes:
 
 def offer_leaves(terms, principal, collateral, expiry_locktime):
     """The offer's {take, refund} leaves as hex, for naming a spend."""
-    off = _offer_module()
-    kw = _vault_kwargs(terms)
-    _tap, leaves = off.offer_taptree(
-        asset_c=kw["asset_c"], asset_d=kw["asset_d"],
-        principal=int(principal), collateral=int(collateral),
-        vault_kwargs=kw, expiry_locktime=int(expiry_locktime))
+    _off, _tap, leaves = offer_tree(terms, principal, collateral,
+                                    expiry_locktime)
     return {name: bytes(script).hex() for name, script in leaves.items()}
 
 
@@ -103,6 +113,14 @@ def check_outpoint(node, txid, vout, expected_spk, what="offer"):
             f"that outpoint does not hold this {what}.\n"
             f"  these terms compile to: {expected_spk.hex()}\n"
             f"  the outpoint holds:     {spk}")
-    return {"value": int(round(float(got["value"]) * 1e8)),
+    if "value" not in got or ("asset" not in got and "assetcommitment" in got):
+        # Every leaf starts by reading the input's value, so a blinded coin at
+        # the right address can never be spent by TAKE, REFUND or any vault
+        # exit. Publishing it would rest a principal nobody can move.
+        raise NotOnChain(
+            f"the output at {txid}:{vout} is confidential (blinded); the "
+            f"covenant reads explicit amounts only, so no leaf can ever spend "
+            f"it -- fund a {what} from an unblinded address")
+    return {"value": atoms(got["value"]),
             "asset": got.get("asset"),
             "confirmations": got.get("confirmations", 0)}

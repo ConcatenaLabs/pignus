@@ -19,8 +19,9 @@
 // but building it right means it never gets that far.
 
 import {
-  vaultScriptPubKey, vaultLeaves, seizureAt, surplusAt, isLiquidatable,
-  feedId, verifySchnorr, attestationMessage, _internals as P,
+  vaultScriptPubKey, vaultLeaves, controlBlock, seizureAt, surplusAt,
+  isLiquidatable, feedId, verifySchnorr, verifyAttestation, attestationMessage,
+  _internals as P,
 } from "./pignus.js";
 import * as offer from "./offer.js";
 import { buildPset } from "./pset.js";
@@ -28,31 +29,60 @@ import { select, scriptPubKeyFor, WalletError } from "./wallet.js";
 
 const b = (x) => (typeof x === "bigint" ? x : BigInt(x));
 
+// What the Python composer folds rather than pay out (pignus/vault.py
+// DUST_FOLD). A caller that knows the fee asset's exchange rate passes the
+// real threshold instead; this is the floor both sides agree on when it does
+// not.
+export const DUST_FOLD = 200n;
+
 // ---------------------------------------------------------------- helpers
 
 function feeOutput(feeAsset, feeAmount) {
   return { asset: feeAsset, value: b(feeAmount), script: "" };
 }
 
-function changeOutputs(spend, changeSpk) {
+/**
+ * Change, with fee-asset dust folded into the fee.
+ *
+ * The node rejects an explicit output in the transaction's fee asset below the
+ * dust threshold, so a selection that leaves a few atoms of fee-asset change
+ * would produce a transaction the wallet signs and the network refuses. Those
+ * atoms go to the fee instead, which is what the Python composer does.
+ * Returns `{outs, folded}`; every caller must add `folded` to the fee it emits.
+ */
+function changeOutputs(spend, changeSpk, feeAsset, dustAtoms = DUST_FOLD) {
   // spend: Map asset -> {supplied, used}
   const outs = [];
+  let folded = 0n;
   for (const [asset, { supplied, used }] of spend) {
     const rest = supplied - used;
-    if (rest > 0n) outs.push({ asset, value: rest, script: changeSpk });
-    if (rest < 0n)
-      throw new WalletError(
+    if (rest < 0n) {
+      const err = new WalletError(
         `composition is short ${-rest} atoms of ${asset.slice(0, 12)}…`);
+      err.asset = asset;
+      err.short = -rest;
+      throw err;
+    }
+    if (rest === 0n) continue;
+    if (asset === feeAsset && rest < b(dustAtoms)) { folded += rest; continue; }
+    outs.push({ asset, value: rest, script: changeSpk });
   }
-  return outs;
+  return { outs, folded };
 }
 
 function gather(utxos, wants) {
   // wants: [[asset, atoms], ...] -> {inputs, spend}
+  //
+  // Two wants in the SAME asset are one want of their sum. Selecting for each
+  // separately from the same pool and then deduping the coins covers the
+  // larger of the two and not both -- which is the ordinary case here, because
+  // the fee is preferably paid in the asset the flow is already spending.
+  const need = new Map();
+  for (const [asset, amount] of wants)
+    need.set(asset, (need.get(asset) || 0n) + b(amount));
   const inputs = [];
-  const spend = new Map();
   const seen = new Set();
-  for (const [asset, amount] of wants) {
+  for (const [asset, amount] of need) {
     const { chosen } = select(utxos, asset, amount);
     for (const u of chosen) {
       const k = `${u.txid}:${u.vout}`;
@@ -61,14 +91,15 @@ function gather(utxos, wants) {
       inputs.push(u);
     }
   }
+  const spend = new Map();
   for (const u of inputs) {
     const cur = spend.get(u.asset) || { supplied: 0n, used: 0n };
     cur.supplied += b(u.value);
     spend.set(u.asset, cur);
   }
-  for (const [asset, amount] of wants) {
+  for (const [asset, amount] of need) {
     const cur = spend.get(asset) || { supplied: 0n, used: 0n };
-    cur.used += b(amount);
+    cur.used += amount;
     spend.set(asset, cur);
   }
   return { inputs, spend };
@@ -78,6 +109,110 @@ function psetInput(u) {
   return {
     txid: u.txid, vout: u.vout,
     witnessUtxo: { asset: u.asset, value: b(u.value), script: u.scriptPubkey },
+  };
+}
+
+/**
+ * The fee a composition will pay: which asset, how many atoms, and below what
+ * a change output in it would be dust.
+ *
+ * Sequentia has no privileged fee coin, so there is nothing to fall back to:
+ * a caller that names no fee asset is refused rather than quietly paying in
+ * whatever the policy asset happens to be. `feeRates` is the same thing under
+ * the name the cross-chain flows pass it as: `{asset, atoms, dust}`.
+ */
+function feeFrom({ feeAsset, feeAmount, feeRates, dustAtoms }) {
+  const r = feeRates || {};
+  const asset = feeAsset ?? r.asset;
+  const atoms = feeAmount ?? r.atoms;
+  if (!asset || atoms == null)
+    throw new WalletError(
+      "this composition was given no network fee to pay. Name the asset and " +
+      "the amount: on Sequentia any accepted asset will do, and none is " +
+      "chosen for you.");
+  return { asset, atoms: b(atoms), dust: dustAtoms ?? r.dust ?? DUST_FOLD };
+}
+
+// ---------------------------------------------------------------- payment
+
+/**
+ * A plain explicit payment: one output to `toSpk`, then change, then the fee.
+ *
+ * Nothing covenant-shaped happens here, which is the point: a BTC-collateral
+ * repayment pays an ordinary hashlock address, and only the lender's preimage
+ * takes it out again -- the same preimage that hands the borrower's Bitcoin
+ * back.
+ */
+export function buildPayment({ asset, amount, toSpk, utxos, changeSpk,
+                               feeAsset, feeAmount, feeRates, dustAtoms,
+                               summary = [] }) {
+  const f = feeFrom({ feeAsset, feeAmount, feeRates, dustAtoms });
+  const wants = [[asset, b(amount)], [f.asset, f.atoms]];
+  const { inputs, spend } = gather(utxos, wants);
+  const outs = [{ asset, value: b(amount), script: toSpk }];
+  const { outs: change, folded } = changeOutputs(spend, changeSpk, f.asset, f.dust);
+  const fee = f.atoms + folded;
+  outs.push(...change);
+  outs.push(feeOutput(f.asset, fee));
+  return {
+    pset: buildPset({ inputs: inputs.map(psetInput), outputs: outs }),
+    fee, folded, feeAsset: f.asset,
+    summary: summary.length ? summary
+      : [`Pay ${fmt(amount)} of ${short(asset)}`],
+  };
+}
+
+/**
+ * Take a hashlocked output: the CLAIM leaf by publishing its preimage, or the
+ * REFUND leaf after its deadline, which needs no preimage and no signature.
+ *
+ * Either leaf pays one pinned program the whole input value, so output 0
+ * carries every atom of it and the network fee comes from the spender's own
+ * coins -- the same shape as the vault's signature-free exits, and for the same
+ * reason: anyone may build this, and it can only ever pay the party it was
+ * always going to pay.
+ */
+export function buildHashlockClaim({ tree, leaf = "claim", preimage, outpoint,
+                                     value, asset, payeeSpk, utxos, changeSpk,
+                                     feeAsset, feeAmount, feeRates, dustAtoms,
+                                     locktime = 0, summary = [] }) {
+  const script = tree?.leaves?.[leaf];
+  const control = tree?.controlBlocks?.[leaf];
+  if (!script || !control)
+    throw new WalletError(`that hashlocked output has no leaf called '${leaf}'`);
+  const spk = P.bytesToHex(tree.scriptPubKey());
+  if (outpoint.scriptPubkey && outpoint.scriptPubkey !== spk)
+    throw new WalletError(
+      "the coin at that outpoint is not what these terms compile to -- " +
+      "refusing to build a spend for it");
+  const f = feeFrom({ feeAsset, feeAmount, feeRates, dustAtoms });
+  const { inputs, spend } = gather(utxos, [[f.asset, f.atoms]]);
+  const outs = [{ asset, value: b(value), script: payeeSpk }];
+  const { outs: change, folded } = changeOutputs(spend, changeSpk, f.asset, f.dust);
+  const fee = f.atoms + folded;
+  outs.push(...change);
+  outs.push(feeOutput(f.asset, fee));
+  if (preimage == null && leaf !== "refund")
+    throw new WalletError("taking a hashlocked output by its claim leaf needs " +
+                          "the preimage");
+  const witness = [
+    ...(preimage == null
+      ? []
+      : [typeof preimage === "string" ? preimage : P.bytesToHex(preimage)]),
+    P.bytesToHex(script), P.bytesToHex(control)];
+  return {
+    pset: buildPset({
+      inputs: [{
+        txid: outpoint.txid, vout: outpoint.vout,
+        witnessUtxo: { asset, value: b(value), script: spk },
+        finalWitness: witness,
+      }, ...inputs.map(psetInput)],
+      outputs: outs,
+      locktime,
+    }),
+    fee, folded, feeAsset: f.asset,
+    summary: summary.length ? summary
+      : [`Take ${fmt(value)} of ${short(asset)} by publishing the secret`],
   };
 }
 
@@ -92,7 +227,7 @@ function psetInput(u) {
  */
 export function buildFundOffer({ terms, principal, collateral, expiryLocktime,
                                  lots = 1, utxos, changeSpk, feeAsset,
-                                 feeAmount }) {
+                                 feeAmount, dustAtoms }) {
   const tree = offer.offerTree({ terms, principal, collateral, expiryLocktime });
   const spk = P.bytesToHex(tree.scriptPubKey);
   const total = b(principal) * b(lots);
@@ -100,12 +235,16 @@ export function buildFundOffer({ terms, principal, collateral, expiryLocktime,
   const { inputs, spend } = gather(utxos, wants);
 
   const outs = [{ asset: terms.debt_asset, value: total, script: spk }];
-  outs.push(...changeOutputs(spend, changeSpk));
-  outs.push(feeOutput(feeAsset, feeAmount));
+  const { outs: change, folded } = changeOutputs(spend, changeSpk, feeAsset,
+                                                 dustAtoms);
+  const fee = b(feeAmount) + folded;
+  outs.push(...change);
+  outs.push(feeOutput(feeAsset, fee));
 
   return {
     pset: buildPset({ inputs: inputs.map(psetInput), outputs: outs }),
     offerScriptPubKey: spk,
+    fee, folded,
     summary: [
       `Lock ${fmt(total)} of ${short(terms.debt_asset)} in an offer covenant`,
       `Takeable ${lots} time(s) at ${fmt(principal)} each`,
@@ -128,7 +267,7 @@ export function buildFundOffer({ terms, principal, collateral, expiryLocktime,
 export function buildTakeOffer({ terms, offerOutpoint, offerValue, principal,
                                  collateral, expiryLocktime, borrowerProg,
                                  borrowerVer, utxos, changeSpk, feeAsset,
-                                 feeAmount }) {
+                                 feeAmount, dustAtoms }) {
   // Set ONE field for the borrower's payout program. Setting both
   // `borrower_prog` and the `_borrower_prog` override leaves two values that
   // can disagree, and they did: the vault ADDRESS came from the override while
@@ -160,21 +299,27 @@ export function buildTakeOffer({ terms, offerOutpoint, offerValue, principal,
   // covenant reads asset D there as a remainder claim.
   const outs = [{ asset: terms.collateral_asset, value: b(collateral),
                   script: vaultSpk }];
-  const change = changeOutputs(spend, changeSpk);
+  const { outs: change, folded } = changeOutputs(spend, changeSpk, feeAsset,
+                                                 dustAtoms);
+  const fee = b(feeAmount) + folded;
   if (remainder > 0n) {
     outs.push({ asset: terms.debt_asset, value: remainder, script: offerSpk });
   } else {
     const filler = change.find(o => o.asset !== terms.debt_asset);
     if (!filler)
       throw new WalletError(
-        "taking the whole offer needs an output at index 1 that is not the " +
-        "debt asset; add a little collateral or fee change to make one");
+        "This draws the last lot of the offer, so the transaction needs a " +
+        "change output in some asset other than the debt asset, and this " +
+        "composition has none. Use a collateral coin larger than the " +
+        "collateral amount, or pay the network fee from a coin larger than " +
+        "the fee in an asset other than the debt asset, so there is change " +
+        "to place.");
     outs.push(filler);
     change.splice(change.indexOf(filler), 1);
   }
   outs.push({ asset: terms.debt_asset, value: b(principal), script: changeSpk });
   outs.push(...change);
-  outs.push(feeOutput(feeAsset, feeAmount));
+  outs.push(feeOutput(feeAsset, fee));
 
   const covenantInput = {
     txid: offerOutpoint.txid, vout: offerOutpoint.vout,
@@ -188,6 +333,7 @@ export function buildTakeOffer({ terms, offerOutpoint, offerValue, principal,
                       outputs: outs }),
     vaultScriptPubKey: vaultSpk,
     terms: full,
+    fee, folded,
     summary: [
       `Borrow ${fmt(principal)} of ${short(terms.debt_asset)}`,
       `Lock ${fmt(collateral)} of ${short(terms.collateral_asset)} as collateral`,
@@ -207,7 +353,8 @@ export function buildTakeOffer({ terms, offerOutpoint, offerValue, principal,
  * borrower better off because both destinations are pinned in the address.
  */
 export function buildRepay({ terms, vaultOutpoint, collateralAmount, singleLeaf,
-                             utxos, changeSpk, feeAsset, feeAmount }) {
+                             utxos, changeSpk, feeAsset, feeAmount,
+                             dustAtoms }) {
   const lenderSpk = scriptPubKeyFor(terms.lender_ver ?? 1,
                                     terms.lender_prog ?? terms.lender_x);
   const borrowerSpk = scriptPubKeyFor(terms.borrower_ver ?? 1,
@@ -228,8 +375,11 @@ export function buildRepay({ terms, vaultOutpoint, collateralAmount, singleLeaf,
     { asset: terms.collateral_asset, value: b(collateralAmount),
       script: borrowerSpk },
   ];
-  outs.push(...changeOutputs(spend, changeSpk));
-  outs.push(feeOutput(feeAsset, feeAmount));
+  const { outs: change, folded } = changeOutputs(spend, changeSpk, feeAsset,
+                                                 dustAtoms);
+  const fee = b(feeAmount) + folded;
+  outs.push(...change);
+  outs.push(feeOutput(feeAsset, fee));
 
   const witness = singleLeaf
     ? offer.offerVaultWitness(terms, "repay").map(P.bytesToHex)
@@ -245,6 +395,7 @@ export function buildRepay({ terms, vaultOutpoint, collateralAmount, singleLeaf,
       }, ...inputs.map(psetInput)],
       outputs: outs,
     }),
+    fee, folded,
     summary: [
       `Pay ${fmt(terms.debt)} of ${short(terms.debt_asset)} to the lender`,
       `Take back all ${fmt(collateralAmount)} of ${short(terms.collateral_asset)}`,
@@ -307,7 +458,7 @@ export function thresholdEvidence(terms, attestations, { liquidate }) {
 export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
                                  attestation, attestations, singleLeaf,
                                  takerSpk, utxos, changeSpk, feeAsset,
-                                 feeAmount, atMaturity = false }) {
+                                 feeAmount, dustAtoms, atMaturity = false }) {
   const isThreshold = !!(terms.oracles && terms.oracles.length);
   let price, evidenceData;
   if (isThreshold) {
@@ -327,6 +478,14 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
     if (b(attestation.timestamp) < b(terms.not_before))
       throw new WalletError(
         "that attestation predates the loan, so the covenant will refuse it");
+    // The oracle is trusted for a number and never for the transport that
+    // carried it, so the signature is checked against the key THIS LOAN bakes
+    // in before anything is composed -- as the threshold path above does, and
+    // as the Python composer does, rather than paying a broadcast to find out.
+    if (!verifyAttestation(terms, attestation))
+      throw new WalletError(
+        "that attestation does not verify against this loan's oracle key, so " +
+        "the covenant would refuse it -- refusing to build the spend");
   }
 
   const lenderSpk = scriptPubKeyFor(terms.lender_ver ?? 1,
@@ -344,7 +503,9 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
 
   const outs = [{ asset: terms.debt_asset, value: b(terms.debt),
                   script: lenderSpk }];
-  const change = changeOutputs(spend, changeSpk);
+  const { outs: change, folded } = changeOutputs(spend, changeSpk, feeAsset,
+                                                 dustAtoms);
+  const fee = b(feeAmount) + folded;
   let feePlaced = false;
   if (surplus > 0n) {
     outs.push({ asset: terms.collateral_asset, value: surplus,
@@ -358,14 +519,17 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
     // the collateral asset: the fee, or change in another asset when the fee
     // is being paid in the collateral asset itself.
     if (feeAsset !== terms.collateral_asset) {
-      outs.push(feeOutput(feeAsset, feeAmount));
+      outs.push(feeOutput(feeAsset, fee));
       feePlaced = true;
     } else {
       const filler = change.find(o => o.asset !== terms.collateral_asset);
       if (!filler)
         throw new WalletError(
-          "an underwater seizure needs an output at index 1 that is not the " +
-          "collateral asset; pay the fee in another asset, or bring change in one");
+          "This loan is under water, so the transaction needs an output in " +
+          "some asset other than the collateral asset, and this composition " +
+          "has none. Pay the network fee in a different asset than the " +
+          "collateral, or pay it from a collateral coin larger than the fee " +
+          "so there is change in another asset.");
       change.splice(change.indexOf(filler), 1);
       outs.push(filler);
     }
@@ -373,7 +537,7 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
                 script: takerSpk });
   }
   outs.push(...change);
-  if (!feePlaced) outs.push(feeOutput(feeAsset, feeAmount));
+  if (!feePlaced) outs.push(feeOutput(feeAsset, fee));
 
   const exit = atMaturity ? "default" : "liquidate";
   const data = isThreshold ? evidenceData
@@ -394,7 +558,7 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
       outputs: outs,
       locktime: atMaturity ? Number(terms.maturity) : 0,
     }),
-    seize, surplus,
+    seize, surplus, fee, folded,
     summary: [
       `Pay ${fmt(terms.debt)} of ${short(terms.debt_asset)} to the lender`,
       `Keep ${fmt(b(collateralAmount) - surplus)} of ${short(terms.collateral_asset)}`,
@@ -407,28 +571,14 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
 
 // ------------------------------------------------------- four-leaf witness
 
-const NUMS_HEX =
-  "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
-
 function fourLeafWitness(terms, exit, data = []) {
   const leaves = vaultLeaves(terms);
-  const order = ["repay", "liquidate", "default", "recover"];
-  const h = order.map(n => P.leafHash(leaves[n]));
-  const root = P.branchHash(P.branchHash(h[0], h[1]), P.branchHash(h[2], h[3]));
-  const nums = P.hexToBytes(NUMS_HEX);
-  const tweak = P.taggedHash("TapTweak/elements",
-                             Uint8Array.from([...nums, ...root]));
-  const { negated } = P.tweakAddPubkey(nums, tweak);
-  // The tree is ((repay, liquidate), (default, recover)), so a leaf's proof is
-  // its sibling then the other pair's branch -- the same shape the Python
-  // builder produces, and the reason the order array above is not arbitrary.
-  const i = order.indexOf(exit);
-  if (i < 0) throw new WalletError("unknown exit: " + exit);
-  const sibling = h[i ^ 1];
-  const upper = i < 2 ? P.branchHash(h[2], h[3]) : P.branchHash(h[0], h[1]);
-  const control = Uint8Array.from([
-    0xc4 + (negated ? 1 : 0), ...nums, ...sibling, ...upper]);
-  return [...data, P.bytesToHex(leaves[exit]), P.bytesToHex(control)];
+  if (!leaves[exit]) throw new WalletError("unknown exit: " + exit);
+  // The control block comes from pignus.js, beside the tree it proves, so the
+  // branch order and the parity byte have one definition and the golden
+  // vectors pin it.
+  return [...data, P.bytesToHex(leaves[exit]),
+          P.bytesToHex(controlBlock(terms, exit))];
 }
 
 // ------------------------------------------------------------------ format
@@ -451,7 +601,8 @@ export const _flowInternals = { gather, changeOutputs, fourLeafWitness };
  */
 export function buildWithdrawOffer({ terms, offerOutpoint, offerValue,
                                      principal, collateral, expiryLocktime,
-                                     utxos, changeSpk, feeAsset, feeAmount }) {
+                                     utxos, changeSpk, feeAsset, feeAmount,
+                                     dustAtoms }) {
   const tree = offer.offerTree({ terms, principal, collateral, expiryLocktime });
   const offerSpk = P.bytesToHex(tree.scriptPubKey);
   if (offerSpk !== offerOutpoint.scriptPubkey)
@@ -463,8 +614,11 @@ export function buildWithdrawOffer({ terms, offerOutpoint, offerValue,
   const wants = [[feeAsset, b(feeAmount)]];
   const { inputs, spend } = gather(utxos, wants);
   const outs = [{ asset: terms.debt_asset, value: b(offerValue), script: lenderSpk }];
-  outs.push(...changeOutputs(spend, changeSpk));
-  outs.push(feeOutput(feeAsset, feeAmount));
+  const { outs: change, folded } = changeOutputs(spend, changeSpk, feeAsset,
+                                                 dustAtoms);
+  const fee = b(feeAmount) + folded;
+  outs.push(...change);
+  outs.push(feeOutput(feeAsset, fee));
   const witness = [tree.leaves.refund, tree.controlBlocks.refund].map(P.bytesToHex);
   return {
     pset: buildPset({
@@ -477,6 +631,7 @@ export function buildWithdrawOffer({ terms, offerOutpoint, offerValue,
       outputs: outs,
       locktime: Number(expiryLocktime),
     }),
+    fee, folded,
     summary: [
       `Return ${fmt(offerValue)} of ${short(terms.debt_asset)} to the lender's pinned address`,
       `The offer expired at ${expiryLocktime}; nothing else can be done with it`,
@@ -492,7 +647,8 @@ export function buildWithdrawOffer({ terms, offerOutpoint, offerValue,
  * vault whose oracle has vanished is not locked forever.
  */
 export function buildRecover({ terms, vaultOutpoint, collateralAmount, singleLeaf,
-                               utxos, changeSpk, feeAsset, feeAmount }) {
+                               utxos, changeSpk, feeAsset, feeAmount,
+                               dustAtoms }) {
   const lenderSpk = scriptPubKeyFor(terms.lender_ver ?? 1,
                                     terms.lender_prog ?? terms.lender_x);
   const vaultSpk = singleLeaf
@@ -506,8 +662,11 @@ export function buildRecover({ terms, vaultOutpoint, collateralAmount, singleLea
   const { inputs, spend } = gather(utxos, wants);
   const outs = [{ asset: terms.collateral_asset, value: b(collateralAmount),
                   script: lenderSpk }];
-  outs.push(...changeOutputs(spend, changeSpk));
-  outs.push(feeOutput(feeAsset, feeAmount));
+  const { outs: change, folded } = changeOutputs(spend, changeSpk, feeAsset,
+                                                 dustAtoms);
+  const fee = b(feeAmount) + folded;
+  outs.push(...change);
+  outs.push(feeOutput(feeAsset, fee));
   const witness = singleLeaf
     ? offer.offerVaultWitness(terms, "recover").map(P.bytesToHex)
     : fourLeafWitness(terms, "recover");
@@ -522,6 +681,7 @@ export function buildRecover({ terms, vaultOutpoint, collateralAmount, singleLea
       outputs: outs,
       locktime: Number(terms.recover_after),
     }),
+    fee, folded,
     summary: [
       `Sweep all ${fmt(collateralAmount)} of ${short(terms.collateral_asset)} to the lender`,
       `Open since block ${terms.recover_after}: the oracle-liveness backstop`,

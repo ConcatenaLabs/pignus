@@ -271,3 +271,13 @@ def timelocked_single(locktime, key_x):
     """<n> CLTV DROP <K> CHECKSIG."""
     return ser_script([locktime, OP_CHECKLOCKTIMEVERIFY, OP_DROP,
                        key_x, OP_CHECKSIG])
+
+
+def hashlocked_single(h, key_x):
+    """SHA256 <h> EQUALVERIFY <K> CHECKSIG -- a signature AND a preimage.
+
+    The preimage is what carries a fact across the chain boundary: whoever
+    learns it on Sequentia can finish a Bitcoin spend the key holder signed in
+    advance, and nothing else about the two chains has to agree.
+    """
+    return ser_script([OP_SHA256, h, OP_EQUALVERIFY, key_x, OP_CHECKSIG])

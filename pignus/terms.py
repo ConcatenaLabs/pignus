@@ -87,6 +87,35 @@ class LoanTerms:
     borrower_prog: str = ""
 
     def __post_init__(self):
+        # The covenant builder states these as `assert`, which surfaces as an
+        # AssertionError from inside build() -- three frames away from the
+        # caller, uncatchable by anything looking for a ValueError, and gone
+        # entirely under `python -O`. Checked here instead, so a page or a CLI
+        # can say what is wrong with a loan before deriving any address from it.
+        if self.debt < 1:
+            raise ValueError("debt must be at least 1 atom")
+        if not 1 <= self.strike < (1 << 63):
+            raise ValueError(f"strike {self.strike} is outside 1..2^63-1")
+        if self.bonus_den < 1 or self.bonus_num < self.bonus_den:
+            raise ValueError(
+                f"the liquidation bonus {self.bonus_num}/{self.bonus_den} is "
+                "below 1: a seizure could not even cover the debt")
+        if self.price_scale < 1:
+            raise ValueError("price_scale must be at least 1")
+        if self.recover_after <= self.maturity:
+            raise ValueError(
+                f"recover_after {self.recover_after} must sit strictly after "
+                f"maturity {self.maturity}: RECOVER is the backstop for a loan "
+                "the oracle never resolved, not a second way to call it early")
+        # The 64-bit bound the seizure arithmetic works inside. DEFAULT has no
+        # strike to bound the price, so an unset max_price leaves the builder
+        # assuming 2^40; the larger of the two is what has to fit.
+        bound = self.max_price or max(self.strike, 1 << 40)
+        if self.gross * self.price_scale + bound >= (1 << 63):
+            raise ValueError(
+                f"gross {self.gross:,} x price_scale {self.price_scale:,} + "
+                f"{bound:,} exceeds 2^63: lower price_scale, the debt, or "
+                "max_price, or the covenant's seizure arithmetic overflows")
         if self.oracles and self.oracle_x:
             raise ValueError("give oracle_x or oracles, not both: they compile "
                              "to different vaults")
@@ -173,6 +202,10 @@ class LoanTerms:
 
     def seizure_at(self, price: int) -> int:
         """Collateral the covenant will let a liquidator keep at `price`."""
+        if int(price) < 1:
+            raise ValueError("price must be positive: at a price of zero the "
+                             "collateral is worth nothing and the covenant's "
+                             "own division would abort")
         return -(-self.gross * self.price_scale // price)
 
     def surplus_at(self, price: int) -> int:
@@ -206,7 +239,7 @@ class LoanTerms:
 
     # ----------------------------------------------------------- the check
 
-    def verify_funding(self, funding_script_pubkey) -> None:
+    def verify_funding(self, funding_script_pubkey, single_leaf=False) -> bool:
         """The check that makes every non-custodial claim true.
 
         A borrower MUST call this before signing an origination, and a lender
@@ -215,24 +248,41 @@ class LoanTerms:
         funded, so a counterparty or a book that misdescribes a loan is caught
         by arithmetic rather than by trust.
 
-        Also asserts the internal key is NUMS: a vault with any other internal
-        key has a key path, which is a silent way to give someone the ability to
-        take the collateral without satisfying any leaf.
+        A loan lives in one of two vault formats: the four-leaf tree of a
+        directly originated loan, which is what this checks by default, and the
+        single-leaf tree an offer creates, which is where every loan drawn from
+        the book lives. `single_leaf=True` checks that one instead (so does
+        `verify_offer_funding`), and `single_leaf=None` accepts either and
+        returns True when it was the single-leaf one -- worth knowing, because
+        the two are spent with different witnesses.
+
+        Because the taproot output key commits to the internal key, matching the
+        locally built NUMS-keyed tree also proves there is no key path: no
+        second, hidden way to move the collateral without satisfying a leaf.
         """
-        cov = load_covenant()
         if isinstance(funding_script_pubkey, str):
-            funding_script_pubkey = bytes.fromhex(funding_script_pubkey)
-        tap, _ = self.build()
-        if bytes(tap.internal_pubkey) != cov.NUMS:
-            raise ValueError(
-                "vault internal key is not NUMS: this output has a key path and "
-                "the covenant leaves are not the only way to spend it")
-        mine = bytes(tap.scriptPubKey)
-        if mine != funding_script_pubkey:
-            raise ValueError(
-                "vault address does NOT match these terms -- do not sign.\n"
-                f"  terms compile to: {mine.hex()}\n"
-                f"  being funded:     {funding_script_pubkey.hex()}")
+            funding_script_pubkey = bytes.fromhex(funding_script_pubkey.lower())
+        from .offers import offer_vault_taptree
+        both = [("four-leaf vault", False, bytes(self.build()[0].scriptPubKey)),
+                ("offer-born vault", True,
+                 bytes(offer_vault_taptree(self)[0].scriptPubKey))]
+        for _label, is_single, mine in both:
+            if mine == funding_script_pubkey and single_leaf in (None, is_single):
+                return is_single
+        wrong = next((label for label, is_single, mine in both
+                      if mine == funding_script_pubkey), None)
+        raise ValueError(
+            "vault address does NOT match these terms -- do not sign.\n"
+            + "".join(f"  {label + ':':18}{mine.hex()}\n"
+                      for label, _s, mine in both)
+            + f"  being funded:     {funding_script_pubkey.hex()}"
+            + (f"\n  that output is the {wrong} these terms compile to, and "
+               "this check was asked for the other format" if wrong else ""))
+
+    def verify_offer_funding(self, funding_script_pubkey) -> bool:
+        """verify_funding restricted to the single-leaf vault an offer creates,
+        which is the format every loan drawn from the book lives in."""
+        return self.verify_funding(funding_script_pubkey, single_leaf=True)
 
     def sanity_check(self) -> list:
         """Terms that are individually valid but a bad idea. Returns warnings
@@ -242,11 +292,24 @@ class LoanTerms:
         if self.debt < self.principal:
             w.append("debt is less than the principal: this loan pays the "
                      "borrower to take it")
-        if self.recover_after - self.maturity < 4320:
-            w.append(f"RECOVER opens only {self.recover_after - self.maturity} "
-                     "blocks after maturity; a transient oracle outage could "
-                     "reach the lender's blunt sweep. 30 days (43200 blocks at "
-                     "60s) is the suggested gap")
+        # Both locktimes are heights, or both are Unix times; the split is at
+        # 500,000,000, and the gap between them only means anything when they
+        # are the same kind.
+        m_time = self.maturity >= 500_000_000
+        r_time = self.recover_after >= 500_000_000
+        if m_time != r_time:
+            w.append("maturity and recover_after are not the same kind of "
+                     "locktime -- one is a block height, the other a Unix time "
+                     "-- so the gap between them is not a duration")
+        else:
+            gap = self.recover_after - self.maturity
+            # 30 days, in whichever unit this loan counts in (60-second blocks).
+            want, unit = (2_592_000, "seconds") if m_time else (43_200, "blocks")
+            if gap < want:
+                w.append(f"RECOVER opens only {gap:,} {unit} after maturity; a "
+                         "transient oracle outage could reach the lender's "
+                         f"blunt sweep. 30 days ({want:,} {unit}) is the "
+                         "suggested gap")
         if self.strike and self.collateral_amount:
             open_ltv = self.debt / (self.collateral_amount * self.strike / self.price_scale)
             if open_ltv > 1:

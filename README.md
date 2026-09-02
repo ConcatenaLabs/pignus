@@ -127,8 +127,19 @@ liquidator and the browser all assemble the threshold witness.
 
 Borrow a Sequentia asset against real Bitcoin. The collateral sits on Bitcoin,
 the debt on Sequentia, bound by an adaptor signature so repaying and reclaiming
-are one act. A two-party handshake, one command per move, a `ticket` JSON
-passed between the parties (public state only, never a key or `t`):
+are one act.
+
+Origination is atomic, because otherwise it is a gift: the collateral waits in a
+pre-vault the borrower can take back, the principal is paid into an output only
+the borrower can open, and opening it publishes the secret that moves the
+collateral into the vault. Neither side ever holds both, and the only party
+exposed to a loss rather than a delay is a lender who goes offline in the middle
+of it. `pignus-cli btc-check` prints where a loan stands and what each party can
+do next.
+
+A borrower does all of this in the browser at `/lending/`. From the command
+line, it is a two-party handshake, one command per move, with a `ticket` JSON
+passed between the parties (public state only, never a key or a secret):
 
 ```
 pignus-cli btc-keygen --out lender.key            # each party once
@@ -145,8 +156,22 @@ pignus-cli btc-reclaim  loan.json --borrower-key borrower.key --rpc ... --btc-rp
 
 and the other endings: `btc-seize-sighash` / `btc-seize` (lender + oracle),
 `btc-timeout` (lender, after the term), `btc-refund` (borrower, if the lender
-stalls). The trust model and why liquidation needs the oracle to co-sign on the
+stalls), `btc-abort` (borrower, if the principal never came). The trust model,
+the exposure at each step and why liquidation needs the oracle to co-sign on the
 Bitcoin side are in the design doc, section 7.
+
+A lender who wants their offers taken while they sleep runs the responder, which
+signs releases, pays principals, starts loans as borrowers claim them and takes
+back what nobody claimed:
+
+```
+pignus-cli btc-respond --config responder.json --watch
+```
+
+The configuration file carries the node credentials and the path to the lender's
+key, so nothing secret is on the command line, where every user on the machine
+can read it. `deploy/responder.example.json` is the starting point and
+`deploy/pignus-btc-responder.service` runs it.
 
 ## Running it
 

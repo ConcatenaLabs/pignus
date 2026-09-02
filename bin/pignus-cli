@@ -23,8 +23,30 @@ With a node wallet, everything the page does:
     pignus-cli offer-fund --market GOLD/USDX --principal 100 --lots 3 \\
         --interest 3 --open-ltv 50 --liq-ltv 75 --term-days 30 --rpc-wallet me
     pignus-cli offer-take --offer <id> --rpc-wallet me
+    pignus-cli offer-publish --body offer-<txid>.json
+    pignus-cli loan-export --loan <id> --out loan.json
     pignus-cli repay | liquidate | default | recover --loan <id> --rpc-wallet me
+    pignus-cli repay --terms loan.json --txid <vault> --rpc-wallet me
     pignus-cli offer-withdraw --offer <id> --rpc-wallet me
+
+Native BTC collateral (Tier B), a two-party handshake carrying a ticket JSON:
+
+    btc-keygen, btc-propose, btc-prepare, btc-adaptor, btc-originate, btc-repay,
+    btc-claim, btc-reclaim, btc-seize-sighash, btc-seize, btc-timeout,
+    btc-refund; through a relay: btc-offer-publish, btc-respond
+
+Pledged collateral at an OpenAMP issuer (Tier C), where a signature rather than
+a key travels between the parties:
+
+    pledge-sign, pledge-list, pledge-create, pledge-release, pledge-seize
+
+A repurchase against an OpenDAMP asset (Tier D, not a loan):
+
+    repo-propose, repo-show, repo-verify, repo-fund, repo-settle, repo-forfeit
+
+`pignus-cli <command> --help` describes each. Exit status: 0 done, 1 the command
+could not run, 2 REFUSED -- a check failed and nothing was built or broadcast,
+3 the covenant is unavailable.
 """
 
 import argparse
@@ -35,15 +57,67 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
+from pignus import __version__ as PIGNUS_VERSION  # noqa: E402
 from pignus import compat, oracle as O          # noqa: E402
 from pignus.node import Node                    # noqa: E402
 from pignus.terms import LoanTerms, feed_id     # noqa: E402
 from pignus.watcher import VaultWatcher         # noqa: E402
 
 
-def read_terms(path):
+def refuse(message):
+    """A check failed, so nothing was built. Exit status 2, always, so that a
+    script can tell a refusal from a crash."""
+    print(f"REFUSED: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _funding_for(args, node, need, exclude=(), fee_asset=None):
+    """Explicit coins covering `need`, or None when a dry run would have had to
+    move money to get them.
+
+    Preparing explicit coins is itself a broadcast -- a node wallet's change is
+    blinded, and a covenant cannot spend a blinded input -- so `--dry-run` must
+    not reach it. A dry run that pays a preparing fee has moved money.
+
+    `fee_asset` is the asset this command is already paying its fee in, which
+    is the one the preparing sends should use too: the choice a person made on
+    the command line, not a default picked behind them.
+    """
+    from pignus.vault import select_funding
+
+    def said(asset, wants, txids):
+        short = ", ".join(f"{n} of {a[:8]}…" for a, n in wants.items())
+        print(f"  prepared explicit coins ({short}), fee in {asset[:8]}…: "
+              + ", ".join(txids), file=sys.stderr)
+
+    try:
+        return select_funding(node, need, exclude=exclude,
+                              prepare=not args.dry_run,
+                              prep_fee_asset=fee_asset, on_prepare=said)
+    except ValueError as e:
+        if not args.dry_run:
+            raise
+        print(f"dry-run: nothing composed. Preparing explicit coins would have "
+              f"broadcast a payment: {e}", file=sys.stderr)
+        return None
+
+
+def terms_doc(path):
+    """The terms object in a file, and the record around it if there is one.
+
+    `offer-take` prints {"terms": {...}, "txid", "vout", ...}; a plain terms
+    document is the object itself. Accepting both means the output of one
+    command is the input of the next without hand editing.
+    """
     with open(path) as f:
-        return LoanTerms.from_json(f.read())
+        d = json.load(f)
+    if "collateral_asset" not in d and isinstance(d.get("terms"), (dict, str)):
+        return LoanTerms.from_json(d["terms"]), d
+    return LoanTerms.from_json(d), d
+
+
+def read_terms(path):
+    return terms_doc(path)[0]
 
 
 def node_from(args):
@@ -52,11 +126,21 @@ def node_from(args):
 
 
 def add_node_args(p):
-    p.add_argument("--rpc", default="http://127.0.0.1:18443")
-    p.add_argument("--rpc-user")
-    p.add_argument("--rpc-password")
-    p.add_argument("--rpc-wallet")
-    p.add_argument("--rpc-cookie")
+    p.add_argument("--rpc", default=os.environ.get(
+        "PIGNUS_RPC_URL", "http://127.0.0.1:18776"),
+        help="the Sequentia node's JSON-RPC url (18776 on the default chain, "
+             "7040 on elementsregtest), or PIGNUS_RPC_URL")
+    p.add_argument("--rpc-user", default=os.environ.get("PIGNUS_RPC_USER"),
+                   help="RPC user, or PIGNUS_RPC_USER")
+    p.add_argument("--rpc-password", default=os.environ.get("PIGNUS_RPC_PASSWORD"),
+                   help="RPC password, or PIGNUS_RPC_PASSWORD; prefer "
+                        "--rpc-cookie or the environment, because a command "
+                        "line is readable by every process on the machine")
+    p.add_argument("--rpc-wallet", default=os.environ.get("PIGNUS_RPC_WALLET"),
+                   help="the node wallet to spend and sign with")
+    p.add_argument("--rpc-cookie", default=os.environ.get("PIGNUS_RPC_COOKIE"),
+                   help="path to the node's .cookie file, used when --rpc-user "
+                        "is not given; or PIGNUS_RPC_COOKIE")
 
 
 # --------------------------------------------------------------- commands
@@ -72,38 +156,48 @@ def cmd_selftest(args):
     return 0
 
 
+def split_market(market):
+    """(collateral ticker, debt ticker) from a TICKER/TICKER market name."""
+    parts = [p.strip().upper() for p in market.split("/")]
+    if len(parts) != 2 or not all(parts):
+        raise SystemExit(f"--market must be TICKER/TICKER, got {market!r}")
+    return parts[0], parts[1]
+
+
 def cmd_quote(args):
+    c, d = split_market(args.market)
     price = O.quote_price(args.collateral_ref, args.debt_ref,
                           args.collateral_precision, args.debt_precision,
                           args.price_scale)
     back = O.unquote_price(price, args.collateral_precision,
                            args.debt_precision, args.price_scale)
-    c, d = [p.strip().upper() for p in args.market.split("/")]
+    open_ltv = args.open_ltv / 100
+    if not 0 < open_ltv <= 1:
+        raise SystemExit("--open-ltv is a percentage above 0 and at most 100")
     print(json.dumps({
-        "market": args.market.upper(),
+        "market": f"{c}/{d}",
         "feed_id": feed_id(args.market).hex(),
         "price": price,
         "price_scale": args.price_scale,
         "reads_as": f"1 {c} = {back:,.8f} {d}",
-        "strike_at_ltv": {
-            f"{int(ltv*100)}%": round(price * ltv)
-            for ltv in (0.5, 0.6, 0.7, 0.8)},
+        "opened_at_ltv": f"{args.open_ltv:g}%",
+        # The strike a loan opened at --open-ltv implies for each liquidation
+        # ratio: price * open / liq, the same arithmetic offer-fund does.
+        "strike_at_liq_ltv": {
+            f"{liq}%": math.ceil(price * args.open_ltv / liq)
+            for liq in (60, 70, 75, 80)},
     }, indent=2))
     return 0
 
 
 def cmd_propose(args):
-    oracles = tuple(k.strip() for k in args.oracles.split(",") if k.strip())
-    threshold = args.oracle_threshold or (len(oracles) if oracles else 0)
-    if oracles and not (1 <= threshold <= len(oracles)):
-        raise SystemExit(f"--oracle-threshold {threshold} outside 1..{len(oracles)}")
-    if not oracles and not args.oracle_x:
-        raise SystemExit("give --oracle-x or --oracles")
+    oracle_x, oracles, threshold = resolve_oracle_set(
+        args.oracle_x, args.oracles, args.oracle_threshold)
     t = LoanTerms(
         collateral_asset=args.collateral_asset, debt_asset=args.debt_asset,
         collateral_amount=args.collateral_amount, principal=args.principal,
         debt=args.debt, borrower_x=args.borrower_x, lender_x=args.lender_x,
-        market=args.market, oracle_x=args.oracle_x,
+        market=args.market, oracle_x=oracle_x,
         oracles=oracles, oracle_threshold=threshold, strike=args.strike,
         not_before=args.not_before, maturity=args.maturity,
         recover_after=args.recover_after, bonus_num=args.bonus_num,
@@ -116,10 +210,26 @@ def cmd_propose(args):
     return 0
 
 
+def match_vault(t, funded, single_leaf=None):
+    """Which of the two vault layouts these terms compile to is being funded.
+
+    A loan drawn from a funded offer sits at the offer's single-leaf vault, not
+    at the four-leaf tree `propose` describes, so a check that knew only the
+    four-leaf address would refuse every offer-born loan -- which is every loan
+    the book makes. `single_leaf` None accepts either and says which; True or
+    False demands that one. Returns "four-leaf" or "single-leaf", and raises the
+    ValueError `verify_funding` raises -- which names both addresses and the one
+    being funded -- when the output is not the vault asked for.
+    """
+    return ("single-leaf" if t.verify_funding(funded, single_leaf=single_leaf)
+            else "four-leaf")
+
+
 def cmd_show(args):
     t = read_terms(args.terms)
     print(t.describe(args.price))
-    print(f"  vault address (scriptPubKey) {t.script_pubkey().hex()}")
+    print(f"  four-leaf vault  (scriptPubKey) {t.script_pubkey().hex()}")
+    print(f"  offer-born vault (scriptPubKey) {offer_vault_address(t).hex()}")
     return 0
 
 
@@ -128,35 +238,81 @@ def cmd_address(args):
     return 0
 
 
+def _funded_spk(args):
+    """The scriptPubKey being checked, read without a transaction index.
+
+    `gettxout` answers from the utxo set, which is what a node without
+    `-txindex` -- every committee node -- can do for a mined funding.
+    """
+    node = node_from(args)
+    got = node.gettxout(args.txid, args.vout, True)
+    if got is not None:
+        return got["scriptPubKey"]["hex"]
+    if args.blockhash:
+        tx = node.getrawtransaction(args.txid, True, args.blockhash)
+        return tx["vout"][args.vout]["scriptPubKey"]["hex"]
+    refuse(f"{args.txid}:{args.vout} is not an unspent output: it is spent, or "
+           "this node has not seen it. Pass --blockhash <block> to read it out "
+           "of the block it is in, or --spk <hex> to check the terms against a "
+           "scriptPubKey you already have.")
+
+
 def cmd_verify(args):
     """The check. Prints what it compared, so a person can see it was done."""
-    t = read_terms(args.terms)
+    t, doc = terms_doc(args.terms)
     if args.spk:
         funded = args.spk
     else:
-        node = node_from(args)
-        tx = node.getrawtransaction(args.txid, True)
-        funded = tx["vout"][args.vout]["scriptPubKey"]["hex"]
+        if args.txid is None:
+            args.txid = doc.get("txid")
+            args.vout = int(doc.get("vout") or 0)
+        if args.txid is None:
+            raise SystemExit("verify needs --spk or --txid, or a terms file "
+                             "that carries the funding outpoint")
+        funded = _funded_spk(args)
+    want = True if args.single_leaf else (False if args.four_leaf else None)
     try:
-        t.verify_funding(funded)
+        shape = match_vault(t, funded, want)
     except ValueError as e:
-        print(f"REFUSED\n{e}", file=sys.stderr)
-        return 2
-    print("OK: the funded output is exactly what these terms compile to")
+        refuse(str(e))
+    label = ("four-leaf vault" if shape == "four-leaf"
+             else "single-leaf offer-born vault")
+    print(f"OK: the funded output is the {label} these terms compile to")
     print(f"  terms      {t.loan_id()}")
     print(f"  scriptPubKey {funded}")
-    print("  internal key is NUMS: there is no key path, so the four leaves are")
-    print("  the only ways this collateral can move.")
+    print("  the scriptPubKey matches, and these terms compile with the NUMS")
+    print("  internal key, so the funded output has no key path: an output on")
+    print("  any other internal key would not have matched.")
+    if shape == "four-leaf":
+        print("  The four leaves are the only ways this collateral can move.")
+    else:
+        print("  The one leaf's selector (REPAY, LIQUIDATE, DEFAULT, RECOVER)")
+        print("  is the only way this collateral can move.")
     for w in t.sanity_check():
         print(f"  ! {w}")
     return 0
 
 
 def cmd_status(args):
-    t = read_terms(args.terms)
+    t, doc = terms_doc(args.terms)
+    if args.txid is None:
+        args.txid = doc.get("txid")
+        args.vout = int(doc.get("vout") or 0)
+    if args.txid is None:
+        raise SystemExit("status needs --txid, or a terms file that carries one")
     node = node_from(args)
+    single = bool(args.single_leaf or doc.get("single_leaf"))
+    got = node.gettxout(args.txid, args.vout, True)
+    if got is not None:
+        # While the vault is unspent the chain settles which layout it is; once
+        # it is spent, --single-leaf is the only way to say, because the two are
+        # spent with different witnesses and the exit is read from the leaf.
+        try:
+            single = match_vault(t, got["scriptPubKey"]["hex"]) == "single-leaf"
+        except ValueError as e:
+            refuse(str(e))
     w = VaultWatcher(node, min_depth=args.min_depth)
-    v = w.track(t.loan_id(), t, args.txid, args.vout)
+    v = w.track(t.loan_id(), t, args.txid, args.vout, single_leaf=single)
     w.poll()
     out = v.to_dict()
     if args.price is not None:
@@ -174,10 +330,18 @@ def cmd_status(args):
 
 def cmd_check_attestation(args):
     with open(args.attestation) as f:
-        att = O.Attestation.from_dict(json.load(f))
-    ok = O.verify(args.oracle_x, att)
+        d = json.load(f)
+    # A row from a book's /v1/attestations carries the key that signed it; a
+    # row from an oracle's log does not, so --oracle-x is what names it there.
+    oracle_x = args.oracle_x or d.get("oracle_x")
+    if not oracle_x:
+        raise SystemExit("give --oracle-x: this attestation does not name the "
+                         "key it was signed with")
+    att = O.Attestation.from_dict({k: v for k, v in d.items() if k != "oracle_x"})
+    ok = O.verify(oracle_x, att)
     print(json.dumps({
         "valid": ok,
+        "oracle_x": oracle_x,
         "market": att.market,
         "feed_id": att.feed_id,
         "feed_matches_market": feed_id(att.market).hex() == att.feed_id,
@@ -190,16 +354,57 @@ def cmd_check_attestation(args):
 
 # --- Tier C: pledged collateral on an OpenAMP asset --------------------------
 
+def _read_secret(spec):
+    """A party's own private key, from a file or from stdin ("-").
+
+    Never from the command line: a hex secret in argv is readable by every
+    process on the machine and is kept in the shell's history.
+    """
+    if spec == "-":
+        return bytes.fromhex(sys.stdin.read().strip())
+    return _read_key(spec)
+
+
+def _pledge_sig(spec, action, pledge_id, extra, signer_x=None):
+    """Another party's countersignature, checked before it is sent anywhere.
+
+    `spec` is the hex signature, or the path of the JSON `pledge-sign` printed
+    -- which carries the key that signed it, so the check below needs nothing
+    else. A signature the issuer would reject is one the caller can still fix,
+    and finding that out here says why.
+    """
+    from pignus import openamp as OA
+    named = "repayment" if action == "release" else "reason"
+    sig = spec
+    if os.path.exists(spec):
+        with open(spec) as f:
+            d = json.load(f)
+        if d.get("action") != action or d.get("pledge") != pledge_id:
+            raise SystemExit(
+                f"that signature authorises {d.get('action')} on pledge "
+                f"{d.get('pledge')}, not {action} on {pledge_id}")
+        if (d.get("extra") or "") != (extra or ""):
+            raise SystemExit(f"that signature covers a different {named}: "
+                             f"{d.get('extra')!r}")
+        sig = d.get("signature")
+        signer_x = signer_x or d.get("signed_by")
+    if signer_x and not OA.verify_pledge_sig(signer_x, sig, action, pledge_id,
+                                             extra):
+        raise SystemExit(f"that signature does not verify for this pledge and "
+                         f"{named}")
+    return sig
+
+
 def cmd_pledge_sign(args):
     """Produce the authorisation the issuer's server demands.
 
     Printed rather than sent, deliberately: the party whose key this is may not
     be the party running the command, and a signature is the thing that travels
-    between them. `pignus-cli pledge-release` sends one.
+    between them. `pignus-cli pledge-release --lender-sig` and `pignus-cli
+    pledge-seize --lender-sig/--holder-sig` send one.
     """
     from pignus import openamp as OA
-    sec = bytes.fromhex(open(args.key).read().strip()) if args.key_file \
-        else bytes.fromhex(args.key)
+    sec = _read_secret(args.key)
     sig = OA.sign_pledge(sec, args.action, args.pledge, args.extra)
     print(json.dumps({
         "pledge": args.pledge, "action": args.action, "extra": args.extra,
@@ -224,6 +429,9 @@ def cmd_pledge_list(args):
     from pignus import openamp as OA
     out = _pledge_client(args).list(asset=args.asset, holder=args.holder,
                                     lender=args.lender, state=args.state)
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
     for p in out:
         print(OA.describe(p))
     if not out:
@@ -238,21 +446,43 @@ def cmd_pledge_create(args):
 
 
 def cmd_pledge_release(args):
-    sec = bytes.fromhex(open(args.key).read().strip()) if args.key_file \
-        else (bytes.fromhex(args.key) if args.key else None)
+    if not (args.key or args.lender_sig or args.force):
+        raise SystemExit("a release is the lender's word that the debt is "
+                         "settled: give --key <file>, or --lender-sig from "
+                         "`pledge-sign`, or --force with a --reason")
+    sec = _read_secret(args.key) if args.key else None
+    signed = {}
+    if args.lender_sig:
+        signed["lender_sig"] = _pledge_sig(args.lender_sig, "release",
+                                           args.pledge, args.repaid_txid,
+                                           args.lender_x)
     out = _pledge_client(args).release(
         args.pledge, lender_sec=sec, repaid_txid=args.repaid_txid,
-        force=args.force, reason=args.reason)
+        force=args.force, reason=args.reason, **signed)
     print(json.dumps(out, indent=2))
 
 
 def cmd_pledge_seize(args):
-    lender = bytes.fromhex(open(args.key).read().strip()) if args.key_file \
-        else bytes.fromhex(args.key)
-    borrower = None
-    if args.borrower_key:
-        borrower = bytes.fromhex(args.borrower_key)
-    out = _pledge_client(args).seize(args.pledge, args.reason, lender, borrower)
+    """Deliver defaulted collateral to the lender.
+
+    Before maturity the borrower must countersign, and what travels here is
+    that signature -- produced on the borrower's own machine with `pledge-sign
+    --action seize` -- never their key. A lender holding the borrower's key
+    could spend every enclave output that key controls, which is not what
+    surrendering one pledge means.
+    """
+    if not (args.key or args.lender_sig):
+        raise SystemExit("a seizure needs the lender's authorisation: --key "
+                         "<file>, or --lender-sig from `pledge-sign`")
+    lender = _read_secret(args.key) if args.key else None
+    signed = {}
+    if args.holder_sig:
+        signed["holder_sig"] = _pledge_sig(args.holder_sig, "seize", args.pledge,
+                                           args.reason, args.holder_x)
+    if args.lender_sig:
+        signed["lender_sig"] = _pledge_sig(args.lender_sig, "seize", args.pledge,
+                                           args.reason, args.lender_x)
+    out = _pledge_client(args).seize(args.pledge, args.reason, lender, **signed)
     print(json.dumps(out, indent=2))
 
 
@@ -304,8 +534,11 @@ def cmd_repo_verify(args):
     from pignus.repurchase import RepurchaseTerms
     t = RepurchaseTerms.from_json(open(args.terms).read())
     node = node_from(args)
-    o = t.verify_funding(node, args.txid,
-                         None if args.vout is None else args.vout)
+    try:
+        o = t.verify_funding(node, args.txid,
+                             None if args.vout is None else args.vout)
+    except ValueError as e:
+        refuse(str(e))
     print(json.dumps({"ok": True, "bond": t.bond(),
                       "vout": o["n"], "asset": o.get("asset")}, indent=2))
     print()
@@ -321,21 +554,31 @@ def cmd_repo_fund(args):
     """Pay the bond into the repurchase vault -- the coin every other repo
     command acts on. Derives the address from the terms; nobody has to trust a
     supplied one."""
-    from pignus.vault import select_funding, wallet_payout
     node = node_from(args)
     t = _repo_terms(args)
     spk = t.script_pubkey()
     addr = node.deriveaddresses(
         node.getdescriptorinfo(f"raw({spk.hex()})")["descriptor"])[0]
     fee_asset, fee = choose_fee(node, args, "fund", prefer=[t.debt_asset])
-    _ver, _prog, change = wallet_payout(node)
-    select_funding(node, {t.debt_asset: t.bond(), fee_asset: fee})   # ensure explicit
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "address": addr,
+                          "scriptPubKey": spk.hex(), "bond": t.bond(),
+                          "asset": t.debt_asset, "fee_asset": fee_asset,
+                          "fee": fee}, indent=2))
+        return 0
     txid = node.sendtoaddress(address=addr, amount=f"{t.bond()/1e8:.8f}",
                               assetlabel=t.debt_asset,
-                              fee_asset_label=t.debt_asset)
+                              fee_asset_label=fee_asset)
+    # The wallet orders its own outputs, so the bond is not necessarily first;
+    # the same check repo-verify makes finds it, and confirms the bond landed
+    # explicit, in the right asset and at exactly the right amount.
+    try:
+        vout = int(t.verify_funding(node, txid)["n"])
+    except ValueError as e:
+        refuse(f"the funding at {txid} is not the bond these terms make: {e}")
     print(f"funded the bond ({t.bond()} atoms of {t.debt_asset[:12]}...) at "
-          f"{txid}:0", file=sys.stderr)
-    print(json.dumps({"txid": txid, "vout": 0}))
+          f"{txid}:{vout}  (fee in {fee_asset[:8]}…)", file=sys.stderr)
+    print(json.dumps({"txid": txid, "vout": vout}))
     return 0
 
 
@@ -346,9 +589,18 @@ def _repo_spender(args, node, t):
     if got is None:
         raise SystemExit("that bond vault is already spent")
     if got["scriptPubKey"]["hex"] != t.script_pubkey().hex():
-        raise SystemExit("REFUSED: the coin is not the vault these terms "
-                         "compile to")
+        refuse("the coin is not the vault these terms compile to")
+    if "value" not in got or "asset" not in got:
+        refuse("the bond output is blinded; a repurchase bond must be explicit, "
+               "because the covenant compares its value")
+    if got["asset"] != t.debt_asset:
+        refuse(f"the coin at that address holds {got['asset'][:12]}..., not the "
+               f"bond asset {t.debt_asset[:12]}...")
     bond = int(round(float(got["value"]) * 100_000_000))
+    if bond != t.bond():
+        refuse(f"the vault holds {bond} atoms but these terms make the bond "
+               f"exactly {t.bond()}; the repurchase you were shown is not the "
+               "one being funded")
     coin = Outpoint(args.txid, args.vout, bond, t.debt_asset)
     return RepurchaseSpender, coin
 
@@ -356,7 +608,7 @@ def _repo_spender(args, node, t):
 def cmd_repo_forfeit(args):
     """FORFEIT: after the deadline, sweep the bond back to the borrower.
     Permissionless -- it can only ever pay the borrower."""
-    from pignus.vault import select_funding, wallet_payout
+    from pignus.vault import wallet_payout
     node = node_from(args)
     t = _repo_terms(args)
     RepurchaseSpender, coin = _repo_spender(args, node, t)
@@ -365,8 +617,10 @@ def cmd_repo_forfeit(args):
         raise SystemExit(f"forfeit opens at height {t.forfeit_after}; it is {height}")
     fee_asset, fee = choose_fee(node, args, "recover")
     _ver, _prog, change = wallet_payout(node)
-    funding = select_funding(node, {fee_asset: fee},
-                             exclude=[(coin.txid, coin.vout)])
+    funding = _funding_for(args, node, {fee_asset: fee},
+                           exclude=[(coin.txid, coin.vout)], fee_asset=fee_asset)
+    if funding is None:
+        return 0
     sp = RepurchaseSpender(node, t, fee_asset, fee)
     raw = sp.forfeit(coin, funding, change)
     if args.dry_run:
@@ -382,15 +636,21 @@ def cmd_repo_settle(args):
     the lender. The borrower's DEBT payment is a separate output a full
     settlement adds; this composes the covenant's own two outputs, which is the
     part the covenant enforces."""
-    from pignus.vault import select_funding, wallet_payout
+    from pignus.vault import wallet_payout
     node = node_from(args)
     t = _repo_terms(args)
     RepurchaseSpender, coin = _repo_spender(args, node, t)
-    fee_asset, fee = choose_fee(node, args, "repay", prefer=[t.collateral_asset])
+    fee_asset, fee = choose_fee(node, args, "repay", prefer=[t.debt_asset])
+    if fee_asset == t.collateral_asset:
+        refuse("the fee cannot be paid in the collateral asset: OpenDAMP's "
+               "verifier refuses a fee output carrying the restricted asset, "
+               "and a settlement pays its fee in the debt asset")
     _ver, _prog, change = wallet_payout(node)
-    funding = select_funding(node, {t.collateral_asset: t.collateral_amount,
-                                    fee_asset: fee},
-                             exclude=[(coin.txid, coin.vout)])
+    funding = _funding_for(args, node, {t.collateral_asset: t.collateral_amount,
+                                        fee_asset: fee},
+                           exclude=[(coin.txid, coin.vout)], fee_asset=fee_asset)
+    if funding is None:
+        return 0
     sp = RepurchaseSpender(node, t, fee_asset, fee)
     raw = sp.settle(coin, funding, change)
     if args.dry_run:
@@ -418,11 +678,10 @@ from pignus import fees as F                                 # noqa: E402
 from pignus.offers import offer_address, offer_vault_address  # noqa: E402
 from pignus.vault import (                                   # noqa: E402
     Outpoint, VaultSpender, fund_offer, take_offer, withdraw_offer,
-    select_funding, wallet_payout, payout_spk,
+    wallet_payout, payout_spk,
 )
 
-BLOCKS_PER_DAY = 1440          # 60-second blocks
-RECOVER_GAP = 43200            # 30 days after maturity
+RECOVER_GAP_DAYS = 30          # how long after maturity RECOVER opens
 
 
 def book_get(base, path):
@@ -492,39 +751,107 @@ def fmt_atoms(n, precision=8):
     return f"{int(n) / 10 ** int(precision):,.{int(precision)}f}".rstrip("0").rstrip(".")
 
 
-def _resolve_oracles(args):
-    """(oracle_x, oracles, threshold) from --oracles / --oracle-threshold.
+def resolve_oracle_set(oracle_x, spec, threshold, book=None):
+    """(oracle_x, oracles, threshold) from --oracle-x / --oracles.
+
+    One resolver for `propose` and `offer-fund`, because the two forms compile
+    to DIFFERENT vaults: one key given as a set of one is a 1-of-1 threshold
+    tree, not the single-oracle tree, and the same intention must not land at a
+    different address depending on which command wrote it. So a single key
+    always becomes `oracle_x`.
 
     --oracles is a comma-separated list of x-only keys, or the literal `book`
-    to use every oracle the book quotes against. Absent, the loan uses the
-    book's single primary oracle -- exactly as before.
+    to use every oracle the book quotes against. Absent, a loan built against a
+    book uses that book's primary oracle.
     """
-    spec = (args.oracles or "").strip()
+    spec = (spec or "").strip()
+    if oracle_x and spec:
+        raise SystemExit("give --oracle-x or --oracles, not both: they compile "
+                         "to different vaults")
     if not spec:
-        return book_get(args.book, "/v1/oracle")["oracle_x"], (), 0
+        if oracle_x:
+            return oracle_x, (), 0
+        if book:
+            return book_get(book, "/v1/oracle")["oracle_x"], (), 0
+        raise SystemExit("give --oracle-x or --oracles")
     if spec.lower() == "book":
-        keys = book_get(args.book, "/v1/oracles")["oracles"]
+        if not book:
+            raise SystemExit("--oracles book needs a book to ask (--book)")
+        keys = book_get(book, "/v1/oracles")["oracles"]
     else:
         keys = [k.strip() for k in spec.split(",") if k.strip()]
-    if len(keys) == 1:
-        return keys[0], (), 0
     if not keys:
         raise SystemExit("--oracles resolved to no keys")
-    thr = args.oracle_threshold or len(keys)
+    if len(keys) == 1:
+        return keys[0], (), 0
+    thr = threshold or len(keys)
     if not 1 <= thr <= len(keys):
         raise SystemExit(f"--oracle-threshold {thr} outside 1..{len(keys)}")
     if thr == 1:
         raise SystemExit("a 1-of-n oracle set is WEAKER than one oracle (any "
                          "one key alone can liquidate); pick a threshold >= 2")
+    if thr == len(keys):
+        print(f"warning: {thr}-of-{thr} oracles: while any one of them is down "
+              "this loan cannot be liquidated at all", file=sys.stderr)
     return "", keys, thr
+
+
+def _resolve_oracles(args):
+    return resolve_oracle_set(getattr(args, "oracle_x", "") or "", args.oracles,
+                              args.oracle_threshold, book=args.book)
+
+
+def _attestation_rows(args, market):
+    """The attestations to choose evidence from, each naming its oracle if it
+    knows it.
+
+    A file or an oracle named on the command line comes first, so that a loan
+    can be closed with the book down or with prices from an oracle the book
+    does not carry. Whatever the source, the caller verifies the signature
+    against the key the loan itself names.
+    """
+    path = getattr(args, "attestations", None)
+    if path:
+        with open(path) as f:
+            d = json.load(f)
+        return d["attestations"] if isinstance(d, dict) else d
+    path = getattr(args, "attestation", None)
+    if path:
+        with open(path) as f:
+            return [json.load(f)]
+    url = getattr(args, "oracle", None)
+    if url:
+        return [book_get(url, f"/v1/attestation/{market}")]
+    try:
+        return book_get(args.book, f"/v1/attestations/{market}")["attestations"]
+    except (OSError, KeyError, ValueError):
+        d = book_get(args.book, f"/v1/attestation/{market}")
+        return [d]
+
+
+def _single_evidence(args, terms, market):
+    """The attestation from the oracle THIS LOAN names, verified against it.
+
+    A book serves several oracles; a loan baked to any but the primary one is
+    still closeable, which is why the row is picked by key rather than taken
+    from the market's headline price.
+    """
+    for d in _attestation_rows(args, market):
+        if d.get("oracle_x") not in (None, terms.oracle_x):
+            continue
+        att = O.Attestation.from_dict({k: v for k, v in d.items()
+                                       if k != "oracle_x"})
+        if O.verify(terms.oracle_x, att):
+            return att
+    raise SystemExit("no verifiable attestation from the oracle THIS LOAN "
+                     f"names ({terms.oracle_x[:16]}…); refusing to build it")
 
 
 def _threshold_evidence(args, terms, market):
     """The {oracle_key: Attestation} mapping a threshold spend needs, verified
     against the keys THIS LOAN names."""
-    data = book_get(args.book, f"/v1/attestations/{market}")["attestations"]
     ev = {}
-    for d in data:
+    for d in _attestation_rows(args, market):
         ox = d.get("oracle_x")
         if ox in terms.oracles:
             att = O.Attestation.from_dict({k: v for k, v in d.items()
@@ -539,7 +866,9 @@ def _threshold_evidence(args, terms, market):
 
 def cmd_offer_fund(args):
     node = node_from(args)
-    mk = next((m for m in book_get(args.book, "/v1/markets")["markets"]
+    split_market(args.market)
+    markets = book_get(args.book, "/v1/markets")
+    mk = next((m for m in markets["markets"]
                if m["market"].upper() == args.market.upper()), None)
     if mk is None:
         raise SystemExit(f"the book has no market {args.market}")
@@ -548,6 +877,9 @@ def cmd_offer_fund(args):
                          + ("native BTC is cross-chain" if mk.get("cross_chain")
                             else "no asset id or no verified price"))
     oracle_x, oracles, threshold = _resolve_oracles(args)
+    # Terms are written in blocks, so a day is however many blocks this chain
+    # makes in one; the book publishes its spacing rather than assuming 60s.
+    blocks_per_day = 86400 // int(markets.get("block_seconds") or 60)
     height = node.getblockcount()
     price, scale = int(mk["price"]), int(mk["price_scale"])
     cp, dp = int(mk["collateral_precision"]), int(mk["debt_precision"])
@@ -560,8 +892,8 @@ def cmd_offer_fund(args):
     # collateral value must be principal / open_ltv, in debt atoms
     collateral = math.ceil(principal * scale / (price * open_ltv))
     strike = math.ceil(debt * scale / (collateral * liq_ltv))
-    maturity = height + int(args.term_days * BLOCKS_PER_DAY)
-    expiry = height + int((args.offer_days or args.term_days) * BLOCKS_PER_DAY)
+    maturity = height + int(args.term_days * blocks_per_day)
+    expiry = height + int((args.offer_days or args.term_days) * blocks_per_day)
     ver, prog, change_spk = wallet_payout(node)
     bver = 0 if args.borrower_ver is None else int(args.borrower_ver)
     placeholder = "00" * (20 if bver == 0 else 32)
@@ -573,18 +905,23 @@ def cmd_offer_fund(args):
         market=mk["market"], oracle_x=oracle_x or "",
         oracles=tuple(oracles), oracle_threshold=threshold, strike=strike,
         not_before=int(time.time()), maturity=maturity,
-        recover_after=maturity + RECOVER_GAP,
+        recover_after=maturity + RECOVER_GAP_DAYS * blocks_per_day,
         bonus_num=100 + int(args.bonus), bonus_den=100, price_scale=scale,
         memo=args.memo or "")
     fee_asset, fee = choose_fee(node, args, "fund", prefer=[terms.debt_asset])
     spk = offer_address(terms, principal, collateral, expiry)
+    # The strike is debt atoms per collateral atom; a person reads prices in
+    # whole units, and the two differ by both assets' precisions.
+    strike_unit = O.unquote_price(strike, cp, dp, scale)
     print(f"offer on {mk['market']}: lend {fmt_atoms(principal, dp)} "
           f"{mk['debt_ticker']} per loan x{args.lots}, repay "
           f"{fmt_atoms(debt, dp)}, against {fmt_atoms(collateral, cp)} "
           f"{mk['collateral_ticker']} (open LTV {args.open_ltv}%), liquidate "
-          f"under {strike / scale:.8g} {mk['debt_ticker']}/atom "
-          f"(LTV {args.liq_ltv}%), matures {maturity}, offer expires {expiry}",
-          file=sys.stderr)
+          f"under {strike_unit:,.4f} {mk['debt_ticker']} per "
+          f"{mk['collateral_ticker']} (LTV {args.liq_ltv}%), matures "
+          f"{maturity}, offer expires {expiry}", file=sys.stderr)
+    print(f"  strike {strike}  (debt atoms per collateral atom, scaled by "
+          f"{scale})", file=sys.stderr)
     print(f"  offer address {spk.hex()}", file=sys.stderr)
     for w in terms.sanity_check():
         print(f"  ! {w}", file=sys.stderr)
@@ -600,15 +937,78 @@ def cmd_offer_fund(args):
             "principal": str(principal), "collateral": str(collateral),
             "expiry_locktime": expiry}
     if args.publish:
-        code, rec = book_post(args.book, "/v1/offers", body)
+        try:
+            code, rec = book_post(args.book, "/v1/offers", body)
+        except OSError as e:                       # the book is down
+            code, rec = 0, {"error": str(e)}
         if code != 200:
-            print(f"  book refused the offer: {rec.get('error')}", file=sys.stderr)
+            # The principal is already locked, so this is a warning and not a
+            # failure: a caller that retries on a non-zero status would fund a
+            # second offer for a listing that is all that went wrong.
+            saved = _save_offer_body(txid, body)
+            where = saved or "the record printed below, saved to a file"
+            print(f"  the book did not list it ({rec.get('error')}); the "
+                  f"principal is locked at {txid}:0. Publish it later with:\n"
+                  f"    pignus-cli offer-publish --body {where}",
+                  file=sys.stderr)
             print(json.dumps(body))
-            return 2
+            return 0
         print(f"  published as offer {rec['offer_id']}", file=sys.stderr)
         print(json.dumps(rec, indent=2))
     else:
+        print("  not published. Save the record below and list it whenever you "
+              "like with:\n    pignus-cli offer-publish --body <file>",
+              file=sys.stderr)
         print(json.dumps(body))
+    return 0
+
+
+def _save_offer_body(txid, body):
+    """Keep a funded offer's listing beside the operator, so a book that was
+    down does not leave the principal locked and invisible. Returns the path,
+    or None if it could not be written."""
+    path = f"offer-{txid}.json"
+    try:
+        with open(path, "w") as f:
+            json.dump(body, f, indent=2)
+    except OSError as e:
+        print(f"  (could not save {path}: {e})", file=sys.stderr)
+        return None
+    return path
+
+
+def cmd_loan_export(args):
+    """Write a loan's terms and vault outpoint in the form `verify`, `status`
+    and the exits all read, so the loan can be checked and closed with the book
+    gone."""
+    loan = book_get(args.book, f"/v1/loan/{args.loan}")
+    doc = {"terms": json.loads(loan["terms"]), "txid": loan["txid"],
+           "vout": int(loan["vout"]),
+           "single_leaf": bool(loan.get("single_leaf"))}
+    out = json.dumps(doc, indent=2)
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(out + "\n")
+        print(f"wrote {args.out}", file=sys.stderr)
+    else:
+        print(out)
+    return 0
+
+
+def cmd_offer_publish(args):
+    """List an already-funded offer. Nothing is funded here, so a failure is
+    safe to retry."""
+    with open(args.body) as f:
+        body = json.load(f)
+    if body.get("kind") != "funded" or not body.get("outpoint"):
+        raise SystemExit(f"{args.body} is not the record offer-fund prints: it "
+                         "needs kind 'funded' and the offer's outpoint")
+    code, rec = book_post(args.book, "/v1/offers", body)
+    if code != 200:
+        print(f"the book refused the offer: {rec.get('error')}", file=sys.stderr)
+        return 2
+    print(f"published as offer {rec['offer_id']}", file=sys.stderr)
+    print(json.dumps(rec, indent=2))
     return 0
 
 
@@ -625,9 +1025,9 @@ def _load_offer(args, node):
     want = offer_address(terms, principal, collateral, expiry).hex()
     have = got["scriptPubKey"]["hex"]
     if want != have:
-        raise SystemExit("REFUSED: the offer's coin is not what its terms "
-                         f"compile to\n  terms compile to: {want}\n"
-                         f"  the coin pays:    {have}")
+        refuse("the offer's coin is not what its terms compile to\n"
+               f"  terms compile to: {want}\n"
+               f"  the coin pays:    {have}")
     value = int(round(float(got["value"]) * 100_000_000))
     return off, terms, Outpoint(txid, int(vout), value, terms.debt_asset), \
         principal, collateral, expiry
@@ -681,6 +1081,13 @@ def cmd_offer_withdraw(args):
         raise SystemExit(f"the offer expires at block {expiry}; it is {height}")
     _ver, _prog, spk = wallet_payout(node)
     fee_asset, fee = choose_fee(node, args, "withdraw")
+    # `withdraw_offer` selects its own funding, and selecting can broadcast a
+    # preparing send, so a dry run checks first that the explicit coins are
+    # already there and composes nothing when they are not.
+    if args.dry_run and _funding_for(args, node, {fee_asset: fee},
+                                     exclude=[(coin.txid, coin.vout)],
+                                     fee_asset=fee_asset) is None:
+        return 0
     raw = withdraw_offer(node, terms, coin, coin.amount, principal, collateral,
                          expiry, fee_asset, fee, spk)
     if args.dry_run:
@@ -694,17 +1101,32 @@ def cmd_offer_withdraw(args):
 
 
 def _load_loan(args, node):
-    loan = book_get(args.book, f"/v1/loan/{args.loan}")
-    terms = LoanTerms.from_json(loan["terms"])
-    single = bool(loan.get("single_leaf"))
-    got = node.gettxout(loan["txid"], int(loan["vout"]), True)
+    """The loan to act on, from the book or from a terms file and an outpoint.
+
+    A loan can always be closed from its own terms: the book is a way to find
+    one, never a party to it, so a book that is down or that never listed a
+    loan must not be able to stop its borrower repaying.
+    """
+    if args.terms:
+        terms, doc = terms_doc(args.terms)
+        txid = args.txid or doc.get("txid")
+        vout = int(args.vout if args.vout is not None else (doc.get("vout") or 0))
+        if not txid:
+            raise SystemExit("give --txid: the terms file carries no funding "
+                             "outpoint")
+        loan = {"terms": terms.to_json(), "txid": txid, "vout": vout}
+    else:
+        loan = book_get(args.book, f"/v1/loan/{args.loan}")
+        terms = LoanTerms.from_json(loan["terms"])
+        txid, vout = loan["txid"], int(loan["vout"])
+    got = node.gettxout(txid, vout, True)
     if got is None:
         raise SystemExit("that vault is already spent")
-    want = (offer_vault_address(terms) if single else terms.script_pubkey()).hex()
-    if got["scriptPubKey"]["hex"] != want:
-        raise SystemExit("REFUSED: the vault coin is not what these terms "
-                         "compile to")
-    coin = Outpoint(loan["txid"], int(loan["vout"]),
+    try:
+        single = match_vault(terms, got["scriptPubKey"]["hex"]) == "single-leaf"
+    except ValueError as e:
+        refuse(str(e))
+    coin = Outpoint(txid, vout,
                     int(round(float(got["value"]) * 100_000_000)),
                     terms.collateral_asset)
     return loan, terms, coin, single
@@ -713,13 +1135,24 @@ def _load_loan(args, node):
 def _exit(args, exit_name):
     node = node_from(args)
     loan, terms, coin, single = _load_loan(args, node)
+    height = node.getblockcount()
+    # DEFAULT and RECOVER carry a locktime, so building one early only wastes a
+    # preparing send and dies on the node's `non-final`; say so first instead.
+    if exit_name == "default" and height < terms.maturity:
+        raise SystemExit(f"DEFAULT opens at block {terms.maturity}; it is {height}")
+    if exit_name == "recover" and height < terms.recover_after:
+        raise SystemExit(f"RECOVER opens at block {terms.recover_after}; it is "
+                         f"{height}")
     _ver, _prog, spk = wallet_payout(node)
     flow = exit_name if single else exit_name + "4"
     fee_asset, fee = choose_fee(node, args, flow, prefer=[terms.debt_asset])
     spender = VaultSpender(node, terms, fee_asset, fee, single_leaf=single)
     need = {terms.debt_asset: terms.debt} if exit_name != "recover" else {}
     need[fee_asset] = need.get(fee_asset, 0) + fee
-    funding = select_funding(node, need, exclude=[(coin.txid, coin.vout)])
+    funding = _funding_for(args, node, need, exclude=[(coin.txid, coin.vout)],
+                           fee_asset=fee_asset)
+    if funding is None:
+        return 0
     if exit_name == "repay":
         raw = spender.repay(coin, funding, spk)
     elif exit_name == "recover":
@@ -729,12 +1162,7 @@ def _exit(args, exit_name):
         if terms.oracles:
             evidence = _threshold_evidence(args, terms, market)
         else:
-            att = O.Attestation.from_dict(
-                book_get(args.book, f"/v1/attestation/{market}"))
-            if not O.verify(terms.oracle_x, att):
-                raise SystemExit("the attestation does not verify against the "
-                                 "oracle THIS LOAN names; refusing to build it")
-            evidence = att
+            evidence = _single_evidence(args, terms, market)
         if exit_name == "liquidate":
             raw = spender.liquidate(coin, funding, evidence, spk)
         else:
@@ -774,7 +1202,9 @@ def add_wallet_commands(sub):
                        "the node publishes a rate for")
         p.add_argument("--fee-amount", type=int, help="atoms; default: priced "
                        "from the node's exchange rates at 20x the relay floor")
-        p.add_argument("--dry-run", action="store_true")
+        p.add_argument("--dry-run", action="store_true",
+                       help="compose and print, broadcast nothing -- no "
+                            "preparing sends either")
 
     p = sub.add_parser("offer-fund", help="lock principal in a funded offer, "
                        "and publish it")
@@ -800,11 +1230,27 @@ def add_wallet_commands(sub):
                    help="comma-separated oracle x-only keys, or 'book' to use "
                    "every oracle the book quotes against, for an m-of-n loan")
     p.add_argument("--oracle-threshold", type=int, default=0,
-                   help="m in an m-of-n oracle set (default: all of them)")
+                   help="m in an m-of-n oracle set (default: all of them, "
+                        "which no single oracle outage can then liquidate under)")
     p.add_argument("--memo", default="")
-    p.add_argument("--no-publish", dest="publish", action="store_false")
+    p.add_argument("--no-publish", dest="publish", action="store_false",
+                   help="fund the offer without listing it on the book")
     common(p)
     p.set_defaults(fn=cmd_offer_fund)
+
+    p = sub.add_parser("offer-publish",
+                       help="list an already-funded offer on the book")
+    p.add_argument("--body", required=True,
+                   help="the record offer-fund printed, saved to a file")
+    add_book_arg(p)
+    p.set_defaults(fn=cmd_offer_publish)
+
+    p = sub.add_parser("loan-export", help="write a loan's terms and vault "
+                       "outpoint to a file the other commands read")
+    p.add_argument("--loan", required=True, help="loan id from the book")
+    p.add_argument("--out", help="file to write (default: stdout)")
+    add_book_arg(p)
+    p.set_defaults(fn=cmd_loan_export)
 
     p = sub.add_parser("offer-take", help="borrow from a funded offer")
     p.add_argument("--offer", required=True, help="offer id from the book")
@@ -813,7 +1259,7 @@ def add_wallet_commands(sub):
 
     p = sub.add_parser("offer-withdraw", help="return an expired offer's "
                        "principal to its lender")
-    p.add_argument("--offer", required=True)
+    p.add_argument("--offer", required=True, help="offer id from the book")
     common(p)
     p.set_defaults(fn=cmd_offer_withdraw)
 
@@ -823,7 +1269,22 @@ def add_wallet_commands(sub):
             ("default", cmd_default, "seize a loan past maturity, at any price"),
             ("recover", cmd_recover, "sweep a long-overdue vault to the lender")):
         p = sub.add_parser(name, help=help_)
-        p.add_argument("--loan", required=True, help="loan id from the book")
+        g = p.add_mutually_exclusive_group(required=True)
+        g.add_argument("--loan", help="loan id from the book")
+        g.add_argument("--terms", help="the loan's terms file, for closing a "
+                       "loan the book never listed or cannot serve; needs --txid")
+        p.add_argument("--txid", help="the vault's funding transaction, with "
+                       "--terms")
+        p.add_argument("--vout", type=int, default=None,
+                       help="the vault's output index (default 0)")
+        if name in ("liquidate", "default"):
+            p.add_argument("--attestation", help="a signed price from the "
+                           "oracle this loan names, as a file, instead of the "
+                           "book's")
+            p.add_argument("--attestations", help="a file of signed prices, "
+                           "each naming its oracle, for an m-of-n loan")
+            p.add_argument("--oracle", help="a pignus-oracle to ask directly "
+                           "for the price, instead of the book")
         common(p)
         p.set_defaults(fn=fn)
 
@@ -1360,9 +1821,15 @@ def main():
     ap = argparse.ArgumentParser(
         prog="pignus-cli", description=__doc__.split("\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--version", action="version",
+                    version=f"pignus-cli {PIGNUS_VERSION}")
+    ap.add_argument("--debug", action="store_true",
+                    help="re-raise errors with their traceback")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("selftest").set_defaults(fn=cmd_selftest)
+    sub.add_parser("selftest", help="check the covenant builder against the "
+                   "golden vectors and an oracle round trip"
+                   ).set_defaults(fn=cmd_selftest)
 
     # --- Tier C ---------------------------------------------------------------
     def issuer_args(q):
@@ -1378,15 +1845,17 @@ def main():
     p.add_argument("--pledge", required=True)
     p.add_argument("--extra", default="",
                    help="the repayment txid for a release, the reason for a seizure")
-    p.add_argument("--key", required=True, help="your private key, hex")
-    p.add_argument("--key-file", action="store_true",
-                   help="--key names a file holding the key instead")
+    p.add_argument("--key", required=True,
+                   help="file holding your private key, hex (0600); '-' reads "
+                        "it from stdin")
     p.set_defaults(fn=cmd_pledge_sign)
 
     p = sub.add_parser("pledge-list", help="Tier C pledges at an issuer")
     issuer_args(p)
     for name in ("asset", "holder", "lender", "state"):
         p.add_argument("--" + name, default=None)
+    p.add_argument("--json", action="store_true",
+                   help="print the records as the issuer returned them")
     p.set_defaults(fn=cmd_pledge_list)
 
     p = sub.add_parser("pledge-create", help="lock Tier C collateral in place")
@@ -1405,8 +1874,16 @@ def main():
                        help="Tier C: the debt is settled, unlock the collateral")
     issuer_args(p)
     p.add_argument("--pledge", required=True)
-    p.add_argument("--key", default=None, help="the LENDER's private key, hex")
-    p.add_argument("--key-file", action="store_true")
+    p.add_argument("--key", default=None,
+                   help="file holding the LENDER's private key, hex (0600); "
+                        "'-' reads it from stdin")
+    p.add_argument("--lender-sig", default=None,
+                   help="the lender's signature from `pignus-cli pledge-sign "
+                        "--action release`: hex, or the path of the JSON that "
+                        "command printed. For a lender who signs elsewhere")
+    p.add_argument("--lender-x", default=None,
+                   help="the lender's x-only key, to check --lender-sig "
+                        "against (the pledge-sign JSON already carries it)")
     p.add_argument("--repaid-txid", default="")
     p.add_argument("--force", action="store_true",
                    help="issuer override for a lender who cannot sign; needs --reason")
@@ -1418,10 +1895,22 @@ def main():
     issuer_args(p)
     p.add_argument("--pledge", required=True)
     p.add_argument("--reason", required=True)
-    p.add_argument("--key", required=True, help="the LENDER's private key, hex")
-    p.add_argument("--key-file", action="store_true")
-    p.add_argument("--borrower-key", default=None,
-                   help="the borrower's key; required before maturity")
+    p.add_argument("--key", default=None,
+                   help="file holding the LENDER's private key, hex (0600); "
+                        "'-' reads it from stdin")
+    p.add_argument("--lender-sig", default=None,
+                   help="the lender's signature from `pignus-cli pledge-sign "
+                        "--action seize`: hex, or the JSON it printed")
+    p.add_argument("--lender-x", default=None,
+                   help="the lender's x-only key, to check --lender-sig against")
+    p.add_argument("--holder-sig", default=None,
+                   help="the BORROWER's countersignature, from `pignus-cli "
+                        "pledge-sign --action seize --pledge <id> --extra "
+                        "<reason>` on their own machine: hex, or the JSON it "
+                        "printed. Required before maturity")
+    p.add_argument("--holder-x", default=None,
+                   help="the borrower's x-only key, to check --holder-sig "
+                        "against (the pledge-sign JSON already carries it)")
     p.set_defaults(fn=cmd_pledge_seize)
 
     # --- Tier D ---------------------------------------------------------------
@@ -1445,16 +1934,23 @@ def main():
     p = sub.add_parser("repo-verify",
                        help="THE check: does this bond vault match these terms")
     p.add_argument("terms")
-    p.add_argument("--txid", required=True)
-    p.add_argument("--vout", type=int, default=None)
+    p.add_argument("--txid", required=True,
+                   help="the transaction that funded the bond")
+    p.add_argument("--vout", type=int, default=None,
+                   help="the bond's output index (default: find it in the "
+                        "transaction)")
     add_node_args(p)
     p.set_defaults(fn=cmd_repo_verify)
 
     p = sub.add_parser("repo-fund", help="pay the bond into the repurchase vault")
     p.add_argument("terms")
     add_node_args(p)
-    p.add_argument("--fee-asset"); p.add_argument("--fee-amount", type=int)
-    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--fee-asset", help="label or 64-hex id; default: the bond "
+                   "asset, else anything held that the node publishes a rate for")
+    p.add_argument("--fee-amount", type=int, help="atoms; default: priced from "
+                   "the node's exchange rates")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print what would be funded, broadcast nothing")
     p.set_defaults(fn=cmd_repo_fund)
 
     for name, fn, helptext in (
@@ -1464,21 +1960,32 @@ def main():
              "RETURN: deliver the asset to the borrower, release the bond")):
         p = sub.add_parser(name, help=helptext)
         p.add_argument("terms")
-        p.add_argument("--txid", required=True)
-        p.add_argument("--vout", type=int, default=0)
+        p.add_argument("--txid", required=True, help="the bond vault's coin")
+        p.add_argument("--vout", type=int, default=0,
+                       help="the bond vault's output index, as repo-fund "
+                            "reported it")
         add_node_args(p)
-        p.add_argument("--fee-asset"); p.add_argument("--fee-amount", type=int)
-        p.add_argument("--dry-run", action="store_true")
+        p.add_argument("--fee-asset", help="label or 64-hex id; default: the "
+                       "debt asset, which is the only asset a settlement's fee "
+                       "may be paid in")
+        p.add_argument("--fee-amount", type=int, help="atoms; default: priced "
+                       "from the node's exchange rates")
+        p.add_argument("--dry-run", action="store_true",
+                       help="compose and print, broadcast nothing -- no "
+                            "preparing sends either")
         p.set_defaults(fn=fn)
 
 
     p = sub.add_parser("quote", help="reference prices -> the covenant's integer price")
-    p.add_argument("--market", required=True)
+    p.add_argument("--market", required=True, help="e.g. GOLD/USDX")
     p.add_argument("--collateral-ref", type=float, required=True)
     p.add_argument("--debt-ref", type=float, required=True)
     p.add_argument("--collateral-precision", type=int, default=8)
     p.add_argument("--debt-precision", type=int, default=8)
     p.add_argument("--price-scale", type=int, default=100_000)
+    p.add_argument("--open-ltv", type=float, default=50.0,
+                   help="the loan-to-value a loan opens at, which with each "
+                        "liquidation ratio gives the strike (default 50)")
     p.set_defaults(fn=cmd_quote)
 
     p = sub.add_parser("propose", help="write a loan terms document")
@@ -1510,24 +2017,40 @@ def main():
     p.set_defaults(fn=cmd_address)
 
     p = sub.add_parser("verify", help="THE check: do these terms match the funded vault")
-    p.add_argument("--terms", required=True)
+    p.add_argument("--terms", required=True,
+                   help="the terms document, or the record offer-take printed")
     p.add_argument("--spk", help="the funded scriptPubKey, if you have it directly")
-    p.add_argument("--txid")
+    p.add_argument("--txid", help="the funding transaction; read from the "
+                   "utxo set, so no transaction index is needed")
     p.add_argument("--vout", type=int, default=0)
+    p.add_argument("--blockhash", help="the block the funding is in, needed "
+                   "only to check a vault that has already been spent")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--single-leaf", action="store_true",
+                   help="demand the single-leaf vault an offer creates "
+                        "(default: accept either and report which it is)")
+    g.add_argument("--four-leaf", action="store_true",
+                   help="demand the four-leaf vault of a directly originated loan")
     add_node_args(p)
     p.set_defaults(fn=cmd_verify)
 
     p = sub.add_parser("status", help="reconcile a loan against the chain")
-    p.add_argument("--terms", required=True)
-    p.add_argument("--txid", required=True)
+    p.add_argument("--terms", required=True,
+                   help="the terms document, or the record offer-take printed")
+    p.add_argument("--txid", help="the funding transaction (default: the one "
+                   "the terms file carries)")
     p.add_argument("--vout", type=int, default=0)
+    p.add_argument("--single-leaf", action="store_true",
+                   help="the vault came from a funded offer; needed only once "
+                        "it is spent, since until then the chain says which it is")
     p.add_argument("--price", type=int)
     p.add_argument("--min-depth", type=int, default=2)
     add_node_args(p)
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("check-attestation", help="verify a signed price")
-    p.add_argument("--oracle-x", required=True)
+    p.add_argument("--oracle-x", help="the oracle's x-only key; a row from a "
+                   "book's /v1/attestations already names it")
     p.add_argument("--attestation", required=True)
     p.set_defaults(fn=cmd_check_attestation)
 
@@ -1535,13 +2058,27 @@ def main():
     add_btc_commands(sub)
 
     args = ap.parse_args()
-    if args.cmd == "verify" and not args.spk and not args.txid:
-        ap.error("verify needs --spk or --txid")
     try:
         return args.fn(args)
     except compat.CovenantUnavailable as e:
+        if args.debug:
+            raise
         print(f"error: {e}", file=sys.stderr)
         return 3
+    except urllib.error.URLError as e:
+        if args.debug:
+            raise
+        print(f"error: cannot reach that service ({e.reason}); check --rpc, "
+              "--book and whether the node is running", file=sys.stderr)
+        return 1
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError,
+            IndexError) as e:
+        # A message a person can act on, rather than a traceback. --debug is
+        # there for the case where the traceback is the useful part.
+        if args.debug:
+            raise
+        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -9,14 +9,23 @@ and the bonus is what prices the race. So this is one participant among however
 many choose to run one -- which is the point, because a lending platform whose
 liquidations depend on the operator's bot is a platform with an operator.
 
-    pignus-liquidator --book http://127.0.0.1:8741 --oracle http://127.0.0.1:8740 \
+    pignus-liquidator --book http://127.0.0.1:8741 \\
         --rpc-wallet liquidator --taker-address <addr> [--dry-run]
-    pignus-liquidator --loans loans.json ...
+    pignus-liquidator --loans loans.json --oracle http://127.0.0.1:8740 ...
 
 With `--book` the live loans are read from a pignusd, re-read every round, so
-a loan that appears while this runs is watched too. `loans.json` is a list of
-{"terms": {...}, "txid": "...", "vout": 0, "single_leaf": bool}, for a drill
-or a book of one's own.
+a loan that appears while this runs is watched too, and the book's aggregated
+attestations reach every oracle it quotes against. `--oracle` names an oracle
+directly and may be repeated, which is how loans baked to a key the book does
+not aggregate are still closed. At least one of the two is needed.
+
+`loans.json` is a list of {"terms": {...}, "txid": "...", "vout": 0,
+"single_leaf": bool}, for a drill or a book of one's own.
+
+Every attestation is verified here, against the key THIS LOAN names and at the
+scale THIS LOAN computes with -- not against whichever oracle served it. A price
+signed by another key, or quoted at another scale, is a number about a different
+loan.
 
 --dry-run reports what it would do and touches nothing, which is how this should
 be run first against any real book.
@@ -27,19 +36,33 @@ import json
 import os
 import sys
 import time
-import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
 from pignus import oracle as O                       # noqa: E402
 from pignus.node import Node, RpcError               # noqa: E402
+from pignus.offers import offer_vault_address        # noqa: E402
 from pignus.terms import LoanTerms                   # noqa: E402
 from pignus import fees as F                         # noqa: E402
 from pignus.vault import Outpoint, VaultSpender, select_funding   # noqa: E402
 from pignus.watcher import VaultWatcher, State       # noqa: E402
 
 COIN = 100_000_000
+
+
+def canon(market):
+    """A market name in the one spelling everything here keys by. A feed id is
+    case-insensitive, so an oracle, a book and a terms file may each write the
+    same market differently and mean it."""
+    return "/".join(p.strip().upper() for p in str(market).split("/"))
+
+# What a round is allowed to fail with and carry on. A bot meant to run for the
+# life of a book must not end on a node restart or a book that blinked:
+# urllib's URLError and socket.timeout are OSError subclasses, so HTTP and RPC
+# transport failures are both covered here, and KeyError catches a response that
+# parsed but was not the shape it claims.
+TRANSIENT = (RpcError, RuntimeError, ValueError, OSError, KeyError)
 
 
 def fetch_attestation(base, market):
@@ -49,7 +72,7 @@ def fetch_attestation(base, market):
 
 
 def fetch_attestation_set(base, market):
-    """{oracle_x: Attestation} for a threshold loan, from the book."""
+    """{oracle_x: Attestation} for a market, from the book."""
     url = f"{base.rstrip('/')}/v1/attestations/{market.replace('/', '_')}"
     with urllib.request.urlopen(url, timeout=10) as r:
         data = json.loads(r.read().decode())["attestations"]
@@ -57,8 +80,7 @@ def fetch_attestation_set(base, market):
     for d in data:
         ox = d.get("oracle_x")
         if ox:
-            out[ox] = O.Attestation.from_dict({k: v for k, v in d.items()
-                                               if k != "oracle_x"})
+            out[ox] = O.Attestation.from_dict(d)
     return out
 
 
@@ -79,7 +101,10 @@ def main():
                                  epilog=__doc__)
     ap.add_argument("--loans", help="a JSON list of loans to watch")
     ap.add_argument("--book", help="a pignusd to read LIVE loans from instead")
-    ap.add_argument("--oracle", required=True)
+    ap.add_argument("--oracle", action="append", metavar="URL",
+                    help="an oracle to read prices from; repeatable. Loans are "
+                         "judged against the key each one bakes, so name every "
+                         "oracle whose loans this bot should close")
     ap.add_argument("--rpc", default="http://127.0.0.1:18443")
     ap.add_argument("--rpc-user")
     ap.add_argument("--rpc-password")
@@ -91,6 +116,16 @@ def main():
                     "being spent, else anything held with a published rate")
     ap.add_argument("--fee-amount", type=int, help="atoms; default: priced "
                     "from the node's exchange rates")
+    ap.add_argument("--min-profit", type=int, default=0, metavar="ATOMS",
+                    help="skip a seizure worth less than this much more than "
+                         "the debt it pays, in debt-asset atoms (default 0: "
+                         "never take one at a loss). Negative to allow it")
+    ap.add_argument("--max-attestation-age", type=int, default=600, metavar="S",
+                    help="ignore a price signed longer ago than this (default "
+                         "600 s); the covenant cannot check recency, so this is "
+                         "the only place it is checked")
+    ap.add_argument("--allow-stale", action="store_true",
+                    help="act on attestations older than --max-attestation-age")
     ap.add_argument("--interval", type=float, default=30.0)
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -98,128 +133,276 @@ def main():
                     help="also call loans past maturity via DEFAULT")
     args = ap.parse_args()
 
-    node = Node(url=args.rpc, user=args.rpc_user, password=args.rpc_password,
-                wallet=args.rpc_wallet, cookie_path=args.rpc_cookie)
-    if args.taker_spk:
-        taker_spk = bytes.fromhex(args.taker_spk)
-    elif args.taker_address:
-        info = node.getaddressinfo(args.taker_address)
-        unconf = info.get("unconfidential", args.taker_address)
-        taker_spk = bytes.fromhex(node.getaddressinfo(unconf)["scriptPubKey"])
-    else:
-        ap.error("need --taker-spk or --taker-address")
-
     if not args.loans and not args.book:
         ap.error("need --loans or --book")
-    oracle_x = fetch_oracle_key(args.oracle)
+    if not args.book and not args.oracle:
+        ap.error("need --oracle when there is no --book to read prices from")
+    if args.fee_amount and not args.fee_asset:
+        # Mirrors pignus-cli: an amount without an asset is an instruction this
+        # tool cannot carry out, and quietly pricing its own fee instead is how
+        # an operator's number disappears.
+        ap.error("--fee-amount needs --fee-asset")
+    if not args.taker_spk and not args.taker_address:
+        ap.error("need --taker-spk or --taker-address")
+
+    node = Node(url=args.rpc, user=args.rpc_user, password=args.rpc_password,
+                wallet=args.rpc_wallet, cookie_path=args.rpc_cookie)
 
     watcher = VaultWatcher(node)
     loans = {}
+    oracle_keys = {}          # oracle URL -> its x-only key
+    warned = {}               # loan id -> the last reason it was skipped for
+
+    def resolve_asset(label_or_hex):
+        if len(label_or_hex) == 64:
+            try:
+                int(label_or_hex, 16)
+            except ValueError:
+                raise SystemExit(f"--fee-asset {label_or_hex!r} is 64 "
+                                 "characters but not an asset id") from None
+            return label_or_hex
+        labels = node.dumpassetlabels()
+        if label_or_hex in labels:
+            return labels[label_or_hex]
+        raise SystemExit(f"unknown asset {label_or_hex!r}: give a 64-hex id or "
+                         "a label the node knows")
+
+    def note(who, reason):
+        """Say why a loan was passed over, once, rather than every round."""
+        if warned.get(who) != reason:
+            warned[who] = reason
+            print(f"  skip: {reason}", file=sys.stderr)
 
     def track(entries):
+        """Watch the loans in `entries` whose coin is really what they claim.
+
+        A book entry is a claim about a coin, and this bot is about to spend
+        real fees composing against it. So the outpoint is fetched and compared
+        with the address the terms compile to before anything is tracked -- the
+        same check pignus-cli makes, for the same reason.
+        """
         for e in entries:
             t = LoanTerms.from_json(e["terms"])
-            key = f"{e['txid']}:{int(e.get('vout', 0))}"
+            txid, vout = e["txid"], int(e.get("vout", 0))
+            key = f"{txid}:{vout}"
             if key in loans:
                 continue
-            watcher.track(key, t, e["txid"], int(e.get("vout", 0)),
-                          single_leaf=bool(e.get("single_leaf")))
-            loans[key] = (t, Outpoint(e["txid"], int(e.get("vout", 0)),
-                                      t.collateral_amount, t.collateral_asset),
-                          bool(e.get("single_leaf")))
-
-    if args.loans:
-        with open(args.loans) as f:
-            track(json.load(f))
-    if args.book:
-        track(fetch_book_loans(args.book))
-    print(f"watching {len(loans)} loan(s); oracle key {oracle_x}", file=sys.stderr)
+            single = bool(e.get("single_leaf"))
+            got = node.gettxout(txid, vout, True)
+            if got is None:
+                continue                   # spent already, or never funded
+            want = (offer_vault_address(t) if single else t.script_pubkey()).hex()
+            if got["scriptPubKey"]["hex"] != want:
+                print(f"ignoring {key}: the coin there is not what these terms "
+                      "compile to", file=sys.stderr)
+                continue
+            if got.get("asset") is None:
+                print(f"ignoring {key}: the vault coin is blinded, and the "
+                      "covenant cannot read a blinded amount", file=sys.stderr)
+                continue
+            value = int(round(float(got["value"]) * COIN))
+            if got["asset"] != t.collateral_asset or value != t.collateral_amount:
+                print(f"ignoring {key}: the coin holds {value} of "
+                      f"{got['asset'][:8]}…, not {t.collateral_amount} of "
+                      f"{t.collateral_asset[:8]}…", file=sys.stderr)
+                continue
+            watcher.track(key, t, txid, vout, single_leaf=single)
+            loans[key] = (t, Outpoint(txid, vout, value, t.collateral_asset),
+                          single)
 
     def fee_for(t, flow):
+        """(asset, atoms) for this exit, mirroring pignus-cli's choice."""
         table = F.fee_table(node)
-        labels = node.dumpassetlabels()
-        if args.fee_amount and args.fee_asset:
-            return labels.get(args.fee_asset, args.fee_asset), args.fee_amount
+        if args.fee_amount:
+            return fee_asset, int(args.fee_amount)
+        if fee_asset:
+            rate = table["rates"].get(fee_asset)
+            if not rate:
+                # No silent second choice: the operator named the asset this
+                # bot pays in, and paying in another one is not a smaller
+                # version of that instruction.
+                raise ValueError(f"the node publishes no fee rate for "
+                                 f"{args.fee_asset}")
+            return fee_asset, F.fee_atoms(rate, F.VSIZE[flow],
+                                          table["feerate_rfa_per_kvb"])
         have = {}
         for u in node.listunspent():
             if u.get("spendable"):
                 have[u["asset"]] = have.get(u["asset"], 0) + int(
                     round(float(u["amount"]) * COIN))
-        prefer = [labels.get(args.fee_asset, args.fee_asset)] if args.fee_asset \
-            else [t.debt_asset]
-        return F.pick_fee(table, have, flow, prefer)
+        return F.pick_fee(table, have, flow, [t.debt_asset])
 
-    while True:
+    def oracle_key(url):
+        ox = oracle_keys.get(url)
+        if ox is None:
+            ox = oracle_keys[url] = fetch_oracle_key(url)
+        return ox
+
+    def gather(markets):
+        """{(oracle_x, market): Attestation}, each verified against the key that
+        signed it.
+
+        Never act on a price this bot has not verified itself: an oracle is
+        trusted for the number, not for the transport that carried it, and a
+        book that aggregates several oracles is not trusted to say which key
+        signed which price.
+        """
+        now = int(time.time())
+        ev = {}
+
+        def keep(ox, att, where):
+            if not O.verify(ox, att):
+                print(f"oracle: {att.market}: an attestation from {where} "
+                      "FAILED verification, ignoring", file=sys.stderr)
+                return
+            age = now - int(att.timestamp)
+            if age > args.max_attestation_age and not args.allow_stale:
+                print(f"oracle: {att.market}: {where}'s price was signed {age}s "
+                      f"ago (max {args.max_attestation_age}); not acting on it",
+                      file=sys.stderr)
+                return
+            ev[(ox.lower(), canon(att.market))] = att
+
+        for market in markets:
+            if args.book:
+                try:
+                    for ox, att in fetch_attestation_set(args.book, market).items():
+                        keep(ox, att, "the book")
+                except TRANSIENT as e:
+                    print(f"book: {market}: {type(e).__name__}: {e}",
+                          file=sys.stderr)
+            for url in args.oracle or []:
+                try:
+                    keep(oracle_key(url), fetch_attestation(url, market), url)
+                except TRANSIENT as e:
+                    print(f"oracle: {market}: {type(e).__name__}: {e}",
+                          file=sys.stderr)
+        return ev
+
+    def evidence_for(who, t, ev):
+        """The attestations from `ev` that THIS loan can actually be closed
+        with: signed by a key it names, at the scale it computes with."""
+        out = {}
+        for k in t.oracle_keys:
+            att = ev.get((k.lower(), canon(t.market)))
+            if att is None:
+                continue
+            if not O.verify(k, att, t.price_scale):
+                # A good signature at another price_scale is a good signature
+                # over a different number: at a tenth of this loan's scale the
+                # attested integer is ten times too small, which opens
+                # LIQUIDATE on a healthy loan and seizes ten times the
+                # collateral. The covenant sees only the integer, so this is
+                # the only place it can be caught.
+                note(who,
+                     f"an attestation for {t.market} is at price scale "
+                     f"{att.price_scale}, but this loan computes at "
+                     f"{t.price_scale}; the covenant would misread it")
+                continue
+            if att.timestamp < t.not_before:
+                continue
+            out[k] = att
+        return out
+
+    def decide(v, ev, height):
+        """(kind, price, evidence) for a live vault, or None.
+
+        The decision is made from the loan's OWN oracles before anything is
+        spent: a loan judged on the wrong key is a fee paid to compose a spend
+        the covenant will refuse.
+        """
+        t = v.terms
+        usable = evidence_for(v.loan_id, t, ev)
+        if not usable:
+            return None
+        if t.oracles:
+            slots, price = O.liquidatable_slots(t, usable)
+            if slots is not None:
+                return "liquidate", price, usable
+            if args.call_due and height is not None and height >= t.maturity:
+                slots, price = O.select_threshold(t, usable)
+                if slots is None:
+                    note(v.loan_id, f"cannot reach the {t.threshold}-of-"
+                                    f"{len(t.oracle_keys)} oracle threshold")
+                    return None
+                return "default", price, usable
+            return None
+        att = usable[t.oracle_keys[0]]
+        if t.is_liquidatable(att.price):
+            return "liquidate", att.price, att
+        if args.call_due and height is not None and height >= t.maturity:
+            return "default", att.price, att
+        return None
+
+    def check_coin(v, t, single):
+        """The vault coin, re-read, or None. Nothing is composed against a
+        remembered outpoint: a coin already seized by another racer, or a book
+        entry that never described the coin it named, would otherwise cost a
+        preparing transaction and a rejected broadcast every round."""
+        got = node.gettxout(v.txid, v.vout, True)
+        if got is None:
+            return None
+        want = (offer_vault_address(t) if single else t.script_pubkey()).hex()
+        value = int(round(float(got["value"]) * COIN))
+        if (got["scriptPubKey"]["hex"] != want
+                or got.get("asset") != t.collateral_asset
+                or value != t.collateral_amount):
+            note(v.loan_id, "the vault coin is not what these terms compile to")
+            loans.pop(v.loan_id, None)
+            return None
+        return Outpoint(v.txid, v.vout, value, t.collateral_asset)
+
+    def round_once():
         if args.book:
             try:
                 track(fetch_book_loans(args.book))
-            except Exception as e:               # noqa: BLE001
+            except TRANSIENT as e:
                 print(f"book: {type(e).__name__}: {e}", file=sys.stderr)
         watcher.poll()
-        prices, attestations = {}, {}
-        for market in {t.market for t, _ in loans.values()}:
-            try:
-                att = fetch_attestation(args.oracle, market)
-            except Exception as e:               # noqa: BLE001
-                print(f"oracle: {market}: {type(e).__name__}: {e}", file=sys.stderr)
-                continue
-            # Never act on a price this bot has not verified itself. The oracle
-            # is trusted for the number, not for the transport that carried it.
-            if not O.verify(oracle_x, att):
-                print(f"oracle: {market}: attestation FAILED verification, "
-                      "ignoring", file=sys.stderr)
-                continue
-            prices[market] = att.price
-            attestations[market] = att
+        ev = gather({canon(t.market) for t, _o, _s in loans.values()})
+        height = node.getblockcount() if args.call_due else None
 
-        targets = [(v, prices[v.terms.market], attestations[v.terms.market],
-                    "liquidate")
-                   for v, _p in watcher.liquidatable(prices)]
-        if args.call_due:
-            height = node.getblockcount()
-            for v in watcher.due(height):
-                if v.terms.market in attestations and not any(
-                        t[0] is v for t in targets):
-                    targets.append((v, prices[v.terms.market],
-                                    attestations[v.terms.market], "default"))
-
-        for v, price, att, kind in targets:
+        for v in list(watcher.vaults.values()):
+            if v.state is not State.LIVE or v.loan_id not in loans:
+                continue
             t = v.terms
-            seize, surplus = t.seizure_at(price), t.surplus_at(price)
+            got = decide(v, ev, height)
+            if got is None:
+                continue
+            kind, price, evidence = got
+            seize = min(t.collateral_amount, t.seizure_at(price))
+            surplus = t.surplus_at(price)
+            profit = seize * price // t.price_scale - t.debt
             print(f"{kind}: {t.loan_id()[:16]} {t.market} price={price} "
-                  f"health={t.health(price):.3f} seize={seize} surplus={surplus}",
-                  file=sys.stderr)
+                  f"health={t.health(price):.3f} seize={seize} surplus={surplus} "
+                  f"profit={profit}", file=sys.stderr)
+            if profit < args.min_profit:
+                note(v.loan_id, f"{profit} atoms of profit is under "
+                                f"--min-profit {args.min_profit}")
+                continue
             if args.dry_run:
                 continue
             try:
-                _, outpoint, single = loans[v.loan_id]
-                fee_asset, fee_amount = fee_for(
+                _t, _outpoint, single = loans[v.loan_id]
+                outpoint = check_coin(v, t, single)
+                if outpoint is None:
+                    continue
+                fee_asset_, fee_amount = fee_for(
                     t, (kind if single else kind + "4"))
-                spender = VaultSpender(node, t, fee_asset, fee_amount,
+                spender = VaultSpender(node, t, fee_asset_, fee_amount,
                                        single_leaf=single)
                 wants = {t.debt_asset: t.debt}
-                wants[fee_asset] = wants.get(fee_asset, 0) + fee_amount
+                wants[fee_asset_] = wants.get(fee_asset_, 0) + fee_amount
                 funding = select_funding(node, wants,
                                          exclude=[(outpoint.txid, outpoint.vout)])
-                # A threshold loan is closed with a MAPPING of attestations,
-                # one per oracle, which only the book aggregates.
-                if t.oracles:
-                    if not args.book:
-                        print("  skip: threshold loan needs --book for the "
-                              "attestation set", file=sys.stderr)
-                        continue
-                    ev = fetch_attestation_set(args.book, t.market)
-                    evidence = {k: a for k, a in ev.items()
-                                if k in t.oracles and O.verify(k, a)}
-                else:
-                    evidence = att
                 if kind == "liquidate":
                     raw = spender.liquidate(outpoint, funding, evidence, taker_spk)
                 else:
                     raw = spender.call_default(outpoint, funding, evidence, taker_spk)
                 txid = node.sendrawtransaction(raw)
+                warned.pop(v.loan_id, None)
                 print(f"  broadcast {txid}", file=sys.stderr)
-            except (RpcError, RuntimeError, ValueError) as e:
+            except TRANSIENT as e:
                 # Losing a race is normal and is not an error worth stopping for:
                 # another liquidator got there first and the borrower and lender
                 # are no worse off for it.
@@ -229,8 +412,42 @@ def main():
             if v.state not in (State.LIVE, State.UNCONFIRMED):
                 loans.pop(v.loan_id, None)
 
+    # Start-up talks to the node, the book and the oracles, all of which can be
+    # unreachable or misconfigured. One line each, rather than a traceback.
+    try:
+        if args.taker_spk:
+            taker_spk = bytes.fromhex(args.taker_spk)
+        else:
+            info = node.getaddressinfo(args.taker_address)
+            unconf = info.get("unconfidential", args.taker_address)
+            taker_spk = bytes.fromhex(node.getaddressinfo(unconf)["scriptPubKey"])
+        fee_asset = resolve_asset(args.fee_asset) if args.fee_asset else None
+        for url in args.oracle or []:
+            oracle_key(url)
+        if args.loans:
+            with open(args.loans) as f:
+                track(json.load(f))
+        if args.book:
+            track(fetch_book_loans(args.book))
+    except TRANSIENT as e:
+        sys.exit(f"pignus-liquidator: {type(e).__name__}: {e}")
+
+    print(f"watching {len(loans)} loan(s); "
+          f"{len(oracle_keys)} oracle(s) named directly"
+          + (f", prices also from the book at {args.book}" if args.book else ""),
+          file=sys.stderr)
+
+    while True:
+        failed = False
+        try:
+            round_once()
+        except TRANSIENT as e:
+            # A round that could not be completed is a round skipped, not the
+            # end of the bot.
+            failed = True
+            print(f"round: {type(e).__name__}: {e}", file=sys.stderr)
         if args.once:
-            return 0
+            return 1 if failed else 0
         time.sleep(args.interval)
 
 

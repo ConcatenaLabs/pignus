@@ -423,5 +423,51 @@
         "forfeit": "c550929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0a4949edf2ac6f4616e6d6977f4409466d0af90dadf5d04c1952eba37b4d4a626"
       }
     }
+  ],
+  "hashlocks": [
+    {
+      "name": "hashlock_v1",
+      "params": {
+        "preimage_hash": "7777777777777777777777777777777777777777777777777777777777777777",
+        "asset": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "payee_prog": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "refund_after": 900,
+        "refund_prog": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "leaves": {
+        "claim": "a820777777777777777777777777777777777777777777777777777777777777777788cdc95188cd7693ce518820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88cd7693d1518820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd88cd7693cf51887cdf",
+        "refund": "028403b175cdc95188cd7693ce518820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88cd7693d1518820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc88cd7693cf51887cdf"
+      },
+      "scriptPubKey": "5120f73afab74ed95bf12807353e0910d2c55b0300ab9667cadbd4ec28b242f9165c",
+      "output_key": "f73afab74ed95bf12807353e0910d2c55b0300ab9667cadbd4ec28b242f9165c",
+      "negflag": 0,
+      "control_blocks": {
+        "claim": "c450929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0cfd3391e6685248bd464d406922e6246e8f8de032172b16924a5381c4e4072a1",
+        "refund": "c450929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac08dc1e322bb247950d0afa9a677b270e6c0617bb11e8b54d7f7cef948bbede0a5"
+      }
+    },
+    {
+      "name": "hashlock_v0_payee",
+      "params": {
+        "preimage_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "asset": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "payee_prog": "dddddddddddddddddddddddddddddddddddddddd",
+        "payee_ver": 0,
+        "refund_after": 1800000000,
+        "refund_prog": "cccccccccccccccccccccccccccccccccccccccc",
+        "refund_ver": 0
+      },
+      "leaves": {
+        "claim": "a820888888888888888888888888888888888888888888888888888888888888888888cdc95188cd7693ce518820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88cd7693d1008814dddddddddddddddddddddddddddddddddddddddd88cd7693cf51887cdf",
+        "refund": "0400d2496bb175cdc95188cd7693ce518820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88cd7693d1008814cccccccccccccccccccccccccccccccccccccccc88cd7693cf51887cdf"
+      },
+      "scriptPubKey": "5120b5a0d1bd89d5f6bd1d490693fb9a7398d01885ac733200f00093c502838d5c17",
+      "output_key": "b5a0d1bd89d5f6bd1d490693fb9a7398d01885ac733200f00093c502838d5c17",
+      "negflag": 0,
+      "control_blocks": {
+        "claim": "c450929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac09cfd17ed208f9b4b989de6f0f20fde93a276ea19f8562d07f4cb59c88a82bea9",
+        "refund": "c450929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac01eb211981d3352377f78a18e6737be5996cb58449bd8d6a29b06f298a2e707eb"
+      }
+    }
   ]
 }

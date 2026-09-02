@@ -1,17 +1,14 @@
 # Pignus: non-custodial collateralised lending on Sequentia
 
-Status (2026-08-22): the loan-vault covenant (section 2) is implemented in the
-node repository's
-[`test/functional/pignus_covenant.py`](https://github.com/ConcatenaLabs/Sequentia/blob/master/test/functional/pignus_covenant.py)
-and proven against the node by `feature_pignus_vault.py`, which is in the test
-runner, with the oracle set (6.1), funded offers (3) and the attack suite proven
-by `feature_pignus_oracle_set.py`, `feature_pignus_offer.py` and
-`feature_pignus_attack.py` beside it. The oracle, the loan book, the watcher,
-the browser client, the Bitcoin-collateral construction (section 7) and the
-OpenDAMP repurchase (8.1) are implemented in this repository. The oracle, the
-loan book and the browser client run on the testnet at
-[sequentiatestnet.com/lending/](https://sequentiatestnet.com/lending/), and
-`pignus-cli` is on the download page.
+The loan-vault covenant (section 2) lives in the node repository's
+[`test/functional/pignus_covenant.py`](https://github.com/ConcatenaLabs/Sequentia/blob/master/test/functional/pignus_covenant.py),
+where it is proven against a node by `feature_pignus_vault.py`,
+`feature_pignus_oracle_set.py`, `feature_pignus_offer.py`,
+`feature_pignus_hashlock.py` and `feature_pignus_attack.py`. Everything that
+drives it -- the oracle, the loan book, the watcher, the browser client, the
+Bitcoin-collateral construction (section 7) and the OpenDAMP repurchase (8.1) --
+lives in the `pignus` repository, and runs on the testnet at
+[sequentiatestnet.com/lending/](https://sequentiatestnet.com/lending/).
 
 *Pignus* is the Roman-law term for property pledged as security for a debt: the
 creditor holds the pledge, the debt is owed separately, and redeeming the debt
@@ -418,21 +415,90 @@ path trustless:
    signature on the transaction that returns the BTC to the borrower, as an
    **adaptor** signature under `T`. The borrower holds a release signature they
    cannot yet complete.
-3. The borrower repays on Sequentia into a taproot output with two leaves:
-   CLAIM, `OP_SHA256 <h> OP_EQUALVERIFY <P_lender> CHECKSIG`, and REFUND,
-   `<repay_deadline> CLTV DROP <P_borrower> CHECKSIG` if the lender stalls.
+3. The borrower repays on Sequentia into a hashlocked output whose CLAIM leaf
+   pays the lender against `t` and whose REFUND leaf returns the money to the
+   borrower after `repay_deadline`.
 4. The lender claims the repayment, which publishes `t` on the Sequentia chain.
 5. The borrower reads `t`, completes the adaptor signature, adds their own half,
    and takes the BTC back through RECLAIM.
 
-If the lender never claims, the borrower recovers the principal repayment after
-the CLTV and the lender takes the BTC via TIMEOUT: the loan unwinds, nobody is
-robbed, and the lender is strictly worse off for stalling, so they do not.
+If the lender never claims, the borrower recovers the repayment after the CLTV
+and the lender takes the BTC via TIMEOUT: the loan unwinds and neither side is
+robbed, though the stall is not free for the borrower -- see the exposure table
+below.
 
 The claimant on the Bitcoin side must re-run the anchor-safety check on the
 Sequentia reveal before acting on `t`, for the reason in section 6.4 -- a
 covenant cannot introspect anchoring, so this stays a watcher discipline. This
 is the same discipline the SeqDEX cross-chain leg already documents.
+
+**Origination is atomic, because otherwise it is a gift.** Steps 1 to 5 describe
+a loan that already exists. Getting into one is the harder half, and the obvious
+sequence -- borrower funds the vault, lender then sends the principal -- gives
+the lender a free option: say nothing, wait for `recover_after`, and sweep
+collateral that was never paid for. No amount of care on the borrower's side
+detects it in advance. So the collateral does not go into the vault first.
+
+The borrower funds a **pre-vault**, a P2TR output with the NUMS internal key and
+two leaves, where `w` is a secret the borrower chooses and `H_w = SHA256(w)`:
+
+- leaf UPGRADE: `SHA256 <H_w> EQUALVERIFY <P_borrower> CHECKSIG` -- moves the
+  collateral into the vault;
+- leaf ABORT: `<abort_after> CLTV DROP <P_borrower> CHECKSIG` -- takes it back.
+
+The borrower signs the single UPGRADE transaction, pre-vault to vault, at
+origination, before anything is broadcast. That fixes the vault's outpoint, which
+is what the lender's adaptor signature has to commit to, and it means the
+collateral can be moved on by anyone holding `w` -- without the borrower being
+online. The pre-vault holds `btc_amount + upgrade_fee`, because after
+origination the borrower may be gone and the move still has to pay for itself.
+
+The principal is paid into a hashlocked Sequentia output of the same shape as
+the repayment: CLAIM pays the borrower against `w`, REFUND returns it to the
+lender after `d_refund`. Both Sequentia outputs use the covenant's
+`build_hashlock_leaf`, so **neither leg needs a signature** and neither can pay
+anyone but the party its address already names. That is what lets a browser
+drive the whole thing: the wallet extension signs its own inputs and a Bitcoin
+sighash, but no Sequentia covenant leaf, and here it does not have to.
+
+Origination therefore runs:
+
+| # | who | what | if it stops here |
+|---|---|---|---|
+| 1 | borrower | prepares the pre-vault funding, unbroadcast, and pre-signs UPGRADE | nothing has happened |
+| 2 | lender | verifies the pre-signature, adaptor-signs RECLAIM under a fresh `T` | nothing has happened |
+| 3 | borrower | verifies the release, broadcasts the pre-vault funding | borrower ABORTs at `abort_after`, out only a fee |
+| 4 | lender | sees the collateral confirmed, pays the principal into the hashlock | lender REFUNDs at `d_refund`; borrower ABORTs |
+| 5 | borrower | claims the principal, publishing `w` | lender REFUNDs at `d_refund`; borrower ABORTs |
+| 6 | lender | reads `w`, waits for the claim to be anchor-safe, broadcasts UPGRADE | **the lender loses**: the borrower has the principal and, at `abort_after`, the collateral |
+
+Only step 6 exposes anyone to a loss rather than to a delay, and only the lender,
+who controls whether they are online. The margin between `d_refund` and
+`abort_after` is what makes that exposure a choice rather than a race, which is
+why `timelocks_sane()` refuses a loan whose deadlines do not leave it: at least a
+day, in wall-clock seconds, converting each chain's heights at its own block
+time. The same function refuses a loan whose `recover_after` does not sit a day
+past `repay_deadline`, because a lender who could claim a repayment after the
+Bitcoin timeout had opened would be racing the borrower for the collateral with
+the repayment already in hand.
+
+**What each party is exposed to, once a loan is live.** The bounded losses are
+worth stating plainly rather than being left as "nobody is robbed":
+
+| outcome | borrower ends with | lender ends with |
+|---|---|---|
+| borrower repays, lender claims | the collateral, less the interest | the debt |
+| borrower repays, lender stalls past `repay_deadline` | the repayment back, less two fees; the collateral is lost at TIMEOUT | the collateral, worth more than the debt on an over-collateralised loan |
+| borrower never repays | nothing | the collateral, at TIMEOUT |
+| price crosses the strike | the collateral, less what SEIZE took | the debt, if the oracle co-signs |
+
+The second row is the honest one: a lender who stalls gives up the repayment and
+takes collateral worth more, so on an over-collateralised loan stalling **pays**.
+The borrower's protection is not the lender's incentive; it is the margin
+`timelocks_sane()` enforces plus the borrower's own duty to repay early enough
+that the claim is buried well before `recover_after`. A borrower who repays at
+the last block has chosen the risk. The page says so where the repay button is,
+rather than in a document nobody reads.
 
 ### 7.2 Why an oracle leaf and not a DLC
 
@@ -472,7 +538,7 @@ one to use where a choice exists.
 | Tier | Assets | Enforcement | Trust |
 |---|---|---|---|
 | A | tSEQ, GOLD, SILVR, OILX, EURX, SBTC, and any unrestricted issued asset | The section-2 covenant | Oracle, for one number |
-| B | Native BTC | Section 7, cross-chain | Oracle, interactively, for liquidation only |
+| B | Native BTC | Section 7, cross-chain | Oracle, interactively, for liquidation; the lender, for being online |
 | C | OpenAMP (`cosign`) assets | A pledge the policy server enforces | Oracle **and** the issuer |
 | D | OpenDAMP (`damp`) assets | Not lending: a repurchase (8.1) | Oracle, and the lender for the bond |
 

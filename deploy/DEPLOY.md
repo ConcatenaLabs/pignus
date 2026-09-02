@@ -10,6 +10,12 @@ on the box.
 |---|---|---|
 | `pignus-oracle` | 8740 | signs prices on a timer and publishes every one |
 | `pignusd` | 8741 | the loan book, the chain watcher, and the page |
+| `pignus-btc-responder` | none | a lender's side of every open cross-chain loan |
+
+The responder is a lender's own process, not part of the service: it holds the
+key that signs releases and the wallet that pays principals. It is listed here
+because the testnet runs one, and because a cross-chain offer nobody responds to
+is an offer nobody can take.
 
 Both are pure Python and need no build step. They do need a Sequentia **source**
 checkout, because the loan covenant lives in the node repository and Pignus
@@ -119,14 +125,45 @@ attestation per oracle; a lender opens a 2-of-3 with `offer-fund --oracles book
 ## Native BTC collateral (Tier B)
 
 This tier is cross-chain and, unlike the covenant tiers, needs the lender as an
-active counterparty (Bitcoin has no covenants, so liquidation needs the oracle
-to co-sign and origination is a two-party adaptor handshake). It runs from
-`pignus-cli btc-*` against a Bitcoin Core node (the box already runs one on
-testnet4) and the Sequentia node; the page carries a keyless VERIFIER so a
-borrower can rebuild every address and check the lender's release before funding.
-There is no daemon service to deploy for it beyond the book that lists the
-markets. See the README for the command sequence and the design doc section 7
-for the trust model.
+active counterparty: Bitcoin has no covenants, so liquidation needs the oracle to
+co-sign and origination is a two-party handshake. A borrower does the whole of
+their side in the page; the lender's side is a process that has to be running.
+
+```bash
+cp /root/sequentia/pignus/deploy/responder.example.json \
+   /root/sequentia/pignus-responder.json
+chmod 600 /root/sequentia/pignus-responder.json
+# edit it: the lender key, the Sequentia wallet that pays principals, and the
+# Bitcoin node. Nothing secret goes on the command line -- `ps` is readable by
+# every user on the box.
+cp /root/sequentia/pignus/deploy/pignus-btc-responder.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now pignus-btc-responder
+```
+
+The responder signs releases, pays principals once the collateral is confirmed,
+starts loans as borrowers claim their principal, and takes back what nobody
+claimed. It keeps its state in one file beside the key (`state` in the config):
+that file is what stops a principal being paid twice after a crash, so back it
+up with the key and never delete it while a loan is open.
+
+**Back up the lender key AND the state file.** Losing the key loses the ability
+to claim repayments -- borrowers can still take their collateral back once the
+loans time out, so nobody is robbed, but the lender is. Losing the state file
+without losing the key risks paying a principal twice.
+
+Publishing an offer, from the lender's machine:
+
+```bash
+pignus-cli btc-offer-publish --config /root/sequentia/pignus-responder.json \
+    --oracle-x <x> --btc-amount 100000 --debt-asset <id> --debt 5250000000 \
+    --principal 5000000000 --lots 3 --market BTC/USDX
+```
+
+Every offer is signed by the lender key it names, and the relay refuses one that
+is not: an unsigned offer would let anyone publish in a lender's name and have
+that lender's own responder pay it out. See the README for the whole command
+sequence and the design doc section 7 for the trust model and what each party is
+exposed to at each step.
 
 ## Seeding the book
 

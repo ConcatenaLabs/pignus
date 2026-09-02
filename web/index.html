@@ -10,6 +10,7 @@
     --bad:#ff8f8f;--bad-line:#4d2626;
     --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
   *{box-sizing:border-box}
+  [hidden]{display:none!important}
   body{margin:0;font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
        background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
   .wrap{max-width:1080px;margin:0 auto;padding:32px 24px 72px}
@@ -84,6 +85,10 @@
   .preview .k{color:var(--mute)}
   .kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;font-size:14px}
   .kv .k{color:var(--mute)}
+  tr.det td{display:block;text-align:left;background:var(--card2)}
+  tr.det td::before{content:none}
+  tr.det pre{white-space:pre-wrap;word-break:break-all;font-family:var(--mono);
+             font-size:12px;color:var(--dim);margin:8px 0 0;max-height:260px;overflow:auto}
   .safe{border-left:3px solid var(--gold)}
   .safe code{background:var(--bg);padding:2px 6px;border-radius:4px;font-size:13px}
   details summary{cursor:pointer;color:var(--dim);font-size:14px}
@@ -108,9 +113,10 @@
   }
 </style></head><body><div class="wrap">
 
-<p class="crumb"><a href="/">&larr; Sequentia testnet</a></p>
+<p class="crumb"><a href="/" id="crumb">&larr; Sequentia testnet</a></p>
 <h1>Pignus <span class="t">lending</span></h1>
-<p class="sub">Borrow USDX against GOLD, SILVR, OILX or tSEQ. Every term of a loan
+<p class="sub"><span id="intro_markets">Borrow one Sequentia asset against
+another, or against native Bitcoin.</span> Every term of a loan
 is compiled into a covenant the network enforces: nobody holds the collateral,
 nobody can change the deal once it is struck, and repaying needs no one's
 permission.</p>
@@ -121,25 +127,28 @@ permission.</p>
 </div>
 
 <div class="card" id="wallet"></div>
-<div id="busy"></div>
-<div class="note" id="note"></div>
+<div id="busy" role="status" aria-live="polite"></div>
+<div class="note" id="note" role="status" aria-live="polite"></div>
+<div id="alerts"></div>
 
 <section>
-  <h2>Prices <span class="tag dim">oracle-signed, verified here before use</span></h2>
+  <h2>Prices <span class="tag dim">oracle-signed; verified in your browser before any spend uses one</span></h2>
   <div class="grid" id="markets"><div class="empty">loading&hellip;</div></div>
 </section>
 
 <div class="tabs">
-  <button data-tab="borrow" class="on">Borrow</button>
-  <button data-tab="lend">Lend</button>
-  <button data-tab="loans">Loans</button>
-  <button data-tab="repo">Repurchase</button>
-  <button data-tab="btc">BTC collateral</button>
+  <div role="tablist" aria-label="Pignus sections" class="row">
+    <button data-tab="borrow" id="tab-borrow" aria-controls="panel-borrow" class="on">Borrow</button>
+    <button data-tab="lend" id="tab-lend" aria-controls="panel-lend">Lend</button>
+    <button data-tab="loans" id="tab-loans" aria-controls="panel-loans">Loans</button>
+    <button data-tab="repo" id="tab-repo" aria-controls="panel-repo">Repurchase</button>
+    <button data-tab="btc" id="tab-btc" aria-controls="panel-btc">BTC collateral</button>
+  </div>
   <span class="spacer"></span>
   <button id="refresh" class="sm">Refresh</button>
 </div>
 
-<section data-panel="borrow">
+<section data-panel="borrow" id="panel-borrow" role="tabpanel" aria-labelledby="tab-borrow">
   <div class="row" style="justify-content:space-between">
     <h2>Open offers</h2>
     <span class="row">
@@ -156,29 +165,31 @@ permission.</p>
   <div class="card tbl" id="offers"><div class="empty">loading&hellip;</div></div>
 </section>
 
-<section data-panel="lend" style="display:none">
+<section data-panel="lend" id="panel-lend" role="tabpanel" aria-labelledby="tab-lend" hidden>
   <h2>Lend</h2>
   <p class="hint">Your principal goes into an offer covenant with the terms baked
   in. Borrowers take it while you are offline; you cannot oversell it and cannot
   change a term afterwards. Anything untaken comes back to you after the expiry,
   permissionlessly, to the address this wallet already has.</p>
   <form class="lend card" id="lendform">
-    <div><label>Market</label><select name="market" id="marketsel"></select></div>
-    <div><label>Lend per loan <span id="lend_unit"></span></label>
-      <input name="principal" type="number" step="any" min="0" value="100" required></div>
-    <div><label>How many loans</label>
-      <input name="lots" type="number" value="1" min="1" step="1" required></div>
-    <div><label>Interest over the term (%)</label>
-      <input name="rate" type="number" step="0.01" min="0" value="3" required></div>
-    <div><label>Collateral required (loan-to-value %)</label>
-      <input name="open_ltv" type="number" step="1" min="1" max="99" value="50" required></div>
-    <div><label>Liquidate at (loan-to-value %)</label>
-      <input name="liq_ltv" type="number" step="1" min="2" max="100" value="75" required></div>
-    <div><label>Term (days)</label>
-      <input name="term_days" type="number" step="any" min="0.01" value="30" required></div>
-    <div><label>Offer open for (days)</label>
-      <input name="offer_days" type="number" step="any" min="0.01" value="30" required></div>
-    <div><label>Oracle <span class="small" id="oracle_count"></span></label>
+    <div><label for="marketsel">Market</label>
+      <select name="market" id="marketsel"></select></div>
+    <div><label for="principal">Lend per loan <span id="lend_unit"></span></label>
+      <input id="principal" name="principal" type="number" step="any" min="0" value="100" required></div>
+    <div><label for="lots">How many loans</label>
+      <input id="lots" name="lots" type="number" value="1" min="1" step="1" required></div>
+    <div><label for="rate">Interest to maturity (%)</label>
+      <input id="rate" name="rate" type="number" step="0.01" min="0" value="3" required></div>
+    <div><label for="open_ltv">Collateral required (loan-to-value %)</label>
+      <input id="open_ltv" name="open_ltv" type="number" step="1" min="1" max="99" value="50" required></div>
+    <div><label for="liq_ltv">Liquidate at (loan-to-value %)</label>
+      <input id="liq_ltv" name="liq_ltv" type="number" step="1" min="2" max="100" value="75" required></div>
+    <div><label for="term_days">All loans mature (days from now)</label>
+      <input id="term_days" name="term_days" type="number" step="any" min="0.01" value="30" required>
+      <span class="small">A borrower who takes the offer later gets a shorter loan.</span></div>
+    <div><label for="offer_days">Offer open for (days)</label>
+      <input id="offer_days" name="offer_days" type="number" step="any" min="0.01" value="7" required></div>
+    <div><label for="oraclesel">Oracle <span class="small" id="oracle_count"></span></label>
       <select name="oracle_mode" id="oraclesel">
         <option value="single">Single oracle (default)</option>
       </select></div>
@@ -189,7 +200,7 @@ permission.</p>
   </form>
 </section>
 
-<section data-panel="loans" style="display:none">
+<section data-panel="loans" id="panel-loans" role="tabpanel" aria-labelledby="tab-loans" hidden>
   <div class="row" style="justify-content:space-between">
     <h2>Loans</h2>
     <span class="row">
@@ -202,53 +213,66 @@ permission.</p>
   1.00 anyone may liquidate, and the covenant forces the surplus back to the
   borrower whoever does it &mdash; a liquidation is a race for the bonus, not a
   seizure. After maturity a loan can be called at any price; long after, the
-  lender can sweep it without an oracle.</p>
+  lender can sweep it without an oracle.<br>
+  LIVE means the funding is buried as deep as this book requires; Sequentia
+  follows Bitcoin reorgs, so treat a fresh loan as provisional until it is
+  deeper than you would accept a Bitcoin payment at. To add collateral, repay
+  and take a new offer; the new vault also retires every attestation older than
+  the day it opens.</p>
   <div class="card tbl" id="loans"><div class="empty">loading&hellip;</div></div>
 </section>
 
-<section data-panel="repo" style="display:none">
+<section data-panel="repo" id="panel-repo" role="tabpanel" aria-labelledby="tab-repo" hidden>
   <h2>Check a repurchase <span class="tag">regulated assets &mdash; not a loan</span></h2>
   <p class="hint">A regulated (OpenDAMP) asset cannot sit in a lending vault:
   every output carrying it must pay the holder's own covenant address, so on
   default nobody could ever reach the collateral. What can be built is a
   <strong>repurchase</strong>: you sell the asset to the lender, and their
   obligation to sell it back is secured by a bond in a covenant here. Settling
-  one needs the asset's own machinery, so the transaction is composed elsewhere;
-  this page does the half that protects you &mdash; rebuild the bond vault's
-  address from the terms and check it against the funded coin.</p>
+  one is a single OpenDAMP transfer that also spends the bond vault, and Pignus
+  does not compose that transaction yet; this page does the half that protects
+  you: it rebuilds the bond vault's address from the terms and checks it against
+  the funded coin, its asset and its amount.</p>
   <form class="lend card" id="repoform">
-    <div class="full"><label>Repurchase terms (JSON)</label>
+    <div class="full"><label for="repoterms">Repurchase terms (JSON)</label>
       <textarea name="terms" id="repoterms" rows="8"
         placeholder='{"collateral_asset": "...", "collateral_amount": 10000000000, "debt_asset": "...", "principal": 70000000000, "debt": 75000000000, "collateral_value": 100000000000, "borrower_cu": "...", "borrower_prog": "...", "lender_prog": "...", "borrower_ver": 0, "lender_ver": 0, "forfeit_after": 900000}'></textarea></div>
-    <div><label>Funding txid <span class="small">(optional)</span></label>
+    <div><label for="repotxid">Funding txid <span class="small">(optional)</span></label>
       <input name="txid" id="repotxid" placeholder="the coin that holds the bond"></div>
-    <div><label>Vout</label><input name="vout" id="repovout" value="0"></div>
+    <div><label for="repovout">Vout</label><input name="vout" id="repovout" value="0"></div>
     <div class="full"><button type="submit">Check it</button></div>
   </form>
   <div class="card" id="repoout"><div class="empty">paste the terms you were sent</div></div>
 </section>
 
-<section data-panel="btc" style="display:none">
+<section data-panel="btc" id="panel-btc" role="tabpanel" aria-labelledby="tab-btc" hidden>
   <h2>Native Bitcoin collateral <span class="tag">cross-chain</span></h2>
   <p class="hint">Borrow a Sequentia asset against <strong>real Bitcoin</strong>,
-  not a pegged token. The collateral is a Bitcoin UTXO on the parent chain; the
-  debt is on Sequentia; the two are bound by an adaptor signature so that
-  repaying and getting the collateral back are one act, not two hopes. Because
-  Bitcoin has no covenants, this is the one tier where the lender is an active
-  counterparty: liquidation needs the oracle to co-sign on the Bitcoin side, and
-  origination is a short two-party handshake. The full flow runs from
-  <code>pignus-cli btc-*</code>; what this page does is the part that protects a
-  borrower &mdash; rebuild every address and check the lender's release
-  <em>before</em> any Bitcoin is committed.</p>
+  not a pegged token. The collateral is a Bitcoin output on the parent chain, the
+  debt is on Sequentia, and the two are bound by an adaptor signature, so
+  repaying and getting the collateral back are one act rather than two hopes.
+  Everything on this page runs through your wallet: the page rebuilds every
+  address from the terms, checks the lender's release against them, and only
+  then asks you to commit anything.</p>
+  <p class="hint">Your collateral does not go straight into the loan. It waits
+  where you alone can take it back, and the loan begins only when you claim the
+  principal &mdash; which is the same act, so you can never be left having paid
+  in and received nothing. Because Bitcoin has no covenants, this is the one
+  tier where the lender has to be online, and where a liquidation needs the
+  oracle to co-sign rather than a script to compute it.</p>
   <h3 style="margin-top:14px">Open BTC-collateral offers</h3>
   <div class="card tbl" id="btcoffers"><div class="empty">loading&hellip;</div></div>
+  <h3 style="margin-top:18px">Your BTC-collateral loans</h3>
+  <div class="card tbl" id="btcloans"><div class="empty">connect a wallet to see them</div></div>
+  <h3 style="margin-top:18px">Check a ticket made by hand</h3>
   <form class="lend card" id="btcform">
-    <div class="full"><label>Loan ticket (JSON)</label>
+    <div class="full"><label for="btcticket">Loan ticket (JSON)</label>
       <textarea name="ticket" id="btcticket" rows="9"
-        placeholder='paste the loan ticket the lender sent: btc_amount, lender_x, oracle_x, recover_after, debt_asset, debt, repay_deadline, adaptor_point, payment_hash — and, once you have prepared funding, funding_txid, reclaim_dest, adaptor_sig'></textarea></div>
+        placeholder='paste the loan ticket the lender sent: btc_amount, lender_x, borrower_x, oracle_x, recover_after, debt_asset, debt, repay_deadline, adaptor_point, payment_hash — and, once you have prepared funding, funding_txid, reclaim_dest, adaptor_sig'></textarea></div>
     <div class="full"><button type="submit">Check it</button>
-      <span class="hint" style="display:inline;margin-left:8px">Keyless: this
-      derives addresses and verifies the release; it signs nothing.</span></div>
+      <span class="hint" style="display:inline;margin-left:8px">Keyless: this form
+      derives addresses and verifies the release; it signs nothing. Only the
+      Borrow buttons above ask your wallet to sign.</span></div>
   </form>
   <div class="card" id="btcout"><div class="empty">paste a ticket to verify it</div></div>
 </section>
@@ -265,7 +289,8 @@ permission.</p>
     It cannot move your money: it holds no keys, and your wallet shows you its
     own reading of every transaction before you approve it. If the two disagree,
     reject it &mdash; and tell us.<br><br>
-    Network fees are paid in whichever asset your wallet holds; Sequentia has no
+    Network fees are paid in whichever asset you choose at the confirmation
+    step, from those your wallet holds and the network prices; Sequentia has no
     privileged fee coin. Prefer the command line, or your own node?
     <code>pignus-cli</code> does everything this page does, from a node wallet.</p>
   </div>
@@ -273,8 +298,8 @@ permission.</p>
 
 <footer>
   <a href="https://github.com/ConcatenaLabs/pignus">source</a> &middot;
-  <a href="https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/pignus-design.md">design &amp; security analysis</a> &middot;
-  <a href="/pignus-oracle/v1/log">oracle log</a>
+  <a href="https://github.com/ConcatenaLabs/pignus/blob/main/docs/pignus-design.md">design &amp; security analysis</a> &middot;
+  <a href="/pignus-oracle/v1/log" id="oraclelog">oracle log</a>
   <br>Testnet. The assets have no value and the prices are demo feeds.
 </footer>
 

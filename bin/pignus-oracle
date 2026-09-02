@@ -3,7 +3,7 @@
 # Distributed under the MIT software license.
 """The Pignus price oracle: sign prices, publish them, keep the log.
 
-The oracle is trusted for one number and nothing else (doc/sequentia/pignus-design.md
+The oracle is trusted for one number and nothing else (docs/pignus-design.md
 section 6.1), and the thing that keeps that trust honest is publication: every
 attestation it has ever signed is served, so a fabricated price sits permanently
 next to the real ones and a borrower liquidated on a bad one can point at the
@@ -22,8 +22,17 @@ Config (JSON):
       "markets":     ["GOLD/USDX", "SILVR/USDX", "OILX/USDX", "SEQ/USDX"],
       "precisions":  {"GOLD": 8, "USDX": 8},
       "symbols":     {"BTC": "tBTC"},
+      "log_max_bytes": 0,
       "source":      {"type": "http_bulk", "url": "http://127.0.0.1:8088/prices"}
     }
+
+`precisions` is the decimal count of each asset named in `markets`. Give every
+one of them an entry: a missing or mis-keyed asset is assumed to have 8
+decimals, and where that is wrong the signed price is wrong by a power of ten.
+`log_max_bytes` turns on self-rotation of the attestation log (0, the default,
+never rotates); `source` may take `max_age`, and for an HTTP feed
+`feed_max_age`, which is how old the feed's own `_meta.updated` may be before
+this oracle refuses to re-sign its numbers.
 
 `source` may instead be `{"type": "static", "prices": {"GOLD": 3000, "USDX": 1}}`,
 which is for tests and drills -- and is safe to offer precisely because every
@@ -34,9 +43,21 @@ Endpoints:
     GET /v1/pubkey                 the x-only key vaults must bake in
     GET /v1/markets                the feeds this oracle signs, with feed ids
     GET /v1/attestation/{market}   the latest signed price
-    GET /v1/log?market=&n=         recent attestations
-    GET /v1/digest                 a hash over the whole log
+    GET /v1/attestation/{market}/at/{ts}   the one signed at exactly that second
+    GET /v1/log?market=&n=&since=&until=&cursor=   attestations, recent or by time
+    GET /v1/log/raw?file=          the log itself, as ndjson
+    GET /v1/digest                 the running hash of the log, and its chain
+    GET /v1/seizures               Tier B seizures this oracle has co-signed
+    GET /v1/seizure/{sighash}      one of them, with the attestation behind it
     GET /healthz
+
+Co-signing a Tier B (native BTC) seizure is deliberately not an endpoint: it
+moves someone's bitcoin, so it is an operator's command, run against the same
+config, and it refuses unless this oracle's own published price is under the
+strike.
+
+    pignus-oracle --config oracle.json --sign-seize --market GOLD/USDX \\
+        --strike 18000000 --request seizure.json
 """
 
 import argparse
@@ -55,13 +76,18 @@ from pignus import oracle as O           # noqa: E402
 from pignus.terms import feed_id         # noqa: E402
 
 
-def load_or_create_key(path):
+def load_or_create_key(path, create=True):
     """Read the oracle key, creating it 0600 on first run.
 
     The key is the whole of the oracle's authority, so it is never logged, never
     returned by an endpoint, and the file mode is checked on every start rather
     than only at creation -- a key that became world-readable at some point is
     exactly what nobody notices.
+
+    Only the serving path creates. Everything else passes `create=False`: a
+    mistyped config path, or a machine where the backup was never restored,
+    must not answer "what is your key?" with a brand-new one that no vault
+    bakes in and that the next start would then adopt.
     """
     if os.path.exists(path):
         mode = stat.S_IMODE(os.stat(path).st_mode)
@@ -72,6 +98,10 @@ def load_or_create_key(path):
                 "consider rotating to a new key and re-issuing loans against it.")
         with open(path) as f:
             return bytes.fromhex(f.read().strip())
+    if not create:
+        raise SystemExit(f"no oracle key at {path}: start the oracle to create "
+                         "one, or restore the backup of the key this oracle's "
+                         "live loans were originated against.")
     sec = O.generate_key()
     d = os.path.dirname(path)
     if d:
@@ -89,60 +119,286 @@ def build_source(cfg):
         return O.StaticPriceSource(s.get("prices", {}))
     if kind == "http":
         return O.HttpPriceSource(s["url"], timeout=float(s.get("timeout", 5)),
-                                 field=s.get("field", "price"))
+                                 field=s.get("field", "price"),
+                                 feed_max_age=float(s.get("feed_max_age", 300)))
     if kind == "http_bulk":
         return O.BulkHttpPriceSource(s["url"], timeout=float(s.get("timeout", 8)),
                                      field=s.get("field", "price"),
-                                     max_age=float(s.get("max_age", 300)))
+                                     max_age=float(s.get("max_age", 300)),
+                                     feed_max_age=float(s.get("feed_max_age", 300)))
     raise SystemExit(f"unknown price source type: {kind!r}")
 
 
+class SeizureLog:
+    """What this oracle has co-signed on the Bitcoin side, and why.
+
+    Tier B collateral sits under a plain 2-of-2, so a seizure is not enforced by
+    a covenant that could refuse it -- the oracle's signature is the decision. A
+    lender and a captured oracle together could therefore take collateral that
+    was never liquidatable, and the only thing standing against that is this
+    file: every co-signature is published next to the attestation that justified
+    it, so `seize_is_justified` can be asked afterwards by anyone.
+    """
+
+    # Seizures are rare -- a handful over a book's life -- so the whole file is
+    # small; this bound is only so that a corrupted or padded one cannot be read
+    # into memory by a public request.
+    MAX_READ = 256 * 1024
+
+    def __init__(self, path):
+        self.path = str(path)
+
+    def append(self, rec: dict) -> None:
+        with open(self.path, "a") as f:
+            f.write(json.dumps(rec, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def all(self):
+        try:
+            size = os.path.getsize(self.path)
+            with open(self.path, "rb") as f:
+                if size > self.MAX_READ:
+                    f.seek(size - self.MAX_READ)
+                    f.readline()
+                lines = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return []
+        out = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    def get(self, sighash):
+        sighash = sighash.lower()
+        for rec in self.all():
+            if str(rec.get("sighash", "")).lower() == sighash:
+                return rec
+        return None
+
+
 class Oracle:
-    def __init__(self, cfg):
+    def __init__(self, cfg, create_key=True):
         self.cfg = cfg
-        self.sec = load_or_create_key(cfg["keyfile"])
+        self.sec = load_or_create_key(cfg["keyfile"], create=create_key)
         self.xonly = O.xonly_pubkey(self.sec)
-        self.log = O.AttestationLog(cfg["logfile"])
+        self.log = O.AttestationLog(cfg["logfile"],
+                                    max_bytes=int(cfg.get("log_max_bytes", 0)))
+        self.seizures = SeizureLog(cfg.get("seizures")
+                                   or cfg["logfile"] + ".seizures")
         self.source = build_source(cfg)
         self.markets = list(cfg.get("markets", []))
         self.precisions = {k.upper(): int(v)
                            for k, v in cfg.get("precisions", {}).items()}
+        self._check_precisions()
         # market asset name -> the ticker the feed knows it by
         self.aliases = dict(cfg.get("symbols", {}))
         self.price_scale = int(cfg.get("price_scale", 100_000))
+        self.interval = float(cfg.get("interval", 60))
+        # An x-only key this oracle used to sign with. Live vaults bake the key
+        # they were originated against, so a rotation cannot be a swap: naming
+        # the old keys lets a borrower's page tell a rotation from a stranger.
+        self.previous_keys = [str(k) for k in cfg.get("previous_keys", [])]
         self.latest = {}
         self.errors = {}
+        self.signed_at = {}
+        self.last_round = 0.0
+        # Two different failures, kept apart. `source_error` is the price feed
+        # not answering, which is degraded but not yet wrong: the source serves
+        # its snapshot until `max_age`, and only then do the markets error.
+        # `round_error` is the signing loop itself raising, which is broken.
+        self.source_error = None
+        self.round_error = None
         self._lock = threading.Lock()
+
+    def _check_precisions(self):
+        """Every asset in `markets` needs an explicit decimal count.
+
+        A missing entry is assumed to be 8 decimals, and where that is wrong the
+        signed price is wrong by a power of ten -- which no downstream check
+        catches, because the signature over it is perfectly good. A config that
+        names some assets and not others has made a claim and contradicted it,
+        so that is refused; one that names none has made no claim, and is told
+        loudly what it is being given.
+        """
+        need = sorted({s for m in self.markets
+                       for s in (p.strip().upper() for p in m.split("/"))})
+        self.assumed = [s for s in need if s not in self.precisions]
+        if self.assumed and self.precisions:
+            raise SystemExit(
+                "precisions missing for " + ", ".join(self.assumed) + ": every "
+                "asset named in `markets` needs an entry, because a wrong "
+                "decimal count signs a price wrong by a power of ten.")
+
+    def market_precisions(self, market):
+        c, d = [p.strip().upper() for p in market.split("/")]
+        return self.precisions.get(c, 8), self.precisions.get(d, 8)
+
+    def canonical_market(self, name):
+        """The configured spelling of a market named in a request, or None.
+
+        Everything the oracle stores is keyed by the string in the config, and
+        a feed id is case-insensitive, so a request must be matched to that
+        string rather than compared to it.
+        """
+        want = "/".join(p.strip().upper() for p in str(name).split("/"))
+        for m in self.markets:
+            if "/".join(p.strip().upper() for p in m.split("/")) == want:
+                return m
+        return None
 
     def tick(self):
         """Sign one round of prices. A market that fails is recorded and skipped
         rather than taking the round down: an oracle that stops signing every
         feed because one price source hiccuped is an oracle whose outage reaches
         the RECOVER backstop."""
+        try:
+            # One snapshot for the whole round, so two markets cannot be signed
+            # against feeds that moved between them. A failure here is not fatal
+            # to the round: the source decides how long its last snapshot may go
+            # on being used, and says so per market below.
+            self.source.refresh()
+            source_error = None
+        except Exception as e:                    # noqa: BLE001 - reported, not raised
+            source_error = f"{type(e).__name__}: {e}"
         for market in self.markets:
             try:
                 price = self.source.price_for(market, self.precisions,
                                               self.price_scale, self.aliases)
                 att = O.sign(self.sec, market, price, self.price_scale)
+                # Publish only what is on record. An attestation served but not
+                # logged is exactly the thing the log exists to make impossible,
+                # and a log that cannot be written is an outage, not a detail.
+                self.log.append(att)
             except Exception as e:                # noqa: BLE001 - reported, not raised
                 with self._lock:
                     self.errors[market] = f"{type(e).__name__}: {e}"
                 continue
             with self._lock:
                 self.latest[market] = att
+                self.signed_at[market] = att.timestamp
                 self.errors.pop(market, None)
-            self.log.append(att)
+        with self._lock:
+            self.last_round = time.time()
+            self.source_error = source_error
 
     def run_forever(self, interval):
+        """The signing loop.
+
+        It must not be able to end quietly. If this thread dies the process
+        lives on serving its last attestation as though it were current, which
+        is the failure nobody notices; so a round that raises is reported, and a
+        run of them exits the process for the supervisor to restart.
+        """
+        failures = 0
         while True:
             started = time.time()
-            self.tick()
+            try:
+                self.tick()
+                failures = 0
+                with self._lock:
+                    self.round_error = None
+            except Exception as e:                # noqa: BLE001
+                failures += 1
+                with self._lock:
+                    self.round_error = f"{type(e).__name__}: {e}"
+                print(f"pignus-oracle: signing round failed ({failures}): "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+                if failures >= 5:
+                    print("pignus-oracle: five rounds in a row failed; exiting "
+                          "so the supervisor restarts a clean process",
+                          file=sys.stderr)
+                    sys.stderr.flush()
+                    os._exit(1)
             time.sleep(max(1.0, interval - (time.time() - started)))
+
+    # ---------------------------------------------------------- Tier B seizure
+
+    def sign_seizure(self, sighash: bytes, market: str, strike: int,
+                     max_age=600, allow_stale=False):
+        """Co-sign a native-BTC seizure, and publish what justified it.
+
+        Tier B has no covenant: the Bitcoin script asks only for the lender's
+        and this oracle's signatures, so this signature IS the liquidation
+        decision. It is made against this oracle's own last published price for
+        the market, and both the signature and that attestation are appended to
+        the seizure log, so `seize_is_justified` can be asked by anyone
+        afterwards -- which is the whole of the accountability this tier has.
+        """
+        if len(sighash) != 32:
+            raise SystemExit(f"a seize sighash is 32 bytes, got {len(sighash)}")
+        known = self.canonical_market(market)
+        if known is None:
+            raise SystemExit(f"this oracle does not sign {market}; it signs "
+                             + ", ".join(self.markets))
+        market = known
+        att = self.latest.get(market) or self.log.latest(market)
+        if att is None:
+            raise SystemExit(f"this oracle has signed no price for {market}; "
+                             "there is nothing to justify a seizure with")
+        age = int(time.time()) - int(att.timestamp)
+        if age > int(max_age) and not allow_stale:
+            raise SystemExit(
+                f"REFUSED: the last price for {market} was signed {age}s ago "
+                f"(max {int(max_age)}). Nothing on the Bitcoin side can check "
+                "when a price was signed, so a seizure justified by a stale one "
+                "is justified by nothing. Wait for a fresh attestation, or pass "
+                "--allow-stale if the age is genuinely intended.")
+        if not O.verify(self.xonly, att, self.price_scale):
+            raise SystemExit("the last attestation for that market does not "
+                             "verify against this oracle's own key and scale; "
+                             "refusing to co-sign against it")
+        if att.price >= int(strike):
+            raise SystemExit(
+                f"REFUSED: the last price for {market} is {att.price}, at or "
+                f"above the strike {strike}. This seizure is not justified, and "
+                "co-signing it would be taking collateral that was never "
+                "liquidatable.")
+        from pignus import adaptor as A
+        sig = A.sign(self.sec, sighash)
+        rec = {"sighash": sighash.hex(), "signature": sig.hex(),
+               "market": market, "strike": int(strike),
+               "attestation": att.to_dict(), "ts": int(time.time()),
+               "oracle_x": self.xonly.hex()}
+        self.seizures.append(rec)
+        return rec
+
+
+class _RateLimiter:
+    """A token bucket per client, for the handful of endpoints that read the
+    log off disk. Everything else is answered from memory and is not worth
+    limiting; these are, because an auditor's query is cheap once and expensive
+    in a loop, and this process has signing to do."""
+
+    def __init__(self, rate=1.0, burst=10):
+        self.rate, self.burst = rate, burst
+        self._buckets = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key, now):
+        with self._lock:
+            tokens, last = self._buckets.get(key, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - last) * self.rate)
+            if tokens < 1.0:
+                self._buckets[key] = (tokens, now)
+                return False
+            self._buckets[key] = (tokens - 1.0, now)
+            return True
+
+
+ARCHIVE_LIMIT = _RateLimiter()
 
 
 class Handler(BaseHTTPRequestHandler):
     oracle = None
     server_version = "pignus-oracle"
+    # A thread per connection with no cap is fine only while no connection can
+    # hold one open indefinitely.
+    timeout = 30
 
     def _send(self, code, payload):
         body = json.dumps(payload, indent=2).encode()
@@ -155,8 +411,69 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, fh, size, name):
+        """Stream a log file out in fixed-size blocks, so serving a file this
+        process must never hold in memory does not put it there."""
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{name}"')
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            left = size
+            while left > 0:
+                chunk = fh.read(min(65536, left))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass          # the client stopped the download; nothing to report
+        finally:
+            fh.close()
+
+    def _archive_ok(self):
+        if ARCHIVE_LIMIT.allow(self.client_address[0], time.time()):
+            return True
+        self._send(429, {"error": "too many log queries from this address; "
+                                  "the log is append-only, so a page at a time "
+                                  "reads the same bytes a flood would"})
+        return False
+
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _health(self, o):
+        """`ok` means "this oracle is signing", not "this process is running".
+
+        A dead signing thread, an unwritable log or a feed that stopped
+        answering all leave the process happily serving its last attestation;
+        saying ok to that is how an outage stays invisible until it reaches the
+        RECOVER backstop. So a round that has not completed within two intervals
+        is not ok, and the answer carries 503 for anything that only reads the
+        status code.
+        """
+        now = time.time()
+        with o._lock:
+            errs = dict(o.errors)
+            signed_at = dict(o.signed_at)
+            last_round = o.last_round
+            round_error, source_error = o.round_error, o.source_error
+        # Two intervals, and never less than half a minute: a one-second
+        # interval is a test's, and health that flaps on ordinary scheduling
+        # jitter tells an operator nothing.
+        window = max(2 * o.interval, 30.0)
+        stale = sorted(m for m in o.markets
+                       if now - signed_at.get(m, 0) > window)
+        age = None if not last_round else round(now - last_round, 1)
+        ok = (not errs and not stale and round_error is None
+              and last_round > 0 and now - last_round <= window)
+        return ok, {"ok": ok, "markets": len(o.markets), "errors": errs,
+                    "stale": stale, "round_error": round_error,
+                    "source_error": source_error,
+                    "last_round": int(last_round) or None, "age": age}
 
     def do_GET(self):
         o = self.oracle
@@ -165,38 +482,134 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         try:
             if path == "/healthz":
-                return self._send(200, {"ok": True, "markets": len(o.markets),
-                                        "errors": o.errors})
+                ok, body = self._health(o)
+                return self._send(200 if ok else 503, body)
             if path == "/v1/pubkey":
                 return self._send(200, {"oracle_x": o.xonly.hex(),
-                                        "price_scale": o.price_scale})
+                                        "price_scale": o.price_scale,
+                                        "previous": list(o.previous_keys)})
             if path == "/v1/markets":
-                return self._send(200, {"markets": [
-                    {"market": m, "feed_id": feed_id(m).hex(),
-                     "price_scale": o.price_scale,
-                     "error": o.errors.get(m)} for m in o.markets]})
-            if path == "/v1/digest":
-                return self._send(200, {"digest": o.log.digest()})
-            if path.startswith("/v1/attestation/"):
-                market = path[len("/v1/attestation/"):].replace("_", "/").upper()
                 with o._lock:
-                    att = o.latest.get(market)
-                if att is None:
-                    att = o.log.latest(market)
-                if att is None:
+                    errs = dict(o.errors)
+                out = []
+                for m in o.markets:
+                    cp, dp = o.market_precisions(m)
+                    out.append({"market": m, "feed_id": feed_id(m).hex(),
+                                "price_scale": o.price_scale,
+                                "collateral_precision": cp,
+                                "debt_precision": dp,
+                                "error": errs.get(m)})
+                return self._send(200, {"markets": out})
+            if path == "/v1/digest":
+                return self._send(200, {
+                    "digest": o.log.digest(),
+                    "chained_from": o.log.chained_from,
+                    "file": os.path.basename(o.log.path),
+                    "files": o.log.files()})
+            if path == "/v1/seizures":
+                if not self._archive_ok():
+                    return None
+                return self._send(200, {"seizures": o.seizures.all()})
+            if path.startswith("/v1/seizure/"):
+                if not self._archive_ok():
+                    return None
+                rec = o.seizures.get(path[len("/v1/seizure/"):])
+                if rec is None:
+                    return self._send(404, {"error": "this oracle has co-signed "
+                                                     "no seizure with that sighash"})
+                return self._send(200, rec)
+            if path.startswith("/v1/attestation/"):
+                return self._attestation(o, path[len("/v1/attestation/"):])
+            if path == "/v1/log/raw":
+                if not self._archive_ok():
+                    return None
+                name = q.get("file", [None])[0]
+                try:
+                    fh, size = o.log.open_file(name)
+                except (FileNotFoundError, OSError):
                     return self._send(404, {
-                        "error": f"no attestation for {market}",
-                        "detail": o.errors.get(market),
-                        "markets": o.markets})
-                return self._send(200, att.to_dict())
+                        "error": "no such log file",
+                        "files": [r["file"] for r in o.log.files()]})
+                return self._send_file(fh, size, name or
+                                       os.path.basename(o.log.path))
             if path == "/v1/log":
-                market = (q.get("market", [None])[0] or None)
-                n = min(int(q.get("n", ["50"])[0]), 1000)
-                return self._send(200, {"attestations": [
-                    a.to_dict() for a in o.log.tail(n, market)]})
+                return self._log(o, q)
             return self._send(404, {"error": "no such endpoint", "path": path})
         except Exception as e:                    # noqa: BLE001
             return self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def _attestation(self, o, rest):
+        parts = [p for p in rest.split("/") if p]
+        asked = parts[0].replace("_", "/") if parts else ""
+        # An unknown market is answered before the log is consulted: naming
+        # anything at all must not cost a disk read.
+        market = o.canonical_market(asked)
+        if market is None:
+            return self._send(404, {
+                "error": f"this oracle does not sign {asked.upper()}",
+                "markets": o.markets})
+        if len(parts) == 3 and parts[1] == "at":
+            # The auditor's question: the exact attestation a liquidation was
+            # built on, whatever its age.
+            if not self._archive_ok():
+                return None
+            try:
+                ts = int(parts[2])
+            except ValueError:
+                return self._send(400, {"error": "a timestamp is unix seconds"})
+            att = o.log.at(market, ts)
+            if att is None:
+                return self._send(404, {
+                    "error": f"no attestation for {market} at {ts}",
+                    "detail": "the timestamp must be the one in the attestation, "
+                              "to the second"})
+            return self._send(200, att.to_dict())
+        if len(parts) != 1:
+            return self._send(404, {"error": "no such endpoint", "path": rest})
+        with o._lock:
+            att = o.latest.get(market)
+            error = o.errors.get(market)
+        if att is None:
+            att = o.log.latest(market)
+        if att is None:
+            return self._send(404, {"error": f"no attestation for {market}",
+                                    "detail": error, "markets": o.markets})
+        # The signed fields are untouched; `age` and `stale` are this server
+        # describing what it is serving, because a consumer cannot see from a
+        # valid signature that the feed behind it stopped moving an hour ago.
+        return self._send(200, dict(att.to_dict(),
+                                    age=int(time.time()) - att.timestamp,
+                                    stale=bool(error), error=error))
+
+    def _log(self, o, q):
+        market = (q.get("market", [None])[0] or None)
+        if market:
+            asked = market.replace("_", "/")
+            market = o.canonical_market(asked) or asked.upper()
+        try:
+            n = min(int(q.get("n", ["50"])[0]), 1000)
+            since = q.get("since", [None])[0]
+            until = q.get("until", [None])[0]
+            cursor = q.get("cursor", [None])[0]
+            since = None if since is None else int(since)
+            until = None if until is None else int(until)
+            cursor = None if cursor is None else int(cursor)
+        except ValueError:
+            return self._send(400, {"error": "n, since, until and cursor are "
+                                             "integers"})
+        if n < 1:
+            return self._send(400, {"error": "n must be at least 1"})
+        if since is None and until is None and cursor is None:
+            # The common case, and the one the page links to: the recent view,
+            # held in memory.
+            return self._send(200, {"attestations": [
+                a.to_dict() for a in o.log.tail(n, market)]})
+        if not self._archive_ok():
+            return None
+        rows, next_cursor = o.log.scan(market=market, since=since, until=until,
+                                       limit=n, cursor=cursor)
+        return self._send(200, {"attestations": [a.to_dict() for a in rows],
+                                "cursor": next_cursor})
 
 
 def main():
@@ -206,15 +619,75 @@ def main():
                     help="sign one round and exit, without serving")
     ap.add_argument("--print-pubkey", action="store_true",
                     help="print the oracle x-only key and exit")
+    ap.add_argument("--sign-seize", action="store_true",
+                    help="co-sign a native-BTC seizure sighash, and publish "
+                         "the attestation that justifies it")
+    ap.add_argument("--sighash", help="with --sign-seize: the 32-byte sighash "
+                                      "from `pignus-cli btc-seize-sighash`")
+    ap.add_argument("--request", help="with --sign-seize: the seizure request "
+                                      "file `pignus-cli btc-seize-sighash "
+                                      "--out` writes. Preferred over --sighash: "
+                                      "it carries the loan, so this oracle "
+                                      "rebuilds the sighash from the terms "
+                                      "rather than signing a number somebody "
+                                      "else computed")
+    ap.add_argument("--market", help="with --sign-seize: the market the loan "
+                                     "is priced in")
+    ap.add_argument("--strike", type=int,
+                    help="with --sign-seize: the loan's strike; the seizure is "
+                         "refused unless the published price is under it")
+    ap.add_argument("--max-age", type=int, default=600, metavar="S",
+                    help="with --sign-seize: refuse to co-sign against a price "
+                         "signed longer ago than this (default 600 s)")
+    ap.add_argument("--allow-stale", action="store_true",
+                    help="with --sign-seize: co-sign against a price older "
+                         "than --max-age anyway")
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = json.load(f)
-    o = Oracle(cfg)
+    # Only the serving and signing paths may create a key; asking what the key
+    # is must never answer with a new one.
+    o = Oracle(cfg, create_key=not args.print_pubkey)
 
     if args.print_pubkey:
         print(o.xonly.hex())
         return
+    if args.sign_seize:
+        if args.request:
+            # Rebuild the sighash from the loan in the request. An oracle that
+            # signs a number it was handed has read nothing: the number could
+            # seize a healthy loan, or somebody else's.
+            import json as _json
+            from pignus import btc_collateral as _BC
+            with open(args.request) as fh:
+                req = _json.load(fh)
+            loan, want = _BC.check_seize_request(req)
+            args.sighash = want
+            args.market = args.market or loan.market
+            args.strike = args.strike or int(loan.strike)
+        missing = [f for f, v in (("--sighash", args.sighash),
+                                  ("--market", args.market),
+                                  ("--strike", args.strike)) if not v]
+        if missing:
+            raise SystemExit("--sign-seize needs " + ", ".join(missing))
+        try:
+            sighash = bytes.fromhex(args.sighash)
+        except ValueError:
+            raise SystemExit("--sighash is hex") from None
+        rec = o.sign_seizure(sighash, args.market, args.strike,
+                             max_age=args.max_age,
+                             allow_stale=args.allow_stale)
+        print(json.dumps(rec, indent=2))
+        print(f"pignus-oracle: co-signed, and published in {o.seizures.path}",
+              file=sys.stderr)
+        return
+    if o.assumed:
+        # Said once, on the paths that actually sign.
+        print("pignus-oracle: no `precisions` in the config; assuming 8 decimals "
+              "for " + ", ".join(o.assumed) + ". Set them: an asset with other "
+              "decimals would be signed wrong by a power of ten.",
+              file=sys.stderr)
     if args.once:
         o.tick()
         for m in o.markets:
@@ -225,13 +698,14 @@ def main():
 
     host, _, port = cfg.get("listen", "127.0.0.1:8730").rpartition(":")
     o.tick()                                   # serve something immediately
-    threading.Thread(target=o.run_forever,
-                     args=(int(cfg.get("interval", 60)),), daemon=True).start()
+    threading.Thread(target=o.run_forever, args=(o.interval,),
+                     daemon=True).start()
     Handler.oracle = o
     srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
+    srv.daemon_threads = True
     print(f"pignus-oracle: key {o.xonly.hex()}", file=sys.stderr)
     print(f"pignus-oracle: signing {len(o.markets)} market(s) every "
-          f"{cfg.get('interval', 60)}s, serving on {host}:{port}", file=sys.stderr)
+          f"{o.interval:g}s, serving on {host}:{port}", file=sys.stderr)
     srv.serve_forever()
 
 

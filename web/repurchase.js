@@ -36,6 +36,10 @@ export const TIER = "D";
 export const DAMP_MAX_INPUTS = 4;
 export const DAMP_MAX_OUTPUTS = 6;
 
+// Where the bond vault sits in a settlement, and it is forced rather than
+// chosen: see settlementShape below.
+export const SETTLEMENT_VAULT_INDEX = 1;
+
 function reverse(b) { return Uint8Array.from(b).reverse(); }
 
 /** The borrower's equity, which is the whole of what the bond must cover. */
@@ -53,6 +57,11 @@ export function bondAtoms(collateralValue, debt) {
 }
 
 function checkProg(hex, ver, what) {
+  if (ver !== 0 && ver !== 1) {
+    throw new Error(`${what} is at witness version ${ver}; a payout is segwit ` +
+                    `v0 or v1, and an address at any other version is one no ` +
+                    `wallet can pay`);
+  }
   const b = hexToBytes(hex);
   const want = ver === 1 ? 32 : 20;
   if (b.length !== want) {
@@ -83,7 +92,12 @@ export function normaliseRepurchase(terms) {
   }
   const borrowerVer = t.borrower_ver === undefined ? 1 : Number(t.borrower_ver);
   const lenderVer = t.lender_ver === undefined ? 1 : Number(t.lender_ver);
+  const collateralAmount = big(need("collateral_amount"), "collateral_amount");
+  if (collateralAmount <= 0n) {
+    throw new Error("collateral_amount must be positive");
+  }
   const principal = big(need("principal"), "principal");
+  if (principal <= 0n) throw new Error("principal must be positive");
   const debt = big(need("debt"), "debt");
   if (debt <= principal) {
     throw new Error(
@@ -107,7 +121,7 @@ export function normaliseRepurchase(terms) {
     // this pinned script and I release my whole value to that one".
     assetC: reverse(hexToBytes(need("debt_asset"))),
     assetD: reverse(hexToBytes(need("collateral_asset"))),
-    debt: big(need("collateral_amount"), "collateral_amount"),
+    debt: collateralAmount,
     lenderProg: cu,                                        // asset -> C_U(borrower)
     borrowerProg: checkProg(need("lender_prog"), lenderVer, "lender_prog"),
     lenderVer: 1,                                          // C_U is always a P2TR
@@ -145,7 +159,7 @@ export function repurchaseScriptPubKey(terms) {
 }
 
 /**
- * THE check, and it needs both halves to be worth anything.
+ * THE check, and it needs all three of its parts to be worth anything.
  *
  * The address commits to the collateral leg and the payout destinations: both
  * asset ids, the amount, borrower_cu, lender_prog, borrower_prog and
@@ -155,8 +169,15 @@ export function repurchaseScriptPubKey(terms) {
  * checked for equality rather than sufficiency. An inequality would let a lie
  * about the debt through: a bigger debt is a smaller bond, and "at least the
  * bond" would wave it past.
+ *
+ * The address does not pin what asset the coin carries either, so the coin's
+ * ASSET must equal debt_asset. A bond funded in some cheap asset sits at the
+ * right address in the right quantity and is worth nothing to the borrower:
+ * RETURN and FORFEIT both pay out the DEBT asset, so sweeping it would cost
+ * them the bond out of their own pocket.
  */
-export function verifyRepurchaseFunding(terms, fundingScriptPubKey, fundedAtoms) {
+export function verifyRepurchaseFunding(terms, fundingScriptPubKey, fundedAtoms,
+                                        fundedAsset) {
   const want = bytesToHex(repurchaseScriptPubKey(terms));
   const got = (fundingScriptPubKey || "").toLowerCase().replace(/^0x/, "");
   if (want !== got) {
@@ -164,16 +185,71 @@ export function verifyRepurchaseFunding(terms, fundingScriptPubKey, fundedAtoms)
       "the repurchase you were shown is not the one being funded: these terms " +
       `compile to ${want} and the coin pays ${got}`);
   }
-  if (fundedAtoms !== undefined && fundedAtoms !== null) {
-    const t = normaliseRepurchase(terms);
-    if (big(fundedAtoms, "funded") !== t.bond) {
+  const t = normaliseRepurchase(terms);
+  if (fundedAsset !== undefined && fundedAsset !== null) {
+    const gotAsset = String(fundedAsset).toLowerCase().replace(/^0x/, "");
+    const wantAsset = String(t.raw.debt_asset).toLowerCase();
+    if (gotAsset !== wantAsset) {
       throw new Error(
-        `the vault holds ${fundedAtoms} atoms but these terms make the bond ` +
-        `exactly ${t.bond}; the repurchase you were shown is not the one ` +
-        `being funded`);
+        `the vault at the right address holds ${gotAsset}, not the bond asset ` +
+        `${wantAsset}; the repurchase you were shown is not the one being funded`);
     }
   }
+  if (fundedAtoms === undefined || fundedAtoms === null) {
+    throw new Error(
+      "no funded amount given; the address alone does not pin the money terms, " +
+      "so there is nothing here to check them against");
+  }
+  if (big(fundedAtoms, "funded") !== t.bond) {
+    throw new Error(
+      `the vault holds ${fundedAtoms} atoms but these terms make the bond ` +
+      `exactly ${t.bond}; the repurchase you were shown is not the one ` +
+      `being funded`);
+  }
   return true;
+}
+
+/**
+ * What the settlement transaction must look like, and why it has no slack.
+ *
+ * Two rules fix every position and between them they leave one arrangement.
+ * OpenDAMP wants its verifier output at input 0 and returned whole to output 0;
+ * the covenant maps a vault at input k to output 2k for the credit and 2k+1 for
+ * the return. So the bond vault takes input 1 and pays the asset to
+ * C_U(borrower) at output 2 and the bond to the lender at output 3. Anywhere
+ * lower is the verifier's, and anywhere higher puts the covenant's outputs past
+ * the sixth. Kept word for word beside `settlement_shape` in
+ * pignus/repurchase.py, which is what a composer checks itself against.
+ */
+export function settlementShape(consolidatedDebtInput) {
+  if (!consolidatedDebtInput) {
+    throw new Error(
+      "the borrower's debt-asset side must be a single UTXO: settlement " +
+      "already uses all four inputs OpenDAMP allows, so a second one has " +
+      "nowhere to go. Consolidate first, in its own transaction.");
+  }
+  return {
+    inputs: [
+      "0: the OpenDAMP verifier output",
+      "1: the bond vault",
+      "2: C_U(lender), holding the asset",
+      "3: the borrower's single debt-asset UTXO",
+    ],
+    outputs: [
+      "0: the verifier output, returned",
+      "1: the debt, to the lender",
+      "2: the asset, to C_U(borrower)",
+      "3: the bond, to the lender",
+      "4: the borrower's change",
+      "5: the fee, in the debt asset",
+    ],
+    vault_index: SETTLEMENT_VAULT_INDEX,
+    covenant_outputs: [2 * SETTLEMENT_VAULT_INDEX,
+                       2 * SETTLEMENT_VAULT_INDEX + 1],
+    max_inputs: DAMP_MAX_INPUTS,
+    max_outputs: DAMP_MAX_OUTPUTS,
+    fee_asset: "the debt asset -- a separate fee input would not fit",
+  };
 }
 
 /** Refuse a settlement that cannot confirm, before anybody signs it. */
@@ -197,19 +273,28 @@ export function checkSettlement(nInputs, nOutputs) {
  * Not decoration. A borrower who reads "loan" and signs a sale has been misled
  * by the interface, and this is the interface's one chance to say what is
  * actually happening.
+ *
+ * `fmt(atoms, asset)` renders an amount for somebody who knows the asset's
+ * ticker and precision; the page has that and should pass it, because nobody
+ * reads a quantity in atoms or an asset by twelve hex characters. Without one
+ * the sentence falls back to exactly that, which is precise and unreadable. The
+ * words must stay identical to `describe` in pignus/repurchase.py, so the
+ * browser and the command line say the same thing.
  */
-export function describe(terms) {
+export function describe(terms, fmt) {
   const t = normaliseRepurchase(terms);
-  const short = (h) => String(h).slice(0, 12);
+  const show = fmt || ((atoms, asset) =>
+    `${atoms} atoms of ${String(asset).slice(0, 12)}...`);
   return (
-    `REPURCHASE, not a loan. You are SELLING ${t.debt} atoms of ` +
-    `${short(terms.collateral_asset)}... to the lender now, for ${t.principal} ` +
-    `atoms of ${short(terms.debt_asset)}..., and you may buy it back for ` +
-    `${t.moneyDebt} at any time. If the lender never sells it back, you take a ` +
-    `bond of ${t.bond} atoms after height ${t.recoverAfter}, which is what the ` +
-    `asset was worth today minus what you would have paid. You do NOT get the ` +
-    `asset's later gains: you are made whole at today's price, not the price ` +
-    `on the day.`);
+    `REPURCHASE, not a loan. You are SELLING ` +
+    `${show(t.debt, terms.collateral_asset)} to the lender now, for ` +
+    `${show(t.principal, terms.debt_asset)}, and you may buy it back for ` +
+    `${show(t.moneyDebt, terms.debt_asset)} whenever the lender co-signs the ` +
+    `settlement, at any time before height ${t.recoverAfter}. If the lender ` +
+    `never sells it back, you take a bond of ${show(t.bond, terms.debt_asset)} ` +
+    `after height ${t.recoverAfter}, which is what the asset was worth today ` +
+    `minus what you would have paid. You do NOT get the asset's later gains: ` +
+    `you are made whole at today's price, not the price on the day.`);
 }
 
 /**
