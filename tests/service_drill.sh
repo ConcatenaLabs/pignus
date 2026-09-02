@@ -288,6 +288,13 @@ echo "== an oracle that cannot write its log is not healthy =="
 # impossible, so a log that will not take a write is an outage rather than a
 # detail. The process goes on answering with what it last published -- which is
 # correct, and is exactly why /healthz has to say something different.
+#
+# Root ignores file permissions, so there is no way to make a file unwritable
+# for it: this case is skipped rather than failed. It is not a formality --
+# the drill is run on the testnet box, as root, before every restart.
+if [ "$(id -u)" = "0" ]; then
+    echo "  SKIPPED: running as root, which can write a file whatever its mode"
+else
 chmod 444 "$WORK/attestations.log"
 unhealthy=0
 for i in $(seq 40); do
@@ -309,6 +316,7 @@ test "$code" = "200" || { echo "  the last attestation stopped being served" >&2
     chmod 644 "$WORK/attestations.log"; exit 1; }
 echo "  and the last signed price is still served, because it was logged"
 chmod 644 "$WORK/attestations.log"
+fi
 
 echo
 echo "== a book file that is not valid JSON stops the daemon, intact =="
