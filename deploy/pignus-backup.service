@@ -3,7 +3,9 @@
 # keys and their attestation logs, the lender key, the responder's state file,
 # the book, and the config files beside them. What each piece costs to lose is in
 # deploy/DEPLOY.md; the short version is that the keys and the state file are
-# the ones nobody can reconstruct.
+# the ones nobody can reconstruct: an oracle key that is gone leaves every loan
+# baked to it unliquidatable until it matures, and a responder state file that
+# is gone can cost a principal paid twice.
 Description=Pignus backup
 Documentation=https://github.com/ConcatenaLabs/pignus
 
@@ -19,8 +21,15 @@ UMask=0077
 # what a backup of a live log can be, so that is a success here. A fatal error
 # is exit 2 and still fails the unit.
 SuccessExitStatus=1
+# The destination has to exist before the mount namespace is built, and the
+# namespace is built before the first command in the unit -- so this runs with
+# a `+`, which means outside the sandbox, where it can create it. Without it a
+# fresh install fails at the first firing with a namespace error that names a
+# directory rather than a problem.
+ExecStartPre=+/bin/mkdir -p /root/backups
 ExecStart=/bin/sh -c 'exec tar czf /root/backups/pignus-$(date +%%F).tgz \
     /root/sequentia/pignus-data \
+    /root/sequentia/pignus-btc-keys \
     /root/sequentia/pignusd.json \
     /root/sequentia/pignus-oracle*.json \
     /root/sequentia/pignus-responder.json'
@@ -31,10 +40,8 @@ PrivateTmp=true
 # directory that has to stay WRITABLE is handed back: /root/backups. Everything
 # under /root/sequentia is only read.
 #
-# /root/backups has to EXIST before this unit runs -- First install creates it.
-# The mount namespace is built before the first command in the unit, so a
-# ReadWritePaths= naming a directory that is not there fails the unit with a
-# namespace error, and no ExecStartPre= can get in front of it to create one.
+# /root/backups is created by the `+`-prefixed ExecStartPre= above, which runs
+# outside this namespace precisely so it can.
 ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=/root/backups
