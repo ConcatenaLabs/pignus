@@ -32,10 +32,16 @@ count can exceed what a JSON number holds exactly in a browser. That is true of
 the `terms` document this book serves as well as of the fields around it:
 `collateral_amount`, `principal`, `debt`, `strike`, `max_price` and
 `not_before` are strings inside it, and a cross-chain offer's `btc_amount`,
-`debt`, `principal` and `strike` are strings for the same reason. `web/pignus.js` refuses a number above 2^53
+`debt`, `principal` and `strike` are strings for the same reason.
+`web/pignus.js` refuses a number above 2^53
 outright rather than compute a debt `JSON.parse` may already have rounded, so a
 book that served them as numbers would hold loans its own page could not
-price. Heights,
+price.
+
+Those four are coerced when an offer is published AND again on the way out, so
+the shape is a property of this API rather than of the day a record happened to
+be written. A book carrying records from before the rule serves them the same
+way as any other. Heights,
 locktimes, timestamps, confirmations, counts, prices, `price_scale` and
 `expiry_locktime` are JSON numbers. That holds for the amounts a book derives
 as well as the ones it stores: `seizure_if_liquidated` and

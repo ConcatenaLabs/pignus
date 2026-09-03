@@ -187,7 +187,8 @@ OFFER_STATUS_NAMES = frozenset(
 # The upgrade fee's floor, from the library that every other party checks it
 # with. Typed here as well, it would drift the day one of them changed and the
 # relay would accept an offer no responder would sign.
-from pignus.btc_collateral import MIN_UPGRADE_FEE    # noqa: E402
+from pignus.btc_collateral import (                 # noqa: E402
+    BIG_LOAN_FIELDS, MIN_UPGRADE_FEE)
 # What a Bitcoin output has to hold to be worth anything: below this the network
 # will not relay the transaction that spends it.
 # As many cross-chain offers as this book will hold at once. They cost their
@@ -303,6 +304,33 @@ GLOBAL_SCAN_LIMIT = RateLimiter(rate=40.0, burst=400)
 # list is fetched every few seconds by every open page and by the liquidator,
 # so one bad record is logged when it starts failing rather than once per read.
 UNRENDERABLE = {}
+
+
+def served_loan(rec):
+    """A stored record with its loan's big amounts as decimal strings.
+
+    Publishing coerces them at the door, which is right and is where a bad
+    value has to be refused -- but it only reaches records written since. A
+    record stored before that lives on with plain JSON numbers in it, and a
+    browser parses an amount past 2**53 into a different number without saying
+    so. The wire format is a property of the ENDPOINT, not of the day a record
+    happened to be written, so it is applied on the way out as well.
+
+    Copies, always: the stored dict is the book's, and a view is a view.
+    """
+    if not isinstance(rec, dict):
+        return rec
+    loan = rec.get("loan")
+    if not isinstance(loan, dict):
+        return dict(rec)
+    fixed = dict(loan)
+    for k in BIG_LOAN_FIELDS:
+        v = fixed.get(k)
+        if isinstance(v, bool) or v is None or v == "":
+            continue
+        if isinstance(v, int) or (isinstance(v, str) and v.strip().lstrip("-").isdigit()):
+            fixed[k] = str(int(v))
+    return dict(rec, loan=fixed)
 
 
 def _is_hex(text):
@@ -2500,8 +2528,8 @@ class Handler(BaseHTTPRequestHandler):
             # themselves, so writing a computed field onto one wrote it into
             # the book -- and the next save persisted a number that is only
             # true for an instant.
-            offers = [dict(o, lots_left=s.book.btc_offer_lots_left(
-                o["btc_offer_id"], BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL))
+            offers = [served_loan(dict(o, lots_left=s.book.btc_offer_lots_left(
+                o["btc_offer_id"], BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)))
                 for o in s.book.list_btc_offers(status=status)]
             return self._send(200, {"offers": offers})
         if path.startswith("/v1/btc/offer/"):
@@ -2510,7 +2538,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "no such BTC offer"})
             rec["lots_left"] = s.book.btc_offer_lots_left(
                 rec["btc_offer_id"], BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)
-            return self._send(200, rec)
+            return self._send(200, served_loan(rec))
         if path == "/v1/btc/takes":
             takes = s.book.list_btc_takes(
                 offer_id=q.get("offer_id", [None])[0],
@@ -2532,7 +2560,7 @@ class Handler(BaseHTTPRequestHandler):
                 takes = [t for t in takes
                          if str((t.get("loan") or {}).get("oracle_x", "")).lower()
                          == ox]
-            return self._send(200, {"takes": takes})
+            return self._send(200, {"takes": [served_loan(t) for t in takes]})
         if path.startswith("/v1/btc/take/"):
             # A COPY. Serialising the stored record hands `json.dumps` a dict
             # another thread is writing to, which raises mid-response on a
@@ -2540,7 +2568,7 @@ class Handler(BaseHTTPRequestHandler):
             rec = s.book.btc_take(path[len("/v1/btc/take/"):])
             if not rec:
                 return self._send(404, {"error": "no such take"})
-            return self._send(200, rec)
+            return self._send(200, served_loan(rec))
         if path == "/v1/unrenderable":
             # WHICH records this book cannot show, and why. Counting them in
             # /healthz says something is wrong; this says what, so an operator

@@ -75,12 +75,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent.parent))
 out, debt, principal = sys.argv[1], sys.argv[2], sys.argv[3]
-loan = {"btc_amount": "100000", "lender_x": "bb" * 32, "oracle_x": "cc" * 32,
-        "recover_after": 900000, "debt_asset": "dd" * 32, "debt": debt,
-        "principal": principal, "repay_deadline": 125000,
+# The amounts are stored as JSON NUMBERS, deliberately: that is the shape of a
+# record written before publishing coerced them to strings, and such records
+# exist. Nothing migrates them, so the endpoint has to normalise on the way OUT
+# as well -- and a fixture already in the fixed shape would pass whether it does
+# or not. Written this way, this file is the check on that: the browser's
+# JSON.parse rounds 9007199254740993 to ...992 without a word, and the assertion
+# below looks for the exact digits in the rendered page.
+loan = {"btc_amount": 100000, "lender_x": "bb" * 32, "oracle_x": "cc" * 32,
+        "recover_after": 900000, "debt_asset": "dd" * 32, "debt": int(debt),
+        "principal": int(principal), "repay_deadline": 125000,
         "abort_after": 902000, "upgrade_fee": 10000, "d_refund": 124000,
         "lender_prog": "ee" * 20, "lender_ver": 0, "borrower_x": "",
-        "market": "BTC/USDX", "strike": "0", "price_scale": 100000,
+        "market": "BTC/USDX", "strike": 0, "price_scale": 100000,
         "payment_hash": "", "adaptor_point": "", "h_w": ""}
 Path(out).write_text(json.dumps({
     "loans": {}, "offers": {}, "btc_takes": {}, "btc_commitments": {},
@@ -207,6 +214,16 @@ debt, principal = sys.argv[3], sys.argv[4]
 digits = re.sub(r"[^0-9]", "", dom)
 def as_units(atoms):
     return f"{int(atoms) // 10 ** 8}{int(atoms) % 10 ** 8:08d}"
+# The tab title is the one thing this page says to somebody who is not looking
+# at it, and the code that sets it runs on every render. With no wallet
+# connected there is nothing at risk, so it must be the plain title -- a page
+# that shouted "loans at risk" at a reader with no loans would be worse than
+# one that never shouted at all.
+m = re.search(r"<title>([^<]*)</title>", dom)
+want("the page keeps its own title when nothing is at risk",
+     bool(m) and "at risk" not in m.group(1),
+     (m.group(1) if m else "no <title> in the rendered DOM"))
+
 want("a debt past 2^53 atoms reaches the page with every digit intact",
      as_units(debt) in digits, f"looking for {as_units(debt)}")
 want("and so does a principal", as_units(principal) in digits,

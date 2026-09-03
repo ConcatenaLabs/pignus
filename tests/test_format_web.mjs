@@ -108,5 +108,27 @@ ok("a value smaller than the last shown digit reads as zero, not as nothing",
      refuses("", 8) && refuses("x", 8) && refuses("1.2.3", 8));
 }
 
+{
+  // The one thing this page can say to somebody who is not looking at it. Every
+  // warning it had was inside the page, and a borrower holding a position keeps
+  // that tab in the background, which is exactly where a price moves under
+  // them.
+  const BASE = "Pignus: collateralised lending on Sequentia";
+  ok("no loan at risk leaves the title alone",
+     pig.riskTitle(BASE, 0) === BASE);
+  ok("...and so does a count that is not a number",
+     pig.riskTitle(BASE, undefined) === BASE && pig.riskTitle(BASE, null) === BASE);
+  ok("one at risk says so, in the singular",
+     pig.riskTitle(BASE, 1) === `(1) \u26a0 loan at risk \u2014 ${BASE}`,
+     pig.riskTitle(BASE, 1));
+  ok("more than one is plural",
+     pig.riskTitle(BASE, 3).startsWith("(3) \u26a0 loans at risk"),
+     pig.riskTitle(BASE, 3));
+  // A tab strip truncates from the RIGHT, so the count has to come first or
+  // the whole point of putting it there is lost.
+  ok("the count leads, because a tab strip cuts off the end",
+     pig.riskTitle(BASE, 2).slice(0, 3) === "(2)");
+}
+
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
