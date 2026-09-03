@@ -549,10 +549,28 @@ confirm before `abort_after` is a loan the lender has paid for and cannot
 start. That is why the pre-vault carries a deliberately generous fee, why
 `timelocks_sane` -- which every party calls, relay or not -- refuses a loan
 whose upgrade fee is under a flat 10,000 satoshis, and why the
-margin above is measured in days rather than hours. The same function refuses a loan whose `recover_after` does not sit a day
-past `repay_deadline`, because a lender who could claim a repayment after the
-Bitcoin timeout had opened would be racing the borrower for the collateral with
-the repayment already in hand.
+margin above is measured in days rather than hours. The same function refuses a
+loan whose `recover_after` does not sit a day past `repay_deadline`, because a
+lender who could claim a repayment after the Bitcoin timeout had opened would
+be racing the borrower for the collateral with the repayment already in hand.
+
+**The written repayment deadline is not the one a borrower is held to.**
+Claiming a repayment publishes the secret, so a lender who claimed as the
+borrower's own refund opened would hand them the debt AND the collateral: they
+would refund the repayment and reclaim with the secret. So a lender stops
+claiming `CLAIM_MARGIN_BLOCKS` -- two hours of Sequentia blocks -- before
+`repay_deadline`, and the refusal is permanent, because height only rises. A
+repayment made inside that window is one nobody will answer: it comes back to
+the borrower at `repay_deadline`, and their collateral is swept at
+`recover_after` with the debt paid and refunded.
+
+That makes `repay_deadline - CLAIM_MARGIN_BLOCKS` the EFFECTIVE deadline, and
+it is what every tool quotes: `timelocks_sane` measures its margins against it,
+the offer row and the loan row on the page show it with the written figure
+beside it, and `effective_repay_deadline` is the one place it is computed.
+`web/btcborrow.js` carries the same constant, and a test compares the two,
+because a borrower told a deadline nobody honours is the whole of this
+paragraph going wrong.
 
 **What each party is exposed to, once a loan is live.** The bounded losses are
 worth stating plainly rather than being left as "nobody is robbed":

@@ -171,7 +171,10 @@ BTC_TAKE_TTL = 1800
 OFFER_STATUS_NAMES = frozenset(
     ("open", "taken", "withdrawn", "gone", "ghost", "expired", "all"))
 
-MIN_UPGRADE_FEE = 10_000
+# The upgrade fee's floor, from the library that every other party checks it
+# with. Typed here as well, it would drift the day one of them changed and the
+# relay would accept an offer no responder would sign.
+from pignus.btc_collateral import MIN_UPGRADE_FEE    # noqa: E402
 # What a Bitcoin output has to hold to be worth anything: below this the network
 # will not relay the transaction that spends it.
 BTC_DUST = 330

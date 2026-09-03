@@ -173,6 +173,41 @@ def main():
         100_000, 100_000)
     check("a repayment window whose last two hours nobody would answer is "
           "refused", margin != [])
+    # The margin is a number BOTH languages must agree on: Python decides when
+    # a lender stops claiming, and the page tells the borrower when to pay. A
+    # drift between them is a borrower told a deadline nobody honours.
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if node is None:
+        print("  (margin parity not checked: no node)")
+    else:
+        here = os.path.dirname(os.path.realpath(__file__))
+        got = subprocess.run(
+            [node, "--input-type=module", "-e",
+             "import * as bb from '../web/btcborrow.js';"
+             "process.stdout.write(String(bb.CLAIM_MARGIN_BLOCKS));"],
+            cwd=here, capture_output=True, text=True, timeout=60)
+        check("the browser and the library use the same claim margin",
+              got.returncode == 0
+              and got.stdout.strip() == str(BC.CLAIM_MARGIN_BLOCKS),
+              f"python {BC.CLAIM_MARGIN_BLOCKS}, browser {got.stdout.strip()!r} "
+              f"{got.stderr.strip()[:80]}")
+        eff = subprocess.run(
+            [node, "--input-type=module", "-e",
+             "import * as bb from '../web/btcborrow.js';"
+             "process.stdout.write(String("
+             "bb.effectiveRepayDeadline({repay_deadline: 163293})));"],
+            cwd=here, capture_output=True, text=True, timeout=60)
+        ln = BC.loan_from_dict(loan_for(lender_x, borrower_x="dd" * 32,
+                                        h_w="ee" * 32, borrower_prog="dd" * 20,
+                                        repay_deadline=163_293))
+        check("and compute the same effective deadline from it",
+              eff.returncode == 0
+              and eff.stdout.strip() == str(BC.effective_repay_deadline(ln)),
+              f"python {BC.effective_repay_deadline(ln)}, "
+              f"browser {eff.stdout.strip()!r}")
+
     check("and a sweep that opens before the collateral stops being abortable",
           any("stops being abortable" in p for p in order), str(order))
 

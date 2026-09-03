@@ -67,6 +67,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 from pignus import __version__ as PIGNUS_VERSION  # noqa: E402
 from pignus import atoms, compat, oracle as O    # noqa: E402
 from pignus import atoms as _atoms              # noqa: E402
+from pignus.btc_collateral import MIN_UPGRADE_FEE   # noqa: E402
 from pignus.node import Node                    # noqa: E402
 from pignus.openamp import PledgeError          # noqa: E402
 from pignus.terms import LoanTerms, feed_id     # noqa: E402
@@ -3579,13 +3580,14 @@ def add_btc_commands(sub):
         p.add_argument("--d-refund", type=int, required=True,
                        help="Sequentia height the lender may take an unclaimed "
                             "principal back at")
-        p.add_argument("--upgrade-fee", type=int, default=10_000,
-                       help="satoshis the pre-vault carries to pay for moving "
-                            "the collateral into the loan. That transaction is "
-                            "signed in advance and cannot be replaced or "
-                            "fee-bumped, so this is deliberately generous: a "
-                            "fee too low to confirm is a loan that cannot "
-                            "start")
+        p.add_argument("--upgrade-fee", type=int, default=MIN_UPGRADE_FEE,
+                       help=f"satoshis the pre-vault carries to pay for moving "
+                            f"the collateral into the loan. That transaction is "
+                            f"signed in advance and cannot be replaced or "
+                            f"fee-bumped, so this is deliberately generous: a "
+                            f"fee too low to confirm is a loan that cannot "
+                            f"start. Every party refuses anything under "
+                            f"{MIN_UPGRADE_FEE} (default {MIN_UPGRADE_FEE})")
         p.add_argument("--lender-prog", required=True,
                        help="the lender's Sequentia payout program, hex: 20 "
                             "bytes at witness version 0, 32 at version 1")
