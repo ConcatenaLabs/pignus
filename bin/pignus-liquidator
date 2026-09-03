@@ -466,19 +466,48 @@ def main():
             # own coins, so a seizure whose margin is thinner than the fee is
             # one taken at a loss -- and `--min-profit 0`, whose whole promise
             # is "never take one at a loss", used to take exactly those.
-            #
             # Priced with the same call the spend will use, so the two cannot
-            # drift; and a wallet that cannot pay a fee at all is not a reason
-            # to stop DECIDING, so an unpriceable fee leaves the gross figure
-            # and says so. The attempt that matters fails later, loudly.
-            fee_atoms, fee_known = 0, False
+            # drift.
+            #
+            # Atoms of one asset are not atoms of another, so a fee paid in
+            # something other than the debt asset cannot simply be subtracted
+            # from a gross figure denominated in the debt asset. Nor is it
+            # zero, which is what leaving it out amounts to -- and the bot
+            # prefers the debt asset but will pay in whatever the wallet
+            # holds, so that case is ordinary rather than exotic. What makes
+            # the two comparable is that the node's table preserves fee VALUE
+            # across assets: one flow costs the same in policy terms whichever
+            # asset pays it. Re-pricing this exit at the DEBT asset's own
+            # published rate therefore states the same fee in the units the
+            # profit is measured in, without inventing a rate here.
+            #
+            # A debt asset the node does not price leaves no honest
+            # conversion, so the cost is reported unknown rather than as zero,
+            # and the comparison against --min-profit is refused rather than
+            # decided on a figure that is missing a term. A wallet that cannot
+            # pay a fee at all is not a reason to stop DECIDING; the attempt
+            # that matters fails later, loudly.
+            flow = kind if v.single_leaf else kind + "4"
+            fee_atoms, fee_paid_in, fee_cost, fee_why = 0, None, None, ""
             try:
-                _fa, fee_atoms, _r = fee_for(
-                    t, (kind if v.single_leaf else kind + "4"))
-                fee_known = (_fa == t.debt_asset)
-            except Exception:                           # noqa: BLE001
-                pass
-            profit = gross - (fee_atoms if fee_known else 0)
+                fee_paid_in, fee_atoms, _r = fee_for(t, flow)
+                if fee_paid_in == t.debt_asset:
+                    fee_cost = fee_atoms
+                else:
+                    tbl = F.fee_table(node)
+                    debt_rate = tbl["rates"].get(t.debt_asset)
+                    if debt_rate:
+                        fee_cost = F.fee_atoms(debt_rate, F.VSIZE[flow],
+                                               tbl["feerate_rfa_per_kvb"])
+                    else:
+                        fee_why = ("the node publishes no fee rate for the"
+                                   f" debt asset {t.debt_asset[:8]}, so a fee"
+                                   f" of {fee_atoms} atoms of"
+                                   f" {fee_paid_in[:8]} cannot be restated in"
+                                   " the units this profit is measured in")
+            except Exception as e:                      # noqa: BLE001
+                fee_why = f"the fee for this exit cannot be priced: {e}"
+            profit = gross - (fee_cost or 0)
             # BOTH names. The terms id is what a person recognises -- two
             # fundings of one set of terms share it -- and the book's own key
             # is the terms id hashed with the funding outpoint, which is what
@@ -489,12 +518,33 @@ def main():
                   f"{t.market} price={price} "
                   f"health={t.health(price):.3f} seize={seize} surplus={surplus} "
                   f"gross={gross} "
-                  + (f"fee={fee_atoms} " if fee_known else "fee=? ")
-                  + f"profit={profit}", file=sys.stderr)
+                  + ("fee=? " if fee_cost is None else
+                     f"fee={fee_cost} " if fee_paid_in == t.debt_asset else
+                     f"fee={fee_cost} (paid as {fee_atoms} of "
+                     f"{fee_paid_in[:8]}) ")
+                  + ("profit=?" if fee_cost is None else f"profit={profit}"),
+                  file=sys.stderr)
+            # An unknown fee only ever makes the profit SMALLER, so a gross
+            # that already fails the threshold fails it whatever the fee turns
+            # out to be, and that refusal is stated plainly. It is only the
+            # other direction -- a gross that clears it -- that the missing
+            # term could reverse, and there the honest answer is that this is
+            # not known rather than a seizure decided on an incomplete sum.
+            if fee_cost is None and gross >= args.min_profit:
+                note(v.loan_id,
+                     f"{gross} atoms gross would clear --min-profit"
+                     f" {args.min_profit}, but {fee_why}; seizing on a profit"
+                     " figure that is missing the fee is the loss"
+                     " --min-profit exists to prevent")
+                continue
             if profit < args.min_profit:
                 note(v.loan_id,
-                     f"{profit} atoms of profit"
-                     + (f" after a {fee_atoms}-atom fee" if fee_known else "")
+                     (f"{gross} atoms gross, before a fee that is only ever a"
+                      " further cost," if fee_cost is None else
+                      f"{profit} atoms of profit after a {fee_cost}-atom fee"
+                      + ("" if fee_paid_in == t.debt_asset else
+                         f" (paid as {fee_atoms} atoms of {fee_paid_in[:8]},"
+                         " repriced at the node's rate for the debt asset)"))
                      + f" is under --min-profit {args.min_profit}")
                 continue
             if args.dry_run:

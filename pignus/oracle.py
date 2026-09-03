@@ -52,6 +52,60 @@ def generate_key() -> bytes:
     return _key_module().generate_privkey()
 
 
+# The order of secp256k1's group. A secret key is a number in 1..n-1, and the
+# two ends are not theoretical: a file of zeros and a file truncated to nothing
+# both read as valid hex.
+CURVE_ORDER = int("fffffffffffffffffffffffffffffffe"
+                  "baaedce6af48a03bbfd25e8cd0364141", 16)
+
+
+def check_key(sec: bytes, what="that key"):
+    """The bytes read out of a key file, or a sentence saying what is wrong.
+
+    A key file is edited, copied between machines, restored from a backup and
+    pasted into a config, and every one of those can truncate it or leave it
+    empty. Read without a check, a wrong key does not fail here: it fails as a
+    signature the covenant rejects, or as an x-only public key that names an
+    oracle no loan has heard of, a long way from the file that caused it.
+    """
+    if not isinstance(sec, (bytes, bytearray)):
+        raise ValueError(f"{what} is not bytes")
+    if len(sec) != 32:
+        raise ValueError(f"{what} is {len(sec)} bytes; a secret key is 32")
+    k = int.from_bytes(sec, "big")
+    if k == 0:
+        raise ValueError(f"{what} is all zeroes, which is not a key: an empty "
+                         f"or truncated file reads as exactly this")
+    if k >= CURVE_ORDER:
+        raise ValueError(f"{what} is not below the curve order, so it names no "
+                         f"public key")
+    return bytes(sec)
+
+
+def read_key(path, what="that key"):
+    """A secret key from a file, checked, with the file's mode checked too.
+
+    The mode is checked on every read rather than only at creation, because a
+    key that became world-readable at some point is exactly what nobody
+    notices.
+    """
+    import os as _os
+    import stat as _stat
+    mode = _stat.S_IMODE(_os.stat(path).st_mode)
+    if mode & 0o077:
+        raise ValueError(
+            f"{path} is mode {mode:04o}: {what} is readable by other users. "
+            f"chmod 600 it and, since it may already have leaked, consider "
+            f"rotating to a new key")
+    with open(path) as f:
+        raw = f.read().strip()
+    try:
+        sec = bytes.fromhex(raw)
+    except ValueError:
+        raise ValueError(f"{path} does not hold {what} as hex") from None
+    return check_key(sec, f"{what} in {path}")
+
+
 @dataclass(frozen=True)
 class Attestation:
     """A signed price. `market` and `feed_id` are both carried: the feed id is

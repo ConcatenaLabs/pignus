@@ -145,7 +145,8 @@ class Book:
                 "a backup, or move it aside to start empty on purpose.")
         if not isinstance(d, dict) or not all(
                 isinstance(d.get(k, {}), dict)
-                for k in ("offers", "loans", "btc_offers", "btc_takes")):
+                for k in ("offers", "loans", "btc_offers", "btc_takes",
+                          "btc_commitments")):
             raise SystemExit(
                 f"book {self.path} does not have the shape of a loan book (a "
                 "JSON object with offers, loans, btc_offers and btc_takes "
@@ -661,7 +662,18 @@ class Book:
         with self._lock:
             rec = self.btc_takes.get(take_id)
             now = (rec or {}).get("status") or "requested"
-        if now in self.TAKE_TERMINAL or want in self.TAKE_TERMINAL:
+        # Moving TO a terminal status is an ordinary forward step, so it goes
+        # through and `update_btc_take` decides. Moving AWAY from one never
+        # can -- and that is exactly the case where dropping only the status
+        # matters most. A take that ended as `refunded` still has facts worth
+        # writing: the outpoint a principal went to, and the lender's signature
+        # over it, which is the only thing a borrower can check that report
+        # against. Passing the status through here made the whole write fail
+        # with a 409, so the fact was lost and the lender's responder, which
+        # records a report only on a 200, re-sent it on every pass for ever.
+        if now in self.TAKE_TERMINAL and want != now:
+            return {k: v for k, v in fields.items() if k != "status"}
+        if want in self.TAKE_TERMINAL:
             return fields                   # the ratchet in update_btc_take decides
         a, b = self._rank(now), self._rank(want)
         if a is not None and b is not None and b < a:
@@ -843,10 +855,15 @@ class Book:
                                 "health": round(t.health(price), 4)})
         # OPEN offers, the same count `/healthz` reports. Counting every offer
         # ever recorded made the two disagree for no reason a reader could see.
-        open_offers = sum(1 for o in self.offers.values()
-                          if o.get("status", "open") == "open")
+        # UNDER THE LOCK. Iterating `self.offers` while the poll thread
+        # publishes, cancels or prunes one raises "dictionary changed size
+        # during iteration" -- so `/v1/stats` answers 500 exactly when a book
+        # is busiest, which is when somebody is most likely to be reading it.
+        with self._lock:
+            statuses = [o.get("status", "open") for o in self.offers.values()]
+        open_offers = sum(1 for st in statuses if st == "open")
         return {"loans_by_state": by_state, "offers": open_offers,
-                "offers_all": len(self.offers),
+                "offers_all": len(statuses),
                 "unreadable": unreadable,
                 # Decimal strings, like every other amount this book serves:
                 # a total debt is exactly the figure that grows past what a

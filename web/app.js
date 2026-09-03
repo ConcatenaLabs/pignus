@@ -73,7 +73,11 @@ function note(msg, kind = "info") {
   const el = $("#note");
   el.className = "note " + kind;
   el.innerHTML = msg;
-  el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  // The preference has to be consulted HERE. A `prefers-reduced-motion` rule
+  // in the stylesheet cannot reach a scroll a script asks for by name.
+  const still = window.matchMedia
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  el.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "nearest" });
 }
 
 function busy(on, what = "") {
@@ -2811,6 +2815,20 @@ async function boot() {
     note("Refusing to run: this page could not pin its covenant implementation " +
          "against the golden vectors, so any address it derived could be wrong. " +
          esc(e.message), "bad");
+    // ...and make the dead chrome LOOK dead. Returning here wires nothing, so
+    // the tabs and the Refresh button stay on screen and do nothing when
+    // clicked -- which reads as a broken page rather than as a page that has
+    // deliberately stopped, and invites a reader to keep trying.
+    document.querySelectorAll("button, select, input, textarea")
+      .forEach((el) => { try { el.disabled = true; } catch { /* not a control */ } });
+    document.querySelectorAll("[data-panel]").forEach((el) => {
+      el.innerHTML = '<div class="note bad">This page has stopped: it could ' +
+        'not check its own covenant code against the golden vectors, and it ' +
+        'will not derive an address it cannot prove. Nothing here is safe to ' +
+        'act on until that is fixed — use <code>pignus-cli</code>, which pins ' +
+        'the same vectors against the proven builder, or reload once the site ' +
+        'is updated.</div>';
+    });
     return;
   }
   try { await refresh(); } catch (e) { note("The book is not answering: " + esc(e.message), "bad"); }

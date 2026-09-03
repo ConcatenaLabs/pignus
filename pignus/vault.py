@@ -322,6 +322,33 @@ class VaultSpender:
         change, fee = self._change(funding, {t.debt_asset: t.debt},
                                    change_spk or taker_spk)
         if surplus > 0:
+            # A seizure just past the threshold leaves the borrower a few
+            # atoms, and `IsDust` is applied to outputs in the transaction's
+            # FEE asset -- so when the fee is being paid in the collateral
+            # asset, that tiny return is dust and the relay refuses the whole
+            # spend. The liquidation then cannot be made at the moment it is
+            # most needed, and the operator sees a relay error naming nothing.
+            #
+            # The covenant requires `returned >= required_return`, not
+            # equality: the borrower may be given MORE, never less. So the
+            # return is lifted to the threshold and the difference comes out of
+            # the seizure, which is the taker's own money to give. The other
+            # direction -- folding the borrower's dust into the seizure -- is
+            # what the covenant exists to forbid.
+            if self.fee_asset == t.collateral_asset:
+                dust = self.dust_fold
+                lifted = max(surplus, dust)
+                if seize < dust or held - lifted < dust:
+                    raise ValueError(
+                        f"at this price the seizure takes {seize} atoms and "
+                        f"leaves the borrower {surplus}, and paying the fee in "
+                        f"the collateral asset makes both subject to the "
+                        f"node's dust threshold of {dust} -- so the node would "
+                        f"refuse this spend rather than relay it. Pay the fee "
+                        f"in another asset, which takes both outputs out of "
+                        f"the dust rule entirely, or wait for a price at which "
+                        f"the seizure is worth taking.")
+                surplus, seize = lifted, held - lifted
             outs.append((surplus, borrower_spk, t.collateral_asset))   # 1 surplus
             outs.append((seize, taker_spk, t.collateral_asset))
         else:

@@ -263,7 +263,7 @@ def tier_d_chain():
             n.sendtoaddress(address=n.getnewaddress(), amount=5,
                             fee_asset_label="bitcoin")
         rig.seq_mine(1)
-        # the regulated asset being sold, and the money it is sold for
+        # the restricted asset being sold, and the money it is sold for
         coll = n.issueasset(assetamount=1000, tokenamount=0, blind=False,
                             fee_asset="bitcoin")["asset"]
         money = n.issueasset(assetamount=1_000_000, tokenamount=0, blind=False,
@@ -527,7 +527,19 @@ def tier_d_describe_parity():
     here = os.path.dirname(os.path.realpath(__file__))
     vectors = _json.load(open(os.path.join(here, "..", "pignus",
                                            "vectors.json")))
-    for c in (vectors.get("repurchase") or []):
+    cases = list(vectors.get("repurchase") or [])
+    # Every pinned vector writes `forfeit_after` as a HEIGHT, and the sentence
+    # formats a Unix TIME differently -- a date, in the units a node compares
+    # such a deadline in. That branch is exactly the one where the two
+    # implementations could disagree unnoticed, since one formats the date with
+    # strftime and the other with toISOString, so it gets a case of its own
+    # rather than being covered by nothing.
+    if cases:
+        timed = dict(cases[0])
+        timed["name"] = cases[0]["name"] + " with a time-valued deadline"
+        timed["terms"] = dict(cases[0]["terms"], forfeit_after=1790000000)
+        cases.append(timed)
+    for c in cases:
         t = RepurchaseTerms(**c["terms"])
         script = (
             "import * as repo from '../web/repurchase.js';"

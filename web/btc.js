@@ -289,7 +289,7 @@ export function prevaultValue(loan) {
 }
 export function prevaultAddress(loan, hrp = "tb") {
   const spk = prevaultSpk(loan);
-  return segwitAddress(spk[0] === 0x51 ? 1 : spk[0] - 0x50, spk.slice(2), hrp);
+  return segwitAddress(spk[0] === 0 ? 0 : spk[0] - 0x50, spk.slice(2), hrp);
 }
 
 /** The one transaction that moves the collateral from the pre-vault into the
@@ -438,9 +438,17 @@ function convertBits(data, from, to) {
 }
 /** bech32m-encode a segwit output. hrp "tb" is Bitcoin testnet (testnet4). */
 export function segwitAddress(witver, witprog, hrp = "tb") {
+  // The checksum constant is chosen by the witness VERSION, not fixed. Version
+  // 0 is bech32 (constant 1, BIP173) and versions 1 and up are bech32m
+  // (0x2bc830a3, BIP350). Using bech32m for a v0 program produces a string
+  // that passes every shape check and that no wallet will decode as the
+  // address it was meant to be -- and this encoder is what a borrower funds
+  // collateral to. Every address this file actually builds today is taproot,
+  // so the constant was right for every caller and wrong for the function.
   const data = [witver].concat(convertBits(Array.from(witprog), 8, 5));
   const values = hrpExpand(hrp).concat(data);
-  const mod = polymod(values.concat([0, 0, 0, 0, 0, 0])) ^ 0x2bc830a3;  // bech32m
+  const mod = polymod(values.concat([0, 0, 0, 0, 0, 0]))
+    ^ (witver === 0 ? 1 : 0x2bc830a3);
   const chk = [];
   for (let i = 0; i < 6; i++) chk.push((mod >> (5 * (5 - i))) & 31);
   return hrp + "1" + data.concat(chk).map(d => CHARSET[d]).join("");
@@ -448,7 +456,8 @@ export function segwitAddress(witver, witprog, hrp = "tb") {
 /** The Bitcoin address a borrower funds the collateral to. */
 export function fundingAddress(loan, hrp = "tb") {
   const spk = fundingSpk(loan);
-  const witver = spk[0] === 0x51 ? 1 : spk[0] - 0x50;
+  // OP_0 is 0x00; versions 1..16 are OP_1..OP_16, which is 0x51..0x60.
+  const witver = spk[0] === 0 ? 0 : spk[0] - 0x50;
   return segwitAddress(witver, spk.slice(2), hrp);
 }
 

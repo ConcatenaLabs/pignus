@@ -46,9 +46,20 @@ print(O.generate_key().hex())"; }
 # Run a command that MUST fail, and say what it must fail with. A refusal for
 # the wrong reason is not the refusal that was asked for: a typo in a flag also
 # exits non-zero, and a drill that only checks the exit status is happy with it.
+#
+# The STATUS is checked too, and against the documented one. These tools promise
+# that 1 means the command could not run and 2 means a check failed and nothing
+# was built or broadcast -- a distinction a caller can only use if it is true
+# everywhere. Nothing enforced it, and `raise SystemExit("...")`, which exits 1,
+# is the natural way to write a refusal in Python; so almost every refusal in
+# the command line reported "could not run". Pass WANT_STATUS to expect
+# something else for the few failures that genuinely are not refusals.
 refuses() {
     local what="$1" want="$2"; shift 2
-    if "$@" > "$WORK/out" 2> "$WORK/err"; then
+    local want_status="${WANT_STATUS:-2}"
+    local got=0
+    "$@" > "$WORK/out" 2> "$WORK/err" || got=$?
+    if [ "$got" -eq 0 ]; then
         echo "FAIL: $what was ACCEPTED and should not have been" >&2
         sed 's/^/  /' "$WORK/out" >&2
         exit 1
@@ -56,6 +67,12 @@ refuses() {
     if ! grep -qF -- "$want" "$WORK/err" "$WORK/out"; then
         echo "FAIL: $what was refused, but not for the reason it was aimed at" >&2
         echo "  wanted: $want" >&2
+        sed 's/^/  /' "$WORK/err" >&2
+        exit 1
+    fi
+    if [ "$got" -ne "$want_status" ]; then
+        echo "FAIL: $what exited $got, and the documented status for this is" \
+             "$want_status" >&2
         sed 's/^/  /' "$WORK/err" >&2
         exit 1
     fi
@@ -152,8 +169,14 @@ refuses "naming one oracle AND a set" "not both" \
   --not-before 1700000000 --max-price 100000000000
 refuses "a market that is not a pair" "TICKER/TICKER" \
   "$BIN/pignus-cli" quote --market GOLD --collateral-ref 3000 --debt-ref 1
-refuses "a terms file that is not there" "FileNotFoundError" \
+refuses "a terms file that is not there" "cannot read the terms file" \
   "$BIN/pignus-cli" show --terms "$WORK/no-such-terms.json"
+printf 'not json' > "$WORK/notjson.json"
+refuses "a terms file that is not JSON" "is not valid JSON" \
+  "$BIN/pignus-cli" show --terms "$WORK/notjson.json"
+printf '{"hello": 1}' > "$WORK/notterms.json"
+refuses "a JSON file that is not a loan's terms" "is not a loan's terms" \
+  "$BIN/pignus-cli" show --terms "$WORK/notterms.json"
 
 echo
 echo "== oracle: sign one round =="
@@ -338,26 +361,45 @@ echo "  neither --loans nor --book exits 2, saying which"
 echo
 echo "== one responder per lender key =="
 python3 - "$WORK" "$BIN/pignus-cli" <<'PYLOCK'
-import os, sys, tempfile
+import contextlib, io, os, sys, tempfile
 src = open(sys.argv[2]).read()
 start = src.index("class _ResponderState:")
 end = src.index("\ndef _loan_from_take(")
+# `refuse` comes along, because these checks go through it: a refusal exits 2,
+# and the sentence goes to stderr rather than into the exception. Slicing the
+# class out without it would make this drill test a copy of the code that has
+# nothing to do with what the command line actually runs.
+rstart = src.index("def refuse(message)")
+rend = src.index("\ndef _funding_for(")
 ns = {}
-exec(compile("import os, json, sys\n" + src[start:end], "cli", "exec"), ns)
+exec(compile("import os, json, sys\nfrom typing import NoReturn\n"
+             + src[rstart:rend] + "\n" + src[start:end], "cli", "exec"), ns)
 S = ns["_ResponderState"]
+
+
+def refused(fn):
+    """(exit status, what it said) for a call that must refuse."""
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            fn()
+    except SystemExit as e:
+        return (e.code, err.getvalue())
+    return (0, err.getvalue())
 
 work = sys.argv[1]
 p = os.path.join(work, "responder-state.json")
 held = S(p, exclusive=True)
 print("  a responder starts and takes the lock")
 
-try:
-    S(p, exclusive=True)
+code, said = refused(lambda: S(p, exclusive=True))
+if code == 0:
     sys.exit("FAIL: a second responder on the same key started")
-except SystemExit as e:
-    if "already holds" not in str(e):
-        sys.exit(f"FAIL: it refused for the wrong reason: {e}")
-print("  a second one on the same key is refused, and says why")
+if "already holds" not in said:
+    sys.exit(f"FAIL: it refused for the wrong reason: {said}")
+if code != 2:
+    sys.exit(f"FAIL: a refusal must exit 2, not {code}")
+print("  a second one on the same key is refused, exits 2, and says why")
 
 # A state file in a directory this process cannot write is a responder that
 # would pay a principal it cannot record -- and pay it again next pass. It has
@@ -369,14 +411,15 @@ p2 = os.path.join(ro, "responder-state.json")
 open(p2, "w").write("{}")
 os.chmod(ro, 0o555)
 try:
-    S(p2, exclusive=True)
-    sys.exit("FAIL: it started with a state file it cannot write")
-except SystemExit as e:
-    said = str(e)
+    code, said = refused(lambda: S(p2, exclusive=True))
+    if code == 0:
+        sys.exit("FAIL: it started with a state file it cannot write")
     if "cannot be written" not in said:
         sys.exit(f"FAIL: it refused for the wrong reason: {said}")
     if "ReadWritePaths" not in said:
         sys.exit("FAIL: the refusal does not say where to put the file instead")
+    if code != 2:
+        sys.exit(f"FAIL: a refusal must exit 2, not {code}")
 finally:
     os.chmod(ro, 0o755)
 print("  an unwritable state file is refused at start-up, saying where to move it")
@@ -658,6 +701,23 @@ if missing:
 if len(run) < 20:
     sys.exit(f"FAIL: only found {len(run)} tests in the runner")
 print(f"  the README lists all {len(run)} tests the runner runs")
+
+# The same argument for the MODULE list. It is what a reader consults to find
+# out where something lives, and a module missing from it is one they conclude
+# does not exist -- so they write a second copy of it, which is how two
+# implementations of one rate limiter came to be shipped, only one of which
+# had a fix.
+mods = {f"pignus/{f}" for f in os.listdir(os.path.join(root, "pignus"))
+        if f.endswith(".py") and f != "__init__.py"}
+listed_mods = set(re.findall(r"(pignus/[\w]+\.py)", readme))
+missing = sorted(mods - listed_mods)
+if missing:
+    sys.exit(f"FAIL: the package has these and the README does not list "
+             f"them: {missing}")
+gone = sorted(listed_mods - mods)
+if gone:
+    sys.exit(f"FAIL: the README lists modules that are not there: {gone}")
+print(f"  and describes all {len(mods)} modules the package has")
 TESTLIST
 
 # --- a config file's values must actually be used ----------------------------
@@ -836,7 +896,7 @@ names = re.findall(r"\{([a-z0-9,\-]+)\}", top)[0].split(",")
 if len(names) < 40:
     sys.exit(f"FAIL: only found {len(names)} subcommands to check")
 
-bare, crashed = [], []
+bare, crashed, unlabelled = [], [], []
 history = re.compile(r"\b(until now|used to|no longer|previously|recently|"
                      r"formerly|was renamed|older versions?|new in|"
                      r"we (?:now|have|added))\b", re.I)
@@ -852,6 +912,16 @@ for c in names:
         bare.append(c)
     if history.search(body):
         dated.append(c)
+    # --force walks past a check that exists to protect somebody's money, so
+    # it is the ONE flag whose help text is not optional. Unlabelled, it reads
+    # as "make it work", and the commands here that offer it are spending
+    # Bitcoin on a secret that may still be taken back, or committing
+    # collateral to a transaction that may never confirm.
+    if "--force" in r.stdout:
+        opts = r.stdout.split("options:", 1)[-1]
+        m = re.search(r"^\s*--force\b(.*)$", opts, re.M)
+        if m and not m.group(1).strip():
+            unlabelled.append(c)
 
 if crashed:
     sys.exit(f"FAIL: --help crashed for {crashed}")
@@ -859,7 +929,11 @@ if bare:
     sys.exit(f"FAIL: these say nothing about what they do: {bare}")
 if dated:
     sys.exit(f"FAIL: these tell the reader about the past: {dated}")
+if unlabelled:
+    sys.exit(f"FAIL: these offer --force without saying what it overrides: "
+             f"{unlabelled}")
 print(f"  all {len(names)} subcommands describe themselves, in the present tense")
+print("  and every --force says which check it walks past")
 PYHELP
 
 echo

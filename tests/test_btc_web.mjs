@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as B from "../web/btc.js";
+import { programFromAddress } from "../web/wallet.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const v = JSON.parse(readFileSync(join(here, "..", "web", "btc_vectors.json")));
@@ -107,6 +108,45 @@ ok("and a completed abort is byte-identical to the Python's",
   ok("and the fee is added exactly, at any size",
      B.prevaultValue({ ...bare, upgrade_fee: "9007199254740993" })
      === BigInt(bare.btc_amount) + 9007199254740993n);
+}
+
+
+// --- the address encoder, against an independent decoder --------------------
+//
+// A wrong address here is collateral nobody can spend, and the encoder was
+// pinned by nothing: a single transposed entry in the bech32 charset re-maps
+// every 5-bit group consistently, so the checksum is computed over the
+// corrupted payload and the result is a perfectly valid address for a
+// DIFFERENT witness program. A wallet accepts it, the money goes there, and no
+// script anywhere ever runs.
+//
+// `programFromAddress` in web/wallet.js is a separate decoder in a separate
+// file. Round-tripping through it is a real check; comparing the encoder to
+// itself would not be.
+{
+  const spks = [B.fundingSpk(v.loan), B.prevaultSpk(v.loan)];
+  for (const [i, spk] of spks.entries()) {
+    for (const hrp of ["tb", "bc", "bcrt"]) {
+      const addr = B.segwitAddress(spk[0] === 0x51 ? 1 : spk[0] - 0x50,
+                                   spk.slice(2), hrp);
+      // `spk` comes back as a hex STRING from this decoder.
+      const back = programFromAddress(addr);
+      ok(`address ${i}/${hrp} decodes back to the script it came from`,
+         back.spk === hex(spk), `${addr} -> ${back.spk} vs ${hex(spk)}`);
+    }
+  }
+  // A v0 program too: a different encoding constant, and the one every
+  // ordinary payout uses.
+  const v0 = new Uint8Array([0x00, 0x14, ...Array(20).fill(0xee)]);
+  const a0 = B.segwitAddress(0, v0.slice(2), "tb");
+  ok("a v0 address round-trips as well, and is not a v1 one",
+     programFromAddress(a0).spk === hex(v0) && a0.startsWith("tb1q"), a0);
+  // And a corrupted address is refused rather than decoded to something else.
+  let refused = false;
+  const good = B.segwitAddress(1, spks[0].slice(2), "tb");
+  try { programFromAddress(good.slice(0, -1) + (good.endsWith("q") ? "p" : "q")); }
+  catch { refused = true; }
+  ok("one wrong character is refused by the checksum", refused);
 }
 
 console.log(`\n${pass} checks passed, ${fail} failed`);

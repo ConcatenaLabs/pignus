@@ -269,6 +269,35 @@ def main():
     except TakeMoved:
         check("a finished take stays finished", True)
 
+    # ...and a FACT about a finished take is still worth writing. A report
+    # carries both, and `forward_only` exists to keep the fact and drop the
+    # step; for a terminal take it was passing the step through instead, so
+    # the whole write failed with a 409 and the fact was lost. The lender's
+    # responder records a report only on a 200, so it then re-sent that one on
+    # every pass, for ever, against a relay that could never accept it.
+    kept = bk.forward_only(tid, {"status": "disbursed",
+                                 "disbursement_txid": "ff" * 32,
+                                 "disbursed_auth": "ab" * 64})
+    check("a report about a finished take keeps its facts",
+          kept.get("disbursement_txid") == "ff" * 32
+          and kept.get("disbursed_auth") == "ab" * 64)
+    check("...and drops the step, which is the part that cannot be taken",
+          "status" not in kept)
+    bk.update_btc_take(tid, **kept)
+    check("...so the write lands rather than raising",
+          bk.btc_takes[tid].get("disbursed_auth") == "ab" * 64)
+    check("...and the take is still where it ended",
+          bk.btc_takes[tid]["status"] == "refunded")
+    # The move INTO a terminal status is an ordinary forward step and must
+    # still go through untouched.
+    rec2 = bk.put_btc_take({"btc_offer_id": "o1", "loan": {"h_w": "cd" * 32},
+                            "prevault_txid": "ce" * 32, "prevault_vout": 0,
+                            "status": "requested"}, lots_of="o1")
+    tid2 = rec2["take_id"]
+    check("a take may still be moved into a terminal status",
+          bk.forward_only(tid2, {"status": "refunded"}).get("status")
+          == "refunded")
+
     print("\n== the deadlines a loan needs to be safe ==")
     ln = BC.loan_from_dict(loan_for(lender_x, borrower_x="dd" * 32,
                                     h_w="ee" * 32, borrower_prog="dd" * 20))
