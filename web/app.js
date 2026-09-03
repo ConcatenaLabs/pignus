@@ -2174,7 +2174,8 @@ function renderBtcOffers() {
   // survives the thirty-second refresh.
   btcborrow.renderOffers(box, state.btcOffers || [], btcUi(),
                          (off) => runBtcBorrow(off),
-                         (html, wire) => paint("#btcoffers", html, wire));
+                         (html, wire) => paint("#btcoffers", html, wire),
+                         state.btcFeerate);
 }
 
 /**
