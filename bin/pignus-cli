@@ -2000,21 +2000,52 @@ class _ResponderState:
         principal is paid into does not depend on it, so the loser pays a
         SECOND full principal into the same place. The lender pays twice and
         can claim neither repayment. A lock is cheaper than the arithmetic.
+
+        Beside the state file where that directory is writable, and in the
+        system's temporary directory where it is not -- a hardened unit often
+        gives a service its keys read-only, and refusing to start over that
+        would be this check costing more than it saves. Being UNABLE to make a
+        lock is not the same as somebody else holding one, and the two used to
+        report the same sentence: an operator was told to go and stop a second
+        responder that did not exist.
         """
         import fcntl
-        lock = self.path + ".lock"
-        try:
-            self._lockf = open(lock, "a+")
-            fcntl.flock(self._lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._lockf.seek(0)
-            self._lockf.truncate()
-            self._lockf.write(f"{os.getpid()}\n")
-            self._lockf.flush()
-        except OSError as e:
-            raise SystemExit(
-                f"another responder already holds {lock}: two on one lender "
-                f"key pay two principals for one loan. Stop that one first "
-                f"({type(e).__name__}: {e})") from e
+        import hashlib
+        import tempfile
+        here = os.path.abspath(self.path)
+        tag = hashlib.sha256(here.encode()).hexdigest()[:16]
+        places = [here + ".lock",
+                  os.path.join(tempfile.gettempdir(), f"pignus-responder-{tag}.lock")]
+        last = None
+        for lock in places:
+            try:
+                f = open(lock, "a+")
+            except OSError as e:            # nowhere to put it: try the next
+                last = e
+                continue
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                f.close()
+                # THIS is contention: the file exists and somebody holds it.
+                raise SystemExit(
+                    f"another responder already holds {lock}: two on one "
+                    f"lender key pay two principals for one loan. Stop that "
+                    f"one first ({type(e).__name__}: {e})") from e
+            self._lockf = f
+            try:
+                f.seek(0)
+                f.truncate()
+                f.write(f"{os.getpid()}\n")
+                f.flush()
+            except OSError:
+                pass                        # the flock is the lock, not the text
+            return
+        raise SystemExit(
+            f"no writable place for a responder lock: tried "
+            f"{', '.join(places)} ({type(last).__name__}: {last}). One "
+            "responder per lender key is not optional -- two pay two "
+            "principals for one loan -- so this will not start without it.")
 
     def get(self, take_id):
         return self.data.get(take_id, {})

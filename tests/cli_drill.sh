@@ -304,5 +304,51 @@ grep -q "need --loans or --book" "$WORK/err" || {
     exit 1; }
 echo "  neither --loans nor --book exits 2, saying which"
 
+# --- one responder per lender key, and only for the right reason -----------
+#
+# Two responders on one key each draw their own secret for the same take, and
+# the loser pays a SECOND full principal into an address that does not depend
+# on the secret at all. The lock is what stops that. But a hardened unit often
+# gives a service its keys READ-ONLY, and refusing to start over a lock that
+# cannot be created would cost more than it saves -- so being unable to make
+# one falls back, and only real contention is reported as contention.
+echo
+echo "== one responder per lender key =="
+python3 - "$WORK" "$BIN/pignus-cli" <<'PYLOCK'
+import os, sys, tempfile
+src = open(sys.argv[2]).read()
+start = src.index("class _ResponderState:")
+end = src.index("\ndef _loan_from_take(")
+ns = {}
+exec(compile("import os, json, sys\n" + src[start:end], "cli", "exec"), ns)
+S = ns["_ResponderState"]
+
+work = sys.argv[1]
+p = os.path.join(work, "responder-state.json")
+held = S(p, exclusive=True)
+print("  a responder starts and takes the lock")
+
+try:
+    S(p, exclusive=True)
+    sys.exit("FAIL: a second responder on the same key started")
+except SystemExit as e:
+    if "already holds" not in str(e):
+        sys.exit(f"FAIL: it refused for the wrong reason: {e}")
+print("  a second one on the same key is refused, and says why")
+
+ro = os.path.join(work, "readonly-keys")
+os.makedirs(ro, exist_ok=True)
+p2 = os.path.join(ro, "responder-state.json")
+open(p2, "w").write("{}")
+os.chmod(ro, 0o555)
+try:
+    S(p2, exclusive=True)
+    print("  a read-only key directory does not stop it: the lock falls back")
+except SystemExit as e:
+    sys.exit(f"FAIL: a read-only key directory stopped it: {e}")
+finally:
+    os.chmod(ro, 0o755)
+PYLOCK
+
 echo
 echo "all CLI drills passed"
