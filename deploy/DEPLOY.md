@@ -268,6 +268,12 @@ sequentiatestnet.com {
     handle_path /pignus-oracle/* {
         reverse_proxy 127.0.0.1:8740
     }
+    handle_path /pignus-oracle-2/* {
+        reverse_proxy 127.0.0.1:8742
+    }
+    handle_path /pignus-oracle-3/* {
+        reverse_proxy 127.0.0.1:8743
+    }
     handle {
         reverse_proxy 127.0.0.1:8080   # the explorer: everything else
     }
@@ -277,6 +283,16 @@ sequentiatestnet.com {
 `handle_path` strips the prefix, so the page's relative `v1/...` fetches reach
 `pignusd` at `/v1/...`; the page's `/tx/<txid>` links and
 `/pignus-oracle/v1/log` rely on this exact layout.
+
+**Every oracle gets a route, not only the primary.** A seizure is meant to be
+checkable by anyone — the attestation behind it is at that oracle's own
+`/v1/seizures` — and an m-of-n seizure is signed by oracles that are not the
+primary. One with no public route is one whose seizures nobody outside can
+check, which is most of what bounds an oracle's trust. Put the same addresses
+in `oracle_public_urls` in `pignusd.json`, in the order `oracle` then
+`oracles`, so `/v1/oracles` can tell a reader where to look; the book's own
+loopback addresses are never served, because a browser told to fetch
+`127.0.0.1` fetches from the reader's own machine.
 
 `caddy validate --config /etc/caddy/Caddyfile`, then `caddy reload --config
 /etc/caddy/Caddyfile` — never restart, which would drop the other sites.
@@ -422,7 +438,8 @@ does.
 | `explorer_url` | — | where the page's breadcrumb points. A self-hosted book is not behind the testnet's reverse proxy, so it can say where its explorer really is |
 | `explorer_tx_url` | `/explorer/tx/{txid}` | the link a Sequentia transaction id becomes on the page |
 | `btc_explorer_tx_url` | `/testnet4/tx/{txid}` | the same for a parent-chain transaction |
-| `oracle_public_url` | — | where the page's link to the oracle log points |
+| `oracle_public_url` | — | where the page's link to the primary oracle's log points |
+| `oracle_public_urls` | `[]` | where each oracle can be reached from OUTSIDE, in the same order as `oracle` then `oracles`. Served by `/v1/oracles`; the loopback addresses above never are, since a browser told to fetch `127.0.0.1` fetches from the reader's own machine. An m-of-n seizure is signed by oracles that are not the primary, and the attestation behind it is at that oracle's `/v1/seizures`, so a threshold oracle with no public address is one whose seizures nobody outside can check |
 
 A watcher that was down for longer than `rescan_depth` blocks cannot reach the
 gap at all. Start it once with `--rescan-from <height>` and the forward scan

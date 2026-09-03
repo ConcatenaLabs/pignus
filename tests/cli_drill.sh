@@ -372,7 +372,7 @@ end = src.index("\ndef _loan_from_take(")
 rstart = src.index("def refuse(message)")
 rend = src.index("\ndef _funding_for(")
 ns = {}
-exec(compile("import os, json, sys\nfrom typing import NoReturn\n"
+exec(compile("import os, json, sys, time\nfrom typing import NoReturn\n"
              + src[rstart:rend] + "\n" + src[start:end], "cli", "exec"), ns)
 S = ns["_ResponderState"]
 
@@ -555,6 +555,49 @@ if r.returncode != 0 or "ok" not in r.stdout:
     sys.exit("FAIL: the responder's error record does not clear or date "
              "itself\n" + (r.stderr or r.stdout)[-400:])
 print("  a recorded failure is dated, and a step that succeeds clears it")
+
+# A state file written before waits were dated. The reason a take is STUCK on
+# is the reason that never changes, so an ordinary pass never rewrites it and
+# these would report "unknown" for ever -- which is the answer they gave
+# before, on exactly the takes the report was built for. Only the responder
+# may repair that: this file's second writer is the failure it exists to
+# prevent, and `btc-responder-status` holds no lock.
+old_state = os.path.join(work, "responder-undated.json")
+json.dump({"take-old": {"t": "44" * 32, "waiting": "upgrade-fee"}},
+          open(old_state, "w"))
+r = subprocess.run([sys.executable, cli, "btc-responder-status",
+                    "--state", old_state], capture_output=True, text=True)
+if "no date on it" not in r.stderr:
+    sys.exit("FAIL: an undated wait is passed over in silence\n"
+             + r.stderr[-300:])
+if json.load(open(old_state))["take-old"].get("waiting_since"):
+    sys.exit("FAIL: a read-only command wrote to a live responder's state file")
+r = subprocess.run([sys.executable, "-c", """
+import json, sys
+src = open(sys.argv[1]).read()
+start = src.index("class _ResponderState:")
+end = src.index("\\ndef _loan_from_take(")
+rs = src.index("def refuse(message)")
+re_ = src.index("\\ndef _funding_for(")
+ns = {}
+exec(compile("import os, json, sys, time\\nfrom typing import NoReturn\\n"
+             + src[rs:re_] + "\\n" + src[start:end], "cli", "exec"), ns)
+st = ns["_ResponderState"](sys.argv[2], exclusive=True)
+was = st.get("take-old").get("waiting_since")
+assert was, "the responder did not date a wait that had none"
+# Hand the lock back before starting the second one: two responders on one key
+# is refused, which is the point of the lock and not what is being tested here.
+st._lockf.close()
+st2 = ns["_ResponderState"](sys.argv[2], exclusive=True)
+assert st2.get("take-old")["waiting_since"] == was, \\
+    "a restart reset the clock, so a wait can never grow old"
+print("ok")
+""", cli, old_state], capture_output=True, text=True)
+if r.returncode != 0 or "ok" not in r.stdout:
+    sys.exit("FAIL: the responder does not date an old wait, or resets it on "
+             "restart\n" + (r.stderr or r.stdout)[-400:])
+print("  an undated wait is said to be undated, dated only by the responder, "
+      "and not reset by a restart")
 
 # Clearing refuses without a way to check the chain: that check is the only
 # thing between this command and a second principal.

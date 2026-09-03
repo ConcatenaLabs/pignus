@@ -2363,6 +2363,39 @@ class _ResponderState:
                     f"one and pay every principal again. Restore it from a "
                     f"backup, or move it aside on purpose if this key really "
                     f"has no loans in flight.")
+        # Only the holder of the exclusive lock -- the responder itself --
+        # writes here. `btc-responder-status` opens this file without the lock
+        # and is documented as safe against a running responder, and a second
+        # writer could land its whole snapshot on top of a disbursement the
+        # responder had just recorded. Losing exactly that field is what this
+        # file exists to prevent, and no report is worth the risk of it.
+        if exclusive:
+            self._date_old_waits()
+
+    def _date_old_waits(self):
+        """Give a wait that predates the stamp a date, once.
+
+        A wait's clock starts when its REASON changes, which is right: it is
+        the reason's age that matters, not the last poll's. But a state file
+        written before waits were dated carries reasons with no date, and the
+        reason a take is stuck on is exactly the reason that never changes --
+        so the takes this was built to report would have gone on reporting
+        "unknown" for ever, which is the answer they gave before.
+
+        Stamped on the first load that sees one, and SAVED, so a restart does
+        not reset it. The clock therefore starts late rather than at the true
+        beginning: the age is a floor, and a floor that grows is enough to say
+        "this stopped moving", which is the whole question being asked.
+        """
+        changed = False
+        now = int(time.time())
+        for rec in self.data.values():
+            if isinstance(rec, dict) and rec.get("waiting") \
+                    and not rec.get("waiting_since"):
+                rec["waiting_since"] = now
+                changed = True
+        if changed and self.path:
+            self._save()
 
     def _must_be_writable(self):
         """Refuse to start if this file cannot be written, and say so HERE.
@@ -3165,6 +3198,13 @@ def cmd_btc_responder_status(args):
     slow = [r for r in rows
             if r not in stuck and r["waiting_on"]
             and (r["waiting_hours"] or 0) >= args.waiting_hours]
+    # A wait written before waits were dated has no date, and the reason a take
+    # is stuck on is the reason that never changes -- so these would never be
+    # dated by an ordinary pass. The responder stamps them the next time it
+    # starts, which only it may do: this command holds no lock, and a second
+    # writer here could land its snapshot on top of a disbursement the
+    # responder had just recorded. So it says so instead of guessing.
+    undated = [r for r in rows if r["waiting_on"] and r["waiting_hours"] is None]
     healing = [r for r in rows
                if r not in stuck and "not recorded" in r["stage"]]
     # And the offers this key signed that a book is now serving with a
@@ -3204,6 +3244,12 @@ def cmd_btc_responder_status(args):
               "withdraw the offer and publish a new one, and tell the borrower "
               "they can abort their pre-vault and take their Bitcoin back.",
               file=sys.stderr)
+    if undated:
+        print(f"{len(undated)} take(s) are waiting on something with no date "
+              f"on it, so how long cannot be said here: "
+              + ", ".join(r["take_id"] for r in undated)
+              + ". Restarting the responder dates them; only it may write this "
+                "file.", file=sys.stderr)
     if healing:
         print(f"{len(healing)} take(s) are recovering on their own: a claim or "
               f"a refund was broadcast and the answer lost, and each wrote the "

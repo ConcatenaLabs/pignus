@@ -537,6 +537,22 @@ class Service:
         self.explorer_tx_url = cfg.get("explorer_tx_url", "")
         self.btc_explorer_tx_url = cfg.get("btc_explorer_tx_url", "")
         self.oracle_public_url = cfg.get("oracle_public_url", "").rstrip("/")
+        # Where each oracle can be reached FROM OUTSIDE, in the same order as
+        # `oracle` then `oracles`. These are almost never the addresses this
+        # book uses: a book talks to its oracles over loopback, and serving
+        # those to a browser is worse than serving nothing, because a page that
+        # followed one would be fetching from the reader's own machine.
+        #
+        # It matters because a seizure is meant to be auditable by anyone: the
+        # attestation behind it is published at that oracle's /v1/seizures, and
+        # an m-of-n seizure is signed by oracles that are not the primary. A
+        # threshold loan whose extra oracles are unreachable is one whose
+        # seizure nobody outside can check, which is most of what bounds an
+        # oracle's trust. Empty where none is configured, never a guess.
+        pub = [str(u).rstrip("/") for u in cfg.get("oracle_public_urls", [])]
+        if not pub and self.oracle_public_url:
+            pub = [self.oracle_public_url]
+        self.oracle_public_urls = pub
 
     # ------------------------------------------------------------- the oracle
 
@@ -2095,8 +2111,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/oracles":
             # The set of independent oracles this book quotes against, so a
             # lender can pick an m-of-n subset for a threshold loan.
+            # PUBLIC urls, empty where none is configured. The book's own
+            # addresses for its oracles are loopback, and answering "where is
+            # this oracle" with 127.0.0.1 sends a reader to their own machine.
+            pub = list(s.oracle_public_urls)
+            pub += [""] * max(0, len(s.oracle_keys) - len(pub))
             return self._send(200, {"oracles": list(s.oracle_keys),
-                                    "urls": list(s.oracle_urls)})
+                                    "urls": pub[:len(s.oracle_keys)]})
         if path == "/v1/offers":
             # A misspelt status returned an empty list, which reads as "there
             # are no offers" rather than "that is not a status" -- the same
