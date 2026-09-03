@@ -704,6 +704,19 @@ non-empty), `market`, `lots`, `offer_sig`, and optionally `responder` and a
 what makes this endpoint safe to leave open: an offer carrying somebody else's
 key would make **their** responder pay it out.
 
+`upgrade_fee` must be at least 10,000 satoshis. The transaction it pays for is
+signed in advance by both parties, spends a covenant leaf and sets a final
+sequence, so neither side can replace it or pay for a child: whatever is
+committed at origination is the only fee it will ever have. Every party checks
+this, not only this book, because a loan arranged by hand never passes a relay.
+
+`repay_deadline` is not the moment a borrower is held to. A lender stops
+claiming 120 Sequentia blocks -- two hours -- before it, because claiming
+publishes the secret and doing that as the borrower's own refund opened would
+hand them the debt and the collateral both. So the deadline to show a borrower
+is `repay_deadline - 120`, and a repayment made after it is one nobody will
+answer.
+
 The id is derived from the signed terms, so republishing the same offer is
 idempotent — it keeps the record's age and what has already been taken — and two
 different offers can never collide.

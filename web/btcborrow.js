@@ -166,7 +166,14 @@ export function renderOffers(box, offers, ui, onBorrow) {
       // script, so the price it is meant to be justified below is the only
       // thing a borrower can hold them to afterwards.
       '<td data-label="seized below">' + ui.esc(seizePrice(l, ui)) + '</td>' +
-      '<td data-label="repay by">' + ui.blockTime(l.repay_deadline) + '</td>' +
+      // The EFFECTIVE deadline, which is the one a borrower is really held to:
+      // a lender stops claiming a margin before the written one, and a
+      // repayment nobody claims releases no collateral. Quoting the written
+      // figure invites somebody to pay into a window nobody will answer.
+      '<td data-label="repay by">' + ui.blockTime(effectiveRepayDeadline(l)) +
+      '<span class="sub2">the lender stops claiming after this; the written ' +
+      'deadline is block ' + Number(l.repay_deadline).toLocaleString() +
+      '</span></td>' +
       '<td data-label="lender sweep">Bitcoin block ' +
         Number(l.recover_after).toLocaleString() + '</td>' +
       '<td data-label=""><button data-b="' + i + '" class="primary sm">Borrow</button></td>' +

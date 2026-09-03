@@ -2110,7 +2110,9 @@ async function renderBtcLoans() {
         <td data-label="collateral">${(Number(BigInt(l.btc_amount)) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })} BTC
           ${funded ? `<span class="sub2"><a href="${txLink(funded, true)}" class="mono">${shortHex(funded, 12)}</a></span>` : ""}</td>
         <td data-label="you owe">${units(l.debt, l.debt_asset)} ${d}</td>
-        <td data-label="repay by">${whenBlock(l.repay_deadline)}</td>
+        <td data-label="repay by">${whenBlock(btcborrow.effectiveRepayDeadline(l))}
+          <span class="sub2">the lender stops claiming after this; the written
+          deadline is block ${Number(l.repay_deadline).toLocaleString()}</span></td>
         <td data-label="lender sweep">Bitcoin block ${Number(l.recover_after).toLocaleString()}</td>
         <td data-label="where it stands">${esc(rec.status || "funded")}${step.note ? `<span class="sub2">${esc(step.note)}</span>` : ""}</td>
         <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>`;
