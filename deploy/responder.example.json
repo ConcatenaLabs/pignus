@@ -1,6 +1,7 @@
 {
   "_comment": "The lender's side of a Bitcoin-collateral loan. This file holds credentials: keep it 0600, and never in a repository.",
   "lender_key": "/root/sequentia/pignus-data/lender.key",
+  "_state_dir_note": "In a directory this service may WRITE -- the one named by ReadWritePaths= in the unit, not the key directory. ProtectHome=read-only makes the keys read-only on purpose, and a state file left there records nothing: the responder refuses to start rather than pay a principal it cannot write down.",
   "state": "/root/sequentia/pignus-data/responder-state.json",
   "book": "http://127.0.0.1:8741",
   "interval": 5,

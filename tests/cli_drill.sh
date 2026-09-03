@@ -336,6 +336,10 @@ except SystemExit as e:
         sys.exit(f"FAIL: it refused for the wrong reason: {e}")
 print("  a second one on the same key is refused, and says why")
 
+# A state file in a directory this process cannot write is a responder that
+# would pay a principal it cannot record -- and pay it again next pass. It has
+# to be refused at START-UP: the first thing that would otherwise discover it
+# is a disbursement.
 ro = os.path.join(work, "readonly-keys")
 os.makedirs(ro, exist_ok=True)
 p2 = os.path.join(ro, "responder-state.json")
@@ -343,11 +347,24 @@ open(p2, "w").write("{}")
 os.chmod(ro, 0o555)
 try:
     S(p2, exclusive=True)
-    print("  a read-only key directory does not stop it: the lock falls back")
+    sys.exit("FAIL: it started with a state file it cannot write")
 except SystemExit as e:
-    sys.exit(f"FAIL: a read-only key directory stopped it: {e}")
+    said = str(e)
+    if "cannot be written" not in said:
+        sys.exit(f"FAIL: it refused for the wrong reason: {said}")
+    if "ReadWritePaths" not in said:
+        sys.exit("FAIL: the refusal does not say where to put the file instead")
 finally:
     os.chmod(ro, 0o755)
+print("  an unwritable state file is refused at start-up, saying where to move it")
+
+# ...and the lock itself still falls back when only the LOCK cannot be made,
+# which is a different thing from the state file being unwritable.
+ok_dir = os.path.join(work, "writable")
+os.makedirs(ok_dir, exist_ok=True)
+p3 = os.path.join(ok_dir, "responder-state.json")
+S(p3, exclusive=True)
+print("  a writable directory starts normally")
 PYLOCK
 
 echo
