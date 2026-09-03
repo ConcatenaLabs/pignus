@@ -15,8 +15,13 @@ that weakens it fails here in a second rather than on the testnet.
 import os
 import sys
 import json
+import hashlib
+import importlib.util
+import importlib.machinery
+import pathlib
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 from pignus import adaptor as A                       # noqa: E402
 from pignus import btc_relay as R                     # noqa: E402
@@ -361,6 +366,26 @@ def main():
 
     check("and a sweep that opens before the collateral stops being abortable",
           any("stops being abortable" in p for p in order), str(order))
+
+    # A secret proves itself. Everything else in a lender's report is their
+    # word and needs their signature; a preimage either hashes to the loan's
+    # payment hash or it does not, so a borrower can believe one with no
+    # signature at all -- and must, because that secret is the only way their
+    # collateral comes back.
+    spec = importlib.util.spec_from_loader(
+        "pcli", importlib.machinery.SourceFileLoader(
+            "pcli", str(ROOT / "bin" / "pignus-cli")))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    secret = b"\x11" * 32
+    tk_h = {"payment_hash": hashlib.sha256(secret).hexdigest()}
+    check("a secret that hashes to the loan's payment hash is believed",
+          mod._secret_opens(tk_h, secret.hex()))
+    check("a secret that hashes to something else is not",
+          not mod._secret_opens(tk_h, ("22" * 32)))
+    check("and neither is a malformed one, or one with no hash to check",
+          not mod._secret_opens(tk_h, "not-hex")
+          and not mod._secret_opens({}, secret.hex()))
 
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0
