@@ -17,10 +17,15 @@ After=network-online.target pignus-oracle.service pignusd.service
 [Service]
 Type=oneshot
 User=root
-# Two of the three services are on a different port for each extra oracle, so
-# the set to check is configuration rather than something the script guesses.
-# Match it to what is enabled: the primary plus every pignus-oracle@N.
-Environment=PIGNUS_ORACLES=http://127.0.0.1:8740
+# Every oracle is on its own port, so the set to check is configuration rather
+# than something the script guesses. Match it to what is enabled: the primary
+# plus every pignus-oracle@N. The default here lists the three that DEPLOY.md's
+# own setup enables, rather than only the primary -- a threshold oracle nobody
+# watches is one whose silence is discovered at a liquidation. Drop the extras
+# if you run only the primary; the script now also asks the book which keys it
+# quotes and fails if this list does not cover them, so a mismatch either way
+# is reported rather than assumed.
+Environment=PIGNUS_ORACLES=http://127.0.0.1:8740 http://127.0.0.1:8742 http://127.0.0.1:8743
 Environment=PIGNUS_BOOK=http://127.0.0.1:8741
 # Keep this equal to max_price_age in pignusd.json.
 Environment=PIGNUS_MAX_PRICE_AGE=600
