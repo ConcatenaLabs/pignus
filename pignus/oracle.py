@@ -360,7 +360,7 @@ class BulkHttpPriceSource(PriceSource):
     """
 
     def __init__(self, url: str, timeout: float = 8.0, field: str = "price",
-                 max_age: float = 300.0, feed_max_age: float = 300.0):
+                 max_age: float = 300.0, feed_max_age: float = 0.0):
         self.url = url
         self.timeout = timeout
         self.field = field
@@ -392,6 +392,24 @@ class BulkHttpPriceSource(PriceSource):
             raise ValueError(
                 f"{self.url} was last read {int(age)}s ago (limit "
                 f"{int(self.max_age)}s); refusing to sign a stale snapshot")
+        if self.feed_max_age and not self._updated:
+            # ASKED FOR and unanswerable. `feed_max_age` is off unless an
+            # operator sets it, because a feed is not obliged to publish
+            # `_meta.updated` and most do not -- so a default that refused
+            # would break every deployment pointing at one, including the mock
+            # price server this project ships.
+            #
+            # But an operator who DID set it believes a stale feed will be
+            # caught, and silently treating "cannot tell" as "fresh" is the
+            # worst of both. So the check they asked for is either performed or
+            # refused, never quietly skipped.
+            raise ValueError(
+                f"{self.url} publishes no `_meta.updated`, so `feed_max_age` "
+                f"({int(self.feed_max_age)}s) cannot be checked at all. A feed "
+                f"that cannot say when it last moved could be frozen at a "
+                f"price from a week ago and look perfectly current. Point at a "
+                f"feed that publishes it, or remove `feed_max_age` (it is off "
+                f"by default) to sign without the check.")
         if self.feed_max_age and self._updated:
             fed = time.time() - self._updated
             if fed > self.feed_max_age:

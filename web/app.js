@@ -469,15 +469,35 @@ async function refresh() {
     ? `block ${Number(state.height).toLocaleString()}`
     : "no node: heights unknown";
   $("#chain").className = "tag " + (node && state.height != null ? "ok" : "dim");
-  renderIntro();
-  renderMarkets();
-  renderOffers();
-  renderBtcOffers();
-  renderLoans();
-  renderAlerts();
-  renderLendForm();
-  renderWallet();
-  renderBtcLoans().catch(() => {});
+  // Each panel on its own. One bad record -- an offer somebody published with
+  // a letter where an amount belongs, a loan whose terms will not parse --
+  // used to throw out of the panel it was in and take every panel AFTER it
+  // down with it, for every visitor, until somebody noticed. A panel that
+  // cannot draw now says so where it is, and the others are unaffected.
+  for (const [name, fn] of [["intro", renderIntro], ["markets", renderMarkets],
+                            ["offers", renderOffers],
+                            ["btcoffers", renderBtcOffers],
+                            ["loans", renderLoans], ["alerts", renderAlerts],
+                            ["lendform", renderLendForm],
+                            ["wallet", renderWallet]]) {
+    try { fn(); } catch (e) { panelFailed(name, e); }
+  }
+  renderBtcLoans().catch((e) => panelFailed("btcloans", e));
+}
+
+/**
+ * A panel that could not draw. Says so in its own box, names what it could not
+ * read, and leaves the rest of the page alone -- because the alternative is a
+ * blank page, and a borrower with a live loan needs the panels that DO work.
+ */
+function panelFailed(name, e) {
+  console.error(`pignus: the ${name} panel could not draw`, e);
+  const el = $("#" + name);
+  if (!el) return;
+  el.innerHTML = `<div class="note bad">This section could not be drawn: ` +
+    `${esc(explain(e))}<br><span class="small">Something this book is ` +
+    `serving cannot be read. The rest of the page is unaffected; reload to ` +
+    `try again.</span></div>`;
 }
 
 // ------------------------------------------------------------------ wallet
@@ -1075,8 +1095,8 @@ function renderOffers() {
         acts.push(`<button data-cancel="${i}" data-focus="ca:${esc(o.offer_id)}" class="sm">Cancel listing</button>`);
       acts.push(`<button class="sm" data-det="${esc(key)}" data-focus="det:${esc(key)}" aria-expanded="${state.details.has(key)}">Details</button>`);
       const st = status !== "open"
-        ? `<span class="tag ${status === "ghost" ? "bad" : "dim"}" title="${status === "unlisted"
-            ? "funded on chain, but this book has no listing for it yet" : ""}">${esc(status)}</span>` : "";
+        ? `<span class="tag ${status === "ghost" ? "bad" : "dim"}" title="${
+            esc(OFFER_STATUS_WHY[status] || "")}">${esc(status)}</span>` : "";
       offer.requirePinned();
       const spk = derived(`offer:${o.outpoint}`, () => offer.offerTree({
         terms: t, principal: big(o.principal || t.principal),
@@ -1084,9 +1104,9 @@ function renderOffers() {
         expiryLocktime: o.expiry_locktime }).scriptPubKey);
       return `<tr>
         <td data-label="market">${esc(o.collateral_ticker)} / ${esc(o.debt_ticker)}${oracleTags(t)}${warnTag(o.warnings)}${st}</td>
-        <td data-label="borrow"><b>${amount(t.principal, t.debt_asset)}</b></td>
+        <td data-label="borrow"><b>${amount(o.principal ?? t.principal, t.debt_asset)}</b></td>
         <td data-label="repay">${amount(t.debt, t.debt_asset)}<span class="sub2">+${rate.toFixed(2)}% to maturity</span></td>
-        <td data-label="collateral">${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}${o.open_ltv != null ? ` · LTV ${(o.open_ltv * 100).toFixed(0)}%` : ""}</span></td>
+        <td data-label="collateral">${amount(o.collateral ?? t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(o.collateral ?? t.collateral_amount, t.collateral_asset)}${o.open_ltv != null ? ` · LTV ${(o.open_ltv * 100).toFixed(0)}%` : ""}</span></td>
         <td data-label="liquidation">${money(liq, liq < 10 ? 4 : 2)} ${esc(o.debt_ticker)}<span class="sub2">${drop == null ? ""
           : drop < 0 ? "above the price now — liquidatable immediately" : `${drop.toFixed(0)}% below now`}</span></td>
         <td data-label="matures">${whenBlock(t.maturity)}<span class="sub2">offer expires ${o.expiry_locktime ? whenText(o.expiry_locktime) : "—"}</span></td>
@@ -1114,6 +1134,22 @@ function renderOffers() {
 
 const STATE_CLS = { LIVE: "ok", UNCONFIRMED: "warn", REPAID: "dim", LIQUIDATED: "bad",
                     DEFAULTED: "bad", RECOVERED: "bad", GHOST: "bad", SPENT_UNKNOWN: "dim" };
+
+// Why an OFFER is in the state it is in, for the tag's tooltip. Every state
+// had one except "unlisted", so a reader hovering a `ghost` or a `gone` tag
+// got an empty box -- and those are exactly the two that need a sentence.
+const OFFER_STATUS_WHY = {
+  open: "this offer's coin is on chain and can be taken",
+  taken: "the whole principal has been drawn; nothing is left to borrow",
+  withdrawn: "the lender took their principal back",
+  gone: "the coin was spent by something this book could not name, outside "
+      + "the blocks it walked back over",
+  ghost: "the coin that funded this offer is no longer on chain: a "
+       + "Bitcoin-driven reorg undid it before it buried. It can come back",
+  expired: "past its own expiry: the lender may take the principal back at "
+         + "any moment, so a take would be racing them",
+  unlisted: "funded on chain but not listed on this book",
+};
 
 const STATE_WHY = {
   LIVE: "the funding is buried deep enough for this book to treat the loan as open",
@@ -1769,10 +1805,23 @@ async function repay(l) {
     await confirmAndSend("Repay", (fee) => {
       const built = flows.buildRepay({ ...args, feeAsset: fee.asset,
         feeAmount: fee.atoms, dustAtoms: dustFor(fee.asset) });
+      // Where the collateral actually goes. REPAY pays it to the BORROWER's
+      // pinned program whoever broadcasts -- that is what makes this exit
+      // permissionless and safe for anybody to take -- so telling a third
+      // party they are taking it back is telling them they get the collateral
+      // for the price of the debt. They are not: they are paying somebody
+      // else's loan off.
+      const yours = mine(t.borrower_prog || t.borrower_x);
       built.summary = [
         `Pay ${units(t.debt, t.debt_asset)} ${d} to the lender`,
-        `Take back all ${units(args.collateralAmount, t.collateral_asset)} ${c}`,
-        "No oracle and no signature: this exit is always open to you"];
+        yours
+          ? `Take back all ${units(args.collateralAmount, t.collateral_asset)} ${c}`
+          : `Send all ${units(args.collateralAmount, t.collateral_asset)} ${c} ` +
+            "to the BORROWER, not to you: the vault pays their pinned address " +
+            "whoever broadcasts this",
+        ...(yours ? [] : ["You are paying somebody else's loan off. Nothing " +
+                          "comes back to you."]),
+        "No oracle and no signature: this exit is always open"];
       return built;
     }, { flow: l.single_leaf ? "repay" : "repay4", prefer: [t.debt_asset],
          committed: { [t.debt_asset]: big(t.debt) } });
@@ -2094,7 +2143,7 @@ async function renderBtcLoans() {
       if (step.action)
         acts.push(`<button data-btcstep="${i}" class="primary sm">${esc(step.label)}</button>`);
       if (step.action === "reclaim")
-        acts.push(`<button data-btcforce="${i}" class="sm" title="the Bitcoin block your secret's Sequentia block anchored to is not buried yet, so a Bitcoin reorg could still undo it and you would lose both sides">Reclaim anyway</button>`);
+        acts.push(`<button data-btcforce="${i}" class="sm" title="skip the wait for the Bitcoin block your secret's Sequentia block anchored to. That wait is there because a Bitcoin reorg can undo the secret, and spending your Bitcoin on one that is undone loses both sides">Reclaim anyway</button>`);
       if (btcborrow.canAbort(rec, heights))
         acts.push(`<button data-btcabort="${i}" class="warnbtn sm">Take the collateral back</button>`);
       // The repayment's own REFUND leaf: if the lender never took the money,
@@ -2362,7 +2411,9 @@ async function checkBtc(ev) {
       <span class="k">Repay deadline</span><span>Sequentia block ${Number(loan.repay_deadline).toLocaleString()}${state.height == null ? ""
         : rdOk ? ` — in the future (now block ${Number(state.height).toLocaleString()})`
         : ` — <b>ALREADY PAST</b> (now block ${Number(state.height).toLocaleString()}): the lender's Sequentia refund is open, so do not fund`}</span>
-      <span class="k">Lender sweep</span><span>Bitcoin block ${Number(loan.recover_after).toLocaleString()} — this page cannot see the Bitcoin height; confirm in a Bitcoin explorer that it is well after your repayment deadline</span>
+      <span class="k">Lender sweep</span><span>Bitcoin block ${Number(loan.recover_after).toLocaleString()}${state.btcHeight == null
+        ? " — this book publishes no Bitcoin height, so nothing here can say how far away that is; confirm in a Bitcoin explorer that it is well after your repayment deadline"
+        : ` — about ${Math.max(0, Math.round((Number(loan.recover_after) - Number(state.btcHeight)) * 10 / 1440 * 10) / 10)} days away (now Bitcoin block ${Number(state.btcHeight).toLocaleString()}), and it must sit well after your repayment deadline`}</span>
       </div>
       <p class="hint">That one hash stands in the Bitcoin vault's reclaim leaf and
       in the Sequentia repayment output above. It is the whole of the binding

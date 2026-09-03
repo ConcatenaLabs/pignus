@@ -630,6 +630,31 @@ class Book:
     # nothing moves afterwards.
     TAKE_TERMINAL = frozenset(("refunded", "aborted", "expired"))
 
+    def forward_only(self, take_id, fields):
+        """The same fields, with a BACKWARDS status dropped.
+
+        A report carries a fact and a step. The fact is always worth writing --
+        a `disbursed` report re-sent after the loan went live still records
+        where the principal went, and a lender whose first attempt the relay
+        refused has no other way to get it in. The step is only worth taking
+        when it moves forward, which is what stops a copied report rewriting a
+        live loan back to one whose lot the offer counts as free.
+
+        So: keep everything, and drop the status when it would go back.
+        """
+        want = fields.get("status")
+        if want is None:
+            return fields
+        with self._lock:
+            rec = self.btc_takes.get(take_id)
+            now = (rec or {}).get("status") or "requested"
+        if now in self.TAKE_TERMINAL or want in self.TAKE_TERMINAL:
+            return fields                   # the ratchet in update_btc_take decides
+        a, b = self._rank(now), self._rank(want)
+        if a is not None and b is not None and b < a:
+            return {k: v for k, v in fields.items() if k != "status"}
+        return fields
+
     def _rank(self, status):
         try:
             return self.TAKE_ORDER.index(status)
@@ -656,7 +681,22 @@ class Book:
                         f"cannot become {want}")
                 if want not in self.TAKE_TERMINAL:
                     a, b = self._rank(now), self._rank(want)
-                    if a is not None and b is not None and b <= a:
+                    # STRICTLY backwards. A step may be reported twice with
+                    # more in it than the first time, and one of them is the
+                    # step everything depends on: `claim_pass` reports
+                    # `claimed` the moment the claim is broadcast, with an
+                    # empty secret, and `publish_pass` reports `claimed` again
+                    # once it is buried, WITH the secret that releases the
+                    # borrower's collateral. Refusing the second as a replay
+                    # strands that collateral -- which is the exact failure the
+                    # ratchet was added alongside a fix for.
+                    #
+                    # Re-reporting the same step is therefore allowed, and it
+                    # is safe: every handler verifies the reporter's signature
+                    # over the fields, and the fields themselves are guarded
+                    # where it matters (a secret is checked against the loan's
+                    # own hash, and never overwritten with an empty one).
+                    if a is not None and b is not None and b < a:
                         raise TakeMoved(
                             f"this take is already {now}; a report that would "
                             f"move it back to {want} is one that has already "
@@ -694,10 +734,15 @@ class Book:
         money in flight are kept at any age, and so is anything the book cannot
         date. `max_age` of zero or less prunes nothing.
 
-        Returns {"offers": [...], "loans": [...], "btc_takes": [...]}: the ids
-        dropped, so a caller that was watching those records can stop.
+        `btc_commitments` is NEVER pruned, deliberately: a take is forgotten and
+        a secret is not, and a commitment that became reusable would be one two
+        loans could share. It is one hex string per loan.
+
+        Returns {"offers": [...], "loans": [...], "btc_takes": [...],
+        "btc_offers": [...]}: the ids dropped, so a caller that was watching
+        those records can stop.
         """
-        out = {"offers": [], "loans": [], "btc_takes": []}
+        out = {"offers": [], "loans": [], "btc_takes": [], "btc_offers": []}
         if int(max_age) <= 0:
             return out
         now = int(time.time())
@@ -729,6 +774,22 @@ class Book:
                     offer["lots_taken"] = int(offer.get("lots_taken") or 0) + 1
                 del self.btc_takes[tid]
                 out["btc_takes"].append(tid)
+            # Cross-chain offers, which nothing pruned at all. They are
+            # published with a signature and no chain state, so they cost their
+            # publisher nothing and this book keeps every one for ever --
+            # re-serialised, sorted and fsynced on every write. Withdrawn ones
+            # go the way the others do. A take of a pruned offer keeps its lot
+            # accounting because the take goes first, above.
+            for oid, rec in list(self.btc_offers.items()):
+                ts = _last_touched(rec)
+                if rec.get("status", "open") not in DEAD_OFFERS \
+                        or not ts or ts >= cutoff:
+                    continue
+                if any(t.get("btc_offer_id") == oid
+                       for t in self.btc_takes.values()):
+                    continue            # a take still points at it
+                del self.btc_offers[oid]
+                out["btc_offers"].append(oid)
             if any(out.values()):
                 self._save()
         return out

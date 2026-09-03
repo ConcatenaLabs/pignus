@@ -172,15 +172,39 @@ function u32be(n) {
 // ------------------------------------------------------------------- the list
 
 export function renderOffers(box, offers, ui, onBorrow) {
-  const open = offers.filter(o => (o.status || "open") === "open");
+  // An offer whose numbers are not numbers is DROPPED, not rendered and not
+  // fatal. A book refuses to store one now, but one published before that
+  // still sits in an older book -- and a single such record used to throw out
+  // of this function and blank the whole table for every visitor.
+  const readable = (l) => {
+    try {
+      for (const k of ["btc_amount", "debt", "principal"])
+        if (l[k] !== undefined && l[k] !== "") BigInt(l[k]);
+      // Only what is PRESENT. `abort_after` and `d_refund` are absent from a
+      // loan with no pre-vault, and an absent field is not a malformed one.
+      for (const k of ["repay_deadline", "recover_after", "abort_after",
+                       "d_refund", "upgrade_fee", "strike", "price_scale"])
+        if (l[k] !== undefined && l[k] !== null && l[k] !== ""
+            && !Number.isFinite(Number(l[k]))) return false;
+      return true;
+    } catch { return false; }
+  };
+  const all = offers.filter(o => (o.status || "open") === "open");
+  const open = all.filter(o => o.loan && readable(o.loan));
+  const dropped = all.length - open.length;
   if (!open.length) {
     box.innerHTML = '<div class="empty">No Bitcoin-collateral offers are open. ' +
       'A lender publishes one, and keeps a responder online while it rests.</div>';
     return;
   }
-  box.innerHTML = '<table><tr><th>collateral</th><th>you receive</th>' +
+  const note = dropped
+    ? `<div class="hint">${dropped} offer(s) are not shown: their terms carry ` +
+      'a value that is not a number, so nothing here can price them. That is ' +
+      'the book serving a malformed record, not a loan you are missing.</div>'
+    : "";
+  box.innerHTML = '<table><thead><tr><th>collateral</th><th>you receive</th>' +
     '<th>you repay</th><th>seized below</th><th>repay by</th>' +
-    '<th>lender sweep</th><th></th></tr>' +
+    '<th>lender sweep</th><th></th></tr></thead><tbody>' +
     open.map((o, i) => {
       const l = o.loan;
       const principal = BigInt(l.principal || 0) || BigInt(l.debt);
@@ -207,7 +231,7 @@ export function renderOffers(box, offers, ui, onBorrow) {
         Number(l.recover_after).toLocaleString() + '</td>' +
       '<td data-label=""><button data-b="' + i + '" class="primary sm">Borrow</button></td>' +
       '</tr>';
-    }).join("") + "</table>";
+    }).join("") + "</tbody></table>" + note;
   box.querySelectorAll("[data-b]").forEach(btn => {
     btn.onclick = () => onBorrow(open[Number(btn.dataset.b)]);
   });
@@ -418,6 +442,11 @@ export async function borrow(wallet, offer, ui) {
     reclaim_fee: reclaimFee,
     release_sig: releaseSig,
     funded: true,
+    // This browser built the loan and checked the lender's signature over the
+    // payment hash at the time, so it does not have to check it again from a
+    // relay's copy later. A record RECOVERED from a relay carries no such
+    // history and must prove it.
+    originated: true,
   };
   rec.status = stageOf(rec);
   rememberLoan(rec);
@@ -544,6 +573,10 @@ async function report(wallet, ui, rec, kind, txid, vout) {
                  { take_id: rec.take_id, txid, vout, auth });
 }
 
+function explainish(e) {
+  return String((e && e.message) || e || "unknown").slice(0, 160);
+}
+
 function progToSpk(prog, ver) {
   return (Number(ver) === 0 ? "0014" : "5120") + prog;
 }
@@ -556,14 +589,23 @@ export async function repay(wallet, rec, ui) {
   // lender's own signature says that hash is theirs. A record rebuilt from the
   // relay -- a cleared browser, a second device -- carries the relay's copy of
   // it, so this is where that copy stops being taken on trust.
-  if (rec.hash_auth &&
+  // NOT optional. A record rebuilt from the relay -- a cleared browser, a
+  // second device -- carries the relay's copy of the payment hash, and the
+  // address this repayment goes to is derived from it. Skipping the check when
+  // no signature came back makes it optional exactly on the path it exists
+  // for: a relay that wanted to substitute a hash would simply omit the
+  // signature for it. A record this browser ORIGINATED needs no proof, because
+  // it verified the signature at the time and kept the loan it built.
+  if (!rec.originated &&
       !lenderSaid(loan.lender_x, "pignus/btc-hash/1", rec.take_id,
                   { payment_hash: String(loan.payment_hash || "").toLowerCase(),
                     adaptor_point: String(rec.adaptor_point || "") },
                   rec.hash_auth))
-    throw new Error("this loan's payment hash is not signed by its lender. " +
-      "Paying the debt against it would pay into an address they cannot open. " +
-      "Nothing has been sent.");
+    throw new Error("this loan's payment hash is not signed by its lender, or " +
+      "this book served no signature for it. Paying the debt against it would " +
+      "pay into an address they cannot open. Nothing has been sent. Recover " +
+      "the loan from a book that serves the lender's own signature, or use " +
+      "pignus-cli with the ticket you kept.");
   const tree = hashlockTaptree({
     preimageHash: loan.payment_hash, asset: loan.debt_asset,
     payeeProg: loan.lender_prog, payeeVer: loan.lender_ver,
@@ -576,9 +618,22 @@ export async function repay(wallet, rec, ui) {
   // would cheerfully take the debt a second time. The address is derived from
   // the terms, so the chain can be asked directly, and it is the only place
   // that knows.
-  const already = await ui.api(
-    `v1/scan/${hex(tree.scriptPubKey())}?asset=${loan.debt_asset}` +
-    `&amount=${String(loan.debt)}`).catch(() => null);
+  let already = null;
+  try {
+    already = await ui.api(
+      `v1/scan/${hex(tree.scriptPubKey())}?asset=${loan.debt_asset}` +
+      `&amount=${String(loan.debt)}`);
+  } catch (e) {
+    // A guard that fails OPEN is not a guard. This is the only thing standing
+    // between a borrower whose report was lost and paying the same debt twice,
+    // and "the book is busy" is not "you have not paid". The node's own scan
+    // limiter returns 429 here, so the ordinary busy case lands in exactly
+    // this branch.
+    throw new Error("this book could not check whether you have already paid " +
+      `this debt (${explainish(e)}). Refusing to send a second payment: if ` +
+      "the first one is on chain, a second is money nobody can return to you. " +
+      "Try again in a moment.");
+  }
   if (already && already.found) {
     // Record it, so the rest of the page stops offering Repay, and tell the
     // relay where it went in case that is what was lost.
@@ -814,6 +869,10 @@ export async function recoverLoans(wallet, ui) {
       // borrower on a second device pays their debt into whatever address the
       // relay's copy of the hash compiles to.
       hash_auth: t.hash_auth ?? was.hash_auth,
+      // Kept from whatever this browser already knew: a loan IT originated
+      // verified the signature when it was built, and a relay cannot take
+      // that away by serving a record without one.
+      originated: was.originated || false,
       adaptor_point: t.adaptor_point ?? was.adaptor_point ?? "",
       // What each party has actually DONE. These are the facts every step and
       // every button is decided from, because a fact only ever becomes true:
@@ -950,11 +1009,21 @@ export function nextStep(rec, heights) {
     case "aborted":
       return { action: null, label: "", note: "Aborted; collateral returned." };
     case "repayment-refunded":
-      return { action: "reclaim", label: "Take the collateral back",
-               note: "You took your repayment back because nobody claimed it. " +
-                     "Your collateral is still in the vault until the secret " +
-                     "appears or the lender sweeps it at Bitcoin block " +
-                     Number(l.recover_after).toLocaleString() + "." };
+      // No action. The secret is published by the lender CLAIMING the
+      // repayment, and the repayment is back in the borrower's wallet -- so
+      // there is nothing left to claim and the secret will never appear.
+      // Offering "Take the collateral back" here sends somebody to a screen
+      // that can only tell them the secret is not on chain, over and over,
+      // while the sweep they should be watching for approaches.
+      return { action: null, label: "",
+               note: "Your debt is back in your wallet: nobody claimed the " +
+                     "repayment before its deadline. That also means the " +
+                     "secret that releases your collateral will never be " +
+                     "published, so the Bitcoin stays in the vault until the " +
+                     "lender sweeps it at Bitcoin block " +
+                     Number(l.recover_after).toLocaleString() + ". If your " +
+                     "lender comes back and claims after all, the secret " +
+                     "appears on chain and this page will offer the reclaim." };
     default:
       return { action: null, label: "", note: "" };
   }

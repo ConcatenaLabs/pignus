@@ -337,6 +337,19 @@ tip as far as `back_scan_cap`.
 - 404 if the output is still unspent, or its spend is outside the scan window.
 - 503 if this book has no node.
 
+### `GET /v1/unrenderable`
+
+The records this book holds and cannot show, and why:
+
+```json
+{"unrenderable": {"<offer or loan id>": "ValueError: debt must be at least 1 atom"}}
+```
+
+A record that will not parse is missing from every listing, so a lender looking
+for their own offer simply does not find it. `/healthz` counts them and turns
+unhealthy; this says which, so an operator can look at the record rather than
+at the whole book.
+
 ### `GET /healthz`
 
 ```json
@@ -699,10 +712,16 @@ the debt was paid, `claim_txid` with `secret_t` that the lender took it, and
 true. The page derives everything it shows from them.
 
 `lots_left` on an offer is what a take holds against it. A take still `pending`
-after half an hour releases its lot, and a `signed` one whose collateral never
+after five minutes releases its lot, and a `signed` one whose collateral never
 appeared releases its lot after six hours: a borrower who asks and walks away
 must not hold a lender's offer shut. Every status past that holds its lot for
 good, because money is in flight by then.
+
+Those windows are short on purpose. Asking for a loan is free and anonymous, so
+every second an unfinished request holds a lot is a second somebody who is not
+lending anything has closed a lender's offer. The handshake it waits for takes
+seconds when a responder is running, and the write rate limiter bounds how fast
+one client can make requests at all.
 
 ### `GET /v1/btc/offers`
 
@@ -892,6 +911,16 @@ first form never overwrites a secret already published.
 `{"ok": true, "take_id": "…"}` on success. 403 if the report is not signed by
 this loan's lender, 404 for an unknown take.
 
+Each report's signature is KEPT, under the report's own name —
+`disbursed_auth`, `upgraded_auth`, `claimed_auth`, `refunded_auth`, beside the
+`hash_auth` and `adaptor_auth` from the handshake — and served with the take. A
+borrower rebuilding a loan from this book can then check every step against the
+lender's own key rather than believing the carrier: the outpoint a claim is
+built on decides where the money comes from, so it is not a thing to take on
+anybody's word. A report writes its FIELDS whatever the take's current status,
+and moves the status only forward, so a lender whose report was refused once
+can send it again.
+
 ### `POST /v1/btc/claimed-principal`, `/v1/btc/repaid`
 
 The borrower's own reports: where they took the principal, and where they paid
@@ -1016,6 +1045,19 @@ liquidation decision — there is no covenant to refuse it. This log is the whol
 of that tier's accountability: anyone can check afterwards that the price behind
 a seizure was really under the strike. 404 from `/v1/seizure/{sighash}` if this
 oracle co-signed no such seizure.
+
+### `GET /v1/unrenderable`
+
+The records this book holds and cannot show, and why:
+
+```json
+{"unrenderable": {"<offer or loan id>": "ValueError: debt must be at least 1 atom"}}
+```
+
+A record that will not parse is missing from every listing, so a lender looking
+for their own offer simply does not find it. `/healthz` counts them and turns
+unhealthy; this says which, so an operator can look at the record rather than
+at the whole book.
 
 ### `GET /healthz`
 
