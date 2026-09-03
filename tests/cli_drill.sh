@@ -410,19 +410,32 @@ os.makedirs(ro, exist_ok=True)
 p2 = os.path.join(ro, "responder-state.json")
 open(p2, "w").write("{}")
 os.chmod(ro, 0o555)
-try:
-    code, said = refused(lambda: S(p2, exclusive=True))
-    if code == 0:
-        sys.exit("FAIL: it started with a state file it cannot write")
-    if "cannot be written" not in said:
-        sys.exit(f"FAIL: it refused for the wrong reason: {said}")
-    if "ReadWritePaths" not in said:
-        sys.exit("FAIL: the refusal does not say where to put the file instead")
-    if code != 2:
-        sys.exit(f"FAIL: a refusal must exit 2, not {code}")
-finally:
+# Root ignores the permission bits, so an unwritable directory is not
+# unwritable to root and this check cannot be made to happen at all. Root is
+# who the deploy runbook tells you to run this drill as, where it therefore
+# failed for a reason that has nothing to do with the code. Skipped and SAID,
+# rather than quietly passed: a check reporting "ok" without having run is
+# worse than one reporting that it did not.
+if os.geteuid() == 0:
     os.chmod(ro, 0o755)
-print("  an unwritable state file is refused at start-up, saying where to move it")
+    print("  (an unwritable state file: not checkable as root, who may write "
+          "one anyway)")
+else:
+    try:
+        code, said = refused(lambda: S(p2, exclusive=True))
+        if code == 0:
+            sys.exit("FAIL: it started with a state file it cannot write")
+        if "cannot be written" not in said:
+            sys.exit(f"FAIL: it refused for the wrong reason: {said}")
+        if "ReadWritePaths" not in said:
+            sys.exit("FAIL: the refusal does not say where to put the file "
+                     "instead")
+        if code != 2:
+            sys.exit(f"FAIL: a refusal must exit 2, not {code}")
+    finally:
+        os.chmod(ro, 0o755)
+    print("  an unwritable state file is refused at start-up, saying where to "
+          "move it")
 
 # ...and the lock itself still falls back when only the LOCK cannot be made,
 # which is a different thing from the state file being unwritable.

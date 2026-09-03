@@ -109,10 +109,18 @@ the box:
 mkdir -p /var/lib/pignus-backup
 tar czf /var/lib/pignus-backup/pignus-$(date +%F).tgz \
     /root/sequentia/pignus-data \
+    $(test -d /root/sequentia/pignus-btc-keys \
+      && echo /root/sequentia/pignus-btc-keys) \
     /root/sequentia/pignusd.json \
     /root/sequentia/pignus-oracle*.json \
     /root/sequentia/pignus-responder.json
 ```
+
+`pignus-btc-keys` is named as well as `pignus-data` because a deployment that
+kept the lender key outside `pignus-data` is otherwise one whose backup
+restores everything except the key that signs releases. It is named only if it
+is there, since the setup above puts `lender.key` inside `pignus-data`: naming
+a path that does not exist would fail the whole archive rather than widen it.
 
 What each piece costs to lose is worth knowing before it happens. An oracle key
 that is gone leaves every loan baked to it unliquidatable until it matures --
