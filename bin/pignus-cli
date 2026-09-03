@@ -1983,6 +1983,7 @@ class _ResponderState:
         self.data = {}
         self._lockf = None
         if path and exclusive:
+            self._must_be_writable()
             self._take_lock()
         if path and os.path.exists(path):
             try:
@@ -1990,6 +1991,37 @@ class _ResponderState:
                     self.data = json.load(f)
             except (OSError, ValueError):
                 self.data = {}
+
+    def _must_be_writable(self):
+        """Refuse to start if this file cannot be written, and say so HERE.
+
+        The whole crash-safety design is that the intent is written before the
+        send: a state file that cannot be written is a responder that pays a
+        principal it cannot record, and would pay it again on the next pass.
+
+        It has to be checked at start-up, because the first thing that
+        discovers it otherwise is a disbursement -- a hardened unit gives a
+        service its keys read-only, which is right, and a state file left in
+        that directory then silently records nothing until the moment it
+        matters most.
+        """
+        d = os.path.dirname(os.path.abspath(self.path)) or "."
+        probe = self.path + ".probe"
+        try:
+            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.close(fd)
+            os.unlink(probe)
+        except OSError as e:
+            raise SystemExit(
+                f"the responder's state file cannot be written: {self.path} "
+                f"({type(e).__name__}: {e}).\n"
+                f"This file is what stops a principal being paid twice -- the "
+                f"intent is written before the send and completed after -- so "
+                f"a responder that cannot write it must not run.\n"
+                f"Put it in a directory this process may write. Under systemd "
+                f"that means one named by ReadWritePaths=, not the key "
+                f"directory, which ProtectHome=read-only makes read-only on "
+                f"purpose. ({d} is not writable.)") from None
 
     def _take_lock(self):
         """One responder per key, enforced by the filesystem.

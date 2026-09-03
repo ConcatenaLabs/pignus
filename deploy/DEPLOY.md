@@ -122,6 +122,14 @@ lender key that is gone costs the BORROWERS: their collateral can only be
 released by the secret that key's holder publishes, so it sits until the
 timeout. A responder state file that is gone can cost a principal paid twice.
 
+**Put that state file where the service may write.** The responder's unit runs
+with `ProtectHome=read-only` and one `ReadWritePaths=`, which is
+`/root/sequentia/pignus-data`. Its `state` must point inside that directory,
+not into the key directory beside `lender.key`: the keys are read-only on
+purpose, and the state file is the one thing the responder writes before every
+send. It refuses to start rather than run without being able to, and says where
+to move it.
+
 `pignus-backup.service` is that command as a unit, at `UMask=0077` so the
 archive is 0600. It writes to `/var/lib/pignus-backup`, which systemd creates
 and keeps writable for it; `pignus-backup.timer` runs it daily and catches up a day
