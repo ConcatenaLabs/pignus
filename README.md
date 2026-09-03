@@ -318,8 +318,14 @@ the borrower can open, and opening it publishes the secret that moves the
 collateral into the vault. Neither side ever holds both, and the only party
 exposed to a loss rather than a delay is a lender who goes offline in the middle
 of it. `pignus-cli btc-responder-status` prints what a lender's responder has done
-and what each take is waiting on, read-only and safe against a running one; it
-exits 4 when something needs attention. `btc-responder-clear` is the one
+and what each take is waiting on and for how long, read-only and safe against a
+running one; it exits 4 when something needs attention. Most reasons clear on
+their own within a block or two, so a take on the same one for hours is on one
+that will not, with a borrower's collateral committed behind it; those are
+reported as needing attention, and `--waiting-hours` sets how patient to be.
+Every wait and every recorded failure carries the time it began, and a step
+that succeeds clears the failure before it: an error nothing clears reads as
+current for ever, beside a take that recovered on its own an hour later. `btc-responder-clear` is the one
 recovery a responder cannot make for itself -- telling it a send it recorded as
 in-flight never went out -- and it takes the responder's own lock, so it cannot
 run against a live one, and checks the chain before it does anything.
@@ -400,6 +406,15 @@ loans cannot be started when they are high, which is why `btc-offer-take`
 refuses one whose fee has fallen far behind the chain and says by how much --
 and why the page refuses it too, at the same threshold, before a borrower has
 committed any Bitcoin.
+
+Fees can rise after the take, though, and then a lender is right not to pay a
+principal into a loan whose start cannot confirm. That leaves a borrower with
+collateral committed and nothing moving, so both sides are told: the lender's
+`btc-responder-status` reports a take that has waited on one reason for hours
+as needing attention, and the borrower's page reads the same two numbers -- the
+offer's fee, and what this book says Bitcoin is charging -- and says the loan
+may never start and that the collateral comes back at `abort_after`. Neither
+depends on the other side saying anything.
 
 `--btc-fee` is the flat satoshi fee the transactions spending the vault carry.
 

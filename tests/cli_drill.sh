@@ -480,6 +480,82 @@ if "IN FLIGHT" not in rows["take-stuck"]["stage"]:
     sys.exit(f"FAIL: a stuck send reads as {rows['take-stuck']['stage']!r}")
 print("  a responder's takes can be read, and a stuck one exits 4")
 
+# A WAIT that has stopped being a wait. Most reasons clear within a block or
+# two, so a take still on the same one hours later is on one that will not --
+# an upgrade fee fixed below what the parent chain now charges, a deadline
+# already too close -- with a borrower's collateral committed behind it. The
+# state file looked no different from a take that had been waiting ten
+# seconds, so nothing reported it.
+import time                                             # noqa: PLC0415
+slow_state = os.path.join(work, "responder-waiting.json")
+json.dump({
+    "take-fresh": {"t": "11" * 32, "waiting": "prevault",
+                   "waiting_since": int(time.time()) - 60},
+    "take-blocked": {"t": "22" * 32, "waiting": "upgrade-fee",
+                     "waiting_since": int(time.time()) - 30 * 3600},
+}, open(slow_state, "w"))
+r = subprocess.run([sys.executable, cli, "btc-responder-status",
+                    "--state", slow_state], capture_output=True, text=True)
+if r.returncode != 4:
+    sys.exit(f"FAIL: a take blocked 30h exited {r.returncode}, wanted 4\n"
+             + r.stderr[-300:])
+out = json.loads(r.stdout)
+if out["needing_attention"] != 1:
+    sys.exit(f"FAIL: {out['needing_attention']} needing attention, wanted 1 "
+             f"(the blocked one, not the fresh one)")
+if "upgrade-fee" not in r.stderr or "abort their pre-vault" not in r.stderr:
+    sys.exit("FAIL: it does not say what is blocked or what to do about it\n"
+             + r.stderr[-400:])
+rows = {x["take_id"]: x for x in out["rows"]}
+if not (29 <= (rows["take-blocked"]["waiting_hours"] or 0) <= 31):
+    sys.exit(f"FAIL: it does not say how long: "
+             f"{rows['take-blocked']['waiting_hours']}")
+# ...and the threshold is the operator's to set.
+r = subprocess.run([sys.executable, cli, "btc-responder-status",
+                    "--state", slow_state, "--waiting-hours", "48"],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit(f"FAIL: with a 48h threshold a 30h wait still reported: "
+             f"{r.returncode}")
+print("  a take blocked on one reason for hours is reported, and says what to "
+      "do")
+
+# A recorded failure that is never cleared reads as current for ever: an
+# operator sees `last_error` beside a take that recovered on its own an hour
+# later and cannot tell the two apart. Both halves of the fix are checked here,
+# because one without the other is worse than neither -- a date on an error
+# that never clears just says precisely how long it has been misleading them.
+err_state = os.path.join(work, "responder-errors.json")
+json.dump({"take-err": {"t": "33" * 32}}, open(err_state, "w"))
+S = None
+r = subprocess.run([sys.executable, "-c", """
+import json, os, sys, time
+src = open(sys.argv[1]).read()
+start = src.index("class _ResponderState:")
+end = src.index("\\ndef _loan_from_take(")
+rs = src.index("def refuse(message)")
+re_ = src.index("\\ndef _funding_for(")
+ns = {}
+exec(compile("import os, json, sys, time\\nfrom typing import NoReturn\\n"
+             + src[rs:re_] + "\\n" + src[start:end], "cli", "exec"), ns)
+st = ns["_ResponderState"](sys.argv[2])
+st.set("take-err", last_error="boom")
+rec = st.get("take-err")
+assert rec.get("last_error_at"), "an error was recorded with no date"
+st.set("take-err", last_error="boom")
+assert st.get("take-err")["last_error_at"] == rec["last_error_at"], \\
+    "the same error restamped its own clock"
+st.set("take-err", disbursement_txid="ab" * 32)
+done = st.get("take-err")
+assert done.get("last_error") is None, "a success left the old failure standing"
+assert "last_error_at" not in done, "and left its date behind"
+print("ok")
+""", cli, err_state], capture_output=True, text=True)
+if r.returncode != 0 or "ok" not in r.stdout:
+    sys.exit("FAIL: the responder's error record does not clear or date "
+             "itself\n" + (r.stderr or r.stdout)[-400:])
+print("  a recorded failure is dated, and a step that succeeds clears it")
+
 # Clearing refuses without a way to check the chain: that check is the only
 # thing between this command and a second principal.
 r = subprocess.run([sys.executable, cli, "btc-responder-clear",
@@ -731,6 +807,37 @@ gone = sorted(listed_mods - mods)
 if gone:
     sys.exit(f"FAIL: the README lists modules that are not there: {gone}")
 print(f"  and describes all {len(mods)} modules the package has")
+
+# And the API reference against the routes the daemon actually serves. It is
+# the only description of this book's protocol, and it is what somebody writing
+# a second client reads: an endpoint missing from it is one they conclude does
+# not exist, and one listed that does not exist is an afternoon spent debugging
+# their own correct code.
+daemon = open(os.path.join(root, "bin", "pignusd")).read()
+api = open(os.path.join(root, "docs", "api.md")).read()
+served = set()
+for m in re.finditer(r"path (?:==|in) \(?((?:\"/v1[^\"]*\"(?:,\s*)?)+)\)?",
+                     daemon):
+    served |= set(re.findall(r"\"(/v1[^\"]*)\"", m.group(1)))
+for m in re.finditer(r"path\.startswith\(\"(/v1[^\"]*)\"\)", daemon):
+    served.add(m.group(1))
+
+
+def shape(p):
+    """A path with its variable parts flattened, so /v1/spend/{txid}/{vout} in
+    the reference matches the prefix the daemon dispatches on."""
+    p = re.sub(r"\{[^}]*\}", "", p).rstrip("/")
+    return p
+
+
+documented = {shape(p) for p in re.findall(r"(/v1/[\w{}/-]+)", api)}
+gone = sorted(p for p in served if shape(p) not in documented)
+if gone:
+    sys.exit(f"FAIL: pignusd serves these and docs/api.md does not describe "
+             f"them: {gone}")
+if len(served) < 25:
+    sys.exit(f"FAIL: only found {len(served)} routes in pignusd")
+print(f"  and docs/api.md describes all {len(served)} routes pignusd serves")
 TESTLIST
 
 # --- a config file's values must actually be used ----------------------------
