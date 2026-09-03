@@ -196,6 +196,50 @@ def test_log_rotation():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_a_seizure_is_findable_however_old():
+    """A 404 from /v1/seizure/{sighash} means "this oracle never co-signed it".
+
+    That answer is the whole of this tier's accountability: a Bitcoin seizure
+    is the lender and the oracle signing together with no covenant anywhere, so
+    the published record is the only thing a third party can check afterwards.
+    Reading the log's last 256 KB is right for a LISTING and wrong for a
+    lookup: a seizure older than that tail would be denied, and how fast the
+    log grows is not the oracle's to control -- a requester's own loan object
+    is part of every line.
+    """
+    print("a seizure is findable however old the log has grown")
+    import importlib.machinery                            # noqa: PLC0415
+    import importlib.util                                 # noqa: PLC0415
+    import shutil                                         # noqa: PLC0415
+    import tempfile                                       # noqa: PLC0415
+
+    spec = importlib.util.spec_from_loader(
+        "pignus_oracle_log", importlib.machinery.SourceFileLoader(
+            "pignus_oracle_log", os.path.join(BIN, "pignus-oracle")))
+    om = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(om)
+
+    work = tempfile.mkdtemp()
+    try:
+        log = om.SeizureLog(os.path.join(work, "seizures.log"))
+        first = "aa" * 32
+        log.append({"sighash": first, "market": "GOLD/USDX", "price": 1})
+        # Past the tail window, with lines of the size a real record reaches.
+        while os.path.getsize(log.path) < om.SeizureLog.MAX_READ * 3:
+            log.append({"sighash": os.urandom(32).hex(),
+                        "market": "GOLD/USDX", "loan": {"pad": "y" * 200}})
+        check("the listing is bounded, so it does not grow without limit",
+              not any(r.get("sighash") == first for r in log.all()))
+        check("but the lookup still finds it, which is what a 404 has to mean",
+              (log.get(first) or {}).get("sighash") == first)
+        check("and a sighash nobody signed is still not found",
+              log.get("bb" * 32) is None)
+        check("the lookup is case-insensitive, as the covenant's ids are",
+              (log.get(first.upper()) or {}).get("sighash") == first)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_documented_configs_start():
     """Every example config in this repository must actually start the oracle.
 
@@ -464,22 +508,36 @@ def main():
 
         print("a seizure is co-signed only against this oracle's own price")
         sighash = "ab" * 32
+        # A bare --sighash pins NOTHING: no loan for this oracle to rebuild the
+        # sighash from, and no lender-signed offer pinning the strike -- so the
+        # figure the price is judged against is one the party asking for the
+        # seizure typed, and any strike above today's price passes. That is the
+        # act this oracle exists to refuse, so it is refused, and the checks
+        # below say so by opting in.
+        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+                       "--strike", "400", "--price-scale", "100000",
+                       "--sighash", sighash)
+        check("a bare sighash with no request is refused: it pins nothing",
+              r.returncode != 0 and "pins nothing" in r.stderr, r.stderr[-240:])
+        # From here on, `bare` says "I have checked this by hand" -- which is
+        # what an operator co-signing without a request is really claiming.
+        bare = ("--allow-unpinned-strike",)
         # GOLD/USDX signs at 300 with these precisions, so a strike of 200 is
         # above the price and a strike of 400 is not.
-        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
                        "--strike", "200", "--price-scale", "100000",
                        "--sighash", sighash)
         check("a price at or above the strike is refused",
               r.returncode != 0 and "not justified" in r.stderr, r.stderr[-200:])
-        r = run_oracle(cfg_path, "--sign-seize", "--market", "NOPE/USDX",
+        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "NOPE/USDX",
                        "--strike", "400", "--sighash", sighash)
         check("a market this oracle does not sign is refused",
               r.returncode != 0 and "does not sign" in r.stderr, r.stderr[-200:])
-        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
                        "--strike", "400", "--sighash", "ab" * 20)
         check("a sighash that is not 32 bytes is refused",
               r.returncode != 0 and "32 bytes" in r.stderr, r.stderr[-200:])
-        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
                        "--strike", "400", "--sighash", sighash,
                        "--max-age", "-1")
         check("and so is one justified by a price older than --max-age",
@@ -488,12 +546,12 @@ def main():
         # integer scaled by it, and this oracle signs at its own. Comparing two
         # written at different scales decides a seizure by a power of ten, so
         # the omission is refused rather than guessed at.
-        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
                        "--strike", "400", "--sighash", sighash)
         check("a hand-fed seizure with no price scale is refused",
               r.returncode != 0 and "price scale" in r.stderr,
               r.stderr[-200:])
-        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
                        "--strike", "400", "--price-scale", "100000",
                        "--sighash", sighash)
         check("a genuine seizure is co-signed", r.returncode == 0,
@@ -506,7 +564,7 @@ def main():
         # the seizure would look justified. It is not: the two numbers are not
         # comparable at all, and nothing downstream could catch it -- the scale
         # is in no Bitcoin script, and no covenant runs in a Tier B seizure.
-        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
                        "--strike", "400000", "--price-scale", "100000000",
                        "--sighash", sighash)
         check("a loan written at another price scale is refused",
@@ -556,6 +614,7 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
 
     test_log_rotation()
+    test_a_seizure_is_findable_however_old()
     test_documented_configs_start()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0

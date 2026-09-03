@@ -102,7 +102,11 @@ def cli(*args, wallet, rig, book, expect=0):
            "--book", book, "--rpc", f"http://127.0.0.1:{rig.seq_rpcport}",
            "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS,
            "--rpc-wallet", wallet]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    # From the RIG's directory, not the repository's. `offer-fund` keeps an
+    # offer's terms beside the operator before it locks the principal, and a
+    # test that runs from the checkout leaves those files in it -- twelve of
+    # them were committed that way.
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=rig.root)
     if r.returncode != expect:
         print(r.stdout)
         print(r.stderr)

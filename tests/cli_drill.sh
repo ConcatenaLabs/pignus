@@ -584,6 +584,22 @@ echo "$AGAIN" | grep -q "already verifies" || {
     echo "$AGAIN" | sed 's/^/  /' >&2; exit 1; }
 echo "  running it again on a sound offer says so and changes nothing"
 
+# --- nothing a test runs may leave a file in the checkout --------------------
+#
+# `offer-fund` keeps an offer's terms beside the operator before it locks the
+# principal, because they are the only thing that can ever spend that coin. A
+# test that runs from the repository root leaves them there, and twelve were
+# committed that way.
+DIRT=$(cd "$PKG" && git status --porcelain --untracked-files=all 2>/dev/null \
+       | awk '$1 == "??" {print $2}' | grep -E '^(offer-|loan-|terms-).*\.json$' \
+       || true)
+if [ -n "$DIRT" ]; then
+    echo "the checkout has files a run left behind:" >&2
+    echo "$DIRT" | sed 's/^/  /' >&2
+    exit 1
+fi
+echo "  no run has left a stray record in the checkout"
+
 # --- the golden vectors must be reproducible --------------------------------
 #
 # A generator that draws fresh randomness writes a different file every run, so

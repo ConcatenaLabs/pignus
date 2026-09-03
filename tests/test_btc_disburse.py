@@ -354,6 +354,88 @@ def main():
                   json.dumps(live)[:200])
             check("and the collateral is in the vault the release names",
                   rig.btc.gettxout(live["upgrade_txid"], 0) is not None)
+
+            # ---- repay, claim, publish ---------------------------------
+            #
+            # The half of the loan where the borrower gets their collateral
+            # back, and it had no rig test at all. The lender claiming the
+            # repayment is what publishes the secret, and handing that secret
+            # over is not a courtesy: a lender who claims and sits on it holds
+            # the collateral hostage until the timeout sweeps it.
+            signed_live = B.loan_from_dict({**B.loan_to_dict(signed_loan),
+                                            "payment_hash": reserved["payment_hash"]})
+            # From the rig's main wallet, which is the one holding a fee asset
+            # here -- the borrower's own holds only the principal it was paid.
+            rp_txid, rp_vout = B.pay_repayment(n, signed_live)
+            # ...and the borrower TELLS the relay, which is the fast path the
+            # responder is built around: the chain scan behind it runs at most
+            # once every `scan_interval`, so a test that never reports is
+            # testing the fallback's throttle rather than the claim.
+            from pignus import btc_relay as _R           # noqa: PLC0415
+            post(base + "/v1/btc/repaid", {
+                "take_id": take["take_id"], "txid": rp_txid, "vout": rp_vout,
+                "auth": _R.sign_report(borrower, _R.REPAID_TAG,
+                                       take["take_id"],
+                                       txid=rp_txid, vout=rp_vout)})
+            rig.seq_mine(3)
+            for _ in range(40):
+                respond()
+                st = json.load(open(state_path)).get(take["take_id"], {})
+                if st.get("claim_txid"):
+                    break
+                # BOTH chains: the claim waits on the Bitcoin header its own
+                # Sequentia block anchored to, which is the whole of what
+                # `anchor_safe` measures.
+                rig.seq_mine(1)
+                rig.btc_mine(1)
+            st = json.load(open(state_path)).get(take["take_id"], {})
+            check("the lender claims the repayment, which publishes the secret",
+                  bool(st.get("claim_txid")), json.dumps(st)[:220])
+            check("and records the OUTPOINT that claim spent, which is the "
+                  "only handle a later pass can find it by",
+                  st.get("claim_of_txid") == rp_txid
+                  and int(st.get("claim_of_vout", -1)) == rp_vout,
+                  f"{st.get('claim_of_txid')}:{st.get('claim_of_vout')} "
+                  f"wanted {rp_txid}:{rp_vout}")
+
+            # A state file from BEFORE that outpoint was kept. Both the
+            # publish pass and the reorg check key on it, so without a repair
+            # they each read "nothing to do" -- for ever, and in silence: the
+            # borrower never gets the secret, and a reorg that undid the claim
+            # is never noticed.
+            st_all = json.load(open(state_path))
+            saved_claim = dict(st_all[take["take_id"]])
+            for k in ("claim_of_txid", "claim_of_vout", "secret_published"):
+                st_all[take["take_id"]].pop(k, None)
+            json.dump(st_all, open(state_path, "w"))
+            r = respond()
+            st = json.load(open(state_path)).get(take["take_id"], {})
+            check("an older record without it is REPAIRED from the chain, not "
+                  "skipped",
+                  st.get("claim_of_txid") == rp_txid,
+                  f"{st.get('claim_of_txid')} -- {r.stderr.strip()[-260:]}")
+            st_all = json.load(open(state_path))
+            st_all[take["take_id"]] = saved_claim
+            json.dump(st_all, open(state_path, "w"))
+
+            for _ in range(40):
+                respond()
+                if json.load(open(state_path)).get(take["take_id"], {}) \
+                        .get("secret_published"):
+                    break
+                rig.seq_mine(1)
+                rig.btc_mine(1)
+            st = json.load(open(state_path)).get(take["take_id"], {})
+            check("the secret reaches the borrower once the claim is buried",
+                  st.get("secret_published") is True, json.dumps(st)[:220])
+            served = get(base + f"/v1/btc/take/{take['take_id']}")
+            check("and the relay serves it, so a borrower who cleared their "
+                  "browser can still reclaim",
+                  served.get("secret_t") == w.hex()
+                  or B.sha256(bytes.fromhex(served.get("secret_t", "")
+                                            or "00")).hex()
+                  == signed_live.payment_hash,
+                  str(served.get("secret_t"))[:32])
         finally:
             for p in procs:
                 p.terminate()

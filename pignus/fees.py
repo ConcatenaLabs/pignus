@@ -127,14 +127,23 @@ def fee_atoms(rate, vsize, feerate_kvb=DEFAULT_FEERATE_RFA_PER_KVB):
     return max(1, -(-rfa * RATE_SCALE // int(rate)))
 
 
-def pick_fee(table, holdings, flow, prefer=()):
+def pick_fee(table, holdings, flow, prefer=(), committed=None):
     """Choose a fee asset from what a wallet holds: (asset, atoms).
 
     `holdings` is {asset: atoms}. Assets named in `prefer` come first -- the
     asset already being spent makes the cheapest transaction -- then whatever
     else the node publishes a rate for. There is nothing to fall back to: an
     asset with no rate cannot pay a fee here, whatever it is.
+
+    `committed` is how much of each asset the flow ITSELF already needs, and
+    leaving it out is how a wallet funded with exactly the debt picks the debt
+    asset for the fee and then cannot compose the payment at all -- the balance
+    is enough for the fee and enough for the debt, but not for both, and the
+    failure lands later as a coin-selection error naming neither. The browser
+    has taken this since it was written (`feeFor` in web/app.js); this is the
+    same rule for the library.
     """
+    committed = {k: int(v) for k, v in (committed or {}).items()}
     vsize = VSIZE.get(flow, 2000)
     order = [a for a in prefer if a] + sorted(holdings)
     seen = set()
@@ -147,8 +156,9 @@ def pick_fee(table, holdings, flow, prefer=()):
             continue
         cost = fee_atoms(rate, vsize, table.get("feerate_rfa_per_kvb",
                                                 DEFAULT_FEERATE_RFA_PER_KVB))
-        if int(holdings[asset]) >= cost:
+        if int(holdings[asset]) - committed.get(asset, 0) >= cost:
             return asset, cost
     raise ValueError("this wallet holds nothing the network will take a fee "
-                     "in: it needs some of an asset the node publishes an "
-                     "exchange rate for")
+                     "in, once what this transaction itself spends is set "
+                     "aside: it needs some of an asset the node publishes an "
+                     "exchange rate for, over and above the amount being paid")

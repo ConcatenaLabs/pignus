@@ -150,6 +150,48 @@ def main():
     check("and with no Bitcoin node there is no answer to give",
           s.anchor_depth_at(900, 101) is None)
 
+    print("\nwhy an anchor check said no")
+    from pignus.btc_collateral import AnchorCheck, anchor_safe  # noqa: PLC0415
+
+    # Four different failures reach one return, and only ONE of them is about
+    # Sequentia depth. A refusal that reports that number as the answer sends a
+    # lender to wait for Sequentia blocks when the problem is a shallow Bitcoin
+    # anchor -- and no number of Sequentia blocks would ever help, because
+    # Sequentia reorgs when Bitcoin does.
+    cases = [("ok", True, 20, None, "safe to spend"),
+             ("shallow", False, 3, None, "Sequentia confirmation"),
+             ("unfindable", False, 0, None, "cannot find"),
+             ("unreadable-block", False, 20, None, "would not read"),
+             ("anchor-gone", False, 20, None, "reorged away"),
+             ("anchor-shallow", False, 20, 1, "Bitcoin anchor is only")]
+    for reason, ok, conf, aconf, phrase in cases:
+        c = AnchorCheck(ok, conf, reason, aconf)
+        got_ok, got_conf = c
+        check(f"{reason}: it still unpacks as (ok, confirmations)",
+              got_ok is ok and got_conf == conf)
+        check(f"{reason}: and says so in words a lender can act on",
+              phrase in c.explain(6), c.explain(6))
+    deep = AnchorCheck(False, 20, "anchor-shallow", 1)
+    check("a deep Sequentia claim with a shallow anchor does NOT report the "
+          "Sequentia number as the problem",
+          "20 Sequentia" not in deep.explain(6)
+          and "no number of them" not in deep.explain(6)
+          and "more Sequentia blocks would not help" in deep.explain(6),
+          deep.explain(6))
+
+    class Blind:
+        def getblockcount(self): return 1000
+        def gettxout(self, *a, **k): return None
+        def getrawtransaction(self, *a, **k): raise RuntimeError("no index")
+        # Blocks that hold nothing: the backward walk finds no such
+        # transaction and comes back with "unfindable", which is the case
+        # under test.
+        def getblock(self, h, verbosity=1): return {"hash": h, "tx": []}
+        def getblockhash(self, h): return f"{h:064x}"
+    got = anchor_safe(Blind(), "aa" * 32, min_depth=6)
+    check("a transaction nobody can find is never safe, and says which it is",
+          got[0] is False and got.reason == "unfindable", got.reason)
+
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0
 
