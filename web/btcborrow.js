@@ -248,7 +248,7 @@ export function loanReadable(l) {
   } catch { return false; }
 }
 
-export function renderOffers(box, offers, ui, onBorrow, write) {
+export function renderOffers(box, offers, ui, onBorrow, write, feerateSatVb) {
   // The page redraws this on a timer. Given a writer, the caller's own paint
   // is used: it skips a render whose markup has not changed and puts the
   // keyboard back where it was, so a reader tabbed to a Borrow button does not
@@ -281,6 +281,16 @@ export function renderOffers(box, offers, ui, onBorrow, write) {
       const l = o.loan;
       const principal = BigInt(l.principal || 0) || BigInt(l.debt);
       const left = o.lots_left == null ? null : Number(o.lots_left);
+      // Whether this offer can be taken AT ALL right now. The move into the
+      // vault carries a fee fixed when the offer was published and can never
+      // be bumped, so an offer published when the parent chain was quiet stops
+      // being fundable when it is busy -- the lender's responder will not pay
+      // a principal into one. Saying so in the row is the difference between
+      // a borrower reading a market and a borrower finding out by clicking.
+      const need = upgradeFeeNeeded(feerateSatVb);
+      const priced = !(need && l.abort_after
+                       && Number(l.upgrade_fee || 0) < need / 2);
+      const takeable = left !== 0 && priced;
       return '<tr>' +
       '<td data-label="collateral">' + ui.atomsToBtc(l.btc_amount) + ' BTC</td>' +
       '<td data-label="you receive">' + ui.units(principal.toString(), l.debt_asset) +
@@ -310,12 +320,21 @@ export function renderOffers(box, offers, ui, onBorrow, write) {
       // they have signed.
       '<td data-label="left">' + (left === null ? '?' : String(left)) +
         (left === 0 ? '<span class="sub2">every lot is taken</span>' : '') +
+        (priced ? '' :
+          '<span class="sub2">its move into the vault carries ' +
+          ui.esc(String(Number(l.upgrade_fee || 0))) + ' satoshis and Bitcoin ' +
+          'wants about ' + ui.esc(String(need)) + ' -- that fee cannot be ' +
+          'bumped, so no lender will fund it until the chain quietens or they ' +
+          'republish</span>') +
         '</td>' +
       // `data-focus` keys the button to the OFFER, not to its row index, so
       // the keyboard comes back to the same offer even when the list has
       // reordered under it.
       '<td data-label=""><button data-b="' + i + '"' +
-        (left === 0 ? ' disabled title="every lot of this offer is taken"' : '') +
+        (takeable ? '' : ' disabled title="' +
+          (left === 0 ? 'every lot of this offer is taken'
+                      : 'this offer cannot be funded at the current Bitcoin ' +
+                        'feerate') + '"') +
         ' data-focus="btcb:' +
         ui.esc(String(o.btc_offer_id || i)) +
         '" class="primary sm">Borrow</button></td>' +

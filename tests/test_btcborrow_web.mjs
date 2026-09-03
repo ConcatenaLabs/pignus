@@ -277,5 +277,47 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
      && bb.upgradeFeeNeeded(-1) === null);
 }
 
+
+// --- an offer nobody will fund says so in the row --------------------------
+//
+// The move into the vault carries a fee fixed when the offer was published and
+// which nobody can bump, so an offer published while the parent chain was quiet
+// stops being fundable when it is busy: the lender's responder will not pay a
+// principal into one. Refusing at the click is right and not enough -- a
+// borrower reading a market of offers nobody will answer is reading fiction.
+{
+  const ui = { esc: String, units: (a) => String(a), ticker: () => "USDX",
+               atomsToBtc: (n) => String(Number(n) / 1e8),
+               blockTime: (h, c) => (c ? c + " " : "") + "block " + h };
+  const offer = { btc_offer_id: "abc", status: "open", lots_left: 2, loan: {
+    btc_amount: "100000", debt: "4005003590", principal: "3888353000",
+    debt_asset: "dd".repeat(32), strike: "6675005984", price_scale: 100000,
+    repay_deadline: 163388, recover_after: 155389, abort_after: 151189,
+    d_refund: 121748, upgrade_fee: 10000, h_w: "ee".repeat(32) } };
+  const render = (rate) => {
+    let html = "";
+    bb.renderOffers({}, [offer], ui, () => {}, (h) => { html = h; }, rate);
+    return html;
+  };
+  ok("a quiet chain leaves the offer takeable",
+     !render(5).includes("disabled"));
+  ok("a busy one disables Borrow rather than letting the click fail",
+     render(376.678).includes("disabled"));
+  ok("and the row says what the fee is and what the chain wants",
+     /carries 10000 satoshis and Bitcoin wants about 56502/.test(render(376.678)),
+     render(376.678).slice(0, 200));
+  ok("a book with no feerate judges nothing and leaves it takeable",
+     !render(null).includes("disabled"));
+  ok("an offer with every lot taken is disabled for its own reason",
+     bb.loanReadable(offer.loan));
+  // lots_left of zero, on a quiet chain, is the other reason.
+  const spent = { ...offer, lots_left: 0 };
+  let html = "";
+  bb.renderOffers({}, [spent], ui, () => {}, (h) => { html = h; }, 5);
+  ok("every lot taken disables it and says which reason it is",
+     html.includes("disabled") && html.includes("every lot of this offer is taken"),
+     html.slice(0, 200));
+}
+
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
