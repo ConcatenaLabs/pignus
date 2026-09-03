@@ -170,9 +170,24 @@ def main():
         rig.btc.sendrawtransaction(up3.hex()); rig.btc_mine(1)
         dest3 = btc_dest(rig)
         req = B.seize_request(loan3, up3.txid(), 0, dest3, BTC_FEE)
+        # The lender's own signature over the offer that fixed the strike. It
+        # is what pins the number an oracle judges by: the strike is in no
+        # Bitcoin script, so the request's own sighash cannot check it.
+        from pignus import btc_relay as _R                # noqa: PLC0415
+        req["offer_sig"] = _R.sign_offer(lender, B.loan_to_dict(loan3),
+                                         loan3.market, 1)
+        req["offer_lots"] = 1
         _ln, want = B.check_seize_request(req)
         check("an oracle rebuilds the sighash from the loan rather than "
               "signing what it was handed", want == req["sighash"])
+        bare = {k: v for k, v in req.items() if k != "offer_sig"}
+        try:
+            B.check_seize_request(bare)
+            check("and refuses a request whose strike nothing pins", False,
+                  "it was accepted")
+        except ValueError as e:
+            check("and refuses a request whose strike nothing pins",
+                  "nothing pins the strike" in str(e))
         oracle_sig = A.sign(oracle, bytes.fromhex(want))
         seized = B.seize_tx(loan3, up3.txid(), 0, dest3, BTC_FEE, lender,
                             oracle_sig)

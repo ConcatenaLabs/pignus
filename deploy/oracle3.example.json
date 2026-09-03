@@ -2,6 +2,8 @@
   "keyfile": "/root/sequentia/pignus-data/oracle-3.key",
   "logfile": "/root/sequentia/pignus-data/attestations-3.log",
   "listen": "127.0.0.1:8743",
+  "_trusted_proxies_note": "The peers whose X-Forwarded-For this oracle believes. Behind a reverse proxy every request arrives from loopback, and keying a rate limit on that gives the whole internet one bucket -- one flooder then locks every auditor out of the log that exists to be audited.",
+  "trusted_proxies": ["127.0.0.1", "::1"],
   "interval": 60,
   "price_scale": 100000,
   "markets": ["GOLD/USDX", "SILVR/USDX", "OILX/USDX", "SEQ/USDX",

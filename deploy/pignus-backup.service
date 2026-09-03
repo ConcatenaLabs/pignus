@@ -30,7 +30,6 @@ SuccessExitStatus=1
 StateDirectory=pignus-backup
 ExecStart=/bin/sh -c 'exec tar czf /var/lib/pignus-backup/pignus-$(date +%%F).tgz \
     /root/sequentia/pignus-data \
-    /root/sequentia/pignus-btc-keys \
     /root/sequentia/pignusd.json \
     /root/sequentia/pignus-oracle*.json \
     /root/sequentia/pignus-responder.json'
@@ -38,7 +37,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 # /root is where both the source and the destination live, so ProtectSystem=
 # full protects nothing here either. /root is mounted read-only and the one
-# directory that has to stay WRITABLE is handed back: /root/backups. Everything
+# directory that has to stay WRITABLE is handed back: the one systemd
+# creates from `StateDirectory=`, at /var/lib/pignus-backup. Everything
 # under /root/sequentia is only read.
 #
 # /root holds everything being archived and nothing being written, so it is

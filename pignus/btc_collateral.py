@@ -72,7 +72,7 @@ the design document and the reason both mechanisms exist here.
 import hashlib
 from dataclasses import dataclass
 
-from . import atoms as _atoms
+from . import atoms as _atoms, units as _units
 from . import adaptor as A
 from . import btcscript as B
 from .compat import load_covenant
@@ -611,13 +611,40 @@ def seize_request(loan, funding_txid, vout, dest_spk, fee):
         "sighash": seize_sighash(loan, funding_txid, vout, dest_spk
                                  if isinstance(dest_spk, bytes)
                                  else bytes.fromhex(dest_spk), fee).hex(),
+        # Filled in by the caller: the lender's own signature over the offer
+        # this loan was taken from, and the market and lot count it covers.
+        # The STRIKE is the number the oracle judges by and it is in no
+        # Bitcoin script -- Bitcoin cannot read it -- so the sighash cannot
+        # pin it. This signature is the only thing that can.
+        "offer_sig": "",
+        "offer_lots": 1,
     }
 
 
-def check_seize_request(request):
-    """An oracle's own check before it co-signs anything: rebuild the sighash
-    from the terms in the request and refuse if it differs. Signing a number
-    somebody else computed is signing a transaction nobody has read."""
+def check_seize_request(request, require_offer=True):
+    """An oracle's own check before it co-signs anything.
+
+    Two things, and the second is the one that matters most.
+
+    The SIGHASH is rebuilt from the terms in the request and refused if it
+    differs: signing a number somebody else computed is signing a transaction
+    nobody has read.
+
+    The STRIKE is checked against the lender's own signed offer, because the
+    sighash cannot pin it. `strike`, `market` and `price_scale` are in no
+    Bitcoin script -- Bitcoin cannot read them -- so a lender can raise the
+    strike in the request and the recomputed sighash is identical byte for
+    byte. The oracle then compares an honest price against a number the
+    seizing party chose, finds it under, and co-signs a seizure of a healthy
+    loan. The lender signed the offer that fixed the real strike; this is
+    where that signature is spent.
+
+    `require_offer=False` is for a loan arranged entirely by hand, with no
+    offer to point at. The oracle then has nothing to hold the lender to, and
+    is refusing on the operator's say-so rather than on evidence -- so it is
+    not the default, and `pignus-oracle` makes it an explicit flag.
+    """
+    from . import btc_relay as R
     loan = loan_from_dict(request["loan"])
     dest = bytes.fromhex(request["dest_spk"])
     want = seize_sighash(loan, request["funding_txid"],
@@ -626,6 +653,22 @@ def check_seize_request(request):
     if want != str(request.get("sighash", "")).lower():
         raise ValueError("that seizure request's sighash does not match its own "
                          "terms; refusing to sign it")
+    sig = str(request.get("offer_sig") or "")
+    if not sig:
+        if require_offer:
+            raise ValueError(
+                "this seizure request carries no lender-signed offer, so "
+                "nothing pins the strike it asks to be judged against. The "
+                "strike is in no Bitcoin script, so the sighash above cannot "
+                "check it: a lender could name any number here. Refusing.")
+        return loan, want
+    offered = loan_to_dict(loan)
+    lots = int(request.get("offer_lots", 1) or 1)
+    if not R.verify_offer(offered, loan.market, lots, sig):
+        raise ValueError(
+            "the offer signature in that seizure request does not verify "
+            "against this loan's own lender key. The strike it asks to be "
+            "judged against is therefore unpinned; refusing.")
     return loan, want
 
 
@@ -1262,6 +1305,6 @@ def disburse_principal(seq_node, loan, borrower_seq_spk_hex, fee_asset=None):
         fee_asset, _ = seq_fee_choice(seq_node, prefer=(loan.debt_asset,),
                                       flow="btcrepay")
     return seq_node.sendtoaddress(address=addr,
-                                  amount=f"{principal / COIN:.8f}",
+                                  amount=_units(principal),
                                   assetlabel=loan.debt_asset,
                                   fee_asset_label=fee_asset)

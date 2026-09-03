@@ -203,6 +203,120 @@ def addresses(node):
           len(shapes) >= 4, str(sorted(shapes)))
 
 
+TIMELOCK_SCRIPT = """
+import { readFileSync } from 'node:fs';
+import * as bb from '../web/btcborrow.js';
+const cases = JSON.parse(readFileSync(process.argv[1], 'utf8'));
+process.stdout.write(JSON.stringify(cases.map(c => {
+  try { return bb.timelockProblems(c.loan, c.btc, c.seq).length > 0; }
+  catch (e) { return 'ERR:' + e.message; }
+})));
+"""
+
+
+def timelocks(node):
+    """Does the page refuse the same loans the library does?
+
+    `timelocks_sane` is what a lender's responder and the relay both apply, and
+    `timelockProblems` is what the page shows a borrower before they commit any
+    Bitcoin. A loan the page accepts and the library refuses is a borrower told
+    an offer is safe that no responder will ever answer -- and one the page
+    refuses and the library accepts is a borrower turned away from a loan that
+    was fine. Neither is a wording difference; both are the two halves of the
+    same rule disagreeing, so this compares the VERDICTS, case by case.
+    """
+    from pignus.btc_collateral import loan_from_dict, timelocks_sane  # noqa: PLC0415
+    print("\nthe same loans refused, in two languages")
+    random.seed(20260903 + 2)
+    base = dict(btc_amount=20_000, lender_x="aa" * 32, oracle_x="22" * 32,
+                debt_asset="11" * 32, debt=10_500_000_000,
+                principal=10_000_000_000, lender_prog="cc" * 20, lender_ver=0,
+                market="BTC/USDX", strike=42_000 * 100_000, price_scale=100_000,
+                borrower_x="dd" * 32, h_w="ee" * 32, borrower_prog="dd" * 20)
+    btc_h, seq_h = 100_000, 100_000
+    docs = []
+    for _ in range(600):
+        d = dict(base)
+        # Deadlines drawn across the whole region where the answer changes:
+        # far too tight, marginal, and comfortable.
+        d["d_refund"] = seq_h + random.choice([1, 60, 119, 120, 121, 720, 5000])
+        d["abort_after"] = btc_h + random.choice([1, 12, 24, 144, 300, 900])
+        d["repay_deadline"] = seq_h + random.choice(
+            [1, 100, 121, 1500, 2000, 43_200, 100_000])
+        d["recover_after"] = btc_h + random.choice(
+            [1, 24, 144, 300, 4600, 20_000])
+        d["upgrade_fee"] = random.choice([0, 1, 3000, 9999, 10_000, 50_000])
+        if random.random() < 0.1:
+            d["payment_hash"] = d["h_w"]        # the both-sides-one-secret case
+        docs.append(d)
+
+    # And the BOUNDARIES, deliberately: a random sweep can miss a rule that
+    # only changes the answer in a narrow band, and every one of these rules
+    # has such a band. Each case below is built so exactly ONE rule decides it,
+    # with everything else comfortable -- which is what makes a disagreement
+    # about that rule visible instead of hidden behind another refusal.
+    def one_rule(**over):
+        d = dict(base, d_refund=seq_h + 5000, abort_after=btc_h + 900,
+                 repay_deadline=seq_h + 60_000, recover_after=btc_h + 20_000,
+                 upgrade_fee=50_000)
+        d.update(over)
+        return d
+
+    for k in (0, 1, 118, 119, 120, 121, 122, 239, 240, 241, 300):
+        # The repayment window, measured against the EFFECTIVE deadline. The
+        # answer flips at 240 blocks, not at 120: the margin is subtracted
+        # first. An implementation using the written figure flips at 120, and
+        # these eleven cases are where the two differ.
+        docs.append(one_rule(repay_deadline=seq_h + 120 + k,
+                             recover_after=btc_h + 20_000,
+                             d_refund=seq_h + 1))
+    for fee in (0, 9999, 10_000, 10_001):
+        docs.append(one_rule(upgrade_fee=fee))
+    for gap in (0, 1, 1439, 1440, 1441):
+        # The term minimum: the gap between the last moment a loan can start
+        # and the moment its repayment window shuts.
+        docs.append(one_rule(d_refund=seq_h + 200,
+                             repay_deadline=seq_h + 200 + 120 + gap))
+    docs.append(one_rule(payment_hash=base["h_w"]))
+
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump([{"loan": d, "btc": btc_h, "seq": seq_h} for d in docs], f)
+    f.close()
+    try:
+        r = subprocess.run([node, "--input-type=module", "-e",
+                            TIMELOCK_SCRIPT, "--", f.name], cwd=HERE,
+                           capture_output=True, text=True, timeout=300)
+    finally:
+        os.unlink(f.name)
+    if r.returncode != 0:
+        check("the page's timelock check runs", False, r.stderr.strip()[:200])
+        return
+    got = json.loads(r.stdout)
+
+    disagree, examples = 0, []
+    refused = 0
+    for d, page_says in zip(docs, got):
+        lib_says = bool(timelocks_sane(loan_from_dict(d), btc_h, seq_h))
+        refused += 1 if lib_says else 0
+        if page_says is not lib_says:
+            disagree += 1
+            if len(examples) < 3:
+                examples.append(
+                    f"d_refund=+{d['d_refund'] - seq_h} "
+                    f"abort=+{d['abort_after'] - btc_h} "
+                    f"repay=+{d['repay_deadline'] - seq_h} "
+                    f"recover=+{d['recover_after'] - btc_h} "
+                    f"fee={d['upgrade_fee']}: library "
+                    f"{'refuses' if lib_says else 'accepts'}, page "
+                    f"{'refuses' if page_says else 'accepts'}")
+    check(f"both refuse the same loans, across {len(docs)} sets of deadlines",
+          disagree == 0, f"{disagree} disagree")
+    for line in examples:
+        print("        " + line)
+    check("the sweep contains loans that ARE refused, so it can fail",
+          0 < refused < len(docs), f"{refused} of {len(docs)} refused")
+
+
 def main():
     node = shutil.which("node")
     if node is None:
@@ -272,6 +386,7 @@ def main():
           len(big) > 0, str(len(big)))
 
     addresses(node)
+    timelocks(node)
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0
 

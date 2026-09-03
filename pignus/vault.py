@@ -18,7 +18,7 @@ it did not mean to.
 from dataclasses import dataclass
 from decimal import Decimal
 
-from . import COIN, atoms
+from . import COIN, atoms, units as _units
 from .compat import load_covenant
 
 
@@ -567,7 +567,7 @@ def prepare_explicit(node, wants, fee_asset):
         info = node.getaddressinfo(addr)
         addr = info.get("unconfidential") or addr
         kw = dict(address=addr,
-                  amount=str((Decimal(amount) / COIN).quantize(Decimal("0.00000001"))),
+                  amount=_units(amount),
                   assetlabel=asset, fee_asset_label=fee_asset)
         txids.append(node.sendtoaddress(**kw))
     return txids

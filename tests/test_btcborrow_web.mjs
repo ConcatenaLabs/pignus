@@ -93,8 +93,17 @@ const ALL = ["getBtcPublicKey", "getBtcAddress", "signBtcTaproot",
     h_w: v.loan.h_w,
     abort_after: btcH + 300,          // ~50 hours away
     d_refund: seqH + 600,             // ~10 hours away
-    repay_deadline: seqH + 1440,      // ~24 hours away
-    recover_after: btcH + 500,        // ~83 hours, well past the repayment
+    // 30 days of Sequentia blocks. The 24-hour version used to pass, and now
+    // does not: the library requires a whole day between the last moment a
+    // loan can start (`d_refund`) and the moment its repayment window shuts,
+    // measured against the EFFECTIVE deadline. A loan whose term could be over
+    // before it begins is not a well-spaced one.
+    repay_deadline: seqH + 43_200,
+    recover_after: btcH + 5000,       // well past the repayment, in Bitcoin blocks
+    // And the fee that pays for moving the collateral into the loan. It is
+    // signed in advance and can be neither replaced nor bumped, so every party
+    // refuses anything under the floor.
+    upgrade_fee: 10_000,
   };
   ok("a well-spaced loan has no problems",
      bb.timelockProblems(safe, btcH, seqH).length === 0,

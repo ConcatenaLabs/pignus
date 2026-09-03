@@ -389,6 +389,37 @@ def test_dlc():
           ann.attestation_point(label) == A.point(s))
 
 
+def test_amount_strings():
+    """Atoms to the decimal string an RPC takes, and back, exactly.
+
+    Both directions matter and both had a bug. `atoms()` was already careful;
+    the other way round was `f"{n / 1e8:.8f}"` in two places, which rounds
+    above 2^53 atoms -- about ninety million units, which the testnet treasury
+    passed long ago -- and the difference lands in somebody's coin. The
+    `Decimal` form then had to be forced out of scientific notation, because
+    one atom came out as "1E-8" and a node reads that as no amount at all.
+    """
+    print("atoms and units, in both directions")
+    from pignus import atoms as to_atoms, units    # noqa: PLC0415
+    check("one atom is a plain decimal, not 1E-8",
+          units(1) == "0.00000001", units(1))
+    check("a whole unit keeps its eight places", units(10 ** 8) == "1.00000000")
+    check("zero is zero", units(0) == "0.00000000", units(0))
+    bad = [n for n in (1, 42, 10 ** 8, 2 ** 53 - 1, 2 ** 53, 2 ** 53 + 1,
+                       39_712_956_533_067_833, 10 ** 16 + 7)
+           if to_atoms(units(n)) != n]
+    check("every size round-trips exactly, including past 2^53", not bad,
+          f"lost: {bad}")
+    # The float form this replaced, so the test says what it is protecting.
+    n = 2 ** 53 + 1
+    check("...which the float form did not",
+          f"{n / 1e8:.8f}" != units(n),
+          f"float {f'{n / 1e8:.8f}'} vs exact {units(n)}")
+    check("and no amount is ever in scientific notation",
+          all("e" not in units(n).lower()
+              for n in (1, 7, 10, 999, 10 ** 8, 2 ** 53 + 1)))
+
+
 def test_page_shaped_terms():
     """The exact document the browser posts, through the exact reader that
     takes it.
@@ -446,7 +477,8 @@ def test_page_shaped_terms():
 
 
 def main():
-    for fn in (test_vectors, test_terms, test_page_shaped_terms, test_oracle,
+    for fn in (test_vectors, test_terms, test_amount_strings,
+               test_page_shaped_terms, test_oracle,
                test_amounts,
                test_attestation_log, test_adaptor, test_dlc):
         fn()

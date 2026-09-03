@@ -78,12 +78,41 @@ export function timelockProblems(loan, btcHeight, seqHeight) {
           "the collateral, so no honest lender will fund this.");
     }
   }
-  if (seqS(loan.repay_deadline) < CLAIM_MARGIN_SECONDS)
+  // The EFFECTIVE deadline, exactly as `timelocks_sane` uses it: a lender
+  // stops claiming a margin before the written one, so a window measured
+  // against the written figure is two hours longer than the real one.
+  const dRepay = effectiveRepayDeadline(loan);
+  if (seqS(dRepay) < CLAIM_MARGIN_SECONDS)
     problems.push(`the repayment deadline is only about ` +
-      `${hours(seqS(loan.repay_deadline))} hours away.`);
+      `${hours(Math.max(0, seqS(dRepay)))} hours away, allowing for the ` +
+      `margin in which a lender stops claiming.`);
   if (btcS(loan.recover_after) - seqS(loan.repay_deadline) < REPAY_MARGIN_SECONDS)
     problems.push("the lender could sweep the collateral too soon after your " +
       "repayment deadline: repaying on time would not be enough to be safe.");
+  // A loan cannot start until you claim the principal, and you may do that as
+  // late as its own deadline. Without this, deadlines that pass every other
+  // check can leave a repayment window already over before the loan begins.
+  if (loan.d_refund && seqS(dRepay) - seqS(loan.d_refund) < TERM_MINIMUM_SECONDS)
+    problems.push("the repayment deadline is too close to the last moment " +
+      "this loan can start: the term could be over before it begins.");
+  if (loan.abort_after && btcS(loan.recover_after) <= btcS(loan.abort_after))
+    problems.push("the lender's sweep opens before your collateral stops " +
+      "being abortable, and there is no loan in between.");
+  // The upgrade's fee is fixed at origination and can never be raised: that
+  // transaction is signed in advance, spends a covenant leaf and sets a final
+  // sequence, so neither side can replace it or pay for a child.
+  if (loan.abort_after && Number(loan.upgrade_fee || 0) < MIN_UPGRADE_FEE)
+    problems.push(`this offer carries only ${Number(loan.upgrade_fee || 0)} ` +
+      `satoshis to pay for moving your collateral into the loan. That ` +
+      `transaction cannot be replaced or bumped, so under ${MIN_UPGRADE_FEE} ` +
+      `risks a loan that can never start.`);
+  // One secret must not open both sides. If the hash that releases the
+  // collateral is the hash that releases the principal, claiming the principal
+  // would publish the secret that frees the collateral.
+  if (loan.payment_hash && loan.h_w &&
+      String(loan.payment_hash).toLowerCase() === String(loan.h_w).toLowerCase())
+    problems.push("the repayment and the principal are locked to the same " +
+      "secret, so claiming one would release the other.");
   return problems;
 }
 
@@ -270,7 +299,28 @@ export async function borrow(wallet, offer, ui) {
   // borrower can actually see and spend what they get back.
   const reclaimAddr = (await wallet.request("getBtcAddress", {})).address;
   const reclaimSpk = await ui.addressToSpk(reclaimAddr);
+  // The fee the RECLAIM will pay. The lender signs a release over a
+  // transaction paying `btc_amount - reclaimFee`, so this number decides how
+  // much collateral comes back -- and it arrives on the relay's word, unsigned
+  // and part of no offer signature. A relay that set it to the whole
+  // collateral would have the borrower commit Bitcoin to a loan whose only way
+  // out returns nothing.
   const reclaimFee = Number(offer.reclaim_fee || 3000);
+  const collateral = Number(BigInt(loan.btc_amount));
+  if (!Number.isInteger(reclaimFee) || reclaimFee <= 0)
+    throw new Error("this book named a reclaim fee that is not a whole "
+      + "positive number of satoshis. Nothing has been broadcast.");
+  // A cap in BOTH directions: a fifth of the collateral, and never so little
+  // that the reclaim cannot relay. Neither number is subtle -- an honest fee
+  // here is a few thousand satoshis on a transaction of about 150 vbytes.
+  if (reclaimFee > Math.max(RECLAIM_FEE_FLOOR, collateral / 5))
+    throw new Error(`this book wants ${reclaimFee} satoshis of your ` +
+      `${collateral}-satoshi collateral as the fee on the one transaction ` +
+      `that gives it back. That is not a fee. Nothing has been broadcast.`);
+  if (collateral - reclaimFee < BTC_DUST)
+    throw new Error("after that reclaim fee your collateral would come back " +
+      "as an output too small for the network to relay, so it would never " +
+      "come back at all. Nothing has been broadcast.");
 
   ui.busy(true, "asking the lender to open a loan…");
   const take = await ui.post("v1/btc/take", {
@@ -299,9 +349,25 @@ export async function borrow(wallet, offer, ui) {
   if (!reserved)
     throw new Error("the lender did not answer in time, and nothing was " +
       "broadcast. Your Bitcoin is untouched.");
-  const paymentHash = String(reserved.payment_hash || "");
+  const paymentHash = String(reserved.payment_hash || "").toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(paymentHash))
     throw new Error("the lender's answer carries no usable payment hash.");
+  // ...and the LENDER has to have said it. This hash goes into both chains'
+  // scripts: it decides the vault the collateral moves into and the address
+  // the debt is later paid to. Taken on the relay's word, a substituted one
+  // sends a repayment into an output only the substituter can open. The relay
+  // keeps the lender's own signature over it precisely so this can be checked.
+  if (!lenderSaid(loan.lender_x, "pignus/btc-hash/1", take.take_id,
+                  { payment_hash: paymentHash,
+                    adaptor_point: String(reserved.adaptor_point || "") },
+                  reserved.hash_auth))
+    throw new Error("the payment hash this book served is not signed by this " +
+      "loan's lender. Nothing has been broadcast and your Bitcoin is " +
+      "untouched. Do not retry against this book.");
+  if (paymentHash === String(loan.h_w).toLowerCase())
+    throw new Error("the lender drew the same hash your own origination " +
+      "secret is locked to. Claiming the principal would release your " +
+      "collateral. Refusing; nothing has been broadcast.");
   const live = { ...loan, payment_hash: paymentHash };
 
   // The vault's address depends on that hash, so this is the first moment the
@@ -433,12 +499,42 @@ export async function claimPrincipal(wallet, rec, ui) {
  * of the state their lender is watching for, so it is signed with the key the
  * take already names.
  */
+/**
+ * The canonical bytes a report's signature covers, byte for byte the same as
+ * `pignus/btc_relay.py`'s: sorted keys, no spaces, inside a tagged hash.
+ *
+ * One function, so the form this page SIGNS and the form it CHECKS cannot
+ * drift apart -- and so a relay's word about what a lender said can be tested
+ * rather than believed.
+ */
+function reportDigest(tag, takeId, fields) {
+  const obj = { take_id: String(takeId), ...fields };
+  return P.taggedHash(tag, new TextEncoder().encode(
+    JSON.stringify(obj, Object.keys(obj).sort())));
+}
+
+/**
+ * Did the LENDER really say this, or is it the relay's word for it?
+ *
+ * The relay carries messages and holds no key. Every step it reports is signed
+ * by the party it claims to come from, and it keeps that signature -- so a
+ * borrower can check one instead of trusting the carrier. This page verifies
+ * the release that way already; the payment hash is the other value a whole
+ * loan hangs on, and it was taken on the relay's word alone.
+ */
+export function lenderSaid(lenderX, tag, takeId, fields, authHex) {
+  try {
+    if (!authHex || !/^[0-9a-f]{128}$/i.test(String(authHex))) return false;
+    return badaptor.verifySchnorr(lenderX, hex(reportDigest(tag, takeId, fields)),
+                                  String(authHex));
+  } catch { return false; }
+}
+
 async function report(wallet, ui, rec, kind, txid, vout) {
   const tag = kind === "repaid" ? "pignus/btc-repaid/1"
                                 : "pignus/btc-claimed-principal/1";
-  const payload = P.taggedHash(tag, new TextEncoder().encode(
-    JSON.stringify({ take_id: rec.take_id, txid: String(txid), vout: Number(vout) },
-                   Object.keys({ take_id: 0, txid: 0, vout: 0 }).sort())));
+  const payload = reportDigest(tag, rec.take_id,
+                               { txid: String(txid), vout: Number(vout) });
   const auth = (await wallet.request("signBtcTaproot", {
     sighash: hex(payload),
     display: { detail: "Tell the lender where your payment landed. This " +
@@ -456,12 +552,45 @@ function progToSpk(prog, ver) {
  *  against `t`. Their claim is what publishes `t` and releases the collateral. */
 export async function repay(wallet, rec, ui) {
   const loan = rec.loan;
+  // The address the debt goes to is derived from `payment_hash`, and only the
+  // lender's own signature says that hash is theirs. A record rebuilt from the
+  // relay -- a cleared browser, a second device -- carries the relay's copy of
+  // it, so this is where that copy stops being taken on trust.
+  if (rec.hash_auth &&
+      !lenderSaid(loan.lender_x, "pignus/btc-hash/1", rec.take_id,
+                  { payment_hash: String(loan.payment_hash || "").toLowerCase(),
+                    adaptor_point: String(rec.adaptor_point || "") },
+                  rec.hash_auth))
+    throw new Error("this loan's payment hash is not signed by its lender. " +
+      "Paying the debt against it would pay into an address they cannot open. " +
+      "Nothing has been sent.");
   const tree = hashlockTaptree({
     preimageHash: loan.payment_hash, asset: loan.debt_asset,
     payeeProg: loan.lender_prog, payeeVer: loan.lender_ver,
     refundAfter: loan.repay_deadline, refundProg: loan.borrower_prog,
     refundVer: loan.borrower_ver,
   });
+  // Has the debt ALREADY been paid? A repayment whose report to the relay was
+  // lost -- the relay down, the tab closed between broadcast and report --
+  // leaves a borrower whose record says the loan is still live, and this page
+  // would cheerfully take the debt a second time. The address is derived from
+  // the terms, so the chain can be asked directly, and it is the only place
+  // that knows.
+  const already = await ui.api(
+    `v1/scan/${hex(tree.scriptPubKey())}?asset=${loan.debt_asset}` +
+    `&amount=${String(loan.debt)}`).catch(() => null);
+  if (already && already.found) {
+    // Record it, so the rest of the page stops offering Repay, and tell the
+    // relay where it went in case that is what was lost.
+    rec.repay_txid = already.txid; rec.repay_vout = Number(already.vout || 0);
+    rec.status = stageOf(rec); rememberLoan(rec);
+    await report(wallet, ui, rec, "repaid", already.txid, rec.repay_vout)
+      .catch(() => {});
+    throw new Error("this debt is already paid: the repayment is on chain at " +
+      `${already.txid}. Nothing further has been sent. If your lender has not ` +
+      "claimed it, you can take it back after Sequentia block " +
+      Number(loan.repay_deadline).toLocaleString() + ".");
+  }
   ui.busy(true, "paying the debt…");
   const { pset } = await buildPayment({
     asset: loan.debt_asset, amount: String(loan.debt),
@@ -501,11 +630,25 @@ export async function reclaim(wallet, rec, ui, { minDepth = 6, force = false } =
   // How deep the claim is, read from the chain rather than from the relay: the
   // whole point of waiting is that a reorg could undo it, and a number the
   // relay made up is no protection against that.
+  // The BITCOIN header the claim's own block anchored to, and how deep the
+  // parent chain is behind it. Sequentia reorgs whenever Bitcoin reorgs, so
+  // Sequentia confirmations measure the wrong thing entirely: six of them are
+  // six minutes, about six tenths of one Bitcoin block, and a single ordinary
+  // Bitcoin reorg undoes ten at once. Spending Bitcoin on a secret read from a
+  // Sequentia transaction a Bitcoin reorg can still undo is how a borrower
+  // loses both sides.
+  const anchor = found.anchorConfirmations;
+  if (anchor == null && !force)
+    throw new Error("this book cannot say how deep the Bitcoin chain is behind " +
+      "the block that published your secret, so nothing here can tell whether " +
+      "a Bitcoin reorg could still undo it. Wait, or use pignus-cli, which " +
+      "reads a Bitcoin node directly.");
+  if (anchor != null && anchor < MIN_ANCHOR_DEPTH && !force)
+    throw new Error(`the block that published your secret is anchored to a ` +
+      `Bitcoin block only ${anchor} deep. Sequentia reorgs when Bitcoin ` +
+      `reorgs, so spending your Bitcoin on it now risks losing both. Wait ` +
+      `for ${MIN_ANCHOR_DEPTH} Bitcoin confirmations behind it.`);
   const depth = await ui.confirmations(claimTxid);
-  if (depth < minDepth && !force)
-    throw new Error(`the claim that published the secret has ${depth} ` +
-      `confirmation(s). Sequentia reorgs when Bitcoin reorgs, so spending your ` +
-      `Bitcoin on it now risks losing both. Wait for ${minDepth}.`);
   const vaultTxid = rec.vault_txid
     || btc.upgradeTx(loan, rec.prevault_txid, rec.prevault_vout).txid();
   const sighash = hex(btc.reclaimSighash(loan, vaultTxid, 0,
@@ -539,15 +682,28 @@ export async function reclaim(wallet, rec, ui, { minDepth = 6, force = false } =
 async function findSecret(rec, take, ui) {
   const loan = rec.loan;
   const said = take.secret_t || rec.secret_t || "";
-  if (said && hex(P.sha256(toBytes(said))) === loan.payment_hash)
-    return { secret: said, claimTxid: take.claim_txid || rec.lender_claim_txid };
+  if (said && hex(P.sha256(toBytes(said))) === loan.payment_hash) {
+    // Even when the relay hands over the secret, the DEPTH still has to come
+    // from the chain: the relay's word about a reorg is worth nothing.
+    const where = rec.repay_txid || take.repay_txid;
+    const at = where
+      ? await ui.api(`v1/spend/${where}/` +
+                     Number(rec.repay_vout ?? take.repay_vout ?? 0))
+          .catch(() => null)
+      : null;
+    return { secret: said,
+             claimTxid: (at && at.spend_txid) || take.claim_txid ||
+                        rec.lender_claim_txid,
+             anchorConfirmations: at ? (at.anchor_confirmations ?? null) : null };
+  }
   const txid = rec.repay_txid || take.repay_txid;
   if (!txid) return null;
   const vout = Number(rec.repay_vout ?? take.repay_vout ?? 0);
   const spend = await ui.api(`v1/spend/${txid}/${vout}`).catch(() => null);
   const secret = spend && spend.preimages && spend.preimages[loan.payment_hash];
   if (!secret) return null;
-  return { secret, claimTxid: spend.spend_txid };
+  return { secret, claimTxid: spend.spend_txid,
+           anchorConfirmations: spend.anchor_confirmations ?? null };
 }
 
 /**
@@ -653,6 +809,12 @@ export async function recoverLoans(wallet, ui) {
       // The relay calls the lender's release `adaptor_sig` on the wire; it is
       // an ordinary signature, and the record here calls it what it is.
       release_sig: t.release_sig ?? t.adaptor_sig ?? was.release_sig,
+      // The lender's own signature over the payment hash, so a loan recovered
+      // from the relay can be checked rather than believed. Without it a
+      // borrower on a second device pays their debt into whatever address the
+      // relay's copy of the hash compiles to.
+      hash_auth: t.hash_auth ?? was.hash_auth,
+      adaptor_point: t.adaptor_point ?? was.adaptor_point ?? "",
       // What each party has actually DONE. These are the facts every step and
       // every button is decided from, because a fact only ever becomes true:
       // two parties pushing one status along one line is what let a settled
@@ -708,6 +870,23 @@ export function stageOf(rec) {
 // own refund had opened could take back the debt AND the collateral. It is the
 // deadline a borrower is really held to, so it is the one they are told.
 export const CLAIM_MARGIN_BLOCKS = 120;
+// The shortest term worth calling one: the gap between the last moment a loan
+// can start and the moment its repayment window shuts.
+const TERM_MINIMUM_SECONDS = 24 * 3600;
+// The floor on the fee the pre-vault carries. Signed in advance, spends a
+// covenant leaf, final sequence: whatever is committed at origination is the
+// only fee that move will ever have.
+export const MIN_UPGRADE_FEE = 10000;
+// What a Bitcoin output has to hold to be worth anything: below this the
+// network will not relay the transaction that spends it.
+const BTC_DUST = 330;
+// The most a reclaim fee may be in absolute terms, whatever the collateral.
+// A reclaim is about 150 vbytes; this is roomy at any plausible feerate.
+const RECLAIM_FEE_FLOOR = 50_000;
+// How deep the PARENT chain must be behind a Sequentia block before its
+// contents are worth spending Bitcoin on. Two Bitcoin blocks is the shortest
+// depth that survives an ordinary one-block reorg of the parent chain.
+export const MIN_ANCHOR_DEPTH = 2;
 
 export function effectiveRepayDeadline(loan) {
   return Number(loan.repay_deadline) - CLAIM_MARGIN_BLOCKS;

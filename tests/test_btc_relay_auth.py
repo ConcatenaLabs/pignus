@@ -14,6 +14,7 @@ that weakens it fails here in a second rather than on the testnet.
 
 import os
 import sys
+import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
@@ -103,6 +104,46 @@ def main():
           not R.verify_report(A.xonly_pubkey(other).hex(), R.DISBURSED_TAG,
                               "take-1", r, txid="ff" * 32, vout=0))
 
+    # The BROWSER has to be able to check a lender's report too. The payment
+    # hash decides the vault the collateral moves into and the address the debt
+    # is paid to; taken on the relay's word, a substituted one sends a
+    # repayment into an output only the substituter can open. So the page
+    # verifies the lender's own signature -- which means its canonical form has
+    # to be this one, byte for byte.
+    import shutil as _sh
+    import subprocess as _sp
+    _node = _sh.which("node")
+    if _node is None:
+        print("  (the browser's copy is not checked: no node)")
+    else:
+        ph, pt = "ab" * 32, "02" + "cd" * 32
+        auth = R.sign_report(lender, R.HASH_TAG, "take-1",
+                             payment_hash=ph, adaptor_point=pt)
+        js = (
+            "import * as bb from '../web/btcborrow.js';"
+            "const [lx, ph, pt, auth, other] = process.argv.slice(1);"
+            "const f = (k, a, b) => bb.lenderSaid(k, 'pignus/btc-hash/1', "
+            "  'take-1', { payment_hash: a, adaptor_point: pt }, b);"
+            "process.stdout.write(JSON.stringify(["
+            "  f(lx, ph, auth), f(lx, other, auth), f(other, ph, auth),"
+            "  f(lx, ph, '')]));"
+        )
+        got = _sp.run([_node, "--input-type=module", "-e", js, "--",
+                       lender_x, ph, pt, auth, "ff" * 32],
+                      cwd=os.path.dirname(os.path.realpath(__file__)),
+                      capture_output=True, text=True, timeout=60)
+        try:
+            ok_sig, wrong_hash, wrong_key, no_auth = json.loads(got.stdout)
+        except Exception:                               # noqa: BLE001
+            ok_sig = wrong_hash = wrong_key = no_auth = None
+            check("the browser can check a lender's report at all", False,
+                  got.stderr.strip()[:160])
+        check("the browser accepts the lender's own signed hash",
+              ok_sig is True, str(got.stdout)[:80])
+        check("and refuses a hash the lender did not sign", wrong_hash is False)
+        check("and refuses one signed by anybody else", wrong_key is False)
+        check("and refuses a missing signature", no_auth is False)
+
     print("\n== payout programs are checked where they enter ==")
     check("a 20-byte program is version 0", R.check_program("dd" * 20, 0))
     check("a 32-byte program is version 1", R.check_program("dd" * 32, 1))
@@ -112,6 +153,89 @@ def main():
             check(f"a {len(prog) // 2}-byte version-{ver} program is refused", False)
         except ValueError:
             check(f"a {len(prog) // 2}-byte version-{ver} program is refused", True)
+
+    print("\n== a seizure is judged against the strike the LENDER published ==")
+    # `strike`, `market` and `price_scale` are in no Bitcoin script -- Bitcoin
+    # cannot read them -- so the request's own sighash cannot pin them. A
+    # lender could therefore raise the strike in the request they hand an
+    # oracle, and the oracle would compare an honest price against a number the
+    # seizing party chose. The lender's signature over the offer that fixed the
+    # real strike is the only thing that can catch it.
+    seizing = BC.loan_from_dict(loan_for(
+        lender_x, borrower_x="dd" * 32, h_w="ff" * 32, borrower_prog="dd" * 20,
+        payment_hash="ee" * 32))
+    offer_sig = R.sign_offer(lender, BC.loan_to_dict(seizing), seizing.market, 3)
+    req = BC.seize_request(seizing, "aa" * 32, 0,
+                           bytes.fromhex("0014" + "bb" * 20), 3000)
+    req["offer_sig"], req["offer_lots"] = offer_sig, 3
+    got, _want = BC.check_seize_request(req)
+    check("an honest request is accepted, at the offer's own strike",
+          int(got.strike) == int(seizing.strike))
+
+    lying = dict(req)
+    lying["loan"] = dict(req["loan"], strike=99_999_999_999)
+    lying["sighash"] = BC.seize_sighash(
+        BC.loan_from_dict(lying["loan"]), "aa" * 32, 0,
+        bytes.fromhex("0014" + "bb" * 20), 3000).hex()
+    check("raising the strike does not change the sighash at all, which is "
+          "why the sighash could never catch this",
+          lying["sighash"] == req["sighash"])
+    try:
+        BC.check_seize_request(lying)
+        check("an inflated strike is refused", False, "it was accepted")
+    except ValueError as e:
+        check("an inflated strike is refused", "offer signature" in str(e))
+
+    unpinned = dict(req)
+    unpinned["offer_sig"] = ""
+    try:
+        BC.check_seize_request(unpinned)
+        check("a request with no signed offer is refused", False, "accepted")
+    except ValueError as e:
+        check("a request with no signed offer is refused",
+              "nothing pins the strike" in str(e))
+    got2, _ = BC.check_seize_request(unpinned, require_offer=False)
+    check("...and accepted only when the operator says so explicitly",
+          int(got2.strike) == int(seizing.strike))
+
+    print("\n== a report cannot be replayed to move a take backwards ==")
+    # Every report is a bare signature over {take_id, fields}: no nonce, no
+    # expiry, valid for ever -- and the relay serves it to anybody who asks for
+    # the take. Ranking the statuses is what stops a copied report rewriting a
+    # live loan back to a step whose lot the offer counts as free.
+    from pignus.book import Book, TakeMoved             # noqa: PLC0415
+    import tempfile                                     # noqa: PLC0415
+    bk = Book(os.path.join(tempfile.mkdtemp(), "book.json"))
+    bk.btc_offers["o1"] = {"btc_offer_id": "o1", "lots": 1, "status": "open"}
+    rec = bk.put_btc_take({"btc_offer_id": "o1", "loan": {"h_w": "aa" * 32},
+                           "prevault_txid": "bb" * 32, "prevault_vout": 0,
+                           "status": "requested"}, lots_of="o1")
+    tid = rec["take_id"]
+    for step in ("reserved", "pending", "signed", "disbursed", "live"):
+        bk.update_btc_take(tid, status=step)
+    check("a take walks forward through the handshake",
+          bk.btc_takes[tid]["status"] == "live")
+    check("and its lot is held while it is live",
+          bk.btc_offer_lots_left("o1") == 0,
+          str(bk.btc_offer_lots_left("o1")))
+    for replay in ("reserved", "pending", "signed", "live"):
+        try:
+            bk.update_btc_take(tid, status=replay)
+            check(f"a replayed {replay} report is refused", False, "accepted")
+        except TakeMoved:
+            check(f"a replayed {replay} report is refused", True)
+    check("...and the lot is still held afterwards",
+          bk.btc_offer_lots_left("o1") == 0,
+          str(bk.btc_offer_lots_left("o1")))
+    bk.update_btc_take(tid, repay_txid="cc" * 32)
+    check("a hint that sets no status still writes",
+          bk.btc_takes[tid].get("repay_txid") == "cc" * 32)
+    bk.update_btc_take(tid, status="refunded")
+    try:
+        bk.update_btc_take(tid, status="live")
+        check("a finished take stays finished", False, "it moved")
+    except TakeMoved:
+        check("a finished take stays finished", True)
 
     print("\n== the deadlines a loan needs to be safe ==")
     ln = BC.loan_from_dict(loan_for(lender_x, borrower_x="dd" * 32,

@@ -161,7 +161,17 @@ def main():
         check("the borrower repaid into the hashlock",
               n.gettxout(tk["repay_txid"], tk["repay_vout"]) is not None)
 
-        run("btc-claim", ticket, "--lender-key", lk, *seq)
+        # A repayment signals replacement, so claiming a shallow one puts the
+        # secret in the mempool over a parent its own author can still replace.
+        # The lender waits, and so does this.
+        r = subprocess.run([sys.executable, CLI, "btc-claim", ticket,
+                            "--lender-key", lk, *seq],
+                           capture_output=True, text=True)
+        check("a claim is refused while the repayment is shallow",
+              r.returncode != 0 and "confirmation" in r.stderr,
+              r.stderr.strip()[:120])
+        rig.seq_mine(6)
+        run("btc-claim", ticket, "--lender-key", lk, "--min-depth", "2", *seq)
         rig.seq_mine(2)
         tk = json.load(open(ticket))
         check("the lender claimed it, forcing the secret onto the chain",
