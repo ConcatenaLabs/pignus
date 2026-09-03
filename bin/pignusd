@@ -2214,6 +2214,7 @@ class Handler(BaseHTTPRequestHandler):
                 # that the lender really published it: an offer carrying
                 # somebody else's key would make their own responder pay out.
                 from pignus import btc_relay as R
+                from pignus import btc_collateral as BC
                 loan = dict(body.get("loan") or {})
                 for k in ("btc_amount", "lender_x", "oracle_x", "recover_after",
                           "debt_asset", "debt", "repay_deadline", "abort_after",
@@ -2234,13 +2235,17 @@ class Handler(BaseHTTPRequestHandler):
                     if k not in loan or loan[k] in (None, ""):
                         continue
                     try:
-                        loan[k] = int(str(loan[k]).strip())
+                        n = int(str(loan[k]).strip())
                     except (TypeError, ValueError):
                         raise ValueError(
                             f"the offer's {k} is {loan[k]!r}, which is not a "
                             f"whole number") from None
-                    if loan[k] < 0:
+                    if n < 0:
                         raise ValueError(f"the offer's {k} cannot be negative")
+                    # Checked as a number, kept as the library says to keep it:
+                    # the amounts that outgrow a browser's JSON parser go back
+                    # out as decimal strings, the small ones as numbers.
+                    loan[k] = str(n) if k in BC.BIG_LOAN_FIELDS else n
                 market = str(body.get("market", ""))
                 lots = max(1, int(body.get("lots", 1)))
                 # A cap, the way `/v1/offers` has one. A cross-chain offer is

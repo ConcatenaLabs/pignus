@@ -84,6 +84,51 @@ function big(v, field) {
   throw new Error(field + ": expected a number, string or BigInt");
 }
 
+/**
+ * `n` atoms at `p` decimal places, to at most `maxFrac` of them, EXACTLY.
+ *
+ * The obvious spelling divides by a power of ten and lets `toLocaleString`
+ * finish it. That is a double, and a double starts rounding at 2^53 atoms --
+ * about ninety million units, a figure this chain's treasury passed long ago.
+ * Amounts reach the page as decimal strings precisely so they arrive intact;
+ * dividing them here would throw that away at the last step and show a
+ * borrower a debt that is not the one in the covenant. So the division is done
+ * in BigInt and only the grouping is left to the locale.
+ */
+export function fixed(n, p, maxFrac) {
+  const neg = n < 0n;
+  if (neg) n = -n;
+  const scale = 10n ** BigInt(p);
+  let whole = n / scale, frac = n % scale;
+  if (maxFrac < p) {
+    const cut = 10n ** BigInt(p - maxFrac);
+    const dropped = frac % cut;
+    frac /= cut;
+    if (dropped * 2n >= cut) {          // round half up, and carry if it fills
+      frac += 1n;
+      if (frac >= 10n ** BigInt(maxFrac)) { frac = 0n; whole += 1n; }
+    }
+  }
+  let out = whole.toLocaleString();
+  if (maxFrac > 0) {
+    const f = frac.toString().padStart(maxFrac, "0").replace(/0+$/, "");
+    if (f) out += decimalMark() + f;
+  }
+  return (neg ? "-" : "") + out;
+}
+
+let _mark;
+/** Whatever this reader's locale puts between the whole part and the rest. */
+export function decimalMark() {
+  if (_mark === undefined) {
+    try {
+      _mark = new Intl.NumberFormat().formatToParts(1.1)
+        .find((x) => x.type === "decimal").value;
+    } catch { _mark = "."; }
+  }
+  return _mark;
+}
+
 /** A 64-bit little-endian operand, the on-stack form the covenant compares. */
 function le8(n) {
   const v = BigInt(n);

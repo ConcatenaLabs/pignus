@@ -27,7 +27,8 @@ object, or is not valid JSON, is a 400.
 count can exceed what a JSON number holds exactly in a browser. That is true of
 the `terms` document this book serves as well as of the fields around it:
 `collateral_amount`, `principal`, `debt`, `strike`, `max_price` and
-`not_before` are strings inside it. `web/pignus.js` refuses a number above 2^53
+`not_before` are strings inside it, and a cross-chain offer's `btc_amount`,
+`debt`, `principal` and `strike` are strings for the same reason. `web/pignus.js` refuses a number above 2^53
 outright rather than compute a debt `JSON.parse` may already have rounded, so a
 book that served them as numbers would hold loans its own page could not
 price. Heights,
@@ -733,12 +734,12 @@ offer plus `lots_left`, computed live:
 ```json
 {"offers": [{
   "btc_offer_id": "…24 hex…",
-  "loan": {"btc_amount": 100000, "lender_x": "…", "oracle_x": "…",
-           "recover_after": 900000, "debt_asset": "…", "debt": 5250000000,
-           "principal": 5000000000, "repay_deadline": 125000,
+  "loan": {"btc_amount": "100000", "lender_x": "…", "oracle_x": "…",
+           "recover_after": 900000, "debt_asset": "…", "debt": "5250000000",
+           "principal": "5000000000", "repay_deadline": 125000,
            "abort_after": 902000, "upgrade_fee": 10000, "d_refund": 124000,
            "lender_prog": "…", "lender_ver": 0,
-           "market": "BTC/USDX", "strike": 0, "price_scale": 100000},
+           "market": "BTC/USDX", "strike": "0", "price_scale": 100000},
   "market": "BTC/USDX", "lots": 3, "lots_taken": 1, "lots_left": 2,
   "offer_sig": "…128 hex…", "responder": "", "note": "",
   "status": "open", "created": 1799990000}]}
@@ -755,6 +756,14 @@ A lender publishes an offer. Body: `loan` (the fields above; `btc_amount`,
 `abort_after`, `d_refund` and `lender_prog` are all required and must be
 non-empty), `market`, `lots`, `offer_sig`, and optionally `responder` and a
 `note` of up to 200 characters.
+
+`btc_amount`, `debt`, `principal` and `strike` are decimal strings, for the
+reason every other amount on this book is one. The rest of the loan -- heights,
+locktimes, `upgrade_fee`, `price_scale`, `lender_ver` -- are JSON numbers. The
+book accepts either spelling and stores this one, and the digest under
+`offer_sig` is computed over it, so a lender signing from integers and a relay
+verifying from strings agree. An absent number counts as a zero there, not as
+an empty string.
 
 `offer_sig` is the lender's BIP340 signature over the offer's own terms. It is
 what makes this endpoint safe to leave open: an offer carrying somebody else's
@@ -940,6 +949,12 @@ whole-UTXO-set scan by believing one that checks out.
 canonical({take_id, txid, vout}))`.
 
 `200` on either. `403` the signature is not the borrower's. `404` no such take.
+
+The page sends both as it broadcasts. From the command line they are sent by
+`pignus-cli btc-claim-principal` and `btc-repay` when given `--book` and
+`--borrower-key`, and a failure to send one is printed and otherwise ignored:
+the payment is on chain either way, and the report only spares the lender a
+scan and keeps the borrower's own page current.
 
 # `pignus-oracle`
 

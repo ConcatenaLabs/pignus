@@ -2525,6 +2525,7 @@ def cmd_btc_claim_principal(args):
                               fee_asset=args.fee_asset)
     tk.update(principal_claim_txid=txid, _stage="claimed-principal")
     _save_ticket(args, tk)
+    _tell_book(args, tk, "claimed-principal", txid)
     print(json.dumps({"claim_txid": txid, "stage": "claimed-principal"},
                      indent=2))
     return 0
@@ -2831,6 +2832,40 @@ def cmd_btc_check(args):
     return 0
 
 
+def _tell_book(args, tk, kind, txid, vout=0):
+    """BORROWER: tell a book where their own payment landed.
+
+    A hint, and the relay treats it as one -- it records the outpoint and moves
+    no status, because a status a borrower can move is one a borrower can use
+    against the lender acting on it. What it buys is a page that keeps up: a
+    borrower who has just repaid sees a loan that says so, instead of one that
+    still says `live` until the lender's next scan happens to find the spend.
+
+    Silent when there is no book or no borrower key, because both steps this is
+    attached to are complete without it: the payment is on chain either way.
+    """
+    book = getattr(args, "book", None)
+    key = getattr(args, "borrower_key", None)
+    if not (book and key and tk.get("take_id")):
+        return
+    from pignus import btc_relay as R
+    tag = (R.CLAIMED_PRINCIPAL_TAG if kind == "claimed-principal"
+           else R.REPAID_TAG)
+    try:
+        sec = _read_key(key)
+        code, r = book_post(book, f"/v1/btc/{kind}", {
+            "take_id": tk["take_id"], "txid": txid, "vout": int(vout),
+            "auth": R.sign_report(sec, tag, tk["take_id"],
+                                  txid=txid, vout=int(vout))})
+        if code != 200:
+            print(f"the book would not record this: {r.get('error')}. That is "
+                  "a page that lags, not a payment that failed.",
+                  file=sys.stderr)
+    except Exception as e:                              # noqa: BLE001
+        print(f"could not tell {book} about this: {e}. That is a page that "
+              "lags, not a payment that failed.", file=sys.stderr)
+
+
 def cmd_btc_repay(args):
     """BORROWER: pay the debt into the output the lender can only open by
     publishing the secret that releases your collateral."""
@@ -2841,6 +2876,7 @@ def cmd_btc_repay(args):
     txid, vout = pay_repayment(node, loan, fee_asset=args.fee_asset)
     tk.update(repay_txid=txid, repay_vout=vout, _stage="repaid")
     _save_ticket(args, tk)
+    _tell_book(args, tk, "repaid", txid, vout)
     print(json.dumps({"repay_txid": txid, "vout": vout, "stage": "repaid"},
                      indent=2))
     return 0
@@ -4415,6 +4451,14 @@ def add_btc_commands(sub):
     p.add_argument("ticket")
     p.add_argument("--fee-asset")
     p.add_argument("--out")
+    # Optional, and only to tell a book where the repayment landed. The lender's
+    # responder finds it by scanning the chain either way; the report is what
+    # stops a page saying `live` about a loan that is paid.
+    p.add_argument("--borrower-key",
+                   help="sign a report to the book saying where this "
+                        "repayment landed (optional: the lender finds it on "
+                        "chain regardless)")
+    add_book_arg(p)
     add_node_args(p)
     p.set_defaults(fn=cmd_btc_repay)
 

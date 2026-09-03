@@ -123,8 +123,7 @@ function meta(asset) {
 /** atoms -> units, at the asset's own precision. */
 function units(atoms, asset) {
   const p = meta(asset).precision ?? 8;
-  const n = Number(big(atoms)) / 10 ** p;
-  return n.toLocaleString(undefined, { maximumFractionDigits: Math.min(p, 8) });
+  return pig.fixed(big(atoms), p, Math.min(p, 8));
 }
 
 function amount(atoms, asset) {
@@ -603,8 +602,8 @@ function renderWallet() {
     const v = m
       ? `≈ ${money(Number(big(bal)) / 1e8 * Number(m.unit_price))} ${esc(m.debt_ticker)}`
       : "";
-    rows.unshift(`<span class="bal"><b>${(Number(big(bal)) / 1e8).toLocaleString(undefined,
-      { maximumFractionDigits: 8 })}</b> BTC <span class="ref">Bitcoin ${esc(btcNetworkName())} · ${v}</span></span>`);
+    rows.unshift(`<span class="bal"><b>${pig.fixed(big(bal), 8, 8)}</b> ` +
+      `BTC <span class="ref">Bitcoin ${esc(btcNetworkName())} · ${v}</span></span>`);
   }
   const payout = state.payout
     ? `<span class="small">pays out to v${state.payout.ver}
@@ -2030,7 +2029,7 @@ async function confirmations(txid, maxVout = 4) {
 function btcUi({ flow = "btcrepay", prefer = [], committed = {} } = {}) {
   return {
     esc, units, ticker: (a) => meta(a).ticker,
-    atomsToBtc: (n) => (Number(BigInt(n)) / 1e8)
+    atomsToBtc: (n) => pig.fixed(BigInt(n), 8, 8)
       .toLocaleString(undefined, { maximumFractionDigits: 8 }),
     blockTime: (h) => whenBlock(h),
     busy, api, post,
@@ -2156,7 +2155,7 @@ async function renderBtcLoans() {
         acts.push(`<button data-btcunpay="${i}" class="sm" title="the lender never claimed it, so the repayment's refund leaf is open">Take the repayment back</button>`);
       const funded = rec.prevault_txid || rec.funding_txid;
       return `<tr>
-        <td data-label="collateral">${(Number(BigInt(l.btc_amount)) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })} BTC
+        <td data-label="collateral">${pig.fixed(BigInt(l.btc_amount), 8, 8)} BTC
           ${funded ? `<span class="sub2"><a href="${txLink(funded, true)}" class="mono">${shortHex(funded, 12)}</a></span>` : ""}</td>
         <td data-label="you owe">${units(l.debt, l.debt_asset)} ${d}</td>
         <td data-label="repay by">${whenBlock(btcborrow.effectiveRepayDeadline(l))}
@@ -2405,7 +2404,7 @@ async function checkBtc(ev) {
         ? '<br><span class="small">Do NOT pay this address. The collateral reaches it only through the pre-vault, when claiming the principal publishes the secret that releases it.</span>' : ""}</span>
       ${principalAddr ? `<span class="k">Where the principal waits</span><span>${esc(principalAddr)}<br><span class="small">claiming it is what starts the loan; until you do, nothing is lent and nothing is locked.</span></span>` : ""}
       <span class="k">Sequentia repayment address</span><span>${esc(repayAddr)}<br><span class="mono">${repaySpk}</span></span>
-      <span class="k">Collateral</span><span>${(Number(BigInt(loan.btc_amount))/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC</span>
+      <span class="k">Collateral</span><span>${pig.fixed(BigInt(loan.btc_amount), 8, 8)} BTC</span>
       <span class="k">Debt</span><span>${units(loan.debt, loan.debt_asset)} ${esc(meta(loan.debt_asset).ticker)}</span>
       <span class="k">Both chains' shared secret</span><span class="mono">${esc(loan.payment_hash)}</span>
       <span class="k">Repay deadline</span><span>Sequentia block ${Number(loan.repay_deadline).toLocaleString()}${state.height == null ? ""
@@ -2438,7 +2437,7 @@ async function checkBtc(ev) {
           (rdOk
             ? `<p class="hint">This page cannot see Bitcoin. Before funding, confirm in a Bitcoin explorer that your funding transaction pays ${preAddr
                 ? `exactly ${(Number(preValue)/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC to the pre-vault address above`
-                : `exactly ${(Number(BigInt(loan.btc_amount))/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC to the vault address above`}, and that the lender's sweep height is well after your repayment deadline. The lender pays the principal only after your collateral confirms.</p>`
+                : `exactly ${pig.fixed(BigInt(loan.btc_amount), 8, 8)} BTC to the vault address above`}, and that the lender's sweep height is well after your repayment deadline. The lender pays the principal only after your collateral confirms.</p>`
             : `<p class="hint">The repayment deadline has already passed, so do not fund this whatever else checks out.</p>`)
         : `<p class="tag bad" style="margin-top:10px">The lender's release signature does NOT verify. Do not fund — the release could be worthless.</p>`;
     } else {

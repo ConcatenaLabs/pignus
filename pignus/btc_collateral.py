@@ -696,19 +696,58 @@ def seize_is_justified(loan, attestation, strike=None, oracle_keys=None) -> bool
 
 # --------------------------------------------------------- loan serialisation
 
+from decimal import Decimal as _Decimal
+
+
 def _loan_fields():
     from dataclasses import fields
     return [f.name for f in fields(BtcLoan)]
 
 
+# The amounts that cross a wire as DECIMAL STRINGS rather than as JSON
+# numbers. A Sequentia amount runs to 2**63-1 and a strike is a price times a
+# scale, so both go past 2**53, where a browser's JSON parser starts rounding
+# -- and it rounds silently, so a borrower would be shown a debt that is not
+# the one in the covenant. Strings are exact everywhere and cost nothing. This
+# is the same rule the issued-asset tier's terms follow.
+BIG_LOAN_FIELDS = ("btc_amount", "debt", "principal", "strike")
+
+
+def _int_loan_fields():
+    from dataclasses import fields
+    return tuple(f.name for f in fields(BtcLoan)
+                 if f.type in ("int", int))
+
+
 def loan_to_dict(loan) -> dict:
     from dataclasses import asdict
-    return asdict(loan)
+    d = asdict(loan)
+    for k in BIG_LOAN_FIELDS:
+        if k in d:
+            d[k] = str(int(d[k]))
+    return d
 
 
 def loan_from_dict(d) -> "BtcLoan":
     keep = set(_loan_fields())
-    return BtcLoan(**{k: v for k, v in d.items() if k in keep})
+    ints = set(_int_loan_fields())
+    out = {}
+    for k, v in d.items():
+        if k not in keep:
+            continue
+        if k in ints and not isinstance(v, bool):
+            # Exactly, and only from something that IS an integer: a decimal
+            # string, or a JSON number that lost nothing on the way in. A
+            # float here would be a rounded amount pretending to be a whole
+            # one, which is the failure this conversion exists to catch.
+            n = _Decimal(str(v))
+            if n != n.to_integral_value():
+                raise ValueError(
+                    f"the loan's {k} is {v!r}, which is not a whole number "
+                    f"of atoms. Rounding it here would move somebody's money")
+            v = int(n)
+        out[k] = v
+    return BtcLoan(**out)
 
 
 def loan_to_json(loan) -> str:
