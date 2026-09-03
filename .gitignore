@@ -6,3 +6,8 @@ vendor/
 .venv/
 attestations.log
 .claude/
+
+# What `offer-fund` writes beside the operator: an offer's terms, kept before
+# the principal is locked because they are the only thing that can ever spend
+# it. Not repository content -- a test run in this directory leaves them here.
+offer-*.json

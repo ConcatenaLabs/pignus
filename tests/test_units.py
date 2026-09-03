@@ -627,10 +627,97 @@ def test_repurchase_states():
                            now=1_790_000_001) == "forfeitable")
 
 
+def test_fee_is_priced_in_the_asset_that_pays_it():
+    """A fee named in one asset must be priced at THAT asset's rate.
+
+    Atoms are not comparable across assets: `fee_atoms` divides by the asset's
+    own exchange rate, so the same fee VALUE is a different number of atoms in
+    every one of them. Choosing an asset and then pricing at another's rate is
+    a thousandfold overpay to the block producer in one direction and a
+    transaction under the relay floor in the other, and which of the two it is
+    depends only on which pair of assets happened to be involved.
+
+    The cross-chain tier's Sequentia legs did exactly that whenever
+    `--fee-asset` was given: they asked `pick_fee` to choose again -- which
+    prefers the asset already being moved -- and then paid the caller's asset
+    that other asset's number of atoms.
+    """
+    print("a fee is priced in the asset that pays it")
+    from pignus import fees as F                          # noqa: PLC0415
+    from pignus.btc_collateral import seq_fee_for         # noqa: PLC0415
+
+    cheap, dear = "aa" * 32, "bb" * 32
+    table = {"rates": {cheap: 100_000, dear: 100_000_000},
+             "feerate_rfa_per_kvb": F.DEFAULT_FEERATE_RFA_PER_KVB,
+             "relay_floor_rfa_per_kvb": None}
+
+    class Node:
+        def getfeeexchangerates(self):
+            return dict(table["rates"])
+
+    v = F.VSIZE.get("btcrepay", 2000)
+    a_cheap = F.fee_atoms(table["rates"][cheap], v)
+    a_dear = F.fee_atoms(table["rates"][dear], v)
+    check("a valuable asset pays FEWER atoms for the same fee",
+          a_dear < a_cheap, f"{a_dear} vs {a_cheap}")
+    check("and the difference is the ratio of the rates, exactly",
+          a_cheap // a_dear == table["rates"][dear] // table["rates"][cheap],
+          f"{a_cheap}/{a_dear}")
+
+    # What the bug did: the wrong asset's number of atoms.
+    check("paying one asset another's atom count is out by that ratio",
+          a_cheap != a_dear and a_cheap / a_dear == 1000.0,
+          f"{a_cheap / a_dear}")
+
+    # And what the flow itself is about to spend. A wallet funded with exactly
+    # the debt has enough for the debt and enough for a fee in the same asset,
+    # and not enough for both -- and without setting the first aside, the
+    # failure lands much later, as a coin-selection error naming neither.
+    other = "cc" * 32
+    table2 = {"rates": {cheap: 100_000, other: 100_000},
+              "feerate_rfa_per_kvb": F.DEFAULT_FEERATE_RFA_PER_KVB}
+    debt = 5_000_000_000
+    holdings = {cheap: debt, other: a_cheap * 4}
+    got, _ = F.pick_fee(table2, holdings, "btcrepay", prefer=(cheap,))
+    check("without it, the fee is taken from the asset the payment needs",
+          got == cheap, got[:12])
+    got, _ = F.pick_fee(table2, holdings, "btcrepay", prefer=(cheap,),
+                        committed={cheap: debt})
+    check("with it, an asset the payment has fully spoken for is passed over",
+          got == other, got[:12])
+    refused = False
+    try:
+        F.pick_fee(table2, {cheap: debt}, "btcrepay", prefer=(cheap,),
+                   committed={cheap: debt})
+    except ValueError as e:
+        refused = "what this transaction itself spends" in str(e)
+    check("and a wallet with nothing left over is told exactly that", refused)
+
+    # And the helper that now does it right, against a stub node.
+    import pignus.fees as _F                              # noqa: PLC0415
+    real = _F.fee_table
+    _F.fee_table = lambda node: table
+    try:
+        check("seq_fee_for prices the named asset at its own rate",
+              seq_fee_for(Node(), dear, flow="btcrepay") == a_dear
+              and seq_fee_for(Node(), cheap, flow="btcrepay") == a_cheap,
+              f"{seq_fee_for(Node(), dear)} {seq_fee_for(Node(), cheap)}")
+        refused = False
+        try:
+            seq_fee_for(Node(), "cc" * 32)
+        except ValueError as e:
+            refused = "no fee exchange rate" in str(e)
+        check("an asset the node prices at nothing cannot pay a fee, and is "
+              "not priced from another's rate", refused)
+    finally:
+        _F.fee_table = real
+
+
 def main():
     for fn in (test_vectors, test_terms, test_amount_strings,
                test_price_freshness_is_two_sided,
                test_repurchase_states,
+               test_fee_is_priced_in_the_asset_that_pays_it,
                test_cross_chain_amount_strings,
                test_page_shaped_terms, test_oracle,
                test_amounts,

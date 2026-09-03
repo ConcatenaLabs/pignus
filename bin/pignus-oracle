@@ -204,10 +204,33 @@ class SeizureLog:
         return out
 
     def get(self, sighash):
-        sighash = sighash.lower()
-        for rec in self.all():
-            if str(rec.get("sighash", "")).lower() == sighash:
-                return rec
+        """One seizure by its sighash, from the WHOLE log.
+
+        Not through `all()`. That reads the last MAX_READ bytes, which is right
+        for a listing and wrong here: a 404 from this lookup means "this oracle
+        never co-signed that", and the whole of the tier's accountability rests
+        on that answer being true. A seizure older than the tail would be
+        denied, and the record size is not this oracle's to control -- a
+        requester's `loan` object is part of every line.
+
+        One pass, and nothing is parsed until the sighash matches, so the cost
+        is reading the file rather than decoding it.
+        """
+        want = f'"sighash":"{sighash.lower()}"'
+        want_spaced = f'"sighash": "{sighash.lower()}"'
+        try:
+            with open(self.path, "r", errors="replace") as f:
+                for line in f:
+                    if want not in line and want_spaced not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if str(rec.get("sighash", "")).lower() == sighash.lower():
+                        return rec
+        except OSError:
+            return None
         return None
 
 
@@ -800,9 +823,39 @@ def main():
             seize_scale = int(loan.price_scale)
             # Kept for the published record, so a third party can re-check the
             # judgement rather than only the price.
-            seize_loan = dict(req.get("loan") or {})
+            # The loan this oracle actually JUDGED, not the requester's raw
+            # object. Every key it does not use is dropped before the sighash
+            # is rebuilt, so keeping them would put an unbounded amount of
+            # somebody else's filler into a log every reader of this tier's
+            # accountability has to page through.
+            seize_loan = _BC.loan_to_dict(loan)
             seize_offer_sig = str(req.get("offer_sig") or "")
             seize_offer_lots = int(req.get("offer_lots", 1) or 1)
+        else:
+            # NOTHING is pinned on this path. Without a request there is no
+            # loan, so the sighash is 32 bytes somebody else computed and this
+            # oracle cannot rebuild; and no lender-signed offer, so the strike
+            # it is judged against is one the seizing party typed. The strike
+            # is in no Bitcoin script, so a lender naming any figure above
+            # today's price passes the price check below and takes the
+            # collateral of a loan that was never liquidatable -- which is the
+            # exact act this oracle's own documentation says it refuses.
+            #
+            # The same explicit opt-in as a request that carries no offer
+            # signature, and for the same reason.
+            if not args.allow_unpinned_strike:
+                raise SystemExit(
+                    "--sign-seize with a bare --sighash pins nothing: there is "
+                    "no loan for this oracle to rebuild the sighash from, and "
+                    "no lender-signed offer pinning the strike, so the number "
+                    "it would be judged against is one the party asking for "
+                    "the seizure chose. A strike above today's price passes "
+                    "every check here and takes collateral from a healthy "
+                    "loan.\n\nUse --request <file>, which carries the loan and "
+                    "the lender's own signature over its terms. "
+                    "--allow-unpinned-strike says you have checked this "
+                    "seizure by hand and accept that the published record "
+                    "cannot show anyone else why it was justified.")
         missing = [f for f, v in (("--sighash", args.sighash),
                                   ("--market", args.market),
                                   ("--strike", args.strike)) if not v]

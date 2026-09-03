@@ -90,7 +90,10 @@ def cli(*args, wallet, rig, book, expect=0):
            "--book", book, "--rpc", f"http://127.0.0.1:{rig.seq_rpcport}",
            "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS,
            "--rpc-wallet", wallet]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    # From the rig's directory: `offer-fund` keeps an offer's terms beside the
+    # operator before it locks the principal, and a test run from the checkout
+    # leaves those files in it.
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=rig.root)
     if r.returncode != expect:
         print(r.stdout); print(r.stderr)
         raise AssertionError(f"{' '.join(args[:2])} exited {r.returncode}")

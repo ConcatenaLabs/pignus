@@ -875,6 +875,34 @@ def seq_fee_choice(node, prefer=(), flow="repay4"):
     return F.pick_fee(table, holdings, flow, prefer=tuple(prefer))
 
 
+def seq_fee_for(node, fee_asset, flow="btcrepay"):
+    """What `flow` costs in atoms OF THIS ASSET, at the node's own rate.
+
+    Atoms are not comparable across assets: the same fee value is a different
+    number of atoms in every one of them, because `fee_atoms` divides by that
+    asset's rate. So an asset the caller named has to be priced at its own
+    rate -- pricing at another's and paying in this one is either a thousandfold
+    overpay to the block producer or a transaction under the relay floor, and
+    which of the two it is depends on which pair of assets happened to be
+    involved.
+
+    An asset the node publishes no rate for cannot pay a fee here, and saying
+    so is more use than a number taken from somewhere else.
+    """
+    from . import fees as F
+    table = F.fee_table(node)
+    rate = table["rates"].get(fee_asset)
+    if not rate:
+        raise ValueError(
+            f"the node publishes no fee exchange rate for "
+            f"{str(fee_asset)[:12]}..., so it cannot pay a fee. Nothing here "
+            f"will price it from another asset's rate: atoms of one asset are "
+            f"not atoms of another.")
+    return F.fee_atoms(rate, F.VSIZE.get(flow, 2000),
+                       table.get("feerate_rfa_per_kvb",
+                                 F.DEFAULT_FEERATE_RFA_PER_KVB))
+
+
 def _find_vout(node, raw_hex, spk):
     """The output paying `spk`, found rather than assumed. An index guessed at
     is an index that is wrong the day a wallet reorders its outputs."""
@@ -893,10 +921,15 @@ def _pay_into(node, spk, asset, amount, *, change_spk=None, fee_asset=None,
     the payment must be explicit too. Returns (txid, vout).
     """
     m, _ = _seq_tf()
-    if fee_asset is None or fee is None:
-        chosen, atoms = seq_fee_choice(node, prefer=(asset,), flow=flow)
-        fee_asset = fee_asset or chosen
-        fee = int(fee if fee is not None else atoms)
+    if fee is None:
+        if fee_asset:
+            # Priced at the asset that will actually PAY it. Choosing again
+            # here would price at whatever the wallet happened to prefer and
+            # then emit that number of atoms of the caller's asset instead.
+            fee = seq_fee_for(node, fee_asset, flow=flow)
+        else:
+            fee_asset, fee = seq_fee_choice(node, prefer=(asset,), flow=flow)
+    fee = int(fee)
     need = {asset: int(amount)}
     need[fee_asset] = need.get(fee_asset, 0) + int(fee)
     coins = _seq_explicit_many(node, need)
@@ -1236,6 +1269,53 @@ def preimage_from_claim(node, claim_txid, vout=0, expect_hash=None):
 MIN_ANCHOR_DEPTH = 2
 
 
+class AnchorCheck(tuple):
+    """(ok, sequentia_confirmations), and WHY it came out that way.
+
+    A tuple, so every `ok, conf = anchor_safe(...)` keeps working. What it adds
+    is the reason: the Sequentia depth is only one of four ways this can fail,
+    and a refusal that reports it as though it were the answer sends a lender
+    to wait for Sequentia blocks when the problem is a shallow Bitcoin anchor,
+    or an anchor that is gone, or a transaction nobody can find.
+
+    `reason` is one of: "ok", "shallow" (fewer Sequentia confirmations than
+    asked), "unfindable", "unreadable-block", "anchor-gone", "anchor-shallow".
+    `anchor_conf` is how deep the parent-chain header is, when that is known.
+    """
+
+    def __new__(cls, ok, conf, reason="ok", anchor_conf=None):
+        r = super().__new__(cls, (bool(ok), int(conf)))
+        r.reason = reason
+        r.anchor_conf = anchor_conf
+        return r
+
+    def explain(self, min_depth, min_anchor_depth=None):
+        """One sentence naming what is actually not satisfied."""
+        n = min_anchor_depth if min_anchor_depth is not None \
+            else MIN_ANCHOR_DEPTH
+        return {
+            "ok": "it is safe to spend on",
+            "shallow": (f"it has {self[1]} Sequentia confirmation(s), below "
+                        f"the {min_depth} this asks for"),
+            "unfindable": ("this node cannot find that transaction at all, so "
+                           "there is nothing to measure"),
+            "unreadable-block": ("this node would not read the Sequentia block "
+                                 "it is in, so its Bitcoin anchor cannot be "
+                                 "checked"),
+            "anchor-gone": ("the Bitcoin header its Sequentia block anchored "
+                            "to is not in the parent chain this node follows: "
+                            "it was reorged away, or this node has not seen "
+                            "it. Sequentia follows Bitcoin, so that block is "
+                            "going too"),
+            "anchor-shallow": (f"its Bitcoin anchor is only "
+                               f"{self.anchor_conf} block(s) deep, below the "
+                               f"{n} required. Sequentia reorgs when Bitcoin "
+                               f"reorgs, so more Sequentia blocks would not "
+                               f"help -- what has to bury is the Bitcoin "
+                               f"header"),
+        }.get(self.reason, self.reason)
+
+
 def anchor_safe(node, txid, min_depth=6, vout_hint=0, btc_node=None,
                 min_anchor_depth=MIN_ANCHOR_DEPTH, height=None):
     """Is it safe to spend on the strength of a secret read off this chain?
@@ -1255,32 +1335,40 @@ def anchor_safe(node, txid, min_depth=6, vout_hint=0, btc_node=None,
     Pass `height` when the caller already knows which Sequentia block the
     transaction landed in; it saves a backward scan, and it is the only way to
     re-check a transaction whose outputs have since been spent.
-    Returns (ok, confirmations); a transaction nobody can find is never safe.
+    Returns an `AnchorCheck`, which is `(ok, confirmations)` and also carries
+    the REASON -- because four different failures reach this return and only
+    one of them is about Sequentia depth. A transaction nobody can find is
+    never safe.
     """
     if height is None:
         conf, height = tx_depth(node, txid, vout_hint)
     else:
         conf = max(0, int(node.getblockcount()) - int(height) + 1)
-    if conf < int(min_depth) or height is None:
-        return False, max(0, conf)
+    if height is None:
+        return AnchorCheck(False, max(0, conf), "unfindable")
+    if conf < int(min_depth):
+        return AnchorCheck(False, max(0, conf), "shallow")
     if btc_node is None:
-        return True, conf
+        return AnchorCheck(True, conf)
     try:
         block = node.getblock(node.getblockhash(int(height)), 1)
     except Exception:                                   # noqa: BLE001
-        return False, max(0, conf)
+        return AnchorCheck(False, max(0, conf), "unreadable-block")
     anchor = block.get("anchorhash") or ""
     if not anchor or int(anchor, 16) == 0:
         # A chain without anchoring: Sequentia depth is all there is.
-        return True, conf
+        return AnchorCheck(True, conf)
     try:
         header = btc_node.getblockheader(anchor, True)
     except Exception:                                   # noqa: BLE001
         # The anchor is not in the parent chain this node follows. Either it
         # was reorged away -- in which case the Sequentia block is going too --
         # or this node cannot see it. Neither is a thing to spend on.
-        return False, max(0, conf)
-    return int(header.get("confirmations", -1)) >= int(min_anchor_depth), conf
+        return AnchorCheck(False, max(0, conf), "anchor-gone")
+    deep = int(header.get("confirmations", -1))
+    return AnchorCheck(deep >= int(min_anchor_depth), conf,
+                       "ok" if deep >= int(min_anchor_depth)
+                       else "anchor-shallow", deep)
 
 
 # ------------------------------------------------------------- Bitcoin funding

@@ -1682,6 +1682,10 @@ async function confirmAndSend(label, make, opts = {}) {
     note(`<b>${esc(label)} — cancelled.</b> Nothing was signed or sent.`, "info");
     return null;
   }
+  // `noSend` means the caller only wanted the ANSWER and the fee: a flow that
+  // composes and broadcasts elsewhere still owes its reader the same summary
+  // and the same choice of fee asset before it spends.
+  if (opts.noSend) return fee;
 
   const lines = [...built.summary,
     `Network fee: ${amount(built.fee ?? fee.atoms, fee.asset)}`]
@@ -2160,7 +2164,25 @@ async function confirmations(txid, maxVout = 4) {
  * honest: the asset the payment is already spending is preferred, and what the
  * payment itself needs is set aside before the fee is priced.
  */
-function btcUi({ flow = "btcrepay", prefer = [], committed = {} } = {}) {
+/**
+ * Ask, before a Sequentia leg of a cross-chain loan spends anything.
+ *
+ * The page's own copy says fees are paid in whichever asset you choose at the
+ * confirmation step, and the two largest actions on this tier -- claiming the
+ * principal and repaying the debt -- went straight to the wallet with a fee
+ * nobody was shown. Both build a Sequentia payment, so both belong behind the
+ * same dialog every other spend uses.
+ *
+ * Returns the chosen fee, or null if the reader said no.
+ */
+async function confirmBtcSpend(label, lines, { flow, prefer = [],
+                                               committed = {} }) {
+  return confirmAndSend(label, () => ({ pset: null, summary: lines }),
+                        { flow, prefer, committed, noSend: true });
+}
+
+function btcUi({ flow = "btcrepay", prefer = [], committed = {},
+                fee = null } = {}) {
   return {
     esc, units, ticker: (a) => meta(a).ticker,
     atomsToBtc: (n) => pig.fixed(BigInt(n), 8, 8),
@@ -2184,7 +2206,9 @@ function btcUi({ flow = "btcrepay", prefer = [], committed = {} } = {}) {
     utxos: async () => state.utxos,
     changeSpk: async () => state.payout.spk,
     feeRates: async () => {
-      const f = feeFor(flow, prefer, committed);
+      // The fee the reader CHOSE, where they were asked. Picking again here
+      // would quietly overrule them.
+      const f = fee || feeFor(flow, prefer, committed);
       // `estimated` says the book publishes no size for this flow and the fee
       // was priced at the largest size it does publish, so a screen that draws
       // its own confirmation can say so rather than charging for a guess in
@@ -2384,7 +2408,17 @@ async function btcStep(rec, force) {
   const d = esc(meta(l.debt_asset).ticker);
   try {
     if (step.action === "claim") {
-      const ui = btcUi({ flow: "btcclaim", prefer: [l.debt_asset] });
+      // Asked FIRST. This builds and broadcasts a Sequentia payment, and the
+      // page's own copy promises a confirmation step with a choice of fee
+      // asset before anything is spent.
+      const fee = await confirmBtcSpend("Claim the principal", [
+        `Take ${units(principal, l.debt_asset)} ${d}, which starts this loan`,
+        "Claiming it publishes the secret your lender needs to move your " +
+          "collateral into its vault",
+        `Repay by Sequentia block ${btcborrow.effectiveRepayDeadline(l).toLocaleString()} to get the Bitcoin back`,
+      ], { flow: "btcclaim", prefer: [l.debt_asset] });
+      if (!fee) return;
+      const ui = btcUi({ flow: "btcclaim", prefer: [l.debt_asset], fee });
       const txid = await btcborrow.claimPrincipal(state.wallet, rec, ui);
       // What actually happened, and what has NOT. Claiming publishes the
       // secret the lender needs; the lender is the one who then moves the
@@ -2400,7 +2434,16 @@ async function btcStep(rec, force) {
         `is live, repay by ${whenText(btcborrow.effectiveRepayDeadline(l), "Sequentia")} to ` +
         "get the Bitcoin back.", "ok");
     } else if (step.action === "repay") {
-      const ui = btcUi({ flow: "btcrepay", prefer: [l.debt_asset],
+      const fee = await confirmBtcSpend("Repay", [
+        `Pay ${units(l.debt, l.debt_asset)} ${d} into a hashlocked output`,
+        "Your lender can only take it by publishing the secret that releases " +
+          "your Bitcoin, so repaying and getting the collateral back are one act",
+        `If they never claim it, you take the repayment back after Sequentia ` +
+          `block ${Number(l.repay_deadline).toLocaleString()}`,
+      ], { flow: "btcrepay", prefer: [l.debt_asset],
+           committed: { [l.debt_asset]: big(l.debt) } });
+      if (!fee) return;
+      const ui = btcUi({ flow: "btcrepay", prefer: [l.debt_asset], fee,
                          committed: { [l.debt_asset]: big(l.debt) } });
       const txid = await btcborrow.repay(state.wallet, rec, ui);
       note(`<b>Debt paid.</b> <a href="${txLink(txid)}" class="mono">${esc(txid)}</a>. ` +
