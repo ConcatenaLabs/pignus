@@ -683,8 +683,30 @@ def check_seize_request(request, require_offer=True):
     not the default, and `pignus-oracle` makes it an explicit flag.
     """
     from . import btc_relay as R
-    loan = loan_from_dict(request["loan"])
-    dest = bytes.fromhex(request["dest_spk"])
+    # A request is a file somebody else wrote. A missing field is a malformed
+    # request, not a bug here, and it deserves a sentence naming what is
+    # absent -- a KeyError traceback reaching an oracle operator at the moment
+    # somebody's collateral is waiting on their answer tells them nothing they
+    # can act on.
+    want_fields = ("loan", "dest_spk", "funding_txid", "funding_vout", "fee",
+                   "sighash")
+    absent = [f for f in want_fields if request.get(f) in (None, "")]
+    if absent:
+        raise ValueError(
+            "this seizure request is missing " + ", ".join(absent)
+            + ". `pignus-cli btc-seize-sighash --out` writes one with every "
+              "field; a request without them cannot be checked at all, and an "
+              "unchecked seizure is the one thing this refuses.")
+    try:
+        loan = loan_from_dict(request["loan"])
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"the loan in this seizure request cannot be read: "
+                         f"{e}") from None
+    try:
+        dest = bytes.fromhex(request["dest_spk"])
+    except ValueError:
+        raise ValueError("this request's dest_spk is not hex, so where the "
+                         "collateral would go cannot be read") from None
     want = seize_sighash(loan, request["funding_txid"],
                          int(request["funding_vout"]), dest,
                          int(request["fee"])).hex()
@@ -913,6 +935,21 @@ def _find_vout(node, raw_hex, spk):
     raise ValueError("that transaction pays nothing to the expected script")
 
 
+def _dust_fold(node, fee_asset):
+    """The change threshold for `fee_asset`, from the NODE's own rate.
+
+    Per asset and rate-dependent: a fixed number of atoms is either given away
+    on a valuable asset or refused by the relay on a cheap one. Zero when the
+    node publishes no rate, which means "fold nothing" rather than a guess.
+    """
+    try:
+        from . import fees as F
+        rate = F.fee_table(node)["rates"].get(fee_asset)
+        return F.dust_atoms(rate) if rate else 0
+    except Exception:                                   # noqa: BLE001
+        return 0
+
+
 def _pay_into(node, spk, asset, amount, *, change_spk=None, fee_asset=None,
               fee=None, flow="btcrepay"):
     """Pay `amount` atoms of `asset` into `spk`, explicitly, from a node wallet.
@@ -944,10 +981,22 @@ def _pay_into(node, spk, asset, amount, *, change_spk=None, fee_asset=None,
         tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout)))
     tx.vout.append(m.CTxOut(m.CTxOutValue(int(amount)), spk,
                             m.CTxOutAsset(_aout(asset))))
+    # Change below the node's own dust threshold goes to the FEE rather than to
+    # an output. An output the network calls dust is one nobody will relay a
+    # spend of, so keeping it is not keeping the money -- it is a coin that
+    # exists and cannot move. Every other composer in this repository folds it,
+    # and the browser does too; this tier's Sequentia legs did not.
+    fold = _dust_fold(node, fee_asset)
+    fee = int(fee)
     for a, total in have.items():
-        if total - need.get(a, 0) > 0:
-            tx.vout.append(m.CTxOut(m.CTxOutValue(total - need.get(a, 0)),
-                                    change_spk, m.CTxOutAsset(_aout(a))))
+        rest = total - need.get(a, 0)
+        if rest <= 0:
+            continue
+        if a == fee_asset and rest < fold:
+            fee += rest
+            continue
+        tx.vout.append(m.CTxOut(m.CTxOutValue(rest), change_spk,
+                                m.CTxOutAsset(_aout(a))))
     tx.vout.append(m.CTxOut(m.CTxOutValue(int(fee)),
                             nAsset=m.CTxOutAsset(_aout(fee_asset))))
     signed = node.signrawtransactionwithwallet(tx.serialize().hex())
@@ -1033,10 +1082,16 @@ def _spend_hashlock(node, tap, leaves, txid, vout, leaf, *, value, asset,
     m, _ = _seq_tf()
     from test_framework.messages import tx_from_hex
     value = _outpoint_value(node, txid, vout, asset, value)
-    if fee_asset is None or fee is None:
-        chosen, atoms = seq_fee_choice(node, prefer=(asset,), flow="btcclaim")
-        fee_asset = fee_asset or chosen
-        fee = int(fee if fee is not None else atoms)
+    if fee is None:
+        if fee_asset:
+            # At the asset that will PAY it. Choosing again here prices at
+            # whatever the wallet prefers and then pays the caller's asset that
+            # other asset's number of atoms.
+            fee = seq_fee_for(node, fee_asset, flow="btcclaim")
+        else:
+            fee_asset, fee = seq_fee_choice(node, prefer=(asset,),
+                                            flow="btcclaim")
+    fee = int(fee)
     fee_coins = _seq_explicit_many(node, {fee_asset: int(fee)})
     if change_spk is None:
         from .vault import wallet_payout
@@ -1052,11 +1107,19 @@ def _spend_hashlock(node, tap, leaves, txid, vout, leaf, *, value, asset,
     have = {}
     for o in fee_coins:
         have[o.asset] = have.get(o.asset, 0) + o.amount
+    # Change under the node's own dust threshold goes to the fee: an output the
+    # network calls dust is one nobody will relay a spend of, so keeping it
+    # keeps nothing.
+    fold = _dust_fold(node, fee_asset)
     for a, total in have.items():
         change = total - (int(fee) if a == fee_asset else 0)
-        if change > 0:
-            tx.vout.append(m.CTxOut(m.CTxOutValue(change), change_spk,
-                                    m.CTxOutAsset(_aout(a))))
+        if change <= 0:
+            continue
+        if a == fee_asset and change < fold:
+            fee += change
+            continue
+        tx.vout.append(m.CTxOut(m.CTxOutValue(change), change_spk,
+                                m.CTxOutAsset(_aout(a))))
     tx.vout.append(m.CTxOut(m.CTxOutValue(int(fee)),
                             nAsset=m.CTxOutAsset(_aout(fee_asset))))
     partial = node.signrawtransactionwithwallet(tx.serialize().hex())

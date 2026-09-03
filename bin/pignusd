@@ -150,6 +150,7 @@ from pignus import oracle as O                      # noqa: E402
 from pignus import fees as F                        # noqa: E402
 from pignus.book import Book, OfferExists, TakeMoved  # noqa: E402
 from pignus.node import Node, RpcError              # noqa: E402
+from pignus.ratelimit import RateLimiter            # noqa: E402
 from pignus.offers import (                         # noqa: E402
     NotOnChain, check_outpoint, offer_address, offer_vault_address,
 )
@@ -285,51 +286,18 @@ OFFER_FIELDS = ("terms", "kind", "outpoint", "principal", "collateral",
                 "expiry_locktime", "manage_token")
 
 
-class _RateLimiter:
-    """A token bucket per client, so the public book cannot be flooded with
-    writes. Generous for a testnet -- a real user publishes a handful of
-    offers, not hundreds a second."""
-    def __init__(self, rate=1.0, burst=20):
-        self.rate, self.burst = rate, burst
-        self._buckets = {}
-        self._lock = threading.Lock()
-        self._calls = 0
-
-    def allow(self, key, now):
-        with self._lock:
-            self._calls += 1
-            if self._calls % 1000 == 0 or len(self._buckets) > 10_000:
-                self._sweep(now)
-            tokens, last = self._buckets.get(key, (self.burst, now))
-            tokens = min(self.burst, tokens + (now - last) * self.rate)
-            if tokens < 1.0:
-                self._buckets[key] = (tokens, now)
-                return False
-            self._buckets[key] = (tokens - 1.0, now)
-            return True
-
-    def _sweep(self, now):
-        """Forget buckets that have refilled to full: they say the same thing
-        as a client never seen before, and once the key is a real client
-        address the map would otherwise grow forever."""
-        idle = self.burst / self.rate
-        for k in [k for k, (_t, last) in self._buckets.items()
-                  if now - last >= idle]:
-            del self._buckets[k]
-
-
-WRITE_LIMIT = _RateLimiter()
+WRITE_LIMIT = RateLimiter()
 # A second bucket for everyone together, so a flood spread over many source
 # addresses still cannot rewrite the book file thousands of times a second.
-GLOBAL_WRITE_LIMIT = _RateLimiter(rate=20.0, burst=200)
+GLOBAL_WRITE_LIMIT = RateLimiter(rate=20.0, burst=200)
 # Reads that touch the NODE, which is a different cost from reads served out of
 # memory: `/v1/spend` walks blocks backwards and `/v1/outpoint` asks the node
 # per call. Both are unauthenticated and both must stay so -- a borrower
 # recovering their own collateral has no account here -- so they are rationed
 # instead. Roomier than the write limit, because a page legitimately makes a
 # handful in a row.
-SCAN_LIMIT = _RateLimiter(rate=2.0, burst=30)
-GLOBAL_SCAN_LIMIT = _RateLimiter(rate=40.0, burst=400)
+SCAN_LIMIT = RateLimiter(rate=2.0, burst=30)
+GLOBAL_SCAN_LIMIT = RateLimiter(rate=40.0, burst=400)
 
 # Records that cannot be rendered, and the error each last failed with. Every
 # list is fetched every few seconds by every open page and by the liquidator,

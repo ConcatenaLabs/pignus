@@ -64,6 +64,7 @@ uses it when a take needs a person. In every case the command did what it was
 asked -- what is not true is that the thing is finished.
 """
 
+from typing import NoReturn
 import argparse
 import inspect
 import json
@@ -78,15 +79,26 @@ from pignus import __version__ as PIGNUS_VERSION  # noqa: E402
 from pignus import atoms, compat, oracle as O    # noqa: E402
 from pignus import atoms as _atoms, units      # noqa: E402
 from pignus.btc_collateral import MIN_UPGRADE_FEE   # noqa: E402
+from pignus import locktime_open as _pkg_locktime_open   # noqa: E402
 from pignus.node import Node                    # noqa: E402
 from pignus.openamp import PledgeError          # noqa: E402
 from pignus.terms import LoanTerms, feed_id     # noqa: E402
 from pignus.watcher import VaultWatcher         # noqa: E402
 
 
-def refuse(message):
+def refuse(message) -> NoReturn:
     """A check failed, so nothing was built. Exit status 2, always, so that a
-    script can tell a refusal from a crash."""
+    script can tell a refusal from a crash.
+
+    Every deliberate refusal in this file goes through here rather than raising
+    SystemExit with a message of its own, because that form exits 1 -- the
+    status this tool documents as "could not run". A caller that branches on the
+    difference, and the responder and the drills both do, was told a failed
+    check and a crashed command were the same event.
+
+    This never returns, which is what lets a check read as a guard: the code
+    after a refuse() call runs only when the check passed.
+    """
     print(f"REFUSED: {message}", file=sys.stderr)
     raise SystemExit(2)
 
@@ -144,12 +156,30 @@ def terms_doc(path):
     `offer-take` prints {"terms": {...}, "txid", "vout", ...}; a plain terms
     document is the object itself. Accepting both means the output of one
     command is the input of the next without hand editing.
+
+    A path that is not there, or a file that is not the document it should be,
+    is answered with a sentence rather than a traceback. Every command here
+    takes `--terms`, so a mistyped path is the commonest wrong thing an
+    operator can hand this tool, and a Python traceback tells them their
+    software is broken when what happened is that they mistyped a path.
     """
-    with open(path) as f:
-        d = json.load(f)
-    if "collateral_asset" not in d and isinstance(d.get("terms"), (dict, str)):
-        return LoanTerms.from_json(d["terms"]), d
-    return LoanTerms.from_json(d), d
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except OSError as e:
+        refuse(f"cannot read the terms file {path}: {e.strerror}")
+    except ValueError as e:
+        refuse(f"{path} is not valid JSON ({e}). A terms file is what "
+               f"`propose`, `offer-fund` and `offer-take` write.")
+    if not isinstance(d, dict):
+        refuse(f"{path} holds a {type(d).__name__}, not a terms document")
+    try:
+        if ("collateral_asset" not in d
+                and isinstance(d.get("terms"), (dict, str))):
+            return LoanTerms.from_json(d["terms"]), d
+        return LoanTerms.from_json(d), d
+    except (KeyError, TypeError, ValueError) as e:
+        refuse(f"{path} is not a loan's terms: {e}")
 
 
 def read_terms(path):
@@ -218,7 +248,7 @@ def split_market(market):
     """(collateral ticker, debt ticker) from a TICKER/TICKER market name."""
     parts = [p.strip().upper() for p in market.split("/")]
     if len(parts) != 2 or not all(parts):
-        raise SystemExit(f"--market must be TICKER/TICKER, got {market!r}")
+        refuse(f"--market must be TICKER/TICKER, got {market!r}")
     return parts[0], parts[1]
 
 
@@ -231,7 +261,7 @@ def cmd_quote(args):
                            args.debt_precision, args.price_scale)
     open_ltv = args.open_ltv / 100
     if not 0 < open_ltv <= 1:
-        raise SystemExit("--open-ltv is a percentage above 0 and at most 100")
+        refuse("--open-ltv is a percentage above 0 and at most 100")
     print(json.dumps({
         "market": f"{c}/{d}",
         "feed_id": feed_id(args.market).hex(),
@@ -332,8 +362,8 @@ def cmd_verify(args):
             args.txid = doc.get("txid")
             args.vout = int(doc.get("vout") or 0)
         if args.txid is None:
-            raise SystemExit("verify needs --spk or --txid, or a terms file "
-                             "that carries the funding outpoint")
+            refuse("verify needs --spk or --txid, or a terms file "
+                   "that carries the funding outpoint")
         funded = _funded_spk(args)
     want = True if args.single_leaf else (False if args.four_leaf else None)
     try:
@@ -371,7 +401,7 @@ def cmd_status(args):
         args.txid = doc.get("txid")
         args.vout = int(doc.get("vout") or 0)
     if args.txid is None:
-        raise SystemExit("status needs --txid, or a terms file that carries one")
+        refuse("status needs --txid, or a terms file that carries one")
     node = node_from(args)
     single = bool(args.single_leaf or doc.get("single_leaf"))
     got = node.gettxout(args.txid, args.vout, True)
@@ -396,7 +426,13 @@ def cmd_status(args):
         out["seizure_if_liquidated"] = t.seizure_at(args.price)
         out["surplus_if_liquidated"] = t.surplus_at(args.price)
     out["height"] = node.getblockcount()
-    out["past_maturity"] = out["height"] >= t.maturity
+    # In the maturity's OWN units. Every other reader here uses the package
+    # predicate; comparing a height to a Unix-time maturity says a loan matures
+    # nine thousand years from now, so `past_maturity` would read false for
+    # ever on a time-locked one -- and that field is what tells somebody the
+    # DEFAULT exit has opened.
+    out["past_maturity"] = _pkg_locktime_open(
+        t.maturity, out["height"], median_time(node, out["height"]))
     print(json.dumps(out, indent=2))
     return 0
 
@@ -408,8 +444,8 @@ def cmd_check_attestation(args):
     # row from an oracle's log does not, so --oracle-x is what names it there.
     oracle_x = args.oracle_x or d.get("oracle_x")
     if not oracle_x:
-        raise SystemExit("give --oracle-x: this attestation does not name the "
-                         "key it was signed with")
+        refuse("give --oracle-x: this attestation does not name the "
+               "key it was signed with")
     att = O.Attestation.from_dict({k: v for k, v in d.items() if k != "oracle_x"})
     ok = O.verify(oracle_x, att)
     # The SCALE, printed and optionally checked. It is not inside the
@@ -459,14 +495,15 @@ def _party_key(spec, what):
     try:
         raw = (sys.stdin.read() if spec == "-" else open(spec).read()).strip()
     except OSError as e:
-        raise SystemExit(f"cannot read {what} from {spec}: {e.strerror}") from None
+        refuse(f"cannot read {what} from {spec}: {e.strerror}")
     try:
         sec = bytes.fromhex(raw)
     except ValueError:
-        raise SystemExit(f"{spec} does not hold {what} as hex") from None
-    if len(sec) != 32:
-        raise SystemExit(f"{what} is 32 bytes of hex; {spec} holds {len(sec)}")
-    return sec
+        refuse(f"{spec} does not hold {what} as hex")
+    try:
+        return O.check_key(sec, f"{what} in {spec}")
+    except ValueError as e:
+        refuse(str(e))
 
 
 def _pledge_sig(spec, action, pledge_id, extra, signer_x=None):
@@ -484,18 +521,18 @@ def _pledge_sig(spec, action, pledge_id, extra, signer_x=None):
         with open(spec) as f:
             d = json.load(f)
         if d.get("action") != action or d.get("pledge") != pledge_id:
-            raise SystemExit(
+            refuse(
                 f"that signature authorises {d.get('action')} on pledge "
                 f"{d.get('pledge')}, not {action} on {pledge_id}")
         if (d.get("extra") or "") != (extra or ""):
-            raise SystemExit(f"that signature covers a different {named}: "
-                             f"{d.get('extra')!r}")
+            refuse(f"that signature covers a different {named}: "
+                   f"{d.get('extra')!r}")
         sig = d.get("signature")
         signer_x = signer_x or d.get("signed_by")
     if signer_x and not OA.verify_pledge_sig(signer_x, sig, action, pledge_id,
                                              extra):
-        raise SystemExit(f"that signature does not verify for this pledge and "
-                         f"{named}")
+        refuse(f"that signature does not verify for this pledge and "
+               f"{named}")
     return sig
 
 
@@ -523,7 +560,7 @@ def _pledge_client(args):
     from pignus import openamp as OA
     tok = args.token
     if not tok:
-        raise SystemExit(
+        refuse(
             "an issuer token is required (--token, or PIGNUS_ISSUER_TOKEN in the "
             "environment). It authenticates the caller; it does NOT authorise a "
             "release or a seizure, which need the parties' own signatures.")
@@ -565,7 +602,7 @@ def cmd_pledge_list(args):
     if getattr(args, "pledge", None):
         one = client.get(args.pledge)
         if one is None:
-            raise SystemExit(f"this issuer has no pledge {args.pledge}")
+            refuse(f"this issuer has no pledge {args.pledge}")
         out = [one]
     else:
         out = client.list(asset=args.asset, holder=args.holder,
@@ -588,16 +625,16 @@ def cmd_pledge_create(args):
             debt_asset=args.debt_asset, debt_atoms=args.debt_atoms,
             note=args.note)
     except ValueError as e:
-        raise SystemExit(f"error: {e}") from None
+        refuse(str(e))
     print(json.dumps(p, indent=2))
     _say_tier_c(p)
 
 
 def cmd_pledge_release(args):
     if not (args.key or args.lender_sig or args.force):
-        raise SystemExit("a release is the lender's word that the debt is "
-                         "settled: give --key <file>, or --lender-sig from "
-                         "`pledge-sign`, or --force with a --reason")
+        refuse("a release is the lender's word that the debt is "
+               "settled: give --key <file>, or --lender-sig from "
+               "`pledge-sign`, or --force with a --reason")
     sec = _party_key(args.key, "the LENDER's private key")
     signed = {}
     if args.lender_sig:
@@ -609,7 +646,7 @@ def cmd_pledge_release(args):
             args.pledge, lender_sec=sec, repaid_txid=args.repaid_txid,
             force=args.force, reason=args.reason, **signed)
     except ValueError as e:
-        raise SystemExit(f"error: {e}") from None
+        refuse(str(e))
     print(json.dumps(out, indent=2))
     _say_tier_c(out if isinstance(out, dict) and out.get("id") else None)
 
@@ -624,8 +661,8 @@ def cmd_pledge_seize(args):
     surrendering one pledge means.
     """
     if not (args.key or args.lender_sig):
-        raise SystemExit("a seizure needs the lender's authorisation: --key "
-                         "<file>, or --lender-sig from `pledge-sign`")
+        refuse("a seizure needs the lender's authorisation: --key "
+               "<file>, or --lender-sig from `pledge-sign`")
     lender = _party_key(args.key, "the LENDER's private key")
     signed = {}
     if args.holder_sig:
@@ -638,7 +675,7 @@ def cmd_pledge_seize(args):
         out = _pledge_client(args).seize(args.pledge, args.reason, lender,
                                          **signed)
     except ValueError as e:
-        raise SystemExit(f"error: {e}") from None
+        refuse(str(e))
     print(json.dumps(out, indent=2))
     _say_tier_c(out if isinstance(out, dict) and out.get("id") else None)
     # Say what actually happened. A seizure before maturity is TWO phases --
@@ -725,9 +762,9 @@ def cmd_repo_verify(args):
     t = _repo_terms(args)
     node = node_from(args)
     if bool(args.leg_txid) != bool(args.lender_cu):
-        raise SystemExit("--leg-txid and --lender-cu go together: leg one is "
-                         "checked by finding the collateral asset at the "
-                         "lender's own C_U address, which needs both")
+        refuse("--leg-txid and --lender-cu go together: leg one is "
+               "checked by finding the collateral asset at the "
+               "lender's own C_U address, which needs both")
     # A SPENT bond is not a failed check, it is a finished repurchase -- the
     # settlement or the forfeit took it. `verify_funding` cannot tell the two
     # apart (both look like "no such unspent output"), so the outpoint is asked
@@ -863,7 +900,7 @@ def _repo_spender(args, node, t):
     from pignus.vault import Outpoint
     got = node.gettxout(args.txid, args.vout, True)
     if got is None:
-        raise SystemExit("that bond vault is already spent")
+        refuse("that bond vault is already spent")
     if got["scriptPubKey"]["hex"] != t.script_pubkey().hex():
         refuse("the coin is not the vault these terms compile to")
     if "value" not in got or "asset" not in got:
@@ -924,7 +961,7 @@ def _coin_from_chain(node, spec, what):
     """
     txid, _, vout = str(spec).rpartition(":")
     if not txid or not vout.isdigit():
-        raise SystemExit(f"{what} takes txid:vout, got {spec!r}")
+        refuse(f"{what} takes txid:vout, got {spec!r}")
     got = node.gettxout(txid, int(vout), True)
     if got is None:
         refuse(f"{what} {spec} is not an unspent output: it is spent, or this "
@@ -1025,7 +1062,7 @@ def cmd_repo_settle(args):
                               ("--cu-lender", args.cu_lender),
                               ("--debt-utxo", args.debt_utxo)) if not v]
     if missing:
-        raise SystemExit(
+        refuse(
             "a settlement spends four named coins, in one order and no other: "
             + ", ".join(missing) + " missing. The verifier output and its own "
             "script come from the OpenDAMP transfer tool; --cu-lender is the "
@@ -1142,17 +1179,17 @@ def locktime_open(node, deadline, name, height=None):
     if deadline < LOCKTIME_THRESHOLD:
         if height >= deadline:
             return
-        raise SystemExit(f"{name} opens at block {deadline}; it is {height}")
+        refuse(f"{name} opens at block {deadline}; it is {height}")
     try:
         mtp = int(node.getblockheader(node.getblockhash(height))["mediantime"])
     except Exception as e:                              # noqa: BLE001
-        raise SystemExit(
+        refuse(
             f"{name} opens at Unix time {deadline} and this node would not "
             f"say what its median time is ({e}), so nothing here can tell "
-            "whether it is open yet") from None
+            "whether it is open yet")
     if mtp >= deadline:
         return
-    raise SystemExit(
+    refuse(
         f"{name} opens at Unix time {deadline}; this chain's median time "
         f"is {mtp}. A locktime at or above {LOCKTIME_THRESHOLD} is a time, "
         "not a height, and consensus compares it to the median of the last "
@@ -1227,17 +1264,17 @@ def choose_fee(node, args, flow, prefer=(), committed=None):
     # and priced a fee instead, adding an output the caller did not ask for.
     if args.fee_amount is not None:
         if int(args.fee_amount) < 0:
-            raise SystemExit("--fee-amount cannot be negative")
+            refuse("--fee-amount cannot be negative")
         asset = args.fee_asset or next(iter(prefer), None)
         if not asset:
-            raise SystemExit("--fee-amount needs --fee-asset")
+            refuse("--fee-amount needs --fee-asset")
         asset = resolve_asset(node, asset)
         return asset, int(args.fee_amount), rates.get(asset)
     if args.fee_asset:
         asset = resolve_asset(node, args.fee_asset)
         rate = rates.get(asset)
         if not rate:
-            raise SystemExit(f"the node publishes no fee rate for {args.fee_asset}")
+            refuse(f"the node publishes no fee rate for {args.fee_asset}")
         return asset, F.fee_atoms(rate, F.VSIZE[flow],
                                   table["feerate_rfa_per_kvb"]), rate
     # `committed` is what this transaction itself spends. A wallet funded with
@@ -1272,8 +1309,8 @@ def resolve_asset(node, label_or_hex):
     labels = node.dumpassetlabels()
     if label_or_hex in labels:
         return labels[label_or_hex]
-    raise SystemExit(f"unknown asset {label_or_hex!r}: give a 64-hex id or a "
-                     "label the node knows")
+    refuse(f"unknown asset {label_or_hex!r}: give a 64-hex id or a "
+           "label the node knows")
 
 
 def units_to_atoms(x, precision):
@@ -1305,30 +1342,30 @@ def resolve_oracle_set(oracle_x, spec, threshold, book=None):
     """
     spec = (spec or "").strip()
     if oracle_x and spec:
-        raise SystemExit("give --oracle-x or --oracles, not both: they compile "
-                         "to different vaults")
+        refuse("give --oracle-x or --oracles, not both: they compile "
+               "to different vaults")
     if not spec:
         if oracle_x:
             return oracle_x, (), 0
         if book:
             return book_get(book, "/v1/oracle")["oracle_x"], (), 0
-        raise SystemExit("give --oracle-x or --oracles")
+        refuse("give --oracle-x or --oracles")
     if spec.lower() == "book":
         if not book:
-            raise SystemExit("--oracles book needs a book to ask (--book)")
+            refuse("--oracles book needs a book to ask (--book)")
         keys = book_get(book, "/v1/oracles")["oracles"]
     else:
         keys = [k.strip() for k in spec.split(",") if k.strip()]
     if not keys:
-        raise SystemExit("--oracles resolved to no keys")
+        refuse("--oracles resolved to no keys")
     if len(keys) == 1:
         return keys[0], (), 0
     thr = threshold or len(keys)
     if not 1 <= thr <= len(keys):
-        raise SystemExit(f"--oracle-threshold {thr} outside 1..{len(keys)}")
+        refuse(f"--oracle-threshold {thr} outside 1..{len(keys)}")
     if thr == 1:
-        raise SystemExit("a 1-of-n oracle set is WEAKER than one oracle (any "
-                         "one key alone can liquidate); pick a threshold >= 2")
+        refuse("a 1-of-n oracle set is WEAKER than one oracle (any "
+               "one key alone can liquidate); pick a threshold >= 2")
     if thr == len(keys):
         print(f"warning: {thr}-of-{thr} oracles: while any one of them is down "
               "this loan cannot be liquidated at all", file=sys.stderr)
@@ -1388,13 +1425,13 @@ def _single_evidence(args, terms, market):
         if O.verify(terms.oracle_x, att):
             scales.add(int(att.price_scale))
     if scales:
-        raise SystemExit(
+        refuse(
             f"the oracle this loan names is quoting {terms.market} at price "
             f"scale {', '.join(str(s) for s in sorted(scales))} and this loan "
             f"computes at {terms.price_scale}; the covenant would misread that "
             "number, so nothing was built")
-    raise SystemExit("no verifiable attestation from the oracle THIS LOAN "
-                     f"names ({terms.oracle_x[:16]}…); refusing to build it")
+    refuse("no verifiable attestation from the oracle THIS LOAN "
+           f"names ({terms.oracle_x[:16]}…); refusing to build it")
 
 
 def _threshold_evidence(args, terms, market):
@@ -1409,8 +1446,8 @@ def _threshold_evidence(args, terms, market):
             if O.verify(ox, att, terms.price_scale):
                 ev[ox] = att
     if not ev:
-        raise SystemExit("none of this loan's oracles have a verifiable "
-                         "attestation at this loan's price scale right now")
+        refuse("none of this loan's oracles have a verifiable "
+               "attestation at this loan's price scale right now")
     return ev
 
 
@@ -1440,12 +1477,12 @@ def cmd_offer_fund(args):
     mk = next((m for m in markets["markets"]
                if m["market"].upper() == args.market.upper()), None)
     if mk is None:
-        raise SystemExit(f"the book has no market {args.market}")
+        refuse(f"the book has no market {args.market}")
     if not mk.get("lendable"):
         why = ("native BTC is cross-chain" if mk.get("cross_chain")
                else "the price is stale" if mk.get("stale")
                else "no asset id or no verified price")
-        raise SystemExit(f"{mk['market']} is not lendable here: {why}")
+        refuse(f"{mk['market']} is not lendable here: {why}")
     oracle_x, oracles, threshold = _resolve_oracles(args)
     # Terms are written in blocks, so a day is however many blocks this chain
     # makes in one; the book publishes its spacing rather than assuming 60s.
@@ -1458,7 +1495,7 @@ def cmd_offer_fund(args):
     debt = principal + int(round(principal * args.interest / 100))
     open_ltv, liq_ltv = args.open_ltv / 100, args.liq_ltv / 100
     if not 0 < open_ltv < liq_ltv <= 1:
-        raise SystemExit("need 0 < --open-ltv < --liq-ltv <= 100")
+        refuse("need 0 < --open-ltv < --liq-ltv <= 100")
     # collateral value must be principal / open_ltv, in debt atoms
     collateral = math.ceil(principal * scale / (price * open_ltv))
     strike = math.ceil(debt * scale / (collateral * liq_ltv))
@@ -1517,7 +1554,7 @@ def cmd_offer_fund(args):
             "expiry_locktime": expiry}
     kept = _save_offer_body(txid, body)
     if not kept:
-        raise SystemExit(
+        refuse(
             "the offer's terms could not be written to disk, and they are the "
             "only thing that can ever spend the coin this is about to lock. "
             "Refusing to broadcast: fix the directory and run this again.")
@@ -1600,13 +1637,13 @@ def _spending_tx(node, v):
         for tx in blk.get("tx", []):
             if tx.get("txid") == v.spent_by:
                 return tx
-        raise SystemExit(f"the block at height {v.spent_height} does not carry "
-                         f"{v.spent_by}; the chain has moved under this loan, "
-                         "so run this again once it has settled")
+        refuse(f"the block at height {v.spent_height} does not carry "
+               f"{v.spent_by}; the chain has moved under this loan, "
+               "so run this again once it has settled")
     if v.spent_by in (node.getrawmempool() or []):
         return node.getrawtransaction(v.spent_by, True)
-    raise SystemExit("the spending transaction is in no block this node has "
-                     "and in no mempool it holds; there is nothing to read")
+    refuse("the spending transaction is in no block this node has "
+           "and in no mempool it holds; there is nothing to read")
 
 
 def _book_loan_key(terms, txid, vout):
@@ -1655,15 +1692,15 @@ def cmd_explain(args):
                 said = json.loads(e.read().decode() or "{}").get("error")
             except ValueError:
                 said = None
-            raise SystemExit(f"the book: {said or e.reason}") from None
+            refuse(f"the book: {said or e.reason}")
     else:
         node = node_from(args)
         t, doc = terms_doc(args.terms)
         txid = args.txid or doc.get("txid")
         vout = int(args.vout if args.vout is not None else (doc.get("vout") or 0))
         if not txid:
-            raise SystemExit("give --txid: the terms file carries no funding "
-                             "outpoint")
+            refuse("give --txid: the terms file carries no funding "
+                   "outpoint")
         single = bool(args.single_leaf or doc.get("single_leaf"))
         w = VaultWatcher(node)
         # The id a BOOK knows this loan by, computed the same way a book does:
@@ -1675,15 +1712,15 @@ def cmd_explain(args):
                     single_leaf=single)
         w.poll()
         if not v.spent_by:
-            raise SystemExit(f"{txid}:{vout} has not been spent, so this loan "
-                             f"has no ending yet (it is {v.state.value})")
+            refuse(f"{txid}:{vout} has not been spent, so this loan "
+                   f"has no ending yet (it is {v.state.value})")
         tx = _spending_tx(node, v)
         k = next((i for i, vin in enumerate(tx.get("vin", []))
                   if vin.get("txid") == v.txid
                   and int(vin.get("vout", -1)) == v.vout), -1)
         if k < 0:
-            raise SystemExit(f"{v.spent_by} does not spend {txid}:{vout}; this "
-                             "is not the transaction that closed this loan")
+            refuse(f"{v.spent_by} does not spend {txid}:{vout}; this "
+                   "is not the transaction that closed this loan")
         out = w.explain_exit(v, tx, k)
         # The same spelling the book uses, because comparing the two accounts
         # is the whole reason this branch exists: a diff between them should
@@ -1726,8 +1763,8 @@ def cmd_offer_publish(args):
     with open(args.body) as f:
         body = json.load(f)
     if body.get("kind") != "funded" or not body.get("outpoint"):
-        raise SystemExit(f"{args.body} is not the record offer-fund prints: it "
-                         "needs kind 'funded' and the offer's outpoint")
+        refuse(f"{args.body} is not the record offer-fund prints: it "
+               "needs kind 'funded' and the offer's outpoint")
     code, rec = book_post(args.book, "/v1/offers", body)
     if code != 200:
         print(f"the book refused the offer: {rec.get('error')}", file=sys.stderr)
@@ -1746,8 +1783,8 @@ def _load_offer(args, node):
     expiry = int(off["expiry_locktime"])
     got = node.gettxout(txid, int(vout), True)
     if got is None:
-        raise SystemExit("that offer's coin is gone: it was taken in full or "
-                         "withdrawn")
+        refuse("that offer's coin is gone: it was taken in full or "
+               "withdrawn")
     want = offer_address(terms, principal, collateral, expiry).hex()
     have = got["scriptPubKey"]["hex"]
     if want != have:
@@ -1771,8 +1808,8 @@ def cmd_offer_take(args):
     off, base, coin, principal, collateral, expiry = _load_offer(args, node)
     ver, prog, spk = wallet_payout(node)
     if ver != base.borrower_ver:
-        raise SystemExit(f"this offer is for witness-v{base.borrower_ver} "
-                         f"borrowers and this wallet pays out at v{ver}")
+        refuse(f"this offer is for witness-v{base.borrower_ver} "
+               f"borrowers and this wallet pays out at v{ver}")
     # WHEN, as well as what. The offer's TAKE leaf carries no locktime -- only
     # its REFUND does -- so a funded offer stays takeable for as long as the
     # lender leaves the coin there, which is the whole point of an offer a
@@ -1783,18 +1820,18 @@ def cmd_offer_take(args):
     # did not.
     height = int(node.getblockcount())
     if height >= int(base.maturity) and not args.force:
-        raise SystemExit(
+        refuse(
             f"this offer's loans mature at block {base.maturity} and the chain "
             f"is at {height}. A loan taken now is one anybody may call at any "
             f"price immediately, whatever the collateral is worth. Refusing; "
             f"--force to take it anyway.")
     if height >= int(base.recover_after) and not args.force:
-        raise SystemExit(
+        refuse(
             f"this offer's loans let the lender sweep the collateral without "
             f"an oracle from block {base.recover_after}, and the chain is at "
             f"{height}. There is no loan left in these terms. Refusing.")
     if expiry and height >= int(expiry) and not args.force:
-        raise SystemExit(
+        refuse(
             f"this offer expired at block {expiry} and the chain is at "
             f"{height}: the lender can take their coin back at any moment, and "
             f"a take that races that loses the fee. Refusing; --force to try.")
@@ -1880,16 +1917,16 @@ def cmd_offer_delist(args):
     """
     code, r = book_delete(args.book, f"/v1/offers/{args.offer}", args.token)
     if code == 403:
-        raise SystemExit(
+        refuse(
             "that manage token is not this listing's. It is served once, when "
             "the listing is published, and only its hash is stored -- so a "
             "token that is gone cannot be recovered. The listing expires on "
             "its own at the offer's expiry, and the COIN is yours throughout: "
             "`offer-withdraw` brings it back once that expiry opens.")
     if code == 404:
-        raise SystemExit(f"this book has no listing {args.offer}")
+        refuse(f"this book has no listing {args.offer}")
     if code != 200:
-        raise SystemExit(f"the book refused: {r.get('error') or code}")
+        refuse(f"the book refused: {r.get('error') or code}")
     print(json.dumps({"offer_id": args.offer, "delisted": True,
                       "note": "the listing is gone; the coin is untouched and "
                               "comes back with offer-withdraw at its expiry"},
@@ -1902,7 +1939,7 @@ def cmd_offer_withdraw(args):
     off, terms, coin, principal, collateral, expiry = _load_offer(args, node)
     height = node.getblockcount()
     if height < expiry:
-        raise SystemExit(f"the offer expires at block {expiry}; it is {height}")
+        refuse(f"the offer expires at block {expiry}; it is {height}")
     _ver, _prog, spk = wallet_payout(node)
     fee_asset, fee, rate = choose_fee(node, args, "withdraw")
     # `withdraw_offer` selects its own funding, and selecting can broadcast a
@@ -1937,8 +1974,8 @@ def _load_loan(args, node):
         txid = args.txid or doc.get("txid")
         vout = int(args.vout if args.vout is not None else (doc.get("vout") or 0))
         if not txid:
-            raise SystemExit("give --txid: the terms file carries no funding "
-                             "outpoint")
+            refuse("give --txid: the terms file carries no funding "
+                   "outpoint")
         loan = {"terms": terms.to_json(), "txid": txid, "vout": vout}
     else:
         loan = book_get(args.book, f"/v1/loan/{args.loan}")
@@ -1946,7 +1983,7 @@ def _load_loan(args, node):
         txid, vout = loan["txid"], int(loan["vout"])
     got = node.gettxout(txid, vout, True)
     if got is None:
-        raise SystemExit("that vault is already spent")
+        refuse("that vault is already spent")
     try:
         single = match_vault(terms, got["scriptPubKey"]["hex"]) == "single-leaf"
     except ValueError as e:
@@ -2191,8 +2228,19 @@ def add_btc_node_args(p):
 
 
 def _read_key(path):
-    with open(path) as f:
-        return bytes.fromhex(f.read().strip())
+    """A lender's or borrower's key, checked the way the oracle's is.
+
+    This key is the whole of its holder's authority in a loan, so it gets the
+    same two checks: that no other user can read the file, and that what is in
+    it is a key at all. A truncated or empty file otherwise fails much later,
+    as a release the borrower's covenant will not accept.
+    """
+    try:
+        return O.read_key(path, "that key")
+    except OSError as e:
+        refuse(f"cannot read the key file {path}: {e.strerror}")
+    except ValueError as e:
+        refuse(str(e))
 
 
 def _write_key(path, sec):
@@ -2299,22 +2347,22 @@ class _ResponderState:
                 with open(path) as f:
                     self.data = json.load(f)
             except OSError as e:
-                raise SystemExit(
+                refuse(
                     f"the responder's state file {path} exists and cannot be "
                     f"read ({e}). It is what stops a principal being paid "
                     f"twice; refusing to start rather than begin from an "
-                    f"empty one.") from None
+                    f"empty one.")
             except ValueError as e:
                 # Mirroring `Book._load`, and for the same reason: an empty
                 # state file is a responder that will pay every principal it
                 # has already paid. A corrupt one is a thing to restore from
                 # backup, never a thing to overwrite.
-                raise SystemExit(
+                refuse(
                     f"the responder's state file {path} is not valid JSON "
                     f"({e}); refusing to start rather than begin from an empty "
                     f"one and pay every principal again. Restore it from a "
                     f"backup, or move it aside on purpose if this key really "
-                    f"has no loans in flight.") from None
+                    f"has no loans in flight.")
 
     def _must_be_writable(self):
         """Refuse to start if this file cannot be written, and say so HERE.
@@ -2336,7 +2384,7 @@ class _ResponderState:
             os.close(fd)
             os.unlink(probe)
         except OSError as e:
-            raise SystemExit(
+            refuse(
                 f"the responder's state file cannot be written: {self.path} "
                 f"({type(e).__name__}: {e}).\n"
                 f"This file is what stops a principal being paid twice -- the "
@@ -2345,7 +2393,7 @@ class _ResponderState:
                 f"Put it in a directory this process may write. Under systemd "
                 f"that means one named by ReadWritePaths=, not the key "
                 f"directory, which ProtectHome=read-only makes read-only on "
-                f"purpose. ({d} is not writable.)") from None
+                f"purpose. ({d} is not writable.)")
 
     def _take_lock(self):
         """One responder per key, enforced by the filesystem.
@@ -2385,10 +2433,10 @@ class _ResponderState:
             except OSError as e:
                 f.close()
                 # THIS is contention: the file exists and somebody holds it.
-                raise SystemExit(
+                refuse(
                     f"another responder already holds {lock}: two on one "
                     f"lender key pay two principals for one loan. Stop that "
-                    f"one first ({type(e).__name__}: {e})") from e
+                    f"one first ({type(e).__name__}: {e})")
             self._lockf = f
             try:
                 f.seek(0)
@@ -2398,7 +2446,7 @@ class _ResponderState:
             except OSError:
                 pass                        # the flock is the lock, not the text
             return
-        raise SystemExit(
+        refuse(
             f"no writable place for a responder lock: tried "
             f"{', '.join(places)} ({type(last).__name__}: {last}). One "
             "responder per lender key is not optional -- two pay two "
@@ -2513,15 +2561,15 @@ def cmd_btc_propose(args):
     # disputing it afterwards has nothing to point at. The relay refuses a
     # cross-chain offer without one; a ticket passed by hand had no such check.
     if not int(args.strike or 0):
-        raise SystemExit(
+        refuse(
             "this loan names no strike, so there would be nothing to hold the "
             "lender and the oracle to if they took the collateral. A seizure "
             "here is the two of them signing together, not a script computing "
             "anything. Give --strike.")
     if args.oracle_x == loan.lender_x:
-        raise SystemExit("the lender cannot be their own oracle: that is a "
-                         "loan whose holder decides on their own when to seize "
-                         "it")
+        refuse("the lender cannot be their own oracle: that is a "
+               "loan whose holder decides on their own when to seize "
+               "it")
     tk = loan_to_dict(loan)
     tk["_stage"] = "proposed"
     _save_ticket(args, tk)
@@ -2563,10 +2611,10 @@ def cmd_btc_prepare(args):
     if seq_height is not None:
         problems = timelocks_sane(loan, btc.getblockcount(), int(seq_height))
         if problems and not args.force:
-            raise SystemExit("these terms are not safe to enter:\n  - "
-                             + "\n  - ".join(problems)
-                             + "\nRe-run with --force only if you understand "
-                               "exactly what you are accepting.")
+            refuse("these terms are not safe to enter:\n  - "
+                   + "\n  - ".join(problems)
+                   + "\nRe-run with --force only if you understand "
+                     "exactly what you are accepting.")
 
     txid, vout, fhex = fund_bitcoin(btc, loan, feerate=args.feerate,
                                     broadcast=False)
@@ -2643,14 +2691,14 @@ def cmd_btc_originate(args):
     vault_txid = upgrade_tx(loan, tk["prevault_txid"],
                             int(tk["prevault_vout"])).txid()
     if vault_txid != tk.get("vault_txid"):
-        raise SystemExit("the ticket's vault does not follow from its own "
-                         "funding and terms: something has been altered since "
-                         "you prepared it")
+        refuse("the ticket's vault does not follow from its own "
+               "funding and terms: something has been altered since "
+               "you prepared it")
     rtx = reclaim_tx(loan, vault_txid, 0, bytes.fromhex(tk["reclaim_dest"]),
                      int(tk.get("reclaim_fee", args.btc_fee)))
     if not check_release(loan, rtx, bytes.fromhex(tk["release_sig"])):
-        raise SystemExit("the lender's release does NOT verify against these "
-                         "terms. Nothing has been broadcast.")
+        refuse("the lender's release does NOT verify against these "
+               "terms. Nothing has been broadcast.")
     # Only now can the move into the vault be signed: its address commits to the
     # hash the lender has just drawn.
     presig = presign_upgrade(loan, tk["prevault_txid"],
@@ -2701,7 +2749,7 @@ def cmd_btc_disburse(args):
     tk = _ticket(args)
     loan = loan_from_dict(tk)
     if tk.get("disbursement_txid") and not args.force:
-        raise SystemExit(
+        refuse(
             f"this ticket already records a principal paid at "
             f"{tk['disbursement_txid']}. Paying again would put a second one "
             f"at the same address, opened by the same secret, and the borrower "
@@ -2714,14 +2762,14 @@ def cmd_btc_disburse(args):
                                asset=loan.debt_asset,
                                amount=int(loan.principal) or int(loan.debt))
     except ScanFailed as e:
-        raise SystemExit(
+        refuse(
             f"cannot check whether a principal for this loan is already on "
             f"chain: {e}\nRefusing rather than risk paying twice -- a second "
             f"principal sits at the same address, opens to the same secret, "
             f"and the borrower takes both. Try again, or --force if you know "
-            f"none went out.") from None
+            f"none went out.")
     if already and not args.force:
-        raise SystemExit(
+        refuse(
             f"a principal for this loan is already on chain, unspent, at "
             f"{already[0]}:{already[1]}. This ticket does not record it -- it "
             f"is an older copy, or the payment was made from elsewhere. "
@@ -2730,13 +2778,13 @@ def cmd_btc_disburse(args):
                                    int(tk["prevault_vout"]),
                                    min_conf=args.disburse_conf)
     if not ok:
-        raise SystemExit(f"not disbursing: {why}")
+        refuse(f"not disbursing: {why}")
     if not check_upgrade_presig(loan, tk["prevault_txid"],
                                 int(tk["prevault_vout"]),
                                 bytes.fromhex(tk.get("upgrade_presig", ""))):
-        raise SystemExit("the borrower's advance signature does not move that "
-                         "collateral into this loan's vault, so the loan could "
-                         "never start. Not disbursing.")
+        refuse("the borrower's advance signature does not move that "
+               "collateral into this loan's vault, so the loan could "
+               "never start. Not disbursing.")
     txid, vout = pay_disbursement(seq, loan,
                                   fee_asset=_seq_fee_asset(args, seq))
     tk.update(disbursement_txid=txid, disbursement_vout=vout,
@@ -2843,7 +2891,7 @@ def cmd_btc_claim_principal(args):
     tk = _ticket(args)
     tk, _ = _refresh_from_book(args, tk)
     if not tk.get("disbursement_txid"):
-        raise SystemExit(
+        refuse(
             "this ticket does not say where the principal was paid, and "
             "nothing could be pulled from a book. The lender reports it once "
             "they have paid: give --book, or ask them for the outpoint and "
@@ -2888,7 +2936,7 @@ def cmd_btc_upgrade(args):
         # one of them is about Sequentia depth -- reporting that number as the
         # answer sends a lender to wait for Sequentia blocks when the problem
         # is a shallow Bitcoin anchor, and no number of them would help.
-        raise SystemExit(
+        refuse(
             "the claim that published the secret is not safe to act on yet: "
             + safe.explain(args.min_depth)
             + ". Sequentia reorgs when Bitcoin reorgs; re-run with --force to "
@@ -2914,8 +2962,8 @@ def cmd_btc_abort(args):
     loan = loan_from_dict(tk)
     height = btc.getblockcount()
     if height < loan.abort_after and not args.force:
-        raise SystemExit(f"the collateral becomes abortable at Bitcoin block "
-                         f"{loan.abort_after}; the chain is at {height}")
+        refuse(f"the collateral becomes abortable at Bitcoin block "
+               f"{loan.abort_after}; the chain is at {height}")
     dest = (bytes.fromhex(btc.getaddressinfo(args.dest)["scriptPubKey"])
             if args.dest else bytes.fromhex(tk["reclaim_dest"]))
     tx = abort_tx(loan, tk["prevault_txid"], int(tk["prevault_vout"]), dest,
@@ -2933,6 +2981,11 @@ def cmd_btc_refund_principal(args):
     seq = node_from(args)
     tk = _ticket(args)
     loan = loan_from_dict(tk)
+    # The locktime, before composing anything. A transaction built into a
+    # closed one is rejected by the node as `non-final` -- after the preparing
+    # send that made its explicit coins has already been paid for -- and the
+    # rejection says nothing about WHEN it opens.
+    locktime_open(seq, loan.d_refund, "the principal's refund")
     txid = refund_disbursement(seq, loan, tk["disbursement_txid"],
                                int(tk["disbursement_vout"]),
                                fee_asset=_seq_fee_asset(args, seq))
@@ -2995,19 +3048,19 @@ def cmd_btc_responder_status(args):
     _btc_cfg(args)
     path = args.state or (args.lender_key and args.lender_key + ".state.json")
     if not path:
-        raise SystemExit(
+        refuse(
             "give --state, or --lender-key, or a --config naming one: this "
             "reads a responder's state file and nothing here says which.")
     try:
         with open(path) as f:
             data = json.load(f)
     except OSError as e:
-        raise SystemExit(f"cannot read {path}: {e}") from None
+        refuse(f"cannot read {path}: {e}")
     except ValueError as e:
-        raise SystemExit(
+        refuse(
             f"{path} is not valid JSON ({e}). The responder refuses to start "
             f"on it too, rather than begin from an empty one and pay every "
-            f"principal again. Restore it from a backup.") from None
+            f"principal again. Restore it from a backup.")
 
     def stage(h):
         if h.get("secret_published"):
@@ -3053,8 +3106,16 @@ def cmd_btc_responder_status(args):
                                and not h.get(flag)],
             "last_error": h.get("last_error"),
         })
-    stuck = [r for r in rows if "IN FLIGHT" in r["stage"]
-             or "not recorded" in r["stage"]]
+    # A send that went out and was NOT recorded: the one thing a responder
+    # cannot repair for itself, because clearing the flag blind pays a second
+    # principal. The claim and the refund are different -- each writes its
+    # intent before broadcasting and finds its own transaction on the next
+    # pass by the outpoint it spent -- so raising the alarm on them sends an
+    # operator to `btc-responder-clear`, which refuses them, for something that
+    # was already fixing itself.
+    stuck = [r for r in rows if "DISBURSEMENT IN FLIGHT" in r["stage"]]
+    healing = [r for r in rows
+               if r not in stuck and "not recorded" in r["stage"]]
     # And the offers this key signed that a book is now serving with a
     # signature that does not check out. A responder skips every take of one,
     # silently, so a live loan under it stops being claimed and its borrower's
@@ -3063,6 +3124,7 @@ def cmd_btc_responder_status(args):
     disowned = _disowned_offers(args, lender_x_of(args))
     print(json.dumps({"state": path, "takes": len(rows),
                       "needing_attention": len(stuck) + len(disowned),
+                      "recovering": len(healing),
                       "disowned_offers": disowned, "rows": rows}, indent=2))
     if disowned:
         print(f"{len(disowned)} offer(s) name this key and do not verify under "
@@ -3077,6 +3139,13 @@ def cmd_btc_responder_status(args):
               f"this key would stand behind twice the lots it meant to. "
               f"Re-signing keeps the id, the takes and the loans already under "
               f"it.", file=sys.stderr)
+    if healing:
+        print(f"{len(healing)} take(s) are recovering on their own: a claim or "
+              f"a refund was broadcast and the answer lost, and each wrote the "
+              f"outpoint it spent before sending -- so the next pass finds its "
+              f"own transaction on the chain. Nothing to do; "
+              f"`btc-responder-clear` refuses these, and rightly.",
+              file=sys.stderr)
     if stuck:
         print(f"{len(stuck)} take(s) need attention: a send went out and was "
               f"not recorded. The responder retries by looking at the chain; "
@@ -3086,6 +3155,8 @@ def cmd_btc_responder_status(args):
     # 4 means "a person is needed", and an offer whose takes are being skipped
     # needs one exactly as much as a send that was lost: both leave a loan that
     # will not move, and neither clears itself.
+    # 4 means "a person is needed". A take recovering on its own does not need
+    # one, so it is reported and does not raise the alarm.
     return 4 if (stuck or disowned) else 0
 
 
@@ -3103,15 +3174,15 @@ def cmd_btc_responder_clear(args):
     _btc_cfg(args)
     path = args.state or (args.lender_key and args.lender_key + ".state.json")
     if not path:
-        raise SystemExit(
+        refuse(
             "give --state, or --lender-key, or a --config naming one: this "
             "writes a responder's state file and nothing here says which.")
     state = _ResponderState(path, exclusive=True)   # refuses if one is running
     have = state.get(args.take)
     if not have:
-        raise SystemExit(f"{path} has no record of take {args.take}")
+        refuse(f"{path} has no record of take {args.take}")
     if not have.get("disbursing"):
-        raise SystemExit(
+        refuse(
             f"take {args.take} has no disbursement in flight; there is nothing "
             f"to clear. Its state: {json.dumps(have, sort_keys=True)[:200]}")
     spk = have["disbursing"]
@@ -3120,10 +3191,10 @@ def cmd_btc_responder_clear(args):
         try:
             found = _find_output(node, spk)
         except ScanFailed as e:
-            raise SystemExit(
+            refuse(
                 f"the chain could not be checked ({e}). Refusing: clearing "
                 f"this flag while a payment might be on chain is how a second "
-                f"principal goes out.") from None
+                f"principal goes out.")
         if args.found:
             # The chain CONFIRMS what was passed rather than refusing over it.
             # Refusing here made the command's own instruction a dead end: it
@@ -3134,17 +3205,17 @@ def cmd_btc_responder_clear(args):
             try:
                 out = node.gettxout(want_txid, int(want_vout), True)
             except (ValueError, Exception) as e:        # noqa: BLE001
-                raise SystemExit(f"{args.found} cannot be read on this node "
-                                 f"({type(e).__name__}: {e})") from None
+                refuse(f"{args.found} cannot be read on this node "
+                       f"({type(e).__name__}: {e})")
             if out is None:
-                raise SystemExit(
+                refuse(
                     f"{args.found} is not an unspent output on this node. If "
                     f"the borrower has already claimed the principal it is "
                     f"gone from the UTXO set, and the responder finds it from "
                     f"their own report instead -- leave the flag alone and let "
                     f"it.")
             if out.get("scriptPubKey", {}).get("hex") != spk:
-                raise SystemExit(
+                refuse(
                     f"{args.found} does not pay this loan's disbursement "
                     f"address. That address is derived from the loan's own "
                     f"commitment, so a coin somewhere else is somebody else's "
@@ -3154,19 +3225,19 @@ def cmd_btc_responder_clear(args):
                       f"{found[0]}:{found[1]}; recording the one you named.",
                       file=sys.stderr)
         elif found:
-            raise SystemExit(
+            refuse(
                 f"a payment to {spk[:24]}… IS on chain at {found[0]}:{found[1]}. "
                 f"Do not clear this: record it instead, with "
                 f"`btc-responder-clear --take {args.take} --found "
                 f"{found[0]}:{found[1]}`.")
     elif args.found and not args.force:
-        raise SystemExit(
+        refuse(
             "give node credentials so the outpoint you named can be checked "
             "against this loan's own disbursement address, or --force if you "
             "have checked by hand. Recording the wrong outpoint tells the "
             "responder a principal was paid where it was not.")
     elif not args.force:
-        raise SystemExit(
+        refuse(
             "give node credentials so this can check the chain first, or "
             "--force if you have checked by hand. Clearing the flag while a "
             "payment is on chain pays a second principal.")
@@ -3388,7 +3459,7 @@ def cmd_btc_repay(args):
     # there. Both are opened by the same secret, the lender takes both, and
     # the borrower cannot reach either before `repay_deadline`.
     if tk.get("repay_txid") and not args.force:
-        raise SystemExit(
+        refuse(
             f"this ticket already records a repayment at {tk['repay_txid']}. "
             f"Paying again puts a second debt at the same address, opened by "
             f"the same secret, and the lender takes both -- you could not "
@@ -3401,14 +3472,14 @@ def cmd_btc_repay(args):
         already = _find_output(node, loan.repayment_spk().hex(),
                                asset=loan.debt_asset, amount=int(loan.debt))
     except ScanFailed as e:
-        raise SystemExit(
+        refuse(
             f"cannot check whether a repayment for this loan is already on "
             f"chain: {e}\nRefusing rather than risk paying twice -- a second "
             f"debt sits at the same address, opens to the same secret, and "
             f"the lender takes both. Try again, or --force if you know none "
-            f"went out.") from None
+            f"went out.")
     if already and not args.force:
-        raise SystemExit(
+        refuse(
             f"a repayment for this loan is already on chain, unspent, at "
             f"{already[0]}:{already[1]}. This ticket does not record it -- it "
             f"is an older copy, or the payment was made from elsewhere. "
@@ -3445,7 +3516,7 @@ def cmd_btc_claim(args):
     # back. The margin exists so that is never a race the lender can enter.
     limit = effective_repay_deadline(loan)
     if height >= limit and not args.force:
-        raise SystemExit(
+        refuse(
             f"it is Sequentia block {height} and this loan stops being safely "
             f"claimable at {limit} (its written deadline is "
             f"{loan.repay_deadline}). Claiming now publishes the secret with "
@@ -3456,7 +3527,7 @@ def cmd_btc_claim(args):
     # replace, after reading the secret out of the claim's witness.
     conf = tx_confirmations(node, tk["repay_txid"], int(tk["repay_vout"]))
     if conf < args.min_depth and not args.force:
-        raise SystemExit(
+        refuse(
             f"the repayment at {tk['repay_txid'][:16]}… has {max(0, conf)} "
             f"confirmation(s), below the {args.min_depth} this asks for. It "
             f"signals replacement, so claiming now puts the secret in the "
@@ -3494,7 +3565,7 @@ def cmd_btc_reclaim(args):
         # check. Two refusals for one condition, each asserting a different
         # half of it as though it were the whole, is how a lender concludes
         # the tool is broken.
-        raise SystemExit(
+        refuse(
             "the claim that published your secret is not safe to act on yet: "
             + safe.explain(args.min_depth)
             + ". Spending Bitcoin on a secret a reorg could undo loses both "
@@ -3576,6 +3647,18 @@ def cmd_btc_timeout(args):
     lender = _read_key(args.lender_key)
     tk = _ticket(args)
     loan = loan_from_dict(tk)
+    # The TIMEOUT locktime, before anything is composed. Bitcoin rejects a
+    # transaction built into a closed one as `non-final`, and says nothing
+    # about when it opens; this is that sentence, on a chain where a lender
+    # sweeping too early has a long wait ahead of them.
+    height = int(btc.getblockcount())
+    if height < int(loan.recover_after):
+        refuse(
+            f"the TIMEOUT sweep opens at Bitcoin block {loan.recover_after} "
+            f"and the chain is at {height}: {int(loan.recover_after) - height} "
+            f"block(s) to go, about "
+            f"{(int(loan.recover_after) - height) * 10 // 60} hour(s). Bitcoin "
+            f"would reject this as non-final.")
     dest = (bytes.fromhex(btc.getaddressinfo(args.dest)["scriptPubKey"])
             if args.dest else
             bytes.fromhex(btc.getaddressinfo(btc.getnewaddress())["scriptPubKey"]))
@@ -3595,6 +3678,7 @@ def cmd_btc_refund(args):
     node = node_from(args)
     tk = _ticket(args)
     loan = loan_from_dict(tk)
+    locktime_open(node, loan.repay_deadline, "the repayment's refund")
     txid = refund_repayment(node, loan, tk["repay_txid"], int(tk["repay_vout"]),
                             fee_asset=_seq_fee_asset(args, node))
     tk["_stage"] = "refunded"
@@ -3636,15 +3720,15 @@ def cmd_btc_offer_take(args):
 
     offer = book_get(args.book, f"/v1/btc/offer/{args.offer}")
     if offer.get("status", "open") != "open":
-        raise SystemExit(f"that offer is {offer.get('status')}")
+        refuse(f"that offer is {offer.get('status')}")
     if not R.verify_offer(offer["loan"], offer.get("market", ""),
                           int(offer.get("lots", 1)),
                           offer.get("offer_sig", "")):
-        raise SystemExit("that offer is not signed by the key it names as the "
-                         "lender. Refusing to fund anything against it.")
+        refuse("that offer is not signed by the key it names as the "
+               "lender. Refusing to fund anything against it.")
     if offer["loan"].get("oracle_x") == offer["loan"].get("lender_x"):
-        raise SystemExit("the lender has named their own key as the oracle, so "
-                         "they could seize the collateral on their own say-so")
+        refuse("the lender has named their own key as the oracle, so "
+               "they could seize the collateral on their own say-so")
 
     w = A.new_secret()
     _write_key(args.borrower_key + ".w", w)
@@ -3700,7 +3784,7 @@ def cmd_btc_offer_take(args):
                    f"collateral would then sit until you abort it at Bitcoin "
                    f"block {loan.abort_after}.")
             if not args.force:
-                raise SystemExit(msg + " Re-run with --force to take it anyway.")
+                refuse(msg + " Re-run with --force to take it anyway.")
             print("warning: " + msg, file=sys.stderr)
     except SystemExit:
         raise
@@ -3709,8 +3793,8 @@ def cmd_btc_offer_take(args):
 
     problems = timelocks_sane(loan, btc.getblockcount(), seq.getblockcount())
     if problems and not args.force:
-        raise SystemExit("this offer's deadlines are not safe to enter:\n  - "
-                         + "\n  - ".join(problems))
+        refuse("this offer's deadlines are not safe to enter:\n  - "
+               + "\n  - ".join(problems))
 
     ptxid, pvout, phex = fund_bitcoin(btc, loan, feerate=args.feerate,
                                       broadcast=False)
@@ -3727,7 +3811,7 @@ def cmd_btc_offer_take(args):
         "btc_height": btc.getblockcount(),
         "reclaim_dest": dest.hex(), "reclaim_fee": args.btc_fee})
     if code != 200:
-        raise SystemExit(f"the relay refused the take: {take.get('error')}")
+        refuse(f"the relay refused the take: {take.get('error')}")
 
     # The lender draws this loan's secret, and its hash goes into both chains'
     # scripts -- so the vault, and the advance signature that moves collateral
@@ -3735,8 +3819,8 @@ def cmd_btc_offer_take(args):
     reserved = _await_take(args, take["take_id"],
                            lambda r: r.get("payment_hash"), args.wait)
     if not reserved:
-        raise SystemExit("the lender did not answer in time, and nothing has "
-                         "been broadcast. Your Bitcoin is untouched.")
+        refuse("the lender did not answer in time, and nothing has "
+               "been broadcast. Your Bitcoin is untouched.")
     loan = loan_from_dict({**loan_to_dict(loan),
                            "payment_hash": reserved["payment_hash"],
                            "adaptor_point": reserved.get("adaptor_point", "")})
@@ -3746,22 +3830,22 @@ def cmd_btc_offer_take(args):
                         {"take_id": take["take_id"],
                          "upgrade_presig": presig.hex()})
     if code != 200:
-        raise SystemExit(f"the relay refused the advance signature: "
-                         f"{r.get('error')}")
+        refuse(f"the relay refused the advance signature: "
+               f"{r.get('error')}")
 
     signed = _await_take(args, take["take_id"],
                          lambda r: r.get("status") in ("signed", "disbursed"),
                          args.wait)
     if not signed:
-        raise SystemExit("the lender did not sign in time, and nothing has "
-                         "been broadcast. Your Bitcoin is untouched; try again "
-                         "when their responder is back online.")
+        refuse("the lender did not sign in time, and nothing has "
+               "been broadcast. Your Bitcoin is untouched; try again "
+               "when their responder is back online.")
     if not check_release(loan, reclaim_tx(loan, vault_txid, 0, dest,
                                           args.btc_fee),
                          bytes.fromhex(signed.get("release_sig")
                                        or signed["adaptor_sig"])):
-        raise SystemExit("the lender's release does NOT verify against these "
-                         "terms. Nothing has been broadcast.")
+        refuse("the lender's release does NOT verify against these "
+               "terms. Nothing has been broadcast.")
     # The ticket goes to DISK BEFORE the broadcast. Everything in it is already
     # decided -- the pre-vault's txid comes from the signed transaction, not
     # from the node -- and it is the only thing that can ever move this
@@ -3814,7 +3898,7 @@ def cmd_btc_offer_publish(args):
     lender = _read_key(args.lender_key)
     lender_x = A.xonly_pubkey(lender).hex()
     if args.oracle_x == lender_x:
-        raise SystemExit("the lender cannot be their own oracle")
+        refuse("the lender cannot be their own oracle")
     # The upgrade's fee, priced from a Bitcoin node rather than left at a
     # constant. That transaction is signed in advance by both parties, spends
     # a covenant leaf and sets a final sequence, so it can be neither replaced
@@ -3830,11 +3914,11 @@ def cmd_btc_offer_publish(args):
             print(f"upgrade fee {args.upgrade_fee} satoshis, priced from the "
                   f"Bitcoin node. It cannot be raised later.", file=sys.stderr)
         except Exception as e:                          # noqa: BLE001
-            raise SystemExit(
+            refuse(
                 f"no --upgrade-fee given and this node would not price one "
                 f"({type(e).__name__}: {e}). That fee is fixed at origination "
                 f"and can never be raised, so it must not be guessed: give "
-                f"--upgrade-fee, or point --btc-rpc at a node.") from None
+                f"--upgrade-fee, or point --btc-rpc at a node.")
     loan = {
         "btc_amount": args.btc_amount, "lender_x": lender_x,
         "oracle_x": args.oracle_x, "recover_after": args.recover_after,
@@ -3852,7 +3936,7 @@ def cmd_btc_offer_publish(args):
             "offer_sig": R.sign_offer(lender, loan, args.market or "", lots)}
     code, rec = book_post(args.book, "/v1/btc/offers", body)
     if code != 200:
-        raise SystemExit(f"relay refused the offer: {rec.get('error')}")
+        refuse(f"relay refused the offer: {rec.get('error')}")
     print(json.dumps({"btc_offer_id": rec["btc_offer_id"], "lots": lots,
                       "note": "keep the responder running while this rests"},
                      indent=2))
@@ -3870,7 +3954,7 @@ def cmd_btc_offer_withdraw(args):
                         {"sig": R.sign_report(lender, R.WITHDRAW_TAG,
                                               args.offer)})
     if code != 200:
-        raise SystemExit(f"relay refused: {r.get('error')}")
+        refuse(f"relay refused: {r.get('error')}")
     print(json.dumps({"btc_offer_id": args.offer, "status": "withdrawn"},
                      indent=2))
     return 0
@@ -3899,7 +3983,7 @@ def cmd_btc_offer_resign(args):
     from pignus import adaptor as A
     lender_x = A.xonly_pubkey(lender).hex()
     if loan.get("lender_x") != lender_x:
-        raise SystemExit(
+        refuse(
             f"that offer names lender {str(loan.get('lender_x'))[:16]}... and "
             f"this key is {lender_x[:16]}...: only the lender an offer names "
             "can sign for it")
@@ -3912,7 +3996,7 @@ def cmd_btc_offer_resign(args):
     code, r = book_post(args.book, f"/v1/btc/offers/{args.offer}/resign",
                         {"offer_sig": sig})
     if code != 200:
-        raise SystemExit(f"relay refused: {r.get('error')}")
+        refuse(f"relay refused: {r.get('error')}")
     print(json.dumps({"btc_offer_id": args.offer, "resigned": True},
                      indent=2))
     return 0
@@ -3939,7 +4023,7 @@ def cmd_btc_respond(args):
                                        btc_feerate, UPGRADE_VSIZE)
     _btc_cfg(args)
     if not args.lender_key:
-        raise SystemExit("--lender-key, or a config file naming one, is required")
+        refuse("--lender-key, or a config file naming one, is required")
     lender = _read_key(args.lender_key)
     lender_x = A.xonly_pubkey(lender).hex()
     state = _ResponderState(args.state or (args.lender_key + ".state.json"),
@@ -3962,7 +4046,7 @@ def cmd_btc_respond(args):
                               ("--btc-rpc (the Bitcoin node)", btc_node))
                if v is None]
     if missing and not args.sign_only:
-        raise SystemExit(
+        refuse(
             "a responder needs both chains: " + ", ".join(missing) + " is not "
             "configured. Without it this key would sign releases and then "
             "never pay a principal or claim a repayment, and every loan taken "
@@ -4931,6 +5015,19 @@ def cmd_btc_respond(args):
                     print(f"take {tk['take_id']}: re-sent the "
                           f"{path.rsplit('/', 1)[1]} report", file=sys.stderr)
                     n += 1
+                elif code in (400, 403, 404, 409):
+                    # A refusal this responder can never argue its way out of:
+                    # the take is gone, the report is rejected, or the take has
+                    # ended somewhere this report cannot reach. Retried on every
+                    # pass it is an unbounded loop against the relay that never
+                    # finishes, and it hides the passes that ARE making
+                    # progress. Recorded as sent so it stops, and said ONCE so
+                    # an operator can see why.
+                    state.set(tk["take_id"], **{flag: True})
+                    print(f"take {tk['take_id']}: the relay will not take the "
+                          f"{path.rsplit('/', 1)[1]} report (HTTP {code}: "
+                          f"{(_r or {}).get('error', '')}). Not trying again.",
+                          file=sys.stderr)
         return n
 
     PASSES = (("hash", hash_pass), ("sign", sign_pass),
@@ -5265,7 +5362,8 @@ def add_btc_commands(sub):
     p.add_argument("--min-depth", type=int, default=6,
                    help="confirmations required on the borrower's claim before "
                         "acting on it")
-    p.add_argument("--force", action="store_true")
+    p.add_argument("--force", action="store_true",
+        help="upgrade even though the claim that published the secret is not yet buried. Sequentia reorgs when Bitcoin does, so a secret read from a shallow block can be un-published under you.")
     p.add_argument("--out")
     add_node_args(p)
     add_btc_node_args(p)
@@ -5279,7 +5377,8 @@ def add_btc_commands(sub):
     p.add_argument("--dest", help="a Bitcoin address (default: the reclaim "
                                   "address in the ticket)")
     p.add_argument("--btc-fee", type=int, default=3000)
-    p.add_argument("--force", action="store_true")
+    p.add_argument("--force", action="store_true",
+        help="build the abort even though the collateral is not yet abortable. The transaction cannot confirm until abort_after, so this only produces one early.")
     p.add_argument("--out")
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_abort)
@@ -5350,7 +5449,8 @@ def add_btc_commands(sub):
     p.add_argument("--borrower-key", required=True)
     p.add_argument("--btc-fee", type=int, default=3000)
     p.add_argument("--min-depth", type=int, default=6)
-    p.add_argument("--force", action="store_true")
+    p.add_argument("--force", action="store_true",
+        help="reclaim on a secret read from a block that is not yet buried. This spends BITCOIN on a secret Sequentia may still take back, and the collateral is what is at stake.")
     p.add_argument("--out")
     add_node_args(p)
     add_btc_node_args(p)
@@ -5426,7 +5526,8 @@ def add_btc_commands(sub):
     p.add_argument("--btc-fee", type=int, default=3000)
     p.add_argument("--wait", type=float, default=90,
                    help="seconds to wait for the lender's release")
-    p.add_argument("--force", action="store_true")
+    p.add_argument("--force", action="store_true",
+        help="take the offer even though a check said not to: deadlines that are already too close, or an upgrade fee too small to confirm. Each refusal says which, and this overrides all of them.")
     p.add_argument("--out", required=True, help="where to write the ticket")
     add_book_arg(p)
     add_node_args(p)

@@ -559,6 +559,38 @@ def main():
         rec = json.loads(r.stdout)
         check("the co-signature is over the sighash it was given",
               rec["sighash"] == sighash)
+
+        # A loan naming SOMEBODY ELSE's oracle. The Bitcoin script asks for the
+        # key the loan baked in, so this signature would authorise nothing --
+        # while the published record said this oracle had approved a seizure it
+        # has no part in.
+        from pignus import btc_collateral as BC             # noqa: PLC0415
+        mine = run_oracle(cfg_path, "--print-pubkey").stdout.strip()
+        seize_base = dict(
+            btc_amount=100000, lender_x="bb" * 32, borrower_x="cc" * 32,
+            debt_asset="dd" * 32, debt=1000, repay_deadline=200000,
+            recover_after=900000, market="GOLD/USDX", strike=400,
+            price_scale=100000, lender_prog="ee" * 20, lender_ver=0,
+            payment_hash="ff" * 32)
+        for who, key, refused_for_key in (("this oracle", mine, False),
+                                          ("another oracle", "11" * 32, True)):
+            loan = BC.loan_from_dict({**seize_base, "oracle_x": key})
+            # A real request: `seize_request` writes every field, including the
+            # sighash rebuilt from these very terms, so nothing is refused for
+            # a reason of its own and the key is what decides.
+            req = BC.seize_request(loan, "aa" * 32, 0, b"\x00\x14" + b"\xee" * 20,
+                                   1000)
+            rp = os.path.join(work, f"seize-{who.replace(' ', '-')}.json")
+            json.dump(req, open(rp, "w"))
+            r = run_oracle(cfg_path, "--sign-seize", "--request", rp,
+                           "--allow-unpinned-strike")
+            named = "this oracle's key is" in r.stderr
+            if refused_for_key:
+                check("a request naming another oracle's key is refused",
+                      r.returncode != 0 and named, r.stderr[-240:])
+            else:
+                check("and one naming this oracle's own key is not",
+                      not named, r.stderr[-240:])
         # A loan written at ANOTHER scale. The same real price is a different
         # number at each, so the strike below reads as far above the price and
         # the seizure would look justified. It is not: the two numbers are not

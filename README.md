@@ -113,6 +113,8 @@ pignus/btcscript.py      the Bitcoin script and taproot primitives Tier B needs
 pignus/openamp.py        Tier C pledges at an OpenAMP policy server
 pignus/repurchase.py     Tier D: the OpenDAMP repurchase, labelled as one, never a loan
 pignus/node.py           a thin JSON-RPC client
+pignus/ratelimit.py      the token bucket both daemons ration unauthenticated
+                         requests with, in one place rather than a copy each
 bin/pignus-oracle        sign prices on a timer and publish them
 bin/pignusd              the loan book, the watcher, the cross-chain relay, and
                          the page at /lending/

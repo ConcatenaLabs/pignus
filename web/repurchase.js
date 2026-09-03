@@ -278,6 +278,28 @@ export function checkSettlement(nInputs, nOutputs) {
 }
 
 /**
+ * `forfeit_after` said in the units a node will actually compare it in.
+ *
+ * An absolute locktime is a block HEIGHT below 500,000,000 and a Unix TIME at
+ * or above it, and both are accepted. Calling either one "a height" is how
+ * somebody reads 1,790,000,000 as a block a million years away and concludes
+ * the bond can never be taken -- or reads a height as a date and waits for a
+ * day that is not what the script is watching. The confirmation sentence is
+ * the one place a borrower is told when their money comes back, so it names
+ * the kind of deadline rather than only the number.
+ *
+ * `deadline_phrase` in pignus/repurchase.py formats this identically, and the
+ * two are compared word for word by the tier D parity test.
+ */
+export function deadlinePhrase(deadline) {
+  const d = Number(deadline);
+  if (d < 500000000) return `height ${d}`;
+  const when = new Date(d * 1000).toISOString().slice(0, 16).replace("T", " ");
+  return `${when} UTC (Unix time ${d}, which a node compares to the chain's ` +
+         `median time)`;
+}
+
+/**
  * The sentence the confirmation screen must show, in the words it uses.
  *
  * Not decoration. A borrower who reads "loan" and signs a sale has been misled
@@ -300,10 +322,11 @@ export function describe(terms, fmt) {
     `${show(t.debt, terms.collateral_asset)} to the lender now, for ` +
     `${show(t.principal, terms.debt_asset)}, and you may buy it back for ` +
     `${show(t.moneyDebt, terms.debt_asset)} whenever the lender co-signs the ` +
-    `settlement, at any time before height ${t.recoverAfter}. If the lender ` +
-    `never sells it back, you take a bond of ${show(t.bond, terms.debt_asset)} ` +
-    `after height ${t.recoverAfter}, which is what the asset was worth today ` +
-    `minus what you would have paid. You do NOT get the asset's later gains: ` +
+    `settlement, at any time before ${deadlinePhrase(t.recoverAfter)}. If the ` +
+    `lender never sells it back, you take a bond of ` +
+    `${show(t.bond, terms.debt_asset)} after ${deadlinePhrase(t.recoverAfter)}, ` +
+    `which is what the asset was worth today minus ` +
+    `what you would have paid. You do NOT get the asset's later gains: ` +
     `you are made whole at today's price, not the price on the day.`);
 }
 

@@ -713,6 +713,65 @@ def test_fee_is_priced_in_the_asset_that_pays_it():
         _F.fee_table = real
 
 
+def test_rate_limiter():
+    """The bucket that is every public service's only defence.
+
+    Neither the book nor the oracle can require an account -- a borrower
+    recovering their own collateral has none, and neither does an auditor
+    checking a seizure -- so the limit is the whole of it. Both properties
+    below are what make it one rather than a gesture, and the oracle had a
+    COPY of this class with neither: unbounded memory keyed by client address,
+    and no bucket for everyone together.
+    """
+    print("\nThe rate limiter, which is the whole of the public defence")
+    from pignus.ratelimit import RateLimiter
+
+    r = RateLimiter(rate=1.0, burst=3)
+    check("a burst is allowed and then the bucket is empty",
+          [r.allow("a", 0.0) for _ in range(5)] == [True, True, True,
+                                                    False, False])
+    check("and it refills at the rate it says", r.allow("a", 1.0))
+    check("one client's flood does not spend another's tokens",
+          r.allow("b", 0.0))
+
+    # A bucket per client address that is never removed is a map an attacker
+    # grows without bound by varying the address, which is the denial of
+    # service the limiter was put there to prevent.
+    # Every call at the same instant, which is what a flood is: nothing is
+    # ever idle, so the pass that forgets refilled buckets frees nothing and
+    # the map must be bounded some other way. Sweeping for nothing would also
+    # re-run the scan on every request once the map is over its cap, turning a
+    # flood of memory into a flood of CPU.
+    r = RateLimiter(rate=10.0, burst=10, max_keys=500)
+    for i in range(3000):
+        r.allow(f"10.{i // 65536}.{(i // 256) % 256}.{i % 256}", 0.0)
+    check("a flood faster than the refill interval still cannot grow the map",
+          len(r._buckets) <= 500,
+          f"still holding {len(r._buckets)} buckets")
+    check("and the bucket kept is the one seen most recently",
+          "10.0.11.183" in r._buckets)             # the 3000th, i.e. the last
+
+    # Sweeping only ever forgets a bucket that has refilled to full, which says
+    # exactly what a client never seen before says.
+    r = RateLimiter(rate=1.0, burst=2)
+    r.allow("c", 0.0)
+    r._sweep(0.0)
+    check("a client that has just spent a token is not forgotten",
+          "c" in r._buckets)
+    r._sweep(100.0)
+    check("and one that has sat idle long enough to refill is",
+          "c" not in r._buckets)
+
+    # A per-client limit alone is walked around by spreading a flood over many
+    # source addresses, which costs an attacker nothing.
+    per, everyone = RateLimiter(rate=1.0, burst=5), RateLimiter(rate=1.0,
+                                                               burst=8)
+    got = sum(1 for i in range(40)
+              if per.allow(f"1.2.3.{i}", 0.0) and everyone.allow("", 0.0))
+    check("a second bucket for everyone together caps a distributed flood",
+          got == 8, f"let {got} through")
+
+
 def main():
     for fn in (test_vectors, test_terms, test_amount_strings,
                test_price_freshness_is_two_sided,
@@ -721,7 +780,8 @@ def main():
                test_cross_chain_amount_strings,
                test_page_shaped_terms, test_oracle,
                test_amounts,
-               test_attestation_log, test_adaptor, test_dlc):
+               test_attestation_log, test_adaptor, test_dlc,
+               test_rate_limiter):
         fn()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0

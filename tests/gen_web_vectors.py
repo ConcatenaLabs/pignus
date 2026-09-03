@@ -68,7 +68,6 @@ def loan():
 
 def btc_vectors():
     ln, t, w, borrower_sec, lender_sec = loan()
-    dest = bytes.fromhex("00" * 1 + "14") + bytes.fromhex("ee" * 20)
     dest = b"\x00\x14" + bytes.fromhex("ee" * 20)
     txid = _fixed("pignus/web-vectors/funding-txid").hex()
     vout, fee = 1, 3_000
@@ -92,7 +91,6 @@ def btc_vectors():
         "nums": B.NUMS.hex(),
         "leaf_version": B.LEAF_VERSION,
         "funding_spk": tree.scriptPubKey().hex(),
-        "funding_address_tb": None,
         "leaves": {n: bytes(s).hex() for n, s in tree.leaves.items()},
         "control_blocks": {n: tree.control_block(n).hex() for n in tree.leaves},
         "reclaim_dest_spk": dest.hex(),
@@ -201,10 +199,13 @@ def adaptor_vectors():
 def main():
     here = os.path.join(os.path.dirname(__file__), "..", "web")
     btc = btc_vectors()
-    # The address needs no node: the bech32m encoder is in the browser code, so
-    # the vector records the script and the browser proves its own encoding
-    # against the address the CLI prints from a node.
-    btc.pop("funding_address_tb")
+    # No address field. The encoder is browser code and this generator has no
+    # independent one to check it against, so a field written here would only
+    # be the same code agreeing with itself. `tests/test_btc_web.mjs`
+    # round-trips every address through `programFromAddress` -- a separate
+    # DECODER, in a different file -- which is a real check rather than a
+    # restatement.
+    btc.pop("funding_address_tb", None)
     for name, data in (("btc_vectors.json", btc),
                        ("adaptor_vectors.json", adaptor_vectors())):
         path = os.path.join(here, name)

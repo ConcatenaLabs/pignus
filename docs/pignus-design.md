@@ -781,7 +781,7 @@ than a matter of effort. Three independent reasons, any one of which is
 sufficient:
 
 1. **The collateral cannot enter a vault.** The verifier covenant requires that
-   every output carrying the regulated asset pays `C_U(Y)` for a witness-supplied
+   every output carrying the restricted asset pays `C_U(Y)` for a witness-supplied
    recipient key Y (opendamp-design.md 2.2, check 4). A Pignus vault script is
    not of that form and cannot be made to be. This is network-enforced, so it is
    not something an issuer could waive even if it wanted to.
@@ -817,7 +817,7 @@ borrower exactly as well off as if the loan had been liquidated at par.
 That inverts who holds what, and Pignus says so in those words. It is not
 collateralized lending and must never be shown as if it were: the borrower has
 sold their asset and holds a claim. It is also how securities financing actually
-works, which is the point -- the regulated-asset tier ends up with the
+works, which is the point -- the restricted-asset tier ends up with the
 regulated-market instrument. Section 8.1 specifies it.
 
 ### 8.1 The repurchase, specified
@@ -829,7 +829,7 @@ issuer's decisions, not this platform's, and a repurchase against an asset
 where any of them is false cannot be settled by the transaction below:
 
 - **The asset is enforced at the network, not by a policy service.** OpenDAMP
-  covenants confine a regulated asset in consensus, so every transfer spends
+  covenants confine a restricted asset in consensus, so every transfer spends
   the issuer's verifier output at input 0. That is what fixes the bond vault at
   input 1, and with it the output map the covenant reads. An OpenAMP
   (co-signature) asset is a different tier and belongs in Tier C.
@@ -843,10 +843,10 @@ where any of them is false cannot be settled by the transaction below:
   compiles its verifier once per shape, and this settlement saturates `p4x6`
   exactly. An issuer whose taptree carries only the narrower `p3x5` and `p3x4`
   leaves cannot confirm it.
-- **Any-asset fees, with the regulated asset barred from the fee output.**
+- **Any-asset fees, with the restricted asset barred from the fee output.**
   The settlement pays its fee in the debt asset, from the borrower's own input,
   because all four input slots are spoken for. OpenDAMP enforces absolutely
-  that a fee output never carries the regulated asset, which is what makes that
+  that a fee output never carries the restricted asset, which is what makes that
   safe.
 - **The wider Simplicity budget is active on the chain.** OpenDAMP covenants
   are unspendable under the one-to-one rule; on the live testnet the wider

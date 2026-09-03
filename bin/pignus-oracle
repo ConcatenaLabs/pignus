@@ -78,6 +78,7 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
 from pignus import oracle as O           # noqa: E402
+from pignus.ratelimit import RateLimiter            # noqa: E402
 from pignus.compat import CovenantUnavailable   # noqa: E402
 from pignus.terms import feed_id         # noqa: E402
 
@@ -96,14 +97,18 @@ def load_or_create_key(path, create=True):
     bakes in and that the next start would then adopt.
     """
     if os.path.exists(path):
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-        if mode & 0o077:
+        # Contents as well as mode. A key file is edited, copied between
+        # machines, restored from a backup and pasted into a config, and every
+        # one of those can truncate it -- and a truncated file read without a
+        # check does not fail here. It fails later, as signatures a borrower's
+        # covenant rejects, or as an x-only key naming an oracle that no live
+        # loan has ever heard of, with nothing pointing back at the file.
+        try:
+            return O.read_key(path, "the oracle key")
+        except ValueError as e:
             raise SystemExit(
-                f"{path} is mode {mode:04o}: the oracle key is readable by other "
-                "users. chmod 600 it and, since it may already have leaked, "
-                "consider rotating to a new key and re-issuing loans against it.")
-        with open(path) as f:
-            return bytes.fromhex(f.read().strip())
+                f"{e}. Restore the backup of the key this oracle's live loans "
+                f"were originated against; a new one signs for nothing.")
     if not create:
         raise SystemExit(f"no oracle key at {path}: start the oracle to create "
                          "one, or restore the backup of the key this oracle's "
@@ -396,18 +401,44 @@ class Oracle:
             raise SystemExit(f"this oracle does not sign {market}; it signs "
                              + ", ".join(self.markets))
         market = known
+        # THIS ORACLE'S OWN KEY, in the loan being judged. A seizure of a loan
+        # that names somebody else's oracle is one this signature cannot
+        # authorise -- the Bitcoin script asks for the key the loan baked in --
+        # so co-signing it produces a signature nothing accepts while the
+        # published record says this oracle approved a seizure it had no part
+        # in. Only checkable when a loan is given; the bare path is refused
+        # outright elsewhere for the same reason.
+        if loan:
+            keys = {str(loan.get("oracle_x", "")).lower()}
+            keys |= {str(k).lower() for k in (loan.get("oracles") or [])}
+            keys.discard("")
+            if keys and self.xonly.hex().lower() not in keys:
+                raise SystemExit(
+                    "REFUSED: that loan names oracle "
+                    + ", ".join(sorted(k[:16] + "…" for k in keys))
+                    + f" and this oracle's key is {self.xonly.hex()[:16]}…. "
+                    "The Bitcoin script asks for the key the loan baked in, so "
+                    "this signature would authorise nothing -- while the "
+                    "published record said this oracle had approved a seizure "
+                    "it has no part in.")
         att = self.latest.get(market) or self.log.latest(market)
         if att is None:
             raise SystemExit(f"this oracle has signed no price for {market}; "
                              "there is nothing to justify a seizure with")
-        age = int(time.time()) - int(att.timestamp)
-        if age > int(max_age) and not allow_stale:
+        # TWO-SIDED. A one-sided age test treats every timestamp in the future
+        # as infinitely fresh, so a clock that ran fast when the price was
+        # signed keeps that price acceptable for as long as the drift lasts --
+        # and what it would be acceptable FOR is taking somebody's collateral.
+        age = O.age_of(att)
+        if not O.current(att, max_age) and not allow_stale:
+            when = (f"signed {age}s ago (max {int(max_age)})" if age >= 0 else
+                    f"dated {-age}s in the FUTURE, which no honest clock is")
             raise SystemExit(
-                f"REFUSED: the last price for {market} was signed {age}s ago "
-                f"(max {int(max_age)}). Nothing on the Bitcoin side can check "
-                "when a price was signed, so a seizure justified by a stale one "
-                "is justified by nothing. Wait for a fresh attestation, or pass "
-                "--allow-stale if the age is genuinely intended.")
+                f"REFUSED: the last price for {market} was {when}. Nothing on "
+                "the Bitcoin side can check when a price was signed, so a "
+                "seizure justified by one nobody stands behind is justified by "
+                "nothing. Wait for a fresh attestation, or pass --allow-stale "
+                "if the age is genuinely intended.")
         if not O.verify(self.xonly, att, self.price_scale):
             raise SystemExit("the last attestation for that market does not "
                              "verify against this oracle's own key and scale; "
@@ -464,29 +495,13 @@ class Oracle:
         return rec
 
 
-class _RateLimiter:
-    """A token bucket per client, for the handful of endpoints that read the
-    log off disk. Everything else is answered from memory and is not worth
-    limiting; these are, because an auditor's query is cheap once and expensive
-    in a loop, and this process has signing to do."""
-
-    def __init__(self, rate=1.0, burst=10):
-        self.rate, self.burst = rate, burst
-        self._buckets = {}
-        self._lock = threading.Lock()
-
-    def allow(self, key, now):
-        with self._lock:
-            tokens, last = self._buckets.get(key, (self.burst, now))
-            tokens = min(self.burst, tokens + (now - last) * self.rate)
-            if tokens < 1.0:
-                self._buckets[key] = (tokens, now)
-                return False
-            self._buckets[key] = (tokens - 1.0, now)
-            return True
-
-
-ARCHIVE_LIMIT = _RateLimiter()
+ARCHIVE_LIMIT = RateLimiter(rate=1.0, burst=10)
+# And one for everyone together. A per-address bucket alone is walked around by
+# spreading the flood over many source addresses -- free for an attacker, and
+# the ordinary shape of one -- which would leave this process reading the log
+# off disk in a loop instead of signing. The book has had both since it was
+# written; this had one, and a copy of a limiter is how that happens.
+GLOBAL_ARCHIVE_LIMIT = RateLimiter(rate=20.0, burst=200)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -557,11 +572,12 @@ class Handler(BaseHTTPRequestHandler):
         key = self._client_key()
         if key is None:
             return True                 # the box's own tooling
-        if ARCHIVE_LIMIT.allow(key, time.time()):
+        now = time.time()
+        if ARCHIVE_LIMIT.allow(key, now) and GLOBAL_ARCHIVE_LIMIT.allow("", now):
             return True
-        self._send(429, {"error": "too many log queries from this address; "
-                                  "the log is append-only, so a page at a time "
-                                  "reads the same bytes a flood would"})
+        self._send(429, {"error": "too many log queries; the log is "
+                                  "append-only, so a page at a time reads the "
+                                  "same bytes a flood would"})
         return False
 
     def log_message(self, fmt, *args):

@@ -242,11 +242,12 @@ a lender who is online.</p>
 </section>
 
 <section data-panel="repo" id="panel-repo" role="tabpanel" aria-labelledby="tab-repo" hidden>
-  <h2>Check a repurchase <span class="tag">regulated assets &mdash; not a loan</span></h2>
-  <p class="hint">A regulated (OpenDAMP) asset cannot sit in a lending vault:
-  every output carrying it must pay the holder's own covenant address, so on
-  default nobody could ever reach the collateral. What can be built is a
-  <strong>repurchase</strong>: you sell the asset to the lender, and their
+  <h2>Check a repurchase <span class="tag">restricted assets &mdash; not a loan</span></h2>
+  <p class="hint">A restricted (OpenDAMP) asset &mdash; shares, bonds and other
+  instruments whose issuer decides who may hold them &mdash; cannot sit in a
+  lending vault: every output carrying it must pay the holder's own covenant
+  address, so on default nobody could ever reach the collateral. What can be
+  built is a <strong>repurchase</strong>: you sell the asset to the lender, and their
   obligation to sell it back is secured by a bond in a covenant here. Settling
   one is a single OpenDAMP transfer that also spends the bond vault;
   <code>pignus-cli repo-settle</code> composes it, because it needs a verifier

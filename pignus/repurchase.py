@@ -7,7 +7,7 @@ OpenDAMP asset is impossible, for three independent reasons, any one of which
 would be enough:
 
   1. the collateral cannot enter a vault -- the verifier covenant requires every
-     output carrying the regulated asset to pay C_U(Y) for a witness-supplied
+     output carrying the restricted asset to pay C_U(Y) for a witness-supplied
      recipient key, and a Pignus vault script is not of that form;
   2. exits cannot be pre-signed -- every transfer spends the shared verifier
      output as input zero, that outpoint moves on ANY holder's transfer, and
@@ -35,6 +35,7 @@ word the UI must use, and nothing here will build a repurchase while calling it
 a loan.
 """
 
+import datetime as _dt
 from dataclasses import dataclass, asdict, fields
 import json
 
@@ -68,7 +69,7 @@ DAMP_MAX_OUTPUTS = 6
 # at output 2k and returns at 2k+1 for a vault at input k, so the vault takes
 # the lowest index left and its two outputs land at 2 and 3. At input 2 they
 # would land at 4 and 5, which are the borrower's change and the fee -- and a
-# fee output may not carry the regulated asset at all.
+# fee output may not carry the restricted asset at all.
 SETTLEMENT_VAULT_INDEX = 1
 
 # How deep both halves of a repurchase must be buried before it is live. The
@@ -142,6 +143,28 @@ def _find_output(node, txid, vout, matches):
         if o is not None and matches(o):
             return o
     return None
+
+
+def deadline_phrase(deadline):
+    """`forfeit_after` said in the units a node will actually compare it in.
+
+    An absolute locktime is a block HEIGHT below LOCKTIME_THRESHOLD and a Unix
+    TIME at or above it, and `sanity_check` accepts both. Calling either one "a
+    height" is how somebody reads 1,790,000,000 as a block a million years away
+    and concludes the bond can never be taken -- or reads a height as a date and
+    waits for a day that is not what the script is watching. The confirmation
+    sentence is the one place a borrower is told when their money comes back, so
+    it names the kind of deadline rather than only the number.
+
+    `describe` in web/repurchase.js formats this identically, and the two are
+    compared word for word by the tier D parity test.
+    """
+    deadline = int(deadline)
+    if deadline < LOCKTIME_THRESHOLD:
+        return f"height {deadline}"
+    when = _dt.datetime.fromtimestamp(deadline, _dt.timezone.utc)
+    return (f"{when.strftime('%Y-%m-%d %H:%M UTC')} (Unix time {deadline}, "
+            f"which a node compares to the chain's median time)")
 
 
 @dataclass(frozen=True)
@@ -292,10 +315,11 @@ class RepurchaseTerms:
             f"{show(self.collateral_amount, self.collateral_asset)} to the "
             f"lender now, for {show(self.principal, self.debt_asset)}, and you "
             f"may buy it back for {show(self.debt, self.debt_asset)} whenever "
-            f"the lender co-signs the settlement, at any time before height "
-            f"{self.forfeit_after}. If the lender never sells it back, you take "
-            f"a bond of {show(b, self.debt_asset)} after height "
-            f"{self.forfeit_after}, which is what the asset was worth today minus "
+            f"the lender co-signs the settlement, at any time before "
+            f"{deadline_phrase(self.forfeit_after)}. If the lender never sells "
+            f"it back, you take a bond of {show(b, self.debt_asset)} after "
+            f"{deadline_phrase(self.forfeit_after)}, which is what the asset "
+            f"was worth today minus "
             f"what you would have paid. You do NOT get the asset's later gains: "
             f"you are made whole at today's price, not the price on the day.")
 
@@ -684,13 +708,23 @@ class RepurchaseSpender:
             raise ValueError(
                 f"C_U(lender) holds {cu_lender.amount} atoms and the repurchase "
                 f"is for {t.collateral_amount}: a surplus needs a change output "
-                f"in the regulated asset, and every output slot is taken")
+                f"in the restricted asset, and every output slot is taken")
         change = debt_input.amount - t.debt - self.fee_amount
+        # Change below the node's threshold goes to the FEE, not to an output
+        # nobody can spend. `dust_fold` is what this spender was constructed
+        # with and it was never consulted here, though `VaultSpender._change`
+        # has always used it -- and on this tier there is no room to spare: the
+        # settlement's output count is already at the shape's ceiling, so a
+        # dust output can be the thing that makes it unbuildable.
+        fee_amount = int(self.fee_amount)
+        if 0 < change < int(self.dust_fold):
+            fee_amount += change
+            change = 0
         if change < 0:
             raise ValueError(
                 f"the borrower's debt input holds {debt_input.amount} atoms, "
                 f"{-change} short of the debt {t.debt} plus the fee "
-                f"{self.fee_amount}")
+                f"{fee_amount}")
 
         cu_spk, lender_spk, _ = self._spks()
         # The covenant demands the vault's WHOLE input value back, so an
@@ -728,7 +762,7 @@ class RepurchaseSpender:
         for amount, spk, asset in outs:
             tx.vout.append(m.CTxOut(nValue=m.CTxOutValue(amount), scriptPubKey=spk,
                                     nAsset=m.CTxOutAsset(asset_out(asset))))
-        tx.vout.append(m.CTxOut(m.CTxOutValue(self.fee_amount),
+        tx.vout.append(m.CTxOut(m.CTxOutValue(fee_amount),
                                 nAsset=m.CTxOutAsset(asset_out(t.debt_asset))))
         return tx.serialize().hex()
 
