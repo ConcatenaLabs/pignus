@@ -1427,6 +1427,27 @@ function renderAlerts() {
       b.onclick = () => repay(risky[Number(b.dataset.alertRepay)]);
     });
   });
+  markTitle(risky.length);
+}
+
+// The one thing this page can say to somebody who is not looking at it.
+//
+// A borrower's whole exposure here is a price moving while their attention is
+// elsewhere, and every warning the page had was INSIDE the page: open the tab
+// and it is obvious, leave it in the background -- which is what anybody does
+// with a position they are holding -- and it says nothing at all. The tab
+// strip is the one surface a background tab still owns, so the count goes
+// there. No permission to ask for and nothing to grant, which is why this
+// rather than a notification.
+// The wording lives in pignus.js, where a test can reach it: nothing in this
+// file can be exercised without a browser.
+const BASE_TITLE = document.title;
+const titleCounts = { seq: 0, btc: 0 };
+
+function markTitle(seq, btc) {
+  if (seq != null) titleCounts.seq = seq;
+  if (btc != null) titleCounts.btc = btc;
+  document.title = pig.riskTitle(BASE_TITLE, titleCounts.seq + titleCounts.btc);
 }
 
 // -------------------------------------------------------------- lend form
@@ -2383,6 +2404,11 @@ async function renderBtcLoans() {
   }
   const heights = { btc: state.btcHeight, seq: state.height,
                     feerate: state.btcFeerate };
+  // Counted for the tab title as well as shown. This tier is where the
+  // borrower's warning matters most: no script tests the price, so a seizure
+  // is the lender and the oracle signing together and can happen at any
+  // moment nobody tells them about.
+  let atRisk = 0;
   const html = `<table><thead><tr><th>collateral</th><th>you owe</th>
       <th>seized below</th><th>health</th>
       <th>repay by</th><th>lender sweep</th><th>where it stands</th><th></th>
@@ -2398,6 +2424,9 @@ async function renderBtcLoans() {
       const health = btcborrow.seizeHealth(l, btcPriceFor(l.market),
                                            meta(l.debt_asset).precision ?? 8);
       const acts = [];
+      if (health != null && health < 1.15 && !rec.terminal
+          && !btcborrow.stageOf(rec).match(/^(reclaimed|aborted|seized|swept)$/))
+        atRisk += 1;
       if (health != null && health < 1 && !rec.terminal)
         acts.push('<span class="tag bad" title="the lender and the oracle can co-sign a seizure of your collateral at this price. Repaying is what stops it">seizable now</span>');
       if (step.action)
@@ -2439,6 +2468,7 @@ async function renderBtcLoans() {
      block its Sequentia block anchored to. Sequentia follows Bitcoin reorgs in
      real time, so Sequentia confirmations measure the wrong thing: six of them
      are six minutes, and one ordinary Bitcoin reorg undoes ten at once.</p>`;
+  markTitle(null, atRisk);
   paint("#btcloans", html, (b) => {
     b.querySelectorAll("[data-btcstep]").forEach(btn => {
       btn.onclick = () => btcStep(rows[Number(btn.dataset.btcstep)], false);

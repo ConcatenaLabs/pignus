@@ -119,6 +119,25 @@ export function fixed(n, p, maxFrac) {
 
 let _mark;
 /** Whatever this reader's locale puts between the whole part and the rest. */
+/**
+ * The page's title when `n` of the reader's loans are close to being taken.
+ *
+ * A borrower's whole exposure here is a price moving while their attention is
+ * elsewhere, and every warning the page had was INSIDE the page: open the tab
+ * and it is obvious; leave it in the background -- which is what anybody does
+ * with a position they are holding -- and it says nothing at all. The tab strip
+ * is the one surface a background tab still owns, and it needs no permission to
+ * use, which is why this rather than a notification.
+ *
+ * The count leads, because a tab strip truncates from the right and the number
+ * is the part that has to survive.
+ */
+export function riskTitle(base, n) {
+  n = Number(n) || 0;
+  if (n <= 0) return String(base);
+  return `(${n}) \u26a0 loan${n > 1 ? "s" : ""} at risk \u2014 ${base}`;
+}
+
 export function decimalMark() {
   if (_mark === undefined) {
     try {

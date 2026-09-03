@@ -609,6 +609,12 @@ browser client, and on the testnet it is what `/lending/` is.
 Caddy, with `deploy/pignusd.example.json` as the starting configuration, and
 [`docs/api.md`](docs/api.md) documents every endpoint it serves.
 
+A borrower's own risk is a price moving while their attention is elsewhere, so
+the page shows a loan close to its strike as an alert above everything else and
+also puts the count in the browser tab's title. The tab strip is the one
+surface a background tab still owns, and it needs no permission to use, which
+is what a page holding no keys should reach for first.
+
 `pignusd --config <file> --once` refreshes once and prints the markets, the
 stats and the health, without serving, which is the way to check a
 configuration before it is a unit. It refuses to start at all if the covenant
