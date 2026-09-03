@@ -202,6 +202,29 @@ def main():
         check("skipped, and the number is quoted back",
               "--min-profit" in err, err[-200:])
 
+        print("a fee paid in another asset is still a cost, not zero")
+        # `--min-profit 0` promises "never take one at a loss", and a fee paid
+        # in anything but the debt asset used to be dropped from the sum -- so
+        # exactly the seizures that promise covers were taken at one. Atoms of
+        # one asset are not atoms of another, but the node's table preserves
+        # fee VALUE across them, so the exit is re-priced at the debt asset's
+        # own published rate rather than ignored.
+        rc, err = run("--dry-run", "--fee-asset", "gold",
+                      loans_file=loans_file(terms()))
+        check("the fee is stated in the units the profit is measured in",
+              "fee=" in err and "fee=? " not in err, err[-300:])
+        check("...and says plainly that it was paid in a different asset, so "
+              "the number is not one an operator can look up in their wallet",
+              "paid as" in err, err[-300:])
+        # ...and when the debt asset has no rate at all there is no honest
+        # conversion, so the comparison is refused rather than decided on a
+        # sum that is missing a term.
+        rc, err = run("--dry-run", "--fee-asset", "gold",
+                      loans_file=loans_file(terms(debt_asset="cc" * 32)))
+        check("an unpriceable debt asset refuses rather than guessing",
+              "liquidate:" not in err or "cannot be restated" in err
+              or "no fee rate" in err, err[-300:])
+
         print("a stale attestation is not acted on")
         f = loans_file(terms())
         rc, err = run("--dry-run", "--max-attestation-age", "-1", loans_file=f)

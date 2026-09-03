@@ -474,5 +474,30 @@ if also:
 STEPS
 echo "  health names the failing step, and only that step"
 
+# A book that has not read the asset registry yet has every market unlendable
+# for a reason that is about to fix itself, and the message used to send the
+# operator to "check the registry" -- the one thing that is not the problem,
+# at the exact moment they are reading it, because a start-up is when they
+# read it.
+python3 - "$WORK/hostile-health.json" <<'REGWORDS'
+import json, sys
+d = json.load(open(sys.argv[1]))
+err = d.get("error") or ""
+if "priced but not lendable" not in err:
+    print("  (no unlendable markets in this fixture; nothing to check)")
+    raise SystemExit(0)
+# Three distinct causes, three distinct sentences: not read yet (clears on its
+# own), read and empty (the registry, or a node, is the thing to fix), and read
+# with assets that these tickers do not match (the tickers or the precisions).
+# One message for all three sent an operator to check a registry that was fine.
+wanted = ("has not read the asset registry yet",
+          "knows of NO assets at all",
+          "do not resolve to any of the assets this book knows")
+if not any(w in err for w in wanted):
+    sys.exit("an unlendable market is explained by none of the three causes, "
+             "so the message cannot be acted on: " + err[:300])
+REGWORDS
+echo "  an unlendable market says WHICH of the three things went wrong"
+
 echo
 echo "all service drills passed"

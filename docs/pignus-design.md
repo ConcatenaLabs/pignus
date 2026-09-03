@@ -111,7 +111,16 @@ It then computes, on chain,
     seize = ceil(gross * price_scale / price)       -- OP_ADD64/OP_SUB64/OP_DIV64
 
 and requires output `2k` to pay the lender `debt` and output `2k+1` to return
-`L - seize` to the borrower. The liquidator keeps `seize`, whose value at the
+**at least** `L - seize` to the borrower. The inequality is deliberate and is
+not a rounding allowance: a liquidator may always give the borrower more than
+the covenant demands, never less, so the leaf constrains the only direction
+that can hurt. It has a practical use as well as a theoretical one. `IsDust`
+applies to outputs in a transaction's fee asset, so a seizure just past the
+threshold, paid for in the collateral asset, leaves the borrower a return the
+relay would refuse — and the composer lifts that return to the dust threshold
+out of the seizure rather than building a transaction no node will take.
+
+The liquidator keeps what is left, whose value at the
 attested price is `gross` -- the debt plus the bonus that pays for the work --
 overshooting by less than the value of one collateral atom because the ceiling
 rounds the last atom the liquidator's way rather than letting a rounding loss

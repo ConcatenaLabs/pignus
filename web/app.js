@@ -444,7 +444,16 @@ async function refresh() {
     // A self-hosted book is not behind the testnet's reverse proxy, so it can
     // say where its explorer and its oracle actually live.
     if (hz.explorer_url) $("#crumb").href = hz.explorer_url;
-    if (hz.oracle_public_url) $("#oraclelog").href = hz.oracle_public_url;
+    // A BASE address, the same thing `oracle_public_urls` holds for every
+    // oracle, so one name means one thing. It used to be the full link, which
+    // left two settings for "where is the oracle" meaning two different
+    // things, and an operator who set them consistently broke this link.
+    // Idempotent, so a config still holding the full link keeps working.
+    if (hz.oracle_public_url) {
+      $("#oraclelog").href =
+        hz.oracle_public_url.replace(/\/+$/, "").replace(/\/v1\/log$/, "")
+        + "/v1/log";
+    }
   }
   if (m) {
     state.markets = m.markets;
@@ -1554,7 +1563,14 @@ function renderLendForm() {
   const ocur = osel.value;
   const oopts = ['<option value="single">Single oracle (default)</option>'];
   for (let m = 2; m <= n; m++)
-    oopts.push(`<option value="${m}">Require ${m} of ${n} oracles</option>`);
+    // n-of-n is named for what it is. The threshold is baked into the vault
+    // and cannot be lowered afterwards, so requiring every oracle means one
+    // outage stops liquidation entirely until maturity -- and this is the
+    // moment the choice is made. `pignus-cli` warns about exactly this; the
+    // page offered it without a word.
+    oopts.push(`<option value="${m}">Require ${m} of ${n} oracles` +
+               `${m === n ? " — every one, so any outage blocks liquidation"
+                          : ""}</option>`);
   const ohtml = oopts.join("");
   if (osel.innerHTML !== ohtml) {
     osel.innerHTML = ohtml;
@@ -1582,6 +1598,11 @@ function renderPreview() {
     <span class="k">Liquidation</span><span>if ${esc(m.collateral_ticker)} falls below <b>${money(liq, liq < 10 ? 4 : 2)} ${esc(m.debt_ticker)}</b> <span class="k">(${drop < 0 ? "above the price now — a loan would be liquidatable immediately"
       : `${drop.toFixed(0)}% below now`}); whoever liquidates keeps a ${BONUS}% bonus and the rest of the collateral goes back to the borrower</span></span>
     <span class="k">After maturity</span><span class="k">anyone may call the loan at any price; ${RECOVER_GAP_DAYS} days later you can sweep the vault without an oracle</span>
+    ${Number(t.oracle_threshold) > 0 ? `<span class="k">Oracles</span><span>${
+      Number(t.oracle_threshold)} of ${(t.oracles || []).length} must sign a liquidation${
+      Number(t.oracle_threshold) === (t.oracles || []).length
+        ? ` <span class="k">— every one of them, so while any single oracle is down this loan cannot be liquidated at all. The threshold is baked into the vault and cannot be lowered afterwards.</span>`
+        : ` <span class="k">— independent keys; a vault verifies against the ones baked into it</span>`}</span>` : ""}
   </div>`;
 }
 

@@ -261,6 +261,15 @@ pignus-cli offer-fund --market GOLD/USDX --principal 100 \
 `--oracles book` uses every oracle the book quotes against; the CLI, the
 liquidator and the browser all assemble the threshold witness.
 
+The threshold is a constant inside the vault's leaves, so it can never be
+lowered afterwards, and that cuts both ways. A 1-of-n is WEAKER than a single
+oracle, because any one of the keys can liquidate alone; the CLI refuses it and
+the page never offers it. An n-of-n is the other end: while any single one of
+those oracles is down, the loan cannot be liquidated at all until maturity — the
+lender's backstop still works, but the price-driven exit does not. Both the
+CLI and the page say so at the moment the choice is made, which is the only
+moment it can be changed.
+
 ### Running a liquidator
 
 Liquidation is a permissionless race. Every racer must pay the lender in full
