@@ -9,6 +9,7 @@ half of all keys, a terms document that round-trips into a different loan. They
 run in a second and need no daemon.
 """
 
+import json
 import os
 import secrets
 import sys
@@ -476,8 +477,72 @@ def test_page_shaped_terms():
         check("a field this book does not know is refused", "surprise" in str(e))
 
 
+def test_cross_chain_amount_strings():
+    """A cross-chain offer's amounts survive a browser's JSON parser.
+
+    The issued-asset tier learned this the hard way: a Sequentia amount runs to
+    2**63-1, and `JSON.parse` silently rounds anything past 2**53, so a page
+    would show a debt that is not the one in the covenant and a borrower would
+    repay the wrong number. The cross-chain tier carries the same amounts, so
+    it carries them the same way -- as decimal strings, which are exact in
+    every language.
+
+    The digest has to agree across both spellings, because a lender signs an
+    offer from a dataclass full of ints and a relay verifies it from JSON full
+    of strings. If those two disagree the lender's own offer reads as a forgery.
+    """
+    print("cross-chain amounts, and the digest over them")
+    from pignus import btc_collateral as BC                # noqa: PLC0415
+    from pignus import btc_relay as R                      # noqa: PLC0415
+    big = 2 ** 53 + 1
+    d = {"btc_amount": 2_100_000_000_000_000, "borrower_x": "aa" * 32,
+         "lender_x": "bb" * 32, "oracle_x": "cc" * 32, "recover_after": 900,
+         "debt_asset": "dd" * 32, "debt": big, "repay_deadline": 800,
+         "principal": big - 1, "strike": big + 5, "price_scale": 100_000,
+         "upgrade_fee": 10_000, "abort_after": 700, "d_refund": 750,
+         "lender_prog": "ee" * 20, "lender_ver": 0, "market": "BTC/USDX"}
+    wire = BC.loan_to_dict(BC.loan_from_dict(d))
+    check("the amounts that outgrow a double go out as decimal strings",
+          all(wire[k] == str(d[k]) for k in BC.BIG_LOAN_FIELDS),
+          {k: wire[k] for k in BC.BIG_LOAN_FIELDS})
+    check("and the heights and fees, which cannot, stay numbers",
+          all(isinstance(wire[k], int) for k in
+              ("repay_deadline", "recover_after", "abort_after", "d_refund",
+               "upgrade_fee", "price_scale")))
+    back = BC.loan_from_dict(json.loads(json.dumps(wire)))
+    check("a round trip through JSON loses nothing",
+          (back.debt, back.principal, back.strike, back.btc_amount)
+          == (d["debt"], d["principal"], d["strike"], d["btc_amount"]),
+          (back.debt, back.principal, back.strike))
+    check("the same loan hashes the same whichever spelling it arrives in",
+          R.offer_id(d, "BTC/USDX", 3) == R.offer_id(wire, "BTC/USDX", 3),
+          f'{R.offer_id(d, "BTC/USDX", 3)} vs {R.offer_id(wire, "BTC/USDX", 3)}')
+    thin = {k: v for k, v in d.items() if k not in ("abort_after", "d_refund")}
+    check("and an absent number counts as a zero, not as an empty string",
+          R.offer_id({**thin, "abort_after": 0, "d_refund": 0}, "BTC/USDX", 3)
+          == R.offer_id(thin, "BTC/USDX", 3))
+    from pignus import adaptor as A                        # noqa: PLC0415
+    sec = bytes.fromhex("11" * 32)
+    signed = {**d, "lender_x": A.xonly_pubkey(sec).hex()}
+    on_wire = BC.loan_to_dict(BC.loan_from_dict(signed))
+    check("a signature made over the int form verifies over the string form",
+          R.verify_offer(on_wire, "BTC/USDX", 3,
+                         R.sign_offer(sec, signed, "BTC/USDX", 3)))
+    check("a float amount is refused rather than quietly rounded",
+          _raises(lambda: BC.loan_from_dict({**d, "debt": 1.5})))
+
+
+def _raises(fn):
+    try:
+        fn()
+    except Exception:                                      # noqa: BLE001
+        return True
+    return False
+
+
 def main():
     for fn in (test_vectors, test_terms, test_amount_strings,
+               test_cross_chain_amount_strings,
                test_page_shaped_terms, test_oracle,
                test_amounts,
                test_attestation_log, test_adaptor, test_dlc):

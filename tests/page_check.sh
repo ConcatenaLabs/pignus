@@ -62,6 +62,34 @@ cat > "$WORK/pignusd.json" <<J
  "markets":["GOLD/USDX","SILVR/USDX","BTC/USDX"]}
 J
 
+# Seed the book with a cross-chain offer whose amounts are past 2**53, which is
+# where a browser's JSON parser starts rounding silently. Nothing else in the
+# suite can catch that: Node and Python both read these numbers exactly when
+# asked to, and the failure only appears in the engine a borrower actually uses.
+# The check below looks for the exact digits in the rendered page.
+BIG_DEBT=9007199254740993
+BIG_PRINCIPAL=9007199254740992
+python3 - "$WORK/book.json" "$BIG_DEBT" "$BIG_PRINCIPAL" <<'SEED'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent.parent))
+out, debt, principal = sys.argv[1], sys.argv[2], sys.argv[3]
+loan = {"btc_amount": "100000", "lender_x": "bb" * 32, "oracle_x": "cc" * 32,
+        "recover_after": 900000, "debt_asset": "dd" * 32, "debt": debt,
+        "principal": principal, "repay_deadline": 125000,
+        "abort_after": 902000, "upgrade_fee": 10000, "d_refund": 124000,
+        "lender_prog": "ee" * 20, "lender_ver": 0, "borrower_x": "",
+        "market": "BTC/USDX", "strike": "0", "price_scale": 100000,
+        "payment_hash": "", "adaptor_point": "", "h_w": ""}
+Path(out).write_text(json.dumps({
+    "loans": {}, "offers": {}, "btc_takes": {}, "btc_commitments": {},
+    "btc_offers": {"0" * 24: {
+        "btc_offer_id": "0" * 24, "loan": loan, "market": "BTC/USDX",
+        "lots": 1, "offer_sig": "", "responder": "", "note": "",
+        "status": "open", "created": 1799990000}}}, indent=1))
+SEED
+
 python3 "$ROOT/bin/pignus-oracle" --config "$WORK/oracle.json" >"$WORK/o.log" 2>&1 &
 PIDS+=($!)
 python3 "$ROOT/bin/pignusd" --config "$WORK/pignusd.json" >"$WORK/d.log" 2>&1 &
@@ -84,7 +112,7 @@ if [ ! -s "$WORK/dom.html" ]; then
     exit 1
 fi
 
-python3 - "$WORK/dom.html" "$WORK/console.log" <<'PY'
+python3 - "$WORK/dom.html" "$WORK/console.log" "$BIG_DEBT" "$BIG_PRINCIPAL" <<'PY'
 import re, sys
 
 dom = open(sys.argv[1], encoding="utf-8", errors="replace").read()
@@ -121,6 +149,21 @@ want("the Bitcoin tab describes the tier it actually implements",
      "Native Bitcoin collateral" in dom and "keyless" not in dom)
 want("the offers table rendered rather than staying on 'loading'",
      "Open offers" in dom and dom.count("loading&hellip;") == 0)
+
+# The seeded cross-chain offer carries a debt of 2**53+1 atoms. If any of it
+# went through a JSON number the browser has already rounded it to 2**53, and
+# the page is quoting a borrower a debt that is not the one in the covenant.
+# The rendered figure is grouped for reading, so compare on the digits.
+debt, principal = sys.argv[3], sys.argv[4]
+digits = re.sub(r"[^0-9]", "", dom)
+def as_units(atoms):
+    return f"{int(atoms) // 10 ** 8}{int(atoms) % 10 ** 8:08d}"
+want("a debt past 2^53 atoms reaches the page with every digit intact",
+     as_units(debt) in digits, f"looking for {as_units(debt)}")
+want("and so does a principal", as_units(principal) in digits,
+     f"looking for {as_units(principal)}")
+want("the rounded forms are nowhere on the page",
+     as_units(int(debt) - 1) not in digits.replace(as_units(principal), "", 1))
 
 print()
 print(f"{'page check passed' if not fails else str(len(fails)) + ' page check(s) FAILED'}")

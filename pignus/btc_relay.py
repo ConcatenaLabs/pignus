@@ -65,8 +65,30 @@ def offer_payload(loan: dict, market="", lots=1) -> dict:
     """The part of an offer a lender signs: the terms, and how many loans of
     them are on the table. The relay's own bookkeeping is deliberately outside
     it, so the relay cannot change what was signed by rearranging its records."""
-    return {"loan": {k: loan.get(k, "") for k in OFFER_FIELDS},
+    return {"loan": {k: _canon_field(k, loan.get(k, "")) for k in OFFER_FIELDS},
             "market": market or "", "lots": int(lots or 1)}
+
+
+def _canon_field(name, value):
+    """One spelling per value, whoever is signing.
+
+    An amount travels as a decimal string and arrives from a relay as one, but
+    the lender who signs an offer has it as an int in a dataclass. If the two
+    serialise it differently the digests differ and a valid signature reads as
+    a forgery, so the spelling is fixed here rather than left to the caller.
+    """
+    from pignus.btc_collateral import BIG_LOAN_FIELDS, _int_loan_fields
+    if name not in _int_loan_fields():
+        return value
+    try:
+        # An ABSENT number is a zero, not an empty string. Otherwise the same
+        # loan hashes two ways depending on whether an optional field was
+        # written out, and a lender who signed the shorter spelling watches
+        # their own offer be read as a forgery.
+        n = int(value) if value not in (None, "") else 0
+    except (TypeError, ValueError):
+        return value
+    return str(n) if name in BIG_LOAN_FIELDS else n
 
 
 def offer_id(loan: dict, market="", lots=1) -> str:

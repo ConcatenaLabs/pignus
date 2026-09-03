@@ -320,6 +320,11 @@ has opened the principal, which is what publishes the secret `btc-upgrade`
 needs. Every step before `btc-originate` commits nothing at all. `btc-check`
 names the next move at each stage, so the sequence need not be memorised.
 
+Give `btc-claim-principal` and `btc-repay` a `--book` and a `--borrower-key` and
+each tells the book where the payment landed. Nothing depends on it -- the
+lender's responder reads both off the chain -- but it saves that scan and keeps
+the borrower's own page from showing a loan as running after they have paid it.
+
 `--borrower-prog` and `--borrower-ver` are the borrower's Sequentia payout
 program -- where the principal is paid and where a repayment refunds to -- and
 `--lender-prog` and `--lender-ver` the lender's; both are 20 bytes at witness
