@@ -172,6 +172,21 @@ def main():
                            and get(book + "/v1/oracles"))
             check("/v1/oracles lists three distinct keys",
                   bool(ors) and len(set(ors["oracles"])) == 3)
+            # The book talks to its oracles over loopback, and it used to serve
+            # those addresses as the answer to "where is this oracle". A page
+            # that followed one would be fetching from the READER's machine --
+            # and the address matters, because an m-of-3 seizure is signed by
+            # oracles that are not the primary and the attestation behind it is
+            # published at that oracle's own /v1/seizures for anyone to check.
+            urls = ors.get("urls") or []
+            check("/v1/oracles answers with one url slot per oracle",
+                  len(urls) == 3, json.dumps(urls))
+            check("...and never with the book's own loopback addresses",
+                  not any("127.0.0.1" in u or "localhost" in u for u in urls),
+                  json.dumps(urls))
+            check("...saying nothing where no public address is configured, "
+                  "rather than guessing one",
+                  all(u == "" for u in urls), json.dumps(urls))
             atts = wait_for(lambda: len(get(book + "/v1/attestations/GOLD_USDX")
                                         ["attestations"]) == 3 and
                             get(book + "/v1/attestations/GOLD_USDX"))

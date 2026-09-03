@@ -39,6 +39,8 @@
   "explorer_tx_url": "",
   "btc_explorer_tx_url": "",
   "oracle_public_url": "",
+  "_oracle_public_urls_note": "Where each oracle can be reached FROM OUTSIDE, in the same order as `oracle` then `oracles` -- e.g. [\"https://example.com/pignus-oracle/\", \"https://example.com/pignus-oracle-2/\"]. These are not the addresses above, which are loopback: a browser told to fetch 127.0.0.1 fetches from the reader's own machine. It matters because an m-of-n seizure is signed by oracles that are not the primary, and the attestation behind it is published at that oracle's /v1/seizures for anyone to check.",
+  "oracle_public_urls": [],
 
   "_btc_rpc_note": "Optional, and only for cross-chain loans. The book reads the parent chain's tip through it so a Bitcoin-side deadline is checked against a height this daemon read itself rather than one a client sent. It never spends: no wallet is needed.",
   "btc_rpc": {

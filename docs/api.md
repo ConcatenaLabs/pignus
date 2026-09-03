@@ -18,7 +18,11 @@ against the key the vault bakes in.
 under a path prefix by the reverse proxy; on the testnet that is
 `https://sequentiatestnet.com/lending/`, and the page fetches everything by the
 relative path `v1/...`. The oracle listens on `127.0.0.1:8730` by default (8740
-on the testnet box) and is published under `/pignus-oracle/`.
+on the testnet box) and is published under `/pignus-oracle/`. Every further
+oracle a book quotes gets a route of its own — `/pignus-oracle-2/` and
+`/pignus-oracle-3/` on the testnet — because an m-of-n seizure is signed by
+oracles that are not the primary, and its attestation is published only by the
+oracle that signed it. `/v1/oracles` lists every key with its public address.
 
 **Content type.** Requests and responses are JSON. A POST body that is not an
 object, or is not valid JSON, is a 400.
@@ -233,9 +237,17 @@ The note is the API's own health warning and is served with it deliberately.
 
 ### `GET /v1/oracles`
 
-`{"oracles": ["…x-only hex…"], "urls": ["http://…"]}` — every independent oracle
-this book quotes against, in configured order, primary first. A lender picks an
-m-of-n subset from here.
+`{"oracles": ["…x-only hex…"], "urls": ["https://…"]}` — every independent
+oracle this book quotes against, in configured order, primary first. A lender
+picks an m-of-n subset from here.
+
+`urls` are the PUBLIC addresses, from `oracle_public_urls` in the book's
+configuration, and are `""` for an oracle that has none. They are not the
+addresses the book itself uses, which are typically loopback: answering "where
+is this oracle" with `127.0.0.1` sends a reader to their own machine. The
+address matters because a seizure is meant to be checkable by anyone — the
+attestation behind it is at that oracle's `/v1/seizures` — and an m-of-n
+seizure is signed by oracles that are not the primary.
 
 ### `GET /v1/attestation/{market}`
 
@@ -1175,13 +1187,19 @@ Everything above exists so that this is possible without asking anybody:
 
 1. Read the spend that closed the loan and take the `price` and `timestamp` out
    of its witness.
-2. `GET /pignus-oracle/v1/attestation/{market}/at/{timestamp}` for the exact
+2. Find **the oracle the loan names**, which is the key baked into its vault
+   and not necessarily the book's primary — a threshold loan is closed by
+   whichever of its oracles signed. `GET /v1/oracles` gives every key this book
+   quotes with the public address of each, so the paths below are that
+   oracle's. On the testnet the primary is at `/pignus-oracle/` and the others
+   at `/pignus-oracle-2/` and `/pignus-oracle-3/`.
+3. `GET <that oracle>/v1/attestation/{market}/at/{timestamp}` for the exact
    signed bytes.
-3. Check the BIP340 signature against the oracle key **the vault bakes in** —
+4. Check the BIP340 signature against the oracle key **the vault bakes in** —
    not the one `/v1/oracle` or `/v1/pubkey` hands you — and confirm the
    attestation's `price_scale` is the loan's:
    `pignus-cli check-attestation --attestation att.json --oracle-x <key>`.
-4. `GET /pignus-oracle/v1/log/raw` for the file that attestation is in, hash it,
+5. `GET <that oracle>/v1/log/raw` for the file that attestation is in, hash it,
    and compare with the `.sha256` beside it and the chain in `/v1/digest`. A log
    that was rewritten to add or remove an attestation stops matching a digest
    published before the rewrite.

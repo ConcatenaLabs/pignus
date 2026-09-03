@@ -381,6 +381,14 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
      bb.nextStep({ ...live, vault_exit: "seize" }, heights).action === null
      && /already gone/.test(bb.nextStep({ ...live, vault_exit: "seize" },
                                         heights).note));
+  // WHICH oracle. A Tier B loan names one, and it is not necessarily the
+  // primary the page links to -- so a borrower told "the attestation is at the
+  // oracle's /v1/seizures" who follows that link finds nothing and concludes
+  // the seizure was never published.
+  ok("...and names the oracle THIS loan is bound to, not the page's default",
+     bb.nextStep({ ...live, vault_exit: "seize" }, heights).note
+       .includes(String(loan.oracle_x).slice(0, 16)),
+     bb.nextStep({ ...live, vault_exit: "seize" }, heights).note);
   ok("nor does a swept one, for its own reason",
      /timeout/.test(bb.nextStep({ ...live, vault_exit: "timeout" },
                                 heights).note));

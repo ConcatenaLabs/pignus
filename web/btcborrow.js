@@ -1334,8 +1334,11 @@ export function nextStep(rec, heights) {
                      "the debt would pay for collateral that is already gone. " +
                      "The price it was meant to be justified below is this " +
                      "loan's strike, and the attestation behind it is " +
-                     "published at the oracle's /v1/seizures, so a seizure " +
-                     "that was not justified is visible to anyone." };
+                     "published at /v1/seizures on the oracle THIS loan " +
+                     "names -- key " + String(l.oracle_x || "").slice(0, 16) +
+                     "\u2026, which is not necessarily the one this page " +
+                     "links to. A seizure that was not justified is visible " +
+                     "to anyone who asks that oracle." };
     case "swept":
       return { action: null, label: "", terminal: true,
                note: "The lender swept your collateral at the timeout, which " +
