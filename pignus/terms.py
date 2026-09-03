@@ -360,10 +360,29 @@ class LoanTerms:
 
     # -------------------------------------------------------- serialisation
 
+    # The fields a JSON NUMBER cannot carry. An atom count, and a price scaled
+    # into atoms, both pass 2^53 at sizes this platform allows -- and a reader
+    # in a browser cannot represent one exactly, so `JSON.parse` would round a
+    # borrower's debt before anything here could check it. They go out as
+    # decimal strings, which is what `docs/api.md` says every atom amount is
+    # and what the page has always sent. Heights and small ratios stay numbers.
+    BIG = ("collateral_amount", "principal", "debt", "strike", "max_price",
+           "not_before")
+
     def to_json(self) -> str:
         """Canonical JSON: sorted keys, no incidental whitespace, so two parties
-        hash the same bytes for the same agreement."""
-        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        write the same bytes for the same agreement.
+
+        Amounts are decimal STRINGS. Not decoration: above 2^53 a JSON number
+        is not an exact integer in a browser, and `web/pignus.js` refuses one
+        rather than compute a debt it may already have rounded -- so a book
+        that served numbers could hold a loan its own page could not price.
+        `from_json` reads either form, so nothing older breaks.
+        """
+        d = asdict(self)
+        for k in self.BIG:
+            d[k] = str(d[k])
+        return json.dumps(d, sort_keys=True, separators=(",", ":"))
 
     @classmethod
     def from_json(cls, s):

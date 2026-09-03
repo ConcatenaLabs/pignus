@@ -58,6 +58,7 @@ run "CLI drill (offline)"             bash tests/cli_drill.sh
 run "service drill (offline)"         bash tests/service_drill.sh
 run "the page, in a real browser"      bash tests/page_check.sh
 run "unit: covenant vectors + oracle" python3 tests/test_units.py
+run "the same arithmetic in two languages" python3 tests/test_arith_parity.py
 run "unit: Tier C pledge message pin" python3 tests/test_openamp.py
 run "watcher: reorgs, and reading an exit" python3 tests/test_watcher.py
 run "oracle service: what it will not sign" python3 tests/test_oracle_service.py

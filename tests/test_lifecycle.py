@@ -250,8 +250,13 @@ def main():
 
             # ---- take #2 silently, through the library -----------------------
             ver, prog, spk = wallet_payout(bw)
-            t2 = LoanTerms(**{**json.loads(terms.to_json()),
-                              "borrower_x": prog, "borrower_prog": prog})
+            # Through the READER: amounts leave `to_json` as decimal
+            # strings, because a JSON number cannot carry an atom count above
+            # 2^53. The constructor takes integers; `from_json` is what turns
+            # one into the other, and every party uses it.
+            t2 = LoanTerms.from_json(json.dumps(
+                {**json.loads(terms.to_json()),
+                 "borrower_x": prog, "borrower_prog": prog}))
             got = n.gettxout(loan1["txid"], 1, True)
             coin = Outpoint(loan1["txid"], 1,
                             int(round(float(got["value"]) * COIN)), d)
