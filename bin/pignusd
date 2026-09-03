@@ -467,6 +467,8 @@ class Service:
         # survives one, so this is the only place a caller can
         # see that everything the book knows stopped updating.
         self.poll_error = None
+        self._btc_feerate = None
+        self._btc_feerate_at = 0
         self.height = None
         self.assets = {}            # asset id -> {ticker, name, precision}
         self.by_ticker = {}         # TICKER (upper) -> asset id
@@ -1595,6 +1597,28 @@ class Service:
                         "yourself before funding anything"]
         return loan, dest, problems
 
+    def btc_feerate(self):
+        """Satoshis per vbyte on the parent chain, or None.
+
+        None when there is no Bitcoin node or the node will not estimate:
+        unknown is never a number here, because a page that shows a made-up
+        feerate lets a borrower judge an unbumpable fee against nothing.
+        Cached for a poll -- it moves with the mempool, not with a request.
+        """
+        btc = getattr(self, "btc_node", None)
+        if btc is None:
+            return None
+        now = time.time()
+        if self._btc_feerate_at and now - self._btc_feerate_at < 60:
+            return self._btc_feerate
+        try:
+            from pignus.btc_collateral import btc_feerate as _rate  # noqa: PLC0415
+            self._btc_feerate = round(_rate(btc, fallback=None), 3)
+        except Exception:                               # noqa: BLE001
+            self._btc_feerate = None
+        self._btc_feerate_at = now
+        return self._btc_feerate
+
     def btc_height(self):
         """The parent chain's tip, from this book's own Bitcoin node.
 
@@ -1804,6 +1828,13 @@ class Handler(BaseHTTPRequestHandler):
     svc = None
     server_version = "pignusd"
     protocol_version = "HTTP/1.1"
+    # HTTP/1.1 means keep-alive, and a threading server gives every connection
+    # a thread of its own. Without a timeout, a client that opens one and sends
+    # nothing holds that thread for as long as it likes -- so a few hundred
+    # idle sockets are a book that answers nobody, from a machine that has done
+    # nothing wrong. Long enough for an ordinary slow request, short enough
+    # that an abandoned socket is not a resource.
+    timeout = 30
 
     def _send(self, code, payload, ctype="application/json"):
         # Bytes pass through untouched -- a static .json file is already
@@ -1972,6 +2003,15 @@ class Handler(BaseHTTPRequestHandler):
                                     # Bitcoin blocks, so a page without this
                                     # cannot say when either opens.
                                     "btc_height": s.btc_height(),
+                                    # What the parent chain currently charges,
+                                    # in satoshis per vbyte. The one move a
+                                    # cross-chain loan cannot fee-bump is
+                                    # signed at origination, so a borrower
+                                    # needs this BEFORE they commit anything:
+                                    # a fee too low to confirm is a loan that
+                                    # can never start, and the lender refuses
+                                    # to pay a principal into one.
+                                    "btc_feerate_sat_vb": s.btc_feerate(),
                                     "explorer_tx_url": s.explorer_tx_url,
                                     "btc_explorer_tx_url": s.btc_explorer_tx_url,
                                     "reference_ticker": s.reference_ticker,
@@ -2816,8 +2856,7 @@ class Handler(BaseHTTPRequestHandler):
                                            repay_vout=vout)
                 return self._send(200, {"ok": True})
             if path == "/v1/loans":
-                open_loans = sum(1 for r in s.book.loans.values()
-                                 if r.get("state") not in CLOSED_NAMES)
+                open_loans = s.book.open_loans(CLOSED_NAMES)
                 if open_loans >= MAX_LOANS:
                     return self._send(429, {"error": "the book is full"})
                 # A loan is registered before its funding is buried, so a caller
@@ -2952,6 +2991,9 @@ def main():
     host, _, port = cfg.get("listen", "127.0.0.1:8741").rpartition(":")
     Handler.svc = svc
     srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
+    # Threads that outlive the process are threads that keep it alive: a
+    # shutdown should not wait on a client that has stopped talking.
+    srv.daemon_threads = True
     # Bind and serve BEFORE the first sync. That sync re-tracks every loan and
     # can walk a long way back for spends it missed; done first, the page is a
     # proxy error for as long as it takes and nothing says why. Served first,

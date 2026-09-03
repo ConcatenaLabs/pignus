@@ -89,5 +89,25 @@ ok("and a completed abort is byte-identical to the Python's",
                           bytes(r.dest_spk), r.fee)) === r.sighash);
 }
 
+
+// A loan that names no upgrade_fee has no pre-vault amount, and the two
+// implementations must not GUESS one -- the library's default is 10,000 and a
+// browser guessing 3,000 derives a different address, so a borrower funds a
+// script whose move nobody signed and the collateral sits there until they
+// abort it. Refusing is the only answer that cannot be wrong.
+{
+  const bare = { ...v.loan };
+  delete bare.upgrade_fee;
+  let threw = false;
+  try { B.prevaultValue(bare); } catch { threw = true; }
+  ok("a loan with no upgrade_fee has no pre-vault amount, and says so", threw);
+  ok("an explicit zero is still a number, not an absence",
+     B.prevaultValue({ ...bare, upgrade_fee: 0 })
+     === BigInt(bare.btc_amount));
+  ok("and the fee is added exactly, at any size",
+     B.prevaultValue({ ...bare, upgrade_fee: "9007199254740993" })
+     === BigInt(bare.btc_amount) + 9007199254740993n);
+}
+
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

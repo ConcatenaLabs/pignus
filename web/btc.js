@@ -268,8 +268,24 @@ export function prevaultTree(loan) {
   ]);
 }
 export function prevaultSpk(loan) { return prevaultTree(loan).scriptPubKey(); }
+/**
+ * What the pre-vault holds: the collateral plus the fee for the one
+ * transaction that moves it into the vault.
+ *
+ * A loan that names no `upgrade_fee` is REFUSED rather than given a default.
+ * The library's own default is 10,000 satoshis and a guess here of anything
+ * else derives a different address -- so a borrower would fund a script whose
+ * pre-signed move nobody holds a signature for, and the collateral would sit
+ * there until they aborted it. An address derived from a number nobody agreed
+ * is not an address; it is a hole.
+ */
 export function prevaultValue(loan) {
-  return BigInt(loan.btc_amount) + BigInt(loan.upgrade_fee ?? 3000);
+  const fee = loan.upgrade_fee;
+  if (fee === undefined || fee === null || fee === "")
+    throw new Error("this loan names no upgrade_fee, so the pre-vault's " +
+      "amount -- and the address it implies -- cannot be derived. Nothing " +
+      "here will guess one: a guess funds an address whose move nobody signed.");
+  return BigInt(loan.btc_amount) + BigInt(fee);
 }
 export function prevaultAddress(loan, hrp = "tb") {
   const spk = prevaultSpk(loan);

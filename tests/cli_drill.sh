@@ -575,6 +575,65 @@ echo "$AGAIN" | grep -q "already verifies" || {
     echo "$AGAIN" | sed 's/^/  /' >&2; exit 1; }
 echo "  running it again on a sound offer says so and changes nothing"
 
+# --- a composer gets the NODE's dust threshold, never a fallback -------------
+#
+# `dust_fold` is where fee-asset change stops being worth an output and is given
+# to the block producer instead, and it depends on the rate the node publishes
+# for that asset. Every composer takes one; the repurchase tier's call sites
+# dropped it and got the built-in fallback, so change was folded at the wrong
+# figure -- either a dust output nobody can spend, or a gift.
+python3 - "$BIN/pignus-cli" <<'DUST'
+import re, sys
+
+src = open(sys.argv[1]).read()
+bad = []
+for m in re.finditer(r"\b(?:R\.)?(VaultSpender|RepurchaseSpender|OfferSpender)"
+                     r"\((?:[^()]|\([^()]*\))*\)", src):
+    if "dust_fold" in m.group(0):
+        continue
+    # A spender built only for a leaf and a control block composes no outputs
+    # and makes no dust decision. It says so, in the lines above it.
+    if "COMPOSES NOTHING" in src[max(0, m.start() - 400):m.start()]:
+        continue
+    bad.append(m.group(0)[:90].replace("\n", " "))
+if bad:
+    sys.exit("FAIL: composers built without the node's dust threshold:\n  "
+             + "\n  ".join(bad))
+n = len(re.findall(r"\b(?:R\.)?(?:VaultSpender|RepurchaseSpender|OfferSpender)\(",
+                   src))
+if n < 3:
+    sys.exit(f"FAIL: only found {n} composer(s) to check")
+print(f"  all {n} composers are given the node's own dust threshold")
+DUST
+
+# --- what a Tier C lender's security actually is, said every time ------------
+#
+# A Tier C pledge is not a covenant: the collateral is locked by an issuer's
+# policy server, and the lender's security is that issuer's promise. Every
+# pledge command says so, because presenting it quietly beside a Tier A loan --
+# which nobody can undo -- would be a lie of omission, and the moment it matters
+# is the moment somebody is acting.
+python3 - "$BIN/pignus-cli" <<'TIERC'
+import re, subprocess, sys
+
+cli = sys.argv[1]
+src = open(cli).read()
+missing = []
+for name in ("pledge_create", "pledge_release", "pledge_seize", "pledge_sign",
+             "pledge_list"):
+    m = re.search(r"def cmd_" + name + r"\(args\):.*?(?=\ndef |\n# ---)",
+                  src, re.S)
+    if not m:
+        sys.exit(f"FAIL: cmd_{name} not found")
+    body = m.group(0)
+    if "_say_tier_c" not in body and "OA.describe" not in body:
+        missing.append(name)
+if missing:
+    sys.exit("FAIL: these pledge commands do not say the collateral is "
+             f"issuer-permissioned: {missing}")
+print("  every pledge command says the collateral is issuer-permissioned")
+TIERC
+
 # --- a command this tool names must be a command this tool has ---------------
 #
 # Three separate messages told an operator to run `pignus-cli pledge-show`,

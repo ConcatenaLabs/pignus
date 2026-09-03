@@ -165,6 +165,15 @@ def breaks(selector):
                         or "word-break:break-all" in m.group(1).replace(" ", ""))
 want("hashes and addresses are allowed to break, so a phone can hold them",
      breaks(".mono"), css[:0])
+
+# A details row starts collapsed, and deriving the address it holds is a
+# taproot tweak. Doing that eagerly for every row cost seconds of a frozen tab
+# on a book with a few hundred loans, computing text nobody had asked to see.
+# The placeholder is what says the work is deferred; the thunk runs when a row
+# is opened.
+want("the address in a collapsed details row is not derived until it is shown",
+     'data-spk="' in dom or "No open offers" in dom or "empty" in dom,
+     "no deferred address placeholder and no empty book")
 want("and so are the values beside them in a details block",
      breaks(".kv>*") or breaks(".kv > *"), css[:0])
 

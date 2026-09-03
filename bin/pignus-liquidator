@@ -56,12 +56,18 @@ def canon(market):
     same market differently and mean it."""
     return "/".join(p.strip().upper() for p in str(market).split("/"))
 
-# What a round is allowed to fail with and carry on. A bot meant to run for the
-# life of a book must not end on a node restart or a book that blinked:
-# urllib's URLError and socket.timeout are OSError subclasses, so HTTP and RPC
-# transport failures are both covered here, and KeyError catches a response that
-# parsed but was not the shape it claims.
-TRANSIENT = (RpcError, RuntimeError, ValueError, OSError, KeyError)
+# What a single fetch or check is allowed to fail with and carry on. A bot meant
+# to run for the life of a book must not end on a node restart or a book that
+# blinked: urllib's URLError and socket.timeout are OSError subclasses, so HTTP
+# and RPC transport failures are both covered here, and KeyError and TypeError
+# catch a response that parsed but was not the shape it claims -- a reply from
+# a third party is not a promise about types.
+#
+# The ROUND itself catches wider than this. Deciding in advance every way a
+# stranger's JSON can go wrong is the mistake; not liquidating anything until
+# somebody notices is the cost.
+TRANSIENT = (RpcError, RuntimeError, ValueError, OSError, KeyError, TypeError,
+             AttributeError)
 
 
 def fetch_attestation(base, market):
@@ -558,9 +564,14 @@ def main():
         failed = False
         try:
             round_once()
-        except TRANSIENT as e:
-            # A round that could not be completed is a round skipped, not the
-            # end of the bot.
+        except Exception as e:                          # noqa: BLE001
+            # A round that could not be completed is a round SKIPPED, not the
+            # end of the bot -- and the catch is broad here on purpose. The
+            # narrow tuple below is right where a particular failure is
+            # expected; here the inputs are third-party oracles and a book,
+            # and a reply this code did not anticipate raises whatever it
+            # raises. A bot that exits on one stops liquidating every loan it
+            # was watching, silently, for as long as nobody notices.
             failed = True
             print(f"round: {type(e).__name__}: {e}", file=sys.stderr)
         if args.once:

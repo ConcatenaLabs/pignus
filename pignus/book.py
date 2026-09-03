@@ -405,6 +405,19 @@ class Book:
             self._save()
             return rec
 
+    def open_loans(self, closed_names):
+        """How many loans are not in a closed state, counted UNDER THE LOCK.
+
+        Iterating `self.loans` directly races the poll thread, which rebuilds
+        entries as it reconciles: a dict that changes size mid-iteration raises
+        RuntimeError, and the caller here is the admission check on
+        `POST /v1/loans` -- so a book at its busiest would answer a lender
+        registering a loan with a 500 instead of a yes or a no.
+        """
+        with self._lock:
+            rows = list(self.loans.values())
+        return sum(1 for r in rows if r.get("state") not in closed_names)
+
     def list_loans(self, state=None, market=None):
         with self._lock:
             out = list(self.loans.values())

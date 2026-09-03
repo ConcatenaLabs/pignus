@@ -129,12 +129,25 @@ latest verified price.
   ],
   "height": 118432,
   "btc_height": 155377,
+  "btc_feerate_sat_vb": 12.5,
+  "explorer_tx_url": "https://…/tx/{txid}",
+  "btc_explorer_tx_url": "https://…/tx/{txid}",
   "reference_ticker": "USDX",
   "block_seconds": 60,
   "min_depth": 2,
   "max_price_age": 600
 }
 ```
+
+`btc_feerate_sat_vb` is what the parent chain is charging now, and it is
+**null** rather than a guess when this book has no Bitcoin node or the node will
+not estimate. A cross-chain loan's move into the vault is signed at origination
+and can be neither replaced nor paid for by a child, so a borrower has to judge
+the fee that offer committed against this number before they commit anything --
+and against nothing at all rather than against an invented rate.
+
+`explorer_tx_url` and `btc_explorer_tx_url` are templates with a `{txid}`
+placeholder, or empty strings when the operator configured none.
 
 `lendable` is false when either ticker is unknown to the registry, when the
 price is not current, or when the precisions disagree; `stale` is true when a
@@ -414,7 +427,7 @@ one it cannot find on chain.
 | parameter | default | meaning |
 |---|---|---|
 | `market` | every market | `GOLD/USDX` |
-| `status` | `open` | `open`, `taken`, `withdrawn`, `gone`, `ghost`, or `all` |
+| `status` | `open` | `open`, `taken`, `withdrawn`, `gone`, `ghost`, `expired`, or `all`. A value outside that set is a 400 listing them, never an empty result |
 | `limit` | the whole book | how many of the newest to return |
 
 `{"offers": [ … ]}`, newest first. A stored record that cannot be rendered is
@@ -736,10 +749,18 @@ one client can make requests at all.
 
 ### `GET /v1/btc/offers`
 
-`?status=` (`open` by default, or `taken`, `withdrawn`, `gone`, `ghost`,
-`expired`, or `all`). A value outside that set is a 400 listing them, not an
-empty result -- an empty list reads as "there are no offers". Each row is the stored
-offer plus `lots_left`, computed live.
+`?status=` takes the same set as `/v1/offers` -- `open` by default, or `taken`,
+`withdrawn`, `gone`, `ghost`, `expired`, `all` -- and a value outside it is a
+400 listing them, not an empty result, because an empty list reads as "there are
+no offers". Only three of those are ever ASSIGNED to a cross-chain offer:
+`open`, `withdrawn` when its lender takes it down, and `expired` when its own
+deadlines have gone by. The rest describe a coin on a chain, and a cross-chain
+offer has none.
+
+Each row is the stored offer plus `lots_left`, computed live: how many of its
+lots are still free, once the takes holding one are counted. A borrower reads
+that before choosing an offer, since a lot somebody else is part-way through is
+not one they can have.
 
 A cross-chain offer carries no coin, so nothing on a chain ends one. The book
 ends it instead: an offer whose own four deadlines no longer leave both sides
@@ -757,7 +778,7 @@ self-signature.
            "principal": "5000000000", "repay_deadline": 125000,
            "abort_after": 902000, "upgrade_fee": 10000, "d_refund": 124000,
            "lender_prog": "…", "lender_ver": 0,
-           "market": "BTC/USDX", "strike": "0", "price_scale": 100000},
+           "market": "BTC/USDX", "strike": "4200000000", "price_scale": 100000},
   "market": "BTC/USDX", "lots": 3, "lots_taken": 1, "lots_left": 2,
   "offer_sig": "…128 hex…", "responder": "", "note": "",
   "status": "open", "created": 1799990000}]}

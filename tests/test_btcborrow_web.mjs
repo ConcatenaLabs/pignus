@@ -246,5 +246,36 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
                     9007199254740993) != null);
 }
 
+
+// --- the one fee nobody can raise, priced against the chain ----------------
+//
+// The move into the vault is signed at origination, spends a covenant leaf and
+// sets a final sequence: whatever the offer committed is the only fee it will
+// ever have. A lender's responder refuses to pay a principal into a loan whose
+// move will not confirm -- so a borrower who commits Bitcoin against a fee the
+// chain has outgrown waits for their own abort deadline with nothing to show
+// for it. The lender's half of that check existed; this is the borrower's, and
+// it has to fire at the same place.
+{
+  const loan = { h_w: "aa".repeat(32), d_refund: 205000, abort_after: 901000,
+                 repay_deadline: 265000, recover_after: 945000,
+                 upgrade_fee: 10000, btc_amount: "100000", debt: "1000",
+                 strike: "1", price_scale: 100000 };
+  const priced = (r) => bb.timelockProblems(loan, 900000, 200000, r)
+    .filter(x => x.includes("Bitcoin is charging"));
+  ok("a quiet chain accepts the offer's own fee", priced(20).length === 0);
+  ok("and so does one right up to twice what it carries",
+     priced(133).length === 0, String(priced(133)));
+  ok("past that the page refuses, exactly where the responder does",
+     priced(134).length === 1, String(priced(134)));
+  ok("a book with no Bitcoin node judges nothing rather than guessing",
+     priced(null).length === 0 && priced(0).length === 0);
+  ok("and the figure it quotes is the transaction's real cost",
+     bb.upgradeFeeNeeded(400) === 400 * bb.UPGRADE_VSIZE,
+     String(bb.upgradeFeeNeeded(400)));
+  ok("an unusable feerate is not a number", bb.upgradeFeeNeeded("x") === null
+     && bb.upgradeFeeNeeded(-1) === null);
+}
+
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

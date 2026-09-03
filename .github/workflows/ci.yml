@@ -107,7 +107,8 @@ jobs:
         run: |
           set -e
           for f in test_web test_offer_web test_repurchase_web test_btc_web \
-                   test_adaptor_web test_btcborrow_web test_takeoffer_web; do
+                   test_adaptor_web test_btcborrow_web test_takeoffer_web \
+                   test_format_web; do
             echo "== $f"
             node "tests/$f.mjs"
           done
@@ -136,3 +137,4 @@ jobs:
           set -e
           python3 tests/test_btc_relay.py
           python3 tests/test_btc_relay_auth.py
+          python3 tests/test_spend_depth.py

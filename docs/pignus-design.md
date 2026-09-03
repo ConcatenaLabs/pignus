@@ -379,12 +379,23 @@ exactly the `m` lowest attestations they hold, which makes the effective price
 the m-th lowest of the set -- a robust quantile rather than any one oracle's
 number.
 
-Two properties fall out and are worth stating. A single compromised oracle
-cannot trigger a liquidation, because it cannot reach the threshold alone -- and
-a signature from one key replayed into another key's slot fails, since every
-slot pins its own key. A single dead oracle cannot block one either, so the set
-improves both halves of the trust problem rather than trading one for the
-other. An abstaining slot carries an EMPTY signature, which
+Two properties fall out and are worth stating, and the second has a condition
+on it. A single compromised oracle cannot trigger a liquidation, because it
+cannot reach the threshold alone -- and a signature from one key replayed into
+another key's slot fails, since every slot pins its own key. That holds for any
+m-of-n. A single dead oracle cannot BLOCK a liquidation either, but only where
+m is less than n: at n-of-n every slot is required, so any one outage stops
+every liquidation under that set until it comes back.
+
+Which is the choice a lender is making, and `--oracle-threshold` defaults to
+n-of-n deliberately: it is the setting under which no single oracle outage can
+liquidate, and the price of that is the setting under which one can stall. A
+lender who would rather a liquidation survive an outage sets m below n and
+accepts that m keys agreeing is enough. Neither is the safe answer; they are
+opposite risks, and the default takes the one where nobody's collateral moves
+by mistake.
+
+An abstaining slot carries an EMPTY signature, which
 `OP_CHECKSIGFROMSTACK` treats as false; a non-empty invalid signature aborts the
 script instead, so a slot cannot be stuffed with rubbish to fake an abstention.
 

@@ -250,13 +250,22 @@ class BtcLoan:
     def prevault_tree(self):
         """Where the collateral waits until the principal is claimed.
 
-            UPGRADE  SHA256 <h_w> EQUALVERIFY <borrower> CHECKSIG
+            UPGRADE  SHA256 <h_w> EQUALVERIFY
+                     <borrower> CHECKSIGVERIFY <lender> CHECKSIG
             ABORT    <abort_after> CLTV DROP <borrower> CHECKSIG
 
-        The borrower signs the one UPGRADE transaction in advance, so anybody
-        holding `w` can complete it -- in practice the lender, the moment the
-        borrower's claim of the principal publishes `w`. Until then the
-        borrower can walk away at `abort_after` and has lost only time.
+        UPGRADE needs the preimage AND BOTH signatures, and each half is doing
+        work. Without the lender's, the borrower -- who chose `w` -- could move
+        their own collateral into the vault whenever they liked, so the
+        pre-vault would commit them to nothing. Without the preimage, the
+        lender could move it as soon as they held the borrower's advance
+        signature, before the principal they are meant to have paid for it had
+        been claimed at all.
+
+        So in practice the LENDER completes it: they hold the borrower's
+        signature from origination, and the borrower's own claim of the
+        principal publishes `w` on Sequentia. Until that happens the borrower
+        can walk away at `abort_after` and has lost only time.
         """
         if not self.h_w or not self.abort_after:
             raise ValueError("a pre-vault needs h_w and abort_after")
@@ -1297,7 +1306,9 @@ def btc_feerate(btc_node, blocks=3, fallback=FEERATE_FALLBACK):
     the vault, so their only way out is to wait for `abort_after`.
 
     Falls back only when the node will not answer, and never below the
-    mempool's own minimum, which is the floor for relaying at all.
+    mempool's own minimum, which is the floor for relaying at all. Pass
+    `fallback=None` to get None instead of a fallback, for a caller that would
+    rather show nothing than a number nobody stands behind.
     """
     rate = None
     try:
@@ -1307,6 +1318,12 @@ def btc_feerate(btc_node, blocks=3, fallback=FEERATE_FALLBACK):
     except Exception:                                   # noqa: BLE001
         pass
     if not rate or rate <= 0:
+        # `fallback=None` means "say nothing rather than guess". A composer
+        # needs a number to build a transaction with, and takes the fallback;
+        # a page that only DISPLAYS one must not invent it, because a borrower
+        # judging an unbumpable fee against a made-up rate is judging nothing.
+        if fallback is None:
+            return None
         rate = float(fallback)
     try:
         floor = float(btc_node.getmempoolinfo().get("mempoolminfee") or 0)
