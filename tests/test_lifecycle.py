@@ -337,10 +337,36 @@ def main():
                           ["state"] == "LIQUIDATED")
             check("loan 2 is LIQUIDATED", bool(st))
             after = bw.getbalances()["mine"]["trusted"].get(c, 0)
-            surplus = l2v["surplus_if_liquidated"] if l2v else 0
+            # A decimal string on the wire, like every other amount: read it
+            # the way a consumer has to, exactly.
+            surplus = int(l2v["surplus_if_liquidated"]) if l2v else 0
             check("the borrower got the surplus the covenant forces back",
                   surplus > 0 and abs(float(after - before) * COIN - surplus) < 2,
                   f"before {before} after {after} surplus {surplus}")
+
+            # A liquidated borrower's whole recourse is being able to check the
+            # book's account of the close against one they compute themselves.
+            # That only works if the two accounts are comparable, so they are
+            # compared here: the same fields, and the same spelling of every
+            # number in them. A difference should mean a disagreement about a
+            # value, never about its type.
+            terms2 = os.path.join(rig.root, "loan2-terms.json")
+            with open(terms2, "w") as f:
+                f.write(t2.to_json())
+            theirs = cli("explain", "--loan", l2["loan_id"],
+                         wallet="pignus", rig=rig, book=book)
+            mine = cli("explain", "--terms", terms2, "--txid", tx2, "--vout", "0",
+                       "--single-leaf", wallet="pignus", rig=rig, book=book)
+            shared = (set(theirs) & set(mine)) - {"attestations", "problems"}
+            differ = sorted(k for k in shared if theirs[k] != mine[k])
+            check("the book's account of the close and the borrower's own agree",
+                  bool(shared) and not differ,
+                  f"differ at {differ}: "
+                  + json.dumps({k: [theirs[k], mine[k]] for k in differ})[:300])
+            check("and both name the same exit at the same price",
+                  theirs.get("exit") == mine.get("exit") == "LIQUIDATED"
+                  and theirs.get("price_used") == mine.get("price_used"),
+                  f"{theirs.get('exit')}/{mine.get('exit')}")
 
             # ---- withdraw an expired offer -----------------------------------
             off2 = cli("offer-fund", "--market", "GOLD/USDX", "--principal", "40",
@@ -375,7 +401,7 @@ def main():
             l3v = wait_for(lambda: get(f"{book}/v1/loan/{loan3['loan_id']}")
                            .get("past_maturity") and
                            get(f"{book}/v1/loan/{loan3['loan_id']}")
-                           .get("surplus_if_liquidated") == 0 and
+                           .get("surplus_if_liquidated") == "0" and
                            get(f"{book}/v1/loan/{loan3['loan_id']}"), seconds=60)
             check("loan 3 is past maturity and under water", bool(l3v),
                   json.dumps(get(f"{book}/v1/loan/{loan3['loan_id']}"))[:300])

@@ -40,7 +40,8 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
-from pignus import atoms, compat, oracle as O        # noqa: E402
+from pignus import atoms, compat, locktime_open, oracle as O   # noqa: E402
+from pignus.book import Book                         # noqa: E402
 from pignus.node import Node, RpcError               # noqa: E402
 from pignus.offers import offer_vault_address        # noqa: E402
 from pignus.terms import LoanTerms                   # noqa: E402
@@ -291,10 +292,17 @@ def main():
                 print(f"oracle: {att.market}: an attestation from {where} "
                       "FAILED verification, ignoring", file=sys.stderr)
                 return
-            age = now - int(att.timestamp)
-            if age > args.max_attestation_age and not args.allow_stale:
-                print(f"oracle: {att.market}: {where}'s price was signed {age}s "
-                      f"ago (max {args.max_attestation_age}); not acting on it",
+            # Two-sided. A one-sided test reads a price dated AHEAD of this
+            # machine's clock as infinitely fresh, so an oracle whose host
+            # clock runs fast can have a dead price acted on for as long as
+            # the drift lasts -- and what is acted on here is a liquidation.
+            age = O.age_of(att, now)
+            if not O.current(att, args.max_attestation_age, now) \
+                    and not args.allow_stale:
+                when = (f"{age}s ago" if age >= 0
+                        else f"{-age}s in the FUTURE, which no honest clock is")
+                print(f"oracle: {att.market}: {where}'s price was signed {when} "
+                      f"(max {args.max_attestation_age}); not acting on it",
                       file=sys.stderr)
                 return
             ev[(ox.lower(), canon(att.market))] = att
@@ -348,7 +356,7 @@ def main():
                       "--book at a book that aggregates it")
         return out
 
-    def decide(v, ev, height):
+    def decide(v, ev, height, now=None):
         """(kind, price, evidence) for a live vault, or None.
 
         The decision is made from the loan's OWN oracles before anything is
@@ -363,7 +371,8 @@ def main():
             slots, price = O.liquidatable_slots(t, usable)
             if slots is not None:
                 return "liquidate", price, usable
-            if args.call_due and height is not None and height >= t.maturity:
+            if args.call_due and height is not None \
+                    and locktime_open(t.maturity, height, now):
                 slots, price = O.select_threshold(t, usable)
                 if slots is None:
                     note(v.loan_id, f"cannot reach the {t.threshold}-of-"
@@ -374,7 +383,11 @@ def main():
         att = usable[t.oracle_keys[0]]
         if t.is_liquidatable(att.price):
             return "liquidate", att.price, att
-        if args.call_due and height is not None and height >= t.maturity:
+        # In the deadline's own units: a maturity at or above the locktime
+        # threshold is a Unix TIME, and comparing it to a height says the loan
+        # matures thousands of years from now, so DEFAULT would never be called.
+        if args.call_due and height is not None \
+                and locktime_open(t.maturity, height, now):
             return "default", att.price, att
         return None
 
@@ -416,12 +429,21 @@ def main():
         watcher.poll()
         ev = gather({canon(t.market) for t, _o, _s in loans.values()})
         height = node.getblockcount() if args.call_due else None
+        # The chain's median time as well, because a maturity may be written as
+        # a Unix time and only that is what consensus compares such a one to.
+        mtp = None
+        if args.call_due and height is not None:
+            try:
+                mtp = int(node.getblockheader(
+                    node.getblockhash(height))["mediantime"])
+            except TRANSIENT as e:
+                print(f"median time: {type(e).__name__}: {e}", file=sys.stderr)
 
         for v in list(watcher.vaults.values()):
             if v.state is not State.LIVE or v.loan_id not in loans:
                 continue
             t = v.terms
-            got = decide(v, ev, height)
+            got = decide(v, ev, height, mtp)
             if got is None:
                 continue
             kind, price, evidence = got
@@ -451,7 +473,14 @@ def main():
             except Exception:                           # noqa: BLE001
                 pass
             profit = gross - (fee_atoms if fee_known else 0)
-            print(f"{kind}: {t.loan_id()[:16]} {t.market} price={price} "
+            # BOTH names. The terms id is what a person recognises -- two
+            # fundings of one set of terms share it -- and the book's own key
+            # is the terms id hashed with the funding outpoint, which is what
+            # every book record and every URL uses. Printing only the first
+            # leaves an operator with an id no lookup accepts.
+            print(f"{kind}: {t.loan_id()[:16]} (book "
+                  f"{Book.loan_key(t, v.txid, v.vout)[:16]}) "
+                  f"{t.market} price={price} "
                   f"health={t.health(price):.3f} seize={seize} surplus={surplus} "
                   f"gross={gross} "
                   + (f"fee={fee_atoms} " if fee_known else "fee=? ")

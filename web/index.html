@@ -41,7 +41,13 @@
      vertical-align:top}
   tr:last-child td{border-bottom:0}
   td .sub2{display:block;color:var(--mute);font-size:12px;margin-top:1px}
-  .mono{font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+  /* An address, a 64-hex hash and a scriptPubKey have no spaces in them, so a
+     narrow screen cannot wrap one and the whole page grows wider than the
+     viewport instead -- every row, not just the offending one. Breaking
+     anywhere is right for these: they are read a character at a time and
+     copied with a button, never scanned as words. */
+  .mono{font-family:var(--mono);font-size:12.5px;color:var(--dim);
+        overflow-wrap:anywhere}
   .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;
        border:1px solid var(--line);color:var(--dim);white-space:nowrap;vertical-align:middle}
   .tag.ok{color:var(--ok);border-color:var(--ok-line)}
@@ -85,6 +91,9 @@
   .preview .k{color:var(--mute)}
   .kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;font-size:14px}
   .kv .k{color:var(--mute)}
+  /* The value cells too: a bech32 address in one of these is bare text, not
+     inside .mono, and one of them is enough to widen the page. */
+  .kv>*{overflow-wrap:anywhere}
   tr.det td{display:block;text-align:left;background:var(--card2)}
   tr.det td::before{content:none}
   tr.det pre{white-space:pre-wrap;word-break:break-all;font-family:var(--mono);
@@ -173,6 +182,7 @@ a lender who is online.</p>
   in. Borrowers take it while you are offline; you cannot oversell it and cannot
   change a term afterwards. Anything untaken comes back to you after the expiry,
   permissionlessly, to the address this wallet already has.</p>
+  <div id="lendform_err"></div>
   <form class="lend card" id="lendform">
     <div><label for="marketsel">Market</label>
       <select name="market" id="marketsel"></select></div>

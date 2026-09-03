@@ -50,7 +50,7 @@ from .watcher import CLOSED
 CLOSED_STATES = frozenset(s.value for s in CLOSED)
 # An offer in one of these is spent, cancelled or unfindable: its coin cannot
 # be taken again, whatever happens next.
-DEAD_OFFERS = frozenset(("taken", "withdrawn", "gone", "ghost"))
+DEAD_OFFERS = frozenset(("taken", "withdrawn", "gone", "ghost", "expired"))
 # Take statuses that hold no lot of a lender's offer: the loan they were for
 # ended without the principal ever going out, or was undone.
 LOT_FREE = frozenset(("aborted", "refunded", "expired"))
@@ -835,5 +835,8 @@ class Book:
         return {"loans_by_state": by_state, "offers": open_offers,
                 "offers_all": len(self.offers),
                 "unreadable": unreadable,
-                "live_debt_by_asset": total_debt,
+                # Decimal strings, like every other amount this book serves:
+                # a total debt is exactly the figure that grows past what a
+                # JSON number holds, and it is one a lender reads.
+                "live_debt_by_asset": {a: str(v) for a, v in total_debt.items()},
                 "at_risk": sorted(at_risk, key=lambda r: r["health"])}

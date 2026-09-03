@@ -245,14 +245,41 @@ def _cet_sighash(loan, tx):
     return B.taproot_sighash(tx, spent, 0, script=tree.leaves["settle"])
 
 
-def verify_cets(loan, ann, cets, signer_x):
-    """Check every counterparty CET before funding. A single CET that does not
-    verify means one outcome in which the collateral is stuck, and the party who
-    would be stuck is the one who skipped this check."""
+def verify_cets(loan, ann, cets, signer_x, mine=None):
+    """Check every counterparty CET before funding.
+
+    A signature that does not verify means one outcome in which the collateral
+    is stuck, and the party who would be stuck is the one who skipped this
+    check. But a valid signature over the WRONG transaction is worse, and that
+    is what `mine` is for: a counterparty is free to adaptor-sign a set of CETs
+    that all verify perfectly and all pay themselves the whole collateral. Both
+    sides build their set from the same agreed inputs, so each can rebuild the
+    other's exactly -- and comparing the unsigned bytes, outcome by outcome, is
+    the only thing that says the signatures are over the deal that was struck.
+
+    `mine` is the caller's own CET set. Passing it is not optional in any real
+    flow: funding is the irreversible step, and this is the last check before
+    it. It defaults to None only so a caller checking their own set against
+    itself need not pass it twice.
+
+    Returns (ok, label_of_the_first_bad_one).
+    """
     for label, (tx, sig) in cets.items():
+        if mine is not None:
+            ours = mine.get(label)
+            if ours is None:
+                return False, label
+            if ours[0].serialize(witness=False) != tx.serialize(witness=False):
+                return False, label
         if not A.encrypt_verify(bytes.fromhex(signer_x), _cet_sighash(loan, tx),
                                 ann.attestation_point(label), sig):
             return False, label
+    if mine is not None:
+        # An outcome they left out is an outcome nobody can settle, which is
+        # the same loss by omission.
+        missing = set(mine) - set(cets)
+        if missing:
+            return False, sorted(missing)[0]
     return True, None
 
 
@@ -262,7 +289,16 @@ def complete_cet(loan, ann, my_cets, their_cets, outcome, attestation,
     attestation, add my own plain signature, and attach the witness."""
     if not check_attestation(ann, outcome, attestation):
         raise ValueError("attestation does not match the announcement")
-    tx, their_sig = their_cets[outcome]
+    _their_tx, their_sig = their_cets[outcome]
+    # MY transaction, and their signature over it. If the two differ this
+    # settlement is not the one that was agreed, and their signature would be
+    # valid over whatever they sent instead.
+    tx = my_cets[outcome][0]
+    if tx.serialize(witness=False) != _their_tx.serialize(witness=False):
+        raise ValueError(
+            f"the counterparty's CET for {outcome!r} is not the transaction "
+            f"agreed for that outcome. Their signature is over something else; "
+            f"refusing to settle with it")
     msg = _cet_sighash(loan, tx)
     theirs = A.decrypt(their_sig, attestation)
     mine = A.sign(my_sec, msg)

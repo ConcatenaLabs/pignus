@@ -58,7 +58,8 @@ EOF
 # is written straight into the book, which is what a running daemon would have
 # left behind, and the endpoint under test is the DELETE.
 CANCEL_TOKEN="a-token-only-the-publisher-has"
-CANCEL_ID=$(python3 - "$WORK/book.json" "$CANCEL_TOKEN" <<PY
+CLI_TOKEN="a-second-token-for-the-command-line"
+CANCEL_ID=$(python3 - "$WORK/book.json" "$CANCEL_TOKEN" "$CLI_TOKEN" <<PY
 import json, sys
 sys.path.insert(0, "$HERE/..")
 from pignus.book import Book
@@ -73,9 +74,17 @@ b = Book(sys.argv[1])
 rec = b.put_offer({"terms": terms.to_json(), "kind": "funded",
                    "outpoint": "11" * 32 + ":0", "manage_token": sys.argv[2],
                    "funded_value": str(1450 * 10**8), "confirmations": 6})
+# A second listing, for the command-line path: the DELETE endpoint and the
+# command that drives it are different things to get wrong.
+two = b.put_offer({"terms": terms.to_json(), "kind": "funded",
+                   "outpoint": "12" * 32 + ":0", "manage_token": sys.argv[3],
+                   "funded_value": str(1450 * 10**8), "confirmations": 6})
 print(rec["offer_id"])
+print(two["offer_id"])
 PY
 )
+CLI_ID=$(printf '%s\n' "$CANCEL_ID" | tail -1)
+CANCEL_ID=$(printf '%s\n' "$CANCEL_ID" | head -1)
 
 echo "== starting the oracle on :$OPORT =="
 "$BIN/pignus-oracle" --config "$WORK/oracle.json" > "$WORK/oracle.log" 2>&1 &
@@ -223,6 +232,29 @@ assert json.load(open(sys.argv[1]))["removed"] is True, "removed was not true"' 
 code=$(del "$CANCEL_TOKEN")
 test "$code" = "404" || { echo "second cancel -> $code, wanted 404" >&2; exit 1; }
 echo "  cancelled with its own token, then gone"
+
+# ...and from the COMMAND LINE. The endpoint existed and the documentation told
+# a lender to keep the token for it, and no command consumed one: a lender
+# whose strike stopped making sense an hour after publishing could only watch
+# borrowers keep taking the listing until it expired.
+set +e
+OUT=$("$BIN/pignus-cli" offer-delist --offer "$CLI_ID" --token "wrong" \
+        --book "$D" 2>&1); rc=$?
+set -e
+test "$rc" != "0" || { echo "the wrong token delisted somebody's offer" >&2
+                       echo "$OUT" >&2; exit 1; }
+echo "$OUT" | grep -q "served once" || {
+    echo "it refused, but did not say the token cannot be recovered" >&2
+    echo "$OUT" | sed 's/^/  /' >&2; exit 1; }
+curl -fsS "$D/v1/offer/$CLI_ID" >/dev/null || {
+    echo "a refused delist removed the listing" >&2; exit 1; }
+echo "  the command refuses a wrong token and leaves the listing alone"
+
+"$BIN/pignus-cli" offer-delist --offer "$CLI_ID" --token "$CLI_TOKEN" \
+    --book "$D" >/dev/null
+code=$(curl -s -o /dev/null -w '%{http_code}' "$D/v1/offer/$CLI_ID")
+test "$code" = "404" || { echo "after delisting, /v1/offer -> $code" >&2; exit 1; }
+echo "  and takes it down with the right one"
 
 echo
 echo "== the write rate limit is charged to the client, not to the proxy =="

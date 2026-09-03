@@ -330,6 +330,22 @@ def main():
         check("and somebody else's key returns none",
               get(base + "/v1/btc/takes?borrower_x=" + "ab" * 32)["takes"] == [])
 
+        # An operator retiring an oracle key has to see BOTH tiers.
+        # `/v1/loans?oracle_x=` answers for the issued-asset one only, so a
+        # rotation checked against that alone reads "nothing depends on this
+        # key" while live cross-chain loans still name it -- and on this tier
+        # the oracle's signature IS the liquidation, so retiring it takes that
+        # loan's seizure away from the lender for good.
+        ox = loan["oracle_x"]
+        by_oracle = get(base + "/v1/btc/takes?oracle_x=" + ox)["takes"]
+        check("every take naming an oracle comes back from that key alone",
+              len(by_oracle) == len(mine), f"{len(by_oracle)} vs {len(mine)}")
+        check("and a key no loan names returns none",
+              get(base + "/v1/btc/takes?oracle_x=" + "cd" * 32)["takes"] == [])
+        check("the filter is case-insensitive, as the covenant's comparison is",
+              len(get(base + "/v1/btc/takes?oracle_x=" + ox.upper())["takes"])
+              == len(by_oracle))
+
         print("\n== and the lender can take the offer down ==")
         oid = offer["btc_offer_id"]
         check("a stranger cannot withdraw it",

@@ -425,6 +425,42 @@ if r.returncode == 0 or "check the chain" not in r.stderr:
              + r.stderr[-300:])
 print("  clearing refuses without a way to check the chain first")
 
+# --found must be REACHABLE. The chain check used to refuse whenever it saw a
+# payment, including when --found named that very payment, so the command's own
+# instruction -- "record it instead, with --found" -- led nowhere, and the one
+# repair a responder cannot make for itself could not be made at all. With no
+# node, --found is still refused, but for its own reason.
+r = subprocess.run([sys.executable, cli, "btc-responder-clear",
+                    "--state", state, "--take", "take-stuck",
+                    "--found", "aa" * 32 + ":0"],
+                   capture_output=True, text=True)
+if r.returncode == 0 or "checked against this loan" not in r.stderr:
+    sys.exit("FAIL: --found without a node did not say why it was refused\n"
+             + r.stderr[-400:])
+print("  and --found says it needs a node to check the outpoint, not the flag")
+
+# With --force it records what it was told, which is what an operator who has
+# checked by hand needs.
+r = subprocess.run([sys.executable, cli, "btc-responder-clear",
+                    "--state", state, "--take", "take-stuck",
+                    "--found", "aa" * 32 + ":1", "--force"],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit(f"FAIL: --found --force was refused: {r.stderr[-400:]}")
+h = json.load(open(state))["take-stuck"]
+if h.get("disbursement_txid") != "aa" * 32 or int(h.get("disbursement_vout")) != 1:
+    sys.exit(f"FAIL: --found did not record the outpoint: {h}")
+if h.get("disbursing"):
+    sys.exit("FAIL: the in-flight flag survived --found")
+if h.get("disbursed_reported") is not False:
+    sys.exit("FAIL: the recovered disbursement was not queued for reporting")
+print("  and records the outpoint it was given, clearing the flag with it")
+
+# Put it back, so the checks below still meet a take with a send in flight.
+h2 = json.load(open(state))
+h2["take-stuck"] = {"disbursing": "0014" + "bb" * 20, "t": "cc" * 32}
+json.dump(h2, open(state, "w"))
+
 r = subprocess.run([sys.executable, cli, "btc-responder-clear",
                     "--state", state, "--take", "take-stuck", "--force"],
                    capture_output=True, text=True)
@@ -442,6 +478,191 @@ if r.returncode == 0:
     sys.exit("FAIL: clearing a take with nothing in flight was allowed")
 print("  a take with nothing in flight is left alone")
 PYSTATUS
+
+# --- an offer a responder no longer recognises must be LOUD -----------------
+#
+# Every pass skips a take whose offer does not verify under this key, and that
+# skip is indistinguishable from having nothing to do. If a live loan sits
+# under such an offer, the lender stops claiming repayments and stops
+# publishing secrets -- a borrower's collateral held hostage, with the state
+# file looking exactly as it did the day before. There are two ways to get
+# here: a book serving an altered record, and a change to what the signature
+# covers. Both need a person.
+echo
+echo "-- an offer that stops verifying under its own key"
+DPORT2=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+LKEY2="$WORK/disowned.key"
+"$BIN/pignus-cli" btc-keygen --out "$LKEY2" >/dev/null
+python3 - "$LKEY2" "$WORK/disowned-book.json" <<'DISOWN'
+import json, sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, ".")
+from pignus import adaptor as A
+sec = bytes.fromhex(open(sys.argv[1]).read().strip())
+lender_x = A.xonly_pubkey(sec).hex()
+loan = {"btc_amount": "100000", "lender_x": lender_x, "oracle_x": "cc" * 32,
+        "recover_after": 900000, "debt_asset": "dd" * 32, "debt": "5250000000",
+        "principal": "5000000000", "repay_deadline": 125000,
+        "abort_after": 902000, "upgrade_fee": 10000, "d_refund": 124000,
+        "lender_prog": "ee" * 20, "lender_ver": 0, "borrower_x": "",
+        "market": "BTC/USDX", "strike": "0", "price_scale": 100000,
+        "payment_hash": "", "adaptor_point": "", "h_w": ""}
+# Signed over SOMETHING ELSE, which is what an offer published under an older
+# canonical form looks like to a responder reading it today.
+pathlib.Path(sys.argv[2]).write_text(json.dumps({
+    "loans": {}, "offers": {}, "btc_takes": {}, "btc_commitments": {},
+    "btc_offers": {"1" * 24: {
+        "btc_offer_id": "1" * 24, "loan": loan, "market": "BTC/USDX",
+        "lots": 1, "offer_sig": "00" * 64, "responder": "", "note": "",
+        "status": "open", "created": 1799990000}}}))
+DISOWN
+cat > "$WORK/disowned-cfg.json" <<J
+{"listen":"127.0.0.1:$DPORT2","book":"$WORK/disowned-book.json",
+ "oracle":"","registry":"","poll":3600,"markets":[]}
+J
+"$BIN/pignusd" --config "$WORK/disowned-cfg.json" >"$WORK/disowned.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 60); do
+    curl -sf "http://127.0.0.1:$DPORT2/healthz" >/dev/null && break
+    sleep 0.25
+done
+echo '{}' > "$WORK/disowned.state.json"
+set +e
+OUT=$("$BIN/pignus-cli" btc-responder-status --lender-key "$LKEY2"         --state "$WORK/disowned.state.json"         --book "http://127.0.0.1:$DPORT2" 2>&1)
+rc=$?
+set -e
+echo "$OUT" | grep -q "111111111111111111111111" || {
+    echo "the status did not name the offer that stopped verifying" >&2
+    echo "$OUT" | sed 's/^/  /' >&2; exit 1; }
+test "$rc" = "4" || {
+    echo "an offer whose takes are being skipped did not count as needing "\
+         "attention (exit $rc)" >&2; exit 1; }
+echo "  the status names it and exits 4, rather than reporting a quiet night"
+
+# ...and the lender can repair it, which is the whole point of noticing. The
+# book verifies the new signature over the terms it ALREADY holds, so this can
+# only ever replace a signature with one that checks out: it cannot change a
+# term, and nobody without the key can use it.
+set +e
+BAD=$("$BIN/pignus-cli" btc-offer-resign --offer 111111111111111111111111 \
+        --lender-key "$WORK/lender.key" --book "http://127.0.0.1:$DPORT2" 2>&1)
+rc=$?
+set -e
+test "$rc" != "0" || {
+    echo "a stranger's key was allowed to re-sign somebody else's offer" >&2
+    echo "$BAD" | sed 's/^/  /' >&2; exit 1; }
+echo "$BAD" | grep -q "only the lender an offer names" || {
+    echo "it refused, but not for the right reason" >&2
+    echo "$BAD" | sed 's/^/  /' >&2; exit 1; }
+echo "  a key the offer does not name cannot re-sign it"
+
+"$BIN/pignus-cli" btc-offer-resign --offer 111111111111111111111111 \
+    --lender-key "$LKEY2" --book "http://127.0.0.1:$DPORT2" >/dev/null
+OUT=$("$BIN/pignus-cli" btc-responder-status --lender-key "$LKEY2" \
+        --state "$WORK/disowned.state.json" \
+        --book "http://127.0.0.1:$DPORT2" 2>&1)
+echo "$OUT" | grep -q '"disowned_offers": \[\]' || {
+    echo "the offer still does not verify after the lender re-signed it" >&2
+    echo "$OUT" | sed 's/^/  /' >&2; exit 1; }
+echo "  and its own lender repairs it with one signature, changing no term"
+
+# Twice is a no-op rather than an error: an operator running the repair over
+# every offer they hold should not have to know which ones needed it.
+AGAIN=$("$BIN/pignus-cli" btc-offer-resign --offer 111111111111111111111111 \
+          --lender-key "$LKEY2" --book "http://127.0.0.1:$DPORT2" 2>&1)
+echo "$AGAIN" | grep -q "already verifies" || {
+    echo "re-signing an offer that is already sound did not say so" >&2
+    echo "$AGAIN" | sed 's/^/  /' >&2; exit 1; }
+echo "  running it again on a sound offer says so and changes nothing"
+
+# --- a command this tool names must be a command this tool has ---------------
+#
+# Three separate messages told an operator to run `pignus-cli pledge-show`,
+# which has never existed -- and each of them fired at the moment somebody was
+# deciding whether a seizure had actually delivered their collateral. A message
+# that names a command is a message somebody types.
+python3 - "$BIN/pignus-cli" <<'NAMED'
+import re, subprocess, sys
+
+cli = sys.argv[1]
+named = sorted(set(re.findall(r"pignus-cli ([a-z][a-z0-9-]+)", open(cli).read())))
+top = subprocess.run([sys.executable, cli, "--help"],
+                     capture_output=True, text=True).stdout
+have = set(re.findall(r"\{([a-z0-9,\-]+)\}", top)[0].split(","))
+missing = [n for n in named if n not in have]
+if missing:
+    sys.exit(f"FAIL: messages name commands that do not exist: {missing}")
+if len(named) < 5:
+    sys.exit(f"FAIL: only found {len(named)} command names to check")
+print(f"  every one of the {len(named)} commands its own messages name exists")
+NAMED
+
+# ...and the same for the documentation, which is the other place a reader
+# copies a command out of.
+python3 - "$BIN/pignus-cli" "$PKG" <<'NAMEDDOC'
+import re, subprocess, sys, glob, os
+
+cli, root = sys.argv[1], sys.argv[2]
+top = subprocess.run([sys.executable, cli, "--help"],
+                     capture_output=True, text=True).stdout
+have = set(re.findall(r"\{([a-z0-9,\-]+)\}", top)[0].split(","))
+bad = {}
+for path in ["README.md"] + sorted(glob.glob("docs/*.md")) \
+        + sorted(glob.glob("deploy/*.md")):
+    full = os.path.join(root, path)
+    if not os.path.exists(full):
+        continue
+    for name in set(re.findall(r"pignus-cli ([a-z][a-z0-9-]+)",
+                               open(full, encoding="utf-8").read())):
+        if name not in have:
+            bad.setdefault(path, []).append(name)
+if bad:
+    sys.exit(f"FAIL: the documentation names commands that do not exist: {bad}")
+print("  and every command the documentation names exists too")
+NAMEDDOC
+
+# --- every subcommand explains itself, in language that stays true -----------
+#
+# A subcommand's `--help` used to print its flags and nothing about what it
+# does, because argparse shows a subparser's `help=` only in the parent's
+# listing. The descriptions are filled in from the handlers, which means those
+# docstrings are documentation now: they are held to the same rule as every
+# other line a reader sees, and history belongs in the git log.
+python3 - "$BIN/pignus-cli" <<'PYHELP'
+import re, subprocess, sys
+
+cli = sys.argv[1]
+top = subprocess.run([sys.executable, cli, "--help"],
+                     capture_output=True, text=True).stdout
+names = re.findall(r"\{([a-z0-9,\-]+)\}", top)[0].split(",")
+if len(names) < 40:
+    sys.exit(f"FAIL: only found {len(names)} subcommands to check")
+
+bare, crashed = [], []
+history = re.compile(r"\b(until now|used to|no longer|previously|recently|"
+                     r"formerly|was renamed|older versions?|new in|"
+                     r"we (?:now|have|added))\b", re.I)
+dated = []
+for c in names:
+    r = subprocess.run([sys.executable, cli, c, "--help"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        crashed.append(c)
+        continue
+    body = r.stdout.split("options:")[0].split("positional")[0]
+    if len(body.strip().splitlines()) <= 2:
+        bare.append(c)
+    if history.search(body):
+        dated.append(c)
+
+if crashed:
+    sys.exit(f"FAIL: --help crashed for {crashed}")
+if bare:
+    sys.exit(f"FAIL: these say nothing about what they do: {bare}")
+if dated:
+    sys.exit(f"FAIL: these tell the reader about the past: {dated}")
+print(f"  all {len(names)} subcommands describe themselves, in the present tense")
+PYHELP
 
 echo
 echo "all CLI drills passed"

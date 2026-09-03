@@ -20,7 +20,8 @@ Config (JSON):
       "interval":    60,
       "price_scale": 100000,
       "markets":     ["GOLD/USDX", "SILVR/USDX", "OILX/USDX", "SEQ/USDX"],
-      "precisions":  {"GOLD": 8, "USDX": 8},
+      "precisions":  {"GOLD": 8, "SILVR": 8, "OILX": 8,
+                      "SEQ": 8, "USDX": 8},
       "symbols":     {"BTC": "tBTC"},
       "log_max_bytes": 0,
       "source":      {"type": "http_bulk", "url": "http://127.0.0.1:8088/prices"}
@@ -56,8 +57,12 @@ moves someone's bitcoin, so it is an operator's command, run against the same
 config, and it refuses unless this oracle's own published price is under the
 strike.
 
-    pignus-oracle --config oracle.json --sign-seize --market GOLD/USDX \\
-        --strike 18000000 --request seizure.json
+    pignus-oracle --config oracle.json --sign-seize --request seizure.json
+
+The request names the loan, and the loan names its own market and strike, so
+neither is given on the command line: `--market` and `--strike` are accepted
+only to pin what a request should say, and one that disagrees with the request
+is refused rather than followed.
 """
 
 import argparse

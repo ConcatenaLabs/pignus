@@ -454,6 +454,14 @@ CLAIM_MARGIN_BLOCKS = CLAIM_MARGIN_SECONDS // SEQ_BLOCK_SECONDS
 # have.
 MIN_UPGRADE_FEE = 10_000
 
+# Where a node stops reading an absolute locktime as a block HEIGHT and starts
+# reading it as a Unix TIME. Every margin this tier is judged by is measured in
+# blocks -- a deadline is turned into seconds by subtracting a chain's tip
+# HEIGHT and multiplying by a block time -- so a time-valued deadline makes
+# every gap look thousands of years wide and every check pass. This tier is
+# height-only, and `timelocks_sane` is where that is enforced.
+LOCKTIME_THRESHOLD = 500_000_000
+
 
 def effective_repay_deadline(loan):
     """The last Sequentia block at which repaying still works.
@@ -483,6 +491,27 @@ def timelocks_sane(loan, btc_height, seq_height, *,
         enough that a borrower who repays on time can still reclaim.
     """
     problems = []
+    # HEIGHTS, and nothing else. A locktime at or above LOCKTIME_THRESHOLD is a
+    # Unix time to every node that validates it, and every margin below is
+    # computed by subtracting a chain's tip HEIGHT: fed a timestamp, each one
+    # comes out at tens of thousands of years and passes unconditionally. A
+    # lender could then publish an offer whose Bitcoin sweep opens seconds
+    # after the borrower's Sequentia refund and this function would call it
+    # sound. Refuse first, and return, because nothing after this could be
+    # trusted anyway.
+    for name, v in (("d_refund", loan.d_refund),
+                    ("repay_deadline", loan.repay_deadline),
+                    ("abort_after", loan.abort_after),
+                    ("recover_after", loan.recover_after)):
+        if int(v or 0) >= LOCKTIME_THRESHOLD:
+            problems.append(
+                f"{name} is {int(v)}, which is at or above "
+                f"{LOCKTIME_THRESHOLD}, so a node reads it as a Unix time "
+                f"rather than a block height. The margins that protect both "
+                f"sides of this loan are measured in blocks, so nothing here "
+                f"can check them: this tier takes heights only")
+    if problems:
+        return problems
     btc_s = lambda h: (int(h) - int(btc_height)) * btc_block_seconds   # noqa: E731
     seq_s = lambda h: (int(h) - int(seq_height)) * seq_block_seconds   # noqa: E731
     if loan.h_w or loan.abort_after or loan.d_refund:

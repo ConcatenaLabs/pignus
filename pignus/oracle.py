@@ -87,6 +87,34 @@ class Attestation:
         return cls(**{k: v for k, v in d.items() if k in keep})
 
 
+# How far ahead of this machine's clock an attestation may be dated and still
+# be treated as current. Two oracles and a book do not share a clock, and a few
+# seconds of drift between honest hosts is ordinary.
+CLOCK_SKEW = 120
+
+
+def age_of(att, now=None) -> int:
+    """Seconds since an attestation was signed. NEGATIVE when it is dated ahead.
+
+    Every freshness test used to be one-sided -- `now - timestamp <= max_age`
+    -- which reads a price from the future as infinitely fresh. An oracle whose
+    host clock runs six hours fast signs at the real price, its feed then dies,
+    and for the next six hours that dead price is quoted as current: a market
+    stays lendable, a health figure keeps being computed, and a liquidation is
+    judged on a number nobody stands behind any more. So callers compare
+    against `CLOCK_SKEW` in both directions, and the sign of this is what tells
+    them which side they are on.
+    """
+    import time                                          # noqa: PLC0415
+    return int(time.time() if now is None else now) - int(att.timestamp)
+
+
+def current(att, max_age, now=None) -> bool:
+    """Is this attestation one to act on: recent, and not dated ahead?"""
+    age = age_of(att, now)
+    return -CLOCK_SKEW <= age <= int(max_age)
+
+
 def sign(sec: bytes, market: str, price: int, price_scale: int,
          timestamp: int = None) -> Attestation:
     """Sign a price for `market`. The timestamp defaults to now."""

@@ -88,7 +88,8 @@ bin/pignusd              the loan book, the watcher, the cross-chain relay, and
                          the page at /lending/
 bin/pignus-cli           selftest, quote, propose, show, address, verify, status,
                          explain, check-attestation; with a node wallet:
-                         offer-fund, offer-publish, offer-take, offer-withdraw,
+                         offer-fund, offer-publish, offer-take, offer-delist,
+                         offer-withdraw,
                          loan-export, repay, liquidate, default, recover; btc-*
                          (Tier B, both chains); pledge-* (Tier C); repo-*
                          (repurchase)
@@ -138,8 +139,15 @@ pignus-cli offer-fund --market GOLD/USDX --principal 100 --lots 3 \
     --interest 3 --open-ltv 50 --liq-ltv 75 --term-days 30 --rpc-wallet me
 pignus-cli offer-take --offer <id> --rpc-wallet me
 pignus-cli repay | liquidate | default | recover --loan <id> --rpc-wallet me
+pignus-cli offer-delist  --offer <id> --token <manage token>
 pignus-cli offer-withdraw --offer <id> --rpc-wallet me
 ```
+
+`offer-delist` and `offer-withdraw` are different acts. Delisting takes the
+book's advertisement down so nobody new takes the terms, and touches no coin;
+withdrawing brings the principal itself back, and only once the offer's expiry
+has opened. The manage token `offer-publish` prints is served once and stored
+only as a hash, so a lender who loses it waits for the expiry.
 
 `pignus-cli <command> --help` is the complete list of options for any command.
 What shapes an offer is worth having here:
@@ -284,8 +292,18 @@ recovery a responder cannot make for itself -- telling it a send it recorded as
 in-flight never went out -- and it takes the responder's own lock, so it cannot
 run against a live one, and checks the chain before it does anything.
 
-`pignus-cli btc-check` prints where a loan stands on both chains and
-whose move it is next.
+Give `btc-responder-status` a `--book` and it also checks that the offers that
+book serves under this key still verify under it. One that does not is one
+whose takes the responder skips, live loans included, so a borrower's
+collateral is never released and nothing else would show it. `btc-offer-resign
+--offer <id>` repairs that: the book takes a fresh signature over the terms it
+already holds, and changes nothing else.
+
+`pignus-cli btc-check` prints where a loan stands on both chains and whose move
+it is next. When the collateral has left the vault it also names WHICH of the
+three leaves spent it -- reclaim, seizure or the lender's timeout sweep -- read
+out of the spend's own witness, because the three mean opposite things to a
+borrower and only one of them is good news.
 
 A borrower does all of this in the browser at `/lending/`. From the command
 line, it is a two-party handshake, one command per move, with a `ticket` JSON
@@ -372,6 +390,13 @@ signature and the attestation behind it are published at the oracle's
 `/v1/seizures` -- so a seizure that was not justified is visible to anyone
 afterwards, which is the whole of the accountability this tier has.
 `deploy/DEPLOY.md` has the procedure.
+
+Because the decision is a signature rather than a script, the borrower's only
+warning is the distance to it. The page shows every live cross-chain loan's
+strike and its health -- the current price over that strike, from the loan's
+own market -- and marks one whose health has gone under 1.00 as seizable now.
+A loan whose market has no current price shows no health at all rather than a
+zero, which would read as the opposite of what it means.
 
 #### Through the book
 
@@ -546,8 +571,7 @@ pignus-oracle --config oracle.json
   "precisions":    {"GOLD": 8, "SILVR": 8, "OILX": 8, "BTC": 8, "USDX": 8},
   "log_max_bytes": 256000000,
   "source":        {"type": "http_bulk", "url": "http://127.0.0.1:8088/prices",
-                    "field": "price", "timeout": 8, "max_age": 300,
-                    "feed_max_age": 300}
+                    "field": "price", "timeout": 8, "max_age": 300}
 }
 ```
 
@@ -566,7 +590,7 @@ pignus-oracle --config oracle.json
 | `source.prices` | with `static`, the fixed price per market |
 | `source.url`, `.field` | where the prices are, and which field of each row holds one |
 | `source.timeout`, `.max_age` | seconds to wait, and how long a fetched snapshot may be reused |
-| `source.feed_max_age` | how old the feed's own `_meta.updated` may be before this oracle refuses to re-sign its numbers |
+| `source.feed_max_age` | how old the feed's own `_meta.updated` may be before this oracle refuses to re-sign its numbers. **Off unless you set it**, and set it only against a feed that publishes that field: an oracle asked for a check it cannot perform refuses to sign at all rather than read "cannot tell" as "fresh", and a key that signs nothing is one no loan under it can ever be liquidated |
 
 8730 is the built-in listen default; the testnet box runs the oracle on 8740
 and `pignusd` on 8741, see `deploy/DEPLOY.md`.

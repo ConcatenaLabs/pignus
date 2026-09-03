@@ -132,6 +132,64 @@ def spend_tx(txid, prev, vout, leaf="01"):
 
 # ------------------------------------------------------------------- reorgs
 
+def test_offer_not_ghosted_while_the_scan_is_behind():
+    """An offer must never be written off while the forward scan is behind.
+
+    One failed `getblock` leaves `scanned_height` short of the tip, and an
+    offer this watcher last saw unburied skips the backward walk entirely --
+    it only asks the mempool. So a take in a block the scan has not reached
+    looks like a coin nobody spent, and the offer is called a GHOST. That is
+    terminal: `--rescan-from` does not undo one, and a lender's principal is
+    delisted for good over a single RPC hiccup. Coming back next poll costs one
+    gettxout.
+    """
+    print("an offer is not ghosted over a block the scan has not reached")
+    from pignus.terms import LoanTerms                   # noqa: PLC0415
+    real = LoanTerms(collateral_asset="aa" * 32, debt_asset="bb" * 32,
+                     collateral_amount=10 * 100_000_000,
+                     principal=1450 * 100_000_000, debt=1500 * 100_000_000,
+                     borrower_x="dd" * 32, lender_x="ee" * 32,
+                     market="GOLD/USDX", oracle_x="22" * 32,
+                     strike=180 * 100_000, not_before=1_700_000_000,
+                     maturity=1000, recover_after=45_000,
+                     max_price=1_000_000 * 100_000)
+    n = StubNode()
+    w = VaultWatcher(n, min_depth=2, rescan_depth=50)
+    n.utxos[("offer", 0)] = {"value": 1.0, "confirmations": 0}
+    o = w.track_offer("offer1", real, "offer", 0,
+                      principal=1450 * 100_000_000,
+                      collateral=10 * 100_000_000, expiry=n.height + 1000)
+    w.poll()
+    check("an offer seen at one confirmation is open and unburied",
+          o.status == "open" and o.confirmations < 2,
+          f"{o.status} {o.confirmations}")
+
+    # A block the scan cannot fetch, and the take is in one after it.
+    n.mine(1)
+    broken = n.height
+    del n.utxos[("offer", 0)]
+    n.mine(1)
+    real_getblock = n.getblock
+
+    def flaky(blockhash, verbosity=2):
+        if n.hashes.get(broken) == blockhash:
+            raise RuntimeError("the node blinked")
+        return real_getblock(blockhash, verbosity)
+    n.getblock = flaky
+
+    w.poll()
+    check("the coin is gone and the scan could not reach the block that "
+          "spent it, so the offer is left alone rather than written off",
+          o.status == "open", o.status)
+
+    # The node comes back; the scan catches up and the offer is resolved.
+    n.getblock = real_getblock
+    w.poll()
+    w.poll()
+    check("once the scan catches up it is resolved, not left in limbo",
+          o.status != "open", o.status)
+
+
 def test_ghost():
     print("a funding that buries, then is reorged away, is a GHOST")
     n = StubNode()
@@ -601,7 +659,7 @@ def test_explain():
 
 
 def main():
-    for fn in (test_ghost, test_provisional_exit, test_restart,
+    for fn in (test_offer_not_ghosted_while_the_scan_is_behind, test_ghost, test_provisional_exit, test_restart,
                test_reorg_after_restart,
                test_bounded_walk, test_failed_block, test_offers,
                test_rescan_from, test_explain):

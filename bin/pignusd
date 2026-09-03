@@ -102,12 +102,15 @@ Endpoints:
     GET  /v1/btc/offer/{id}    one offer, with the lots left on it
     POST /v1/btc/offers        a lender publishes one, signed by their own key
     POST /v1/btc/offers/{id}/withdraw   the same lender takes it down
+    POST /v1/btc/offers/{id}/resign     ...or replaces its signature, and
+                                        nothing else, over the stored terms
     POST /v1/btc/take          a borrower asks for a loan
     POST /v1/btc/hash          the lender draws this loan's secret and
                                publishes its hash, which both chains commit to
     POST /v1/btc/presig        the borrower signs the move into the vault,
                                which they can only derive once that hash exists
-    GET  /v1/btc/takes         the queue   (?status=, ?offer_id=, ?borrower_x=)
+    GET  /v1/btc/takes         the queue   (?status=, ?offer_id=, ?borrower_x=,
+                               ?oracle_x=)
     GET  /v1/btc/take/{id}     one take
     POST /v1/btc/adaptor       the lender returns a release, with its own secret
     POST /v1/btc/disbursed     the lender reports the principal paid
@@ -206,6 +209,39 @@ CLOSED_NAMES = {s.value for s in CLOSED}
 # then undone. Both are cheap to manufacture, so both count against the cap.
 PENDING_NAMES = {State.UNCONFIRMED.value, State.GHOST.value}
 STATE_NAMES = {s.value for s in State}
+
+
+# The amounts a book DERIVES rather than stores: what a seizure would pay at
+# today's price, and what a close actually paid against what it should have.
+# They are amounts like any other and go out as decimal strings for the same
+# reason -- a browser rounds a JSON number past 2^53, and these are the
+# figures a lender checks a payout against, where a rounded one reads as a
+# shortfall that is not there.
+# The most a book may take as a reclaim fee: never more in absolute terms than
+# a reclaim could plausibly cost, never more than a fifth of the collateral,
+# and never so little that an honest one cannot relay. Both bounds bind, which
+# is why this is the smaller of them. `reclaimFeeCap` in web/btcborrow.js is
+# the same function; a borrower's page refuses anything above it.
+RECLAIM_FEE_CEILING = 50_000
+
+
+def reclaim_fee_cap(collateral):
+    return min(RECLAIM_FEE_CEILING, max(BTC_DUST * 10, int(collateral) // 5))
+
+
+DERIVED_AMOUNTS = ("seizure_if_liquidated", "surplus_if_liquidated",
+                   "seize_paid", "seize_expected", "surplus_paid",
+                   "surplus_expected", "lender_paid", "debt", "collateral")
+
+
+def as_amounts(out, keys=DERIVED_AMOUNTS):
+    """The given keys as decimal strings, leaving an absent one absent."""
+    for k in keys:
+        v = out.get(k)
+        if isinstance(v, int) and not isinstance(v, bool):
+            out[k] = str(v)
+    return out
+
 
 # Market symbols that are not registry tickers. The Sequence token is listed
 # as tSEQ on the testnet; native Bitcoin has no Sequentia asset id at all, so a
@@ -326,8 +362,11 @@ def _attested(att, oracle_x, max_age):
     """
     d = att.to_dict()
     d["oracle_x"] = oracle_x
-    d["age"] = max(0, int(time.time()) - int(att.timestamp))
-    d["stale"] = d["age"] > max_age
+    # The age SIGNED, not clamped at zero: an attestation dated ahead of this
+    # machine's clock is the one case a reader most needs to see, because it is
+    # what makes a dead price read as a current one.
+    d["age"] = O.age_of(att)
+    d["stale"] = not O.current(att, max_age)
     return d
 
 
@@ -424,6 +463,10 @@ class Service:
         # ones only: a mempool spend can be replaced.
         self.spend_cache = {}
         self.last_poll = 0
+        # What the last poll raised, if it raised. The thread
+        # survives one, so this is the only place a caller can
+        # see that everything the book knows stopped updating.
+        self.poll_error = None
         self.height = None
         self.assets = {}            # asset id -> {ticker, name, precision}
         self.by_ticker = {}         # TICKER (upper) -> asset id
@@ -611,7 +654,7 @@ class Service:
         but it is not something to compute a liquidation from."""
         now = int(time.time())
         return {m: a.price for m, a in self.attestations.items()
-                if now - a.timestamp <= self.max_price_age}
+                if O.current(a, self.max_price_age, now)}
 
     def stale_markets(self):
         fresh = self.fresh_prices()
@@ -639,7 +682,7 @@ class Service:
         prices = []
         for k in t.oracle_keys:
             att = self.att_by_oracle.get(self._att_key(k, t.market))
-            if att is None or now - att.timestamp > self.max_price_age:
+            if att is None or not O.current(att, self.max_price_age, now):
                 continue
             if int(att.price_scale) != int(t.price_scale):
                 continue
@@ -984,15 +1027,66 @@ class Service:
             for key in [k for k, rid in index.items() if rid in gone]:
                 del index[key]
 
+    def expire_btc_offers(self):
+        """Close cross-chain offers whose own deadlines have gone by.
+
+        Nothing else ever ended one. They carry no coin, so a lender who walks
+        away leaves theirs listed for ever -- and because publishing costs
+        nothing but a self-signature, MAX_BTC_OFFERS was a one-way ceiling:
+        one script could fill it with well-formed offers under keys it made up
+        and Tier B would be closed to everyone, permanently.
+
+        They need no expiry field. Every one of them names four deadlines, and
+        an offer whose deadlines no longer leave both sides the margins
+        `timelocks_sane` insists on is one no responder will answer and no
+        borrower should take: the same rule that would refuse the take, applied
+        one step earlier. Marked rather than deleted, so pruning collects it on
+        the same schedule as every other dead record.
+        """
+        from pignus import btc_collateral as BC
+        btc_h = self.btc_height()
+        if btc_h is None or not self.height:
+            return 0                    # no parent chain: judge nothing
+        n = 0
+        for o in self.book.list_btc_offers(status="open"):
+            loan = o.get("loan") or {}
+            try:
+                problems = BC.timelocks_sane(BC.loan_from_dict(loan), btc_h,
+                                             int(self.height))
+            except Exception:                           # noqa: BLE001
+                continue                # unreadable is UNRENDERABLE's business
+            if not problems:
+                continue
+            self.book.update_btc_offer(o["btc_offer_id"], status="expired")
+            print(f"pignusd: cross-chain offer {o['btc_offer_id']} has expired: "
+                  + "; ".join(problems)[:200], file=sys.stderr)
+            n += 1
+        return n
+
     def loop(self, interval):
         first = True
         while True:
             started = time.time()
-            self.refresh_registry(force=first)
-            self.refresh_prices()
-            self.refresh_fees()
-            self.refresh_chain()
-            self.prune_book()
+            try:
+                self.refresh_registry(force=first)
+                self.refresh_prices()
+                self.refresh_fees()
+                self.refresh_chain()
+                self.expire_btc_offers()
+                self.prune_book()
+            except Exception as e:                      # noqa: BLE001
+                # A poll that raises must not end the thread. Everything this
+                # book knows is refreshed here -- prices, fees, the chain, the
+                # pruning -- and nothing restarts it: the process stays up and
+                # /healthz keeps answering while a repaid loan reads LIVE for
+                # ever. The oracles this polls are third parties by design, so
+                # a reply this code did not anticipate is a thing that happens
+                # rather than a bug in the caller. Record it and come round.
+                self.poll_error = f"{type(e).__name__}: {e}"
+                print(f"pignusd: poll failed: {self.poll_error}",
+                      file=sys.stderr)
+            else:
+                self.poll_error = None
             self.last_poll = int(time.time())
             if first:
                 # The first pass re-tracks every loan and walks back for spends
@@ -1157,7 +1251,7 @@ class Service:
                                                price_scale=att.price_scale)
                                if att else None),
                 "timestamp": att.timestamp if att else None,
-                "age_seconds": (int(time.time()) - att.timestamp) if att else None,
+                "age_seconds": O.age_of(att) if att else None,
                 "oracles_available": n_oracles,
             })
         return rows
@@ -1269,8 +1363,8 @@ class Service:
             if t.collateral_value(price):
                 out["ltv"] = round(t.ltv(price), 4)
             out["liquidatable"] = t.is_liquidatable(price)
-            out["seizure_if_liquidated"] = t.seizure_at(price)
-            out["surplus_if_liquidated"] = t.surplus_at(price)
+            out["seizure_if_liquidated"] = str(t.seizure_at(price))
+            out["surplus_if_liquidated"] = str(t.surplus_at(price))
         return out
 
     # ----------------------------------------------------- explaining a close
@@ -1471,6 +1565,17 @@ class Service:
                 f"a reclaim fee of {fee} satoshis leaves nothing spendable of "
                 f"{loan.btc_amount}: the release would be one the borrower "
                 "could never use")
+        # And the same cap the page applies, so this relay never records a fee
+        # its own page would refuse -- which would strand a take at the moment
+        # the borrower is asked to commit Bitcoin, with nothing said about why.
+        # The fee is not covered by the lender's offer signature, so this is
+        # the only place it is bounded before a borrower sees it.
+        cap = reclaim_fee_cap(int(loan.btc_amount))
+        if fee > cap:
+            raise ValueError(
+                f"a reclaim fee of {fee} satoshis on {loan.btc_amount} of "
+                f"collateral is more than the {cap} this book will record. "
+                "The reclaim is one transaction of about 150 vbytes")
 
         # Heights this daemon read itself. A height a client sends is a height
         # an attacker chooses, and every cross-chain margin is measured against
@@ -1501,6 +1606,44 @@ class Service:
             return None
         try:
             return int(node.getblockcount())
+        except Exception:                               # noqa: BLE001
+            return None
+
+    def depth_at(self, height, block_hash):
+        """How deep a block is, or None if the chain no longer holds it there.
+
+        Two RPCs at most, and no walk. The hash is checked against the height
+        because that is the whole of the reorg test: a height still exists
+        after a reorg, holding a different block, and a depth computed from it
+        would be a confident answer about a transaction that is no longer in
+        the chain.
+        """
+        if self.node is None or height is None or not block_hash:
+            return None
+        try:
+            if self.node.getblockhash(int(height)) != block_hash:
+                return None
+            tip = int(self.node.getblockcount())
+        except Exception:                               # noqa: BLE001
+            return None
+        return max(0, tip - int(height) + 1)
+
+    def anchor_depth_at(self, height, conf):
+        """`anchor_depth_of` for a block already located, so no walk is needed."""
+        if self.node is None or height is None or not conf:
+            return None
+        btc = getattr(self, "btc_node", None)
+        if btc is None:
+            return None
+        try:
+            block = self.node.getblock(self.node.getblockhash(int(height)), 1)
+        except Exception:                               # noqa: BLE001
+            return None
+        anchor = block.get("anchorhash") or ""
+        if not anchor or int(anchor, 16) == 0:
+            return None                 # a chain without anchoring
+        try:
+            return int(btc.getblockheader(anchor, True).get("confirmations", -1))
         except Exception:                               # noqa: BLE001
             return None
 
@@ -1595,6 +1738,8 @@ class Service:
         elif now - self.last_poll > max(120, 3 * self.poll_interval):
             reasons.append(f"poll thread stalled: last finished "
                            f"{int(now - self.last_poll)}s ago")
+        if self.poll_error:
+            reasons.append(f"the last poll failed: {self.poll_error}")
         if stale:
             reasons.append("stale price: " + ", ".join(stale))
         if UNRENDERABLE:
@@ -1905,6 +2050,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(503, {"error": "no node configured; a close "
                                                  "cannot be read back"})
             out = s.explain_exit(loan_id)
+            if out is not None:
+                as_amounts(out)
             if out is None:
                 return self._send(404, {"error": "that loan is still open, or "
                                                  "this book has not seen it "
@@ -2029,17 +2176,31 @@ class Handler(BaseHTTPRequestHandler):
             hit = s.spend_cache.get((txid, vout))
             if hit is not None:
                 # The SPEND is a fact about a block and does not change. Its
-                # DEPTH does, every ten minutes -- and a browser gates a
-                # reclaim on that depth, so serving a frozen one means the
-                # gate never opens and a borrower can never take their
-                # collateral back. Recomputed on every answer; only the walk
-                # that found the spend is saved.
+                # DEPTH does, every minute -- and a browser gates a reclaim on
+                # that depth, so serving a frozen one means the gate never
+                # opens and a borrower can never take their collateral back.
+                #
+                # Recomputed from the BLOCK the spend landed in, which is what
+                # was saved. Asking the node how deep the transaction is means
+                # a `gettxout` that fails as soon as the spend's own outputs
+                # are spent, and then a linear walk of the last few hundred
+                # blocks -- on an unauthenticated endpoint that every open tab
+                # polls, which made a cache hit ten times more expensive than
+                # the miss it exists to avoid.
                 out = dict(hit)
-                out["confirmations"] = BC.tx_confirmations(
-                    s.node, out["spend_txid"])
-                out["anchor_confirmations"] = s.anchor_depth_of(
-                    out["spend_txid"], out["confirmations"])
-                return self._send(200, out)
+                height = out.pop("spend_height", None)
+                out.pop("spend_block", None)
+                conf = s.depth_at(height, hit.get("spend_block"))
+                if conf is None:
+                    # The block that held it is not at that height any more: a
+                    # reorg. The cached fact is no longer a fact, so it goes,
+                    # and the walk below finds where the spend is now.
+                    s.spend_cache.pop((txid, vout), None)
+                else:
+                    out["confirmations"] = conf
+                    out["anchor_confirmations"] = s.anchor_depth_at(
+                        height, conf)
+                    return self._send(200, out)
             try:
                 from pignus import btc_collateral as BC
                 if s.node.gettxout(txid, vout, True) is not None:
@@ -2085,10 +2246,22 @@ class Handler(BaseHTTPRequestHandler):
             if int(conf or 0) > 0:
                 if len(s.spend_cache) >= 2048:
                     s.spend_cache.clear()
-                # Without the depths: they are recomputed on every read, above.
-                s.spend_cache[(txid, vout)] = {
-                    k: v for k, v in out.items()
-                    if k not in ("confirmations", "anchor_confirmations")}
+                # Without the depths -- they are recomputed on every read --
+                # but WITH the block the spend landed in, which is what makes
+                # recomputing them arithmetic rather than another walk. The
+                # hash goes with the height so a reorg invalidates the entry
+                # instead of quietly changing what it means.
+                height = int(s.height or 0) - int(conf) + 1
+                try:
+                    block_hash = s.node.getblockhash(height)
+                except Exception:                       # noqa: BLE001
+                    block_hash = None
+                if block_hash:
+                    s.spend_cache[(txid, vout)] = {
+                        **{k: v for k, v in out.items()
+                           if k not in ("confirmations",
+                                        "anchor_confirmations")},
+                        "spend_height": height, "spend_block": block_hash}
             return self._send(200, out)
         if path.startswith("/v1/attestations/"):
             market = path[len("/v1/attestations/"):].replace("_", "/").upper()
@@ -2141,6 +2314,17 @@ class Handler(BaseHTTPRequestHandler):
             who = (q.get("borrower_x", [None])[0] or "").lower()
             if who:
                 takes = [t for t in takes if t.get("borrower_x", "") == who]
+            # ...and by ORACLE, which is what an operator retiring a key needs.
+            # `/v1/loans?oracle_x=` answers for the issued-asset tier only, so a
+            # rotation checked against that alone reads "nothing depends on this
+            # key" while live cross-chain loans still name it -- and those are
+            # the ones that most need it, because on that tier the oracle's
+            # signature IS the liquidation and no script can stand in for it.
+            ox = (q.get("oracle_x", [None])[0] or "").lower()
+            if ox:
+                takes = [t for t in takes
+                         if str((t.get("loan") or {}).get("oracle_x", "")).lower()
+                         == ox]
             return self._send(200, {"takes": takes})
         if path.startswith("/v1/btc/take/"):
             # A COPY. Serialising the stored record hands `json.dumps` a dict
@@ -2296,6 +2480,40 @@ class Handler(BaseHTTPRequestHandler):
                     "responder": body.get("responder", ""),
                     "note": str(body.get("note", ""))[:200]})
                 return self._send(200, rec)
+            if path.startswith("/v1/btc/offers/") and path.endswith("/resign"):
+                # A lender replaces the SIGNATURE on an offer this book already
+                # holds, and nothing else about it.
+                #
+                # An offer's signature is what makes it the lender's, and their
+                # own responder checks it before acting on any take of the
+                # offer -- so one that stops verifying stops every loan under
+                # it, live ones included, and the collateral behind them is
+                # never released. There are two ways that happens: a book that
+                # altered the record, and an offer signed under an older
+                # canonical form of the payload. The first cannot be repaired
+                # here and should not be; the second is an upgrade, and a
+                # lender who cannot repair it has to abandon the loans.
+                #
+                # It is safe to leave open because it changes nothing but a
+                # signature, and only to one that verifies over the terms
+                # ALREADY stored: an attacker with no key cannot produce one,
+                # and the lender cannot alter a term with it.
+                from pignus import btc_relay as R
+                oid = path[len("/v1/btc/offers/"):-len("/resign")]
+                offer = s.book.btc_offers.get(oid)
+                if not offer:
+                    return self._send(404, {"error": "no such offer"})
+                sig = str(body.get("offer_sig", ""))
+                if not R.verify_offer(offer["loan"], offer.get("market", ""),
+                                      int(offer.get("lots", 1)), sig):
+                    return self._send(403, {
+                        "error": "that signature does not check out over the "
+                                 "terms this book holds for that offer, under "
+                                 "the key those terms name. Only the lender "
+                                 "can re-sign an offer, and only over what is "
+                                 "already stored"})
+                s.book.update_btc_offer(oid, offer_sig=sig)
+                return self._send(200, {"ok": True, "btc_offer_id": oid})
             if path.startswith("/v1/btc/offers/") and path.endswith("/withdraw"):
                 from pignus import btc_relay as R
                 oid = path[len("/v1/btc/offers/"):-len("/withdraw")]
