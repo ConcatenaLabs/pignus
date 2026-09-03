@@ -42,7 +42,12 @@ PASS = FAIL = 0
 # field; tBTC is a bare number, and the market is written BTC/USDX -- the
 # market name is what the feed id commits to, so the spelling difference has to
 # be bridged by an alias rather than by renaming the market.
-FEED = {"tBTC": 60000, "GOLD": {"price": 3000}, "USDX": {"price": 1}}
+# `_meta.updated` is what `feed_max_age` checks. A feed that omits it cannot be
+# checked at all -- it could be frozen at a week-old price and look current --
+# and the oracle refuses to sign against one while that limit is configured. So
+# this fixture publishes it, which is also what a real feed should do.
+FEED = {"tBTC": 60000, "GOLD": {"price": 3000}, "USDX": {"price": 1},
+        "_meta": {"updated": 0}}
 
 
 def check(name, cond, detail=""):
@@ -63,7 +68,9 @@ class Feed(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") == "/prices":
-            body = json.dumps(FEED).encode()
+            # Stamped as this request is answered, the way a live feed does.
+            body = json.dumps({**FEED,
+                               "_meta": {"updated": int(time.time())}}).encode()
         elif self.path.startswith("/price/"):
             sym = self.path[len("/price/"):]
             row = FEED.get(sym)
@@ -280,6 +287,31 @@ def main():
         check("and the server says how old what it is serving is",
               "age" in g and "stale" in g, json.dumps(g)[:160])
 
+        # And a feed that publishes no `_meta.updated` at all: the limit
+        # cannot be checked, and an unanswerable question is not a yes.
+        import pignus.oracle as _O                      # noqa: PLC0415
+        src = _O.BulkHttpPriceSource(f"http://127.0.0.1:{fport}/prices",
+                                     timeout=5, max_age=300, feed_max_age=300)
+        src._fetched = time.time()
+        src._prices = {"GOLD": 3000.0}
+        src._updated = 0.0                              # the feed said nothing
+        try:
+            src.reference_price("GOLD")
+            check("a feed that cannot say when it moved is refused", False,
+                  "it was accepted")
+        except ValueError as e:
+            check("a feed that cannot say when it moved is refused",
+                  "_meta.updated" in str(e), str(e)[:120])
+        src.feed_max_age = 0
+        src.refresh()                       # the real feed, so a price is there
+        src._updated = 0.0                  # ...still saying nothing about age
+        try:
+            src.reference_price("GOLD")
+            check("...and signing without the check is a deliberate 0", True)
+        except (ValueError, KeyError) as e:
+            check("...and signing without the check is a deliberate 0", False,
+                  str(e)[:120])
+
         print("a market the feed cannot price fails alone, and says why")
         code, body = get(base + "/v1/attestation/SILVR_USDX")
         check("its attestation is a 404", code == 404, str(code))
@@ -364,7 +396,8 @@ def main():
         # GOLD/USDX signs at 300 with these precisions, so a strike of 200 is
         # above the price and a strike of 400 is not.
         r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
-                       "--strike", "200", "--sighash", sighash)
+                       "--strike", "200", "--price-scale", "100000",
+                       "--sighash", sighash)
         check("a price at or above the strike is refused",
               r.returncode != 0 and "not justified" in r.stderr, r.stderr[-200:])
         r = run_oracle(cfg_path, "--sign-seize", "--market", "NOPE/USDX",
@@ -380,13 +413,34 @@ def main():
                        "--max-age", "-1")
         check("and so is one justified by a price older than --max-age",
               r.returncode != 0 and "signed" in r.stderr, r.stderr[-200:])
+        # By hand, the loan's own price scale has to be given: a strike is an
+        # integer scaled by it, and this oracle signs at its own. Comparing two
+        # written at different scales decides a seizure by a power of ten, so
+        # the omission is refused rather than guessed at.
         r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
                        "--strike", "400", "--sighash", sighash)
+        check("a hand-fed seizure with no price scale is refused",
+              r.returncode != 0 and "price scale" in r.stderr,
+              r.stderr[-200:])
+        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+                       "--strike", "400", "--price-scale", "100000",
+                       "--sighash", sighash)
         check("a genuine seizure is co-signed", r.returncode == 0,
               r.stderr[-300:])
         rec = json.loads(r.stdout)
         check("the co-signature is over the sighash it was given",
               rec["sighash"] == sighash)
+        # A loan written at ANOTHER scale. The same real price is a different
+        # number at each, so the strike below reads as far above the price and
+        # the seizure would look justified. It is not: the two numbers are not
+        # comparable at all, and nothing downstream could catch it -- the scale
+        # is in no Bitcoin script, and no covenant runs in a Tier B seizure.
+        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+                       "--strike", "400000", "--price-scale", "100000000",
+                       "--sighash", sighash)
+        check("a loan written at another price scale is refused",
+              r.returncode != 0 and "price scale" in r.stderr,
+              r.stderr[-200:])
         check("and it verifies under this oracle's key",
               __import__("pignus.adaptor", fromlist=["adaptor"]).verify(
                   bytes.fromhex(ox), bytes.fromhex(sighash),

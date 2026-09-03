@@ -73,6 +73,7 @@ from urllib.parse import urlparse, parse_qs
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
 from pignus import oracle as O           # noqa: E402
+from pignus.compat import CovenantUnavailable   # noqa: E402
 from pignus.terms import feed_id         # noqa: E402
 
 
@@ -120,12 +121,12 @@ def build_source(cfg):
     if kind == "http":
         return O.HttpPriceSource(s["url"], timeout=float(s.get("timeout", 5)),
                                  field=s.get("field", "price"),
-                                 feed_max_age=float(s.get("feed_max_age", 300)))
+                                 feed_max_age=float(s.get("feed_max_age", 0)))
     if kind == "http_bulk":
         return O.BulkHttpPriceSource(s["url"], timeout=float(s.get("timeout", 8)),
                                      field=s.get("field", "price"),
                                      max_age=float(s.get("max_age", 300)),
-                                     feed_max_age=float(s.get("feed_max_age", 300)))
+                                     feed_max_age=float(s.get("feed_max_age", 0)))
     raise SystemExit(f"unknown price source type: {kind!r}")
 
 
@@ -325,7 +326,7 @@ class Oracle:
     # ---------------------------------------------------------- Tier B seizure
 
     def sign_seizure(self, sighash: bytes, market: str, strike: int,
-                     loan=None, offer_sig="", offer_lots=1,
+                     loan=None, offer_sig="", offer_lots=1, loan_scale=None,
                      max_age=600, allow_stale=False):
         """Co-sign a native-BTC seizure, and publish what justified it.
 
@@ -359,10 +360,36 @@ class Oracle:
             raise SystemExit("the last attestation for that market does not "
                              "verify against this oracle's own key and scale; "
                              "refusing to co-sign against it")
+        # THE SAME SCALE, first. A price and a strike are both integers scaled
+        # by `price_scale`, and the scale is a property of the LOAN, not of
+        # this oracle. Comparing a price quoted at 1e5 against a strike written
+        # at 1e8 compares two numbers that mean the same thing and differ by a
+        # thousand: the price looks far below the strike, and this oracle
+        # co-signs the seizure of a perfectly healthy loan. Nothing downstream
+        # can catch it -- the scale is in no Bitcoin script, and the covenant
+        # on the Sequentia side is not involved in a Tier B seizure at all.
+        if loan_scale is None:
+            raise SystemExit(
+                "REFUSED: this seizure does not say what price scale the loan "
+                "is written at. A strike is an integer scaled by it and this "
+                "oracle signs at its own, so comparing them without knowing "
+                "both would decide the seizure by a power of ten. Use "
+                "--request, which carries the loan and its scale, or give "
+                "--price-scale.")
+        if int(loan_scale) != int(self.price_scale):
+            raise SystemExit(
+                f"REFUSED: this loan is written at price scale {loan_scale} "
+                f"and this oracle signs at {self.price_scale}. The same real "
+                f"price is a different NUMBER at each, so comparing them would "
+                f"decide the seizure on a factor of "
+                f"{int(loan_scale) / int(self.price_scale):g}. An oracle "
+                f"signing at another scale cannot judge this loan; the loan "
+                f"needs one that signs at its own.")
         if att.price >= int(strike):
             raise SystemExit(
                 f"REFUSED: the last price for {market} is {att.price}, at or "
-                f"above the strike {strike}. This seizure is not justified, and "
+                f"above the strike {strike} (both at price scale "
+                f"{self.price_scale}). This seizure is not justified, and "
                 "co-signing it would be taking collateral that was never "
                 "liquidatable.")
         from pignus import adaptor as A
@@ -687,6 +714,12 @@ def main():
     ap.add_argument("--strike", type=int,
                     help="with --sign-seize: the loan's strike; the seizure is "
                          "refused unless the published price is under it")
+    ap.add_argument("--price-scale", type=int, default=None,
+                    help="with --sign-seize and --strike: the LOAN's price "
+                         "scale. A strike is an integer scaled by it, and this "
+                         "oracle signs at its own -- comparing two numbers "
+                         "written at different scales decides the seizure by a "
+                         "power of ten. --request carries it and is preferred")
     ap.add_argument("--max-age", type=int, default=600, metavar="S",
                     help="with --sign-seize: refuse to co-sign against a price "
                          "signed longer ago than this (default 600 s)")
@@ -734,6 +767,10 @@ def main():
                         f"{theirs}. The loan decides: remove {name}.")
             args.market = loan.market
             args.strike = int(loan.strike)
+            # The loan's OWN price scale. A price and a strike are integers
+            # scaled by it, and comparing two written at different scales
+            # decides a seizure by a factor of ten to some power.
+            seize_scale = int(loan.price_scale)
             # Kept for the published record, so a third party can re-check the
             # judgement rather than only the price.
             seize_loan = dict(req.get("loan") or {})
@@ -742,6 +779,11 @@ def main():
         missing = [f for f, v in (("--sighash", args.sighash),
                                   ("--market", args.market),
                                   ("--strike", args.strike)) if not v]
+        if "seize_scale" not in locals():
+            # Not stated: `sign_seizure` refuses at the point the scale
+            # matters, after the simpler faults it can name first.
+            seize_scale = (int(args.price_scale)
+                           if args.price_scale is not None else None)
         if missing:
             raise SystemExit("--sign-seize needs " + ", ".join(missing))
         try:
@@ -752,6 +794,7 @@ def main():
                              loan=locals().get("seize_loan"),
                              offer_sig=locals().get("seize_offer_sig", ""),
                              offer_lots=locals().get("seize_offer_lots", 1),
+                             loan_scale=locals().get("seize_scale"),
                              max_age=args.max_age,
                              allow_stale=args.allow_stale)
         print(json.dumps(rec, indent=2))
@@ -766,11 +809,29 @@ def main():
               file=sys.stderr)
     if args.once:
         o.tick()
+        signed = 0
         for m in o.markets:
             att = o.latest.get(m)
+            if att:
+                signed += 1
             print(f"{m:16s} {att.price if att else '-':>14}  "
                   f"{o.errors.get(m, 'ok')}")
-        return
+        # An exit status that says what happened. `--once` is what a cron job
+        # and an operator checking a new install both run, and exiting 0 with
+        # a column of dashes tells neither of them that the price feed is
+        # unreachable -- which is the whole thing they were checking.
+        if not signed:
+            print(f"pignus-oracle: signed NOTHING. {len(o.markets)} market(s) "
+                  f"configured and no price could be fetched for any of them. "
+                  f"The feed is unreachable, or the markets are named "
+                  f"differently there.", file=sys.stderr)
+            return 1
+        if signed < len(o.markets):
+            print(f"pignus-oracle: signed {signed} of {len(o.markets)} "
+                  f"markets; the rest are named above with their reasons.",
+                  file=sys.stderr)
+            return 1
+        return 0
 
     host, _, port = cfg.get("listen", "127.0.0.1:8730").rpartition(":")
     o.tick()                                   # serve something immediately
@@ -786,4 +847,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # `main` returns a status on the paths that have one to report -- `--once`
+    # says whether it actually signed anything -- so a cron job and an operator
+    # checking a fresh install both learn what happened.
+    try:
+        sys.exit(main() or 0)
+    except CovenantUnavailable as e:
+        # A sentence and status 3, the same as `pignus-cli` and `pignusd`. This
+        # was the one binary that answered a missing covenant with a traceback,
+        # which reads as a crash rather than as "point SEQUENTIA_SRC at a
+        # checkout" -- and it is the first thing a new operator hits.
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(3)
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -3,21 +3,43 @@
   "logfile": "/root/sequentia/pignus-data/attestations-2.log",
   "listen": "127.0.0.1:8742",
   "_trusted_proxies_note": "The peers whose X-Forwarded-For this oracle believes. Behind a reverse proxy every request arrives from loopback, and keying a rate limit on that gives the whole internet one bucket -- one flooder then locks every auditor out of the log that exists to be audited.",
-  "trusted_proxies": ["127.0.0.1", "::1"],
+  "trusted_proxies": [
+    "127.0.0.1",
+    "::1"
+  ],
   "interval": 60,
   "price_scale": 100000,
-  "markets": ["GOLD/USDX", "SILVR/USDX", "OILX/USDX", "SEQ/USDX",
-              "EURX/USDX", "BTC/USDX"],
-  "symbols": {"BTC": "tBTC"},
+  "markets": [
+    "GOLD/USDX",
+    "SILVR/USDX",
+    "OILX/USDX",
+    "SEQ/USDX",
+    "EURX/USDX",
+    "BTC/USDX"
+  ],
+  "symbols": {
+    "BTC": "tBTC"
+  },
   "_precisions_note": "Every asset named in `markets` needs an entry. A missing one is assumed to have 8 decimals, and where that is wrong the price is signed wrong by a power of ten -- which no signature check downstream can catch. A config that names some and not others is refused at start.",
-  "precisions": {"GOLD": 8, "SILVR": 8, "OILX": 8, "SEQ": 8, "EURX": 8,
-                 "BTC": 8, "USDX": 8},
+  "precisions": {
+    "GOLD": 8,
+    "SILVR": 8,
+    "OILX": 8,
+    "SEQ": 8,
+    "EURX": 8,
+    "BTC": 8,
+    "USDX": 8
+  },
   "_log_note": "Rotate the attestation log past this many bytes (0 never rotates). The closed file's digest is published beside it and seeded into the next file's running hash, so /v1/digest still commits to every attestation ever signed. Rotate ONLY this way: an outside rename or truncate desynchronises the running hash from the file.",
   "log_max_bytes": 256000000,
-  "_source_note": "`max_age` is how long a fetched snapshot may be reused; `feed_max_age` is how old the feed's own _meta.updated may be before this oracle refuses to re-sign its numbers. `type` may also be `http` (one request per market) or `static` (fixed prices, for drills).",
-  "source": {"type": "http_bulk", "url": "http://127.0.0.1:8088/prices",
-             "field": "price", "timeout": 8, "max_age": 300,
-             "feed_max_age": 300},
+  "_source_note": "`max_age` is how long a fetched snapshot may be reused. `feed_max_age` is how old the feed's own `_meta.updated` may be before this oracle refuses to re-sign its numbers -- OFF unless you set it, because a feed is not obliged to publish that field and most do not, the node repository's mock price server included. Set it only against a feed that does: an oracle asked for a check it cannot perform refuses to sign rather than treat 'cannot tell' as 'fresh'. `type` may also be `http` (one request per market) or `static` (fixed prices, for drills).",
+  "source": {
+    "type": "http_bulk",
+    "url": "http://127.0.0.1:8088/prices",
+    "field": "price",
+    "timeout": 8,
+    "max_age": 300
+  },
   "_previous_keys_note": "x-only keys this oracle used to sign with, published at /v1/pubkey so a borrower's page can tell a rotation from a stranger. A live vault bakes the key it was originated against, so rotation is never a swap.",
   "previous_keys": []
 }

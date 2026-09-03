@@ -277,7 +277,14 @@ pre-vault the borrower can take back, the principal is paid into an output only
 the borrower can open, and opening it publishes the secret that moves the
 collateral into the vault. Neither side ever holds both, and the only party
 exposed to a loss rather than a delay is a lender who goes offline in the middle
-of it. `pignus-cli btc-check` prints where a loan stands on both chains and
+of it. `pignus-cli btc-responder-status` prints what a lender's responder has done
+and what each take is waiting on, read-only and safe against a running one; it
+exits 4 when something needs attention. `btc-responder-clear` is the one
+recovery a responder cannot make for itself -- telling it a send it recorded as
+in-flight never went out -- and it takes the responder's own lock, so it cannot
+run against a live one, and checks the chain before it does anything.
+
+`pignus-cli btc-check` prints where a loan stands on both chains and
 whose move it is next.
 
 A borrower does all of this in the browser at `/lending/`. From the command
@@ -289,6 +296,7 @@ pignus-cli btc-keygen --out lender.key            # each party once
 pignus-cli btc-propose --lender-key lender.key --oracle-x <x> \
     --btc-amount 100000 --debt-asset <id> --debt 5250000000 \
     --principal 5000000000 --lender-prog <hex> --market BTC/USDX \
+    --strike <debt atoms per collateral atom, scaled> \
     --recover-after <btc-height> --abort-after <btc-height> \
     --repay-deadline <seq-height> --d-refund <seq-height> --out loan.json
 pignus-cli btc-prepare  loan.json --borrower-key borrower.key \

@@ -290,7 +290,19 @@ refuses "a ticket whose oracle is the lender's own key" \
 import json; print(json.load(open('$WORK/keygen.json'))['pubkey_x'])")" \
   --btc-amount 500000 --debt-asset "$D" --debt 110000 --principal 100000 \
   --recover-after 900 --repay-deadline 5000 --abort-after 700 --d-refund 6000 \
-  --lender-prog "$LPROG0" --out "$WORK/bad-ticket.json"
+  --lender-prog "$LPROG0" --market BTC/USDX --strike 4000000000 \
+  --out "$WORK/bad-ticket.json"
+
+# A seizure is a 2-of-2 between the lender and the oracle, and the strike is
+# the only thing either can be held to afterwards. A loan without one is a
+# seizure nothing constrains.
+refuses "a ticket that names no strike" \
+  "nothing to hold the lender and the oracle to" \
+  "$BIN/pignus-cli" btc-propose --lender-key "$WORK/lender.key" \
+  --oracle-x "$BOX" --btc-amount 500000 --debt-asset "$D" --debt 110000 \
+  --principal 100000 --recover-after 900 --repay-deadline 5000 \
+  --abort-after 700 --d-refund 6000 --lender-prog "$LPROG0" \
+  --out "$WORK/no-strike.json"
 
 echo
 echo "== the liquidation bot refuses to start on a half-given command line =="
@@ -368,6 +380,68 @@ p3 = os.path.join(ok_dir, "responder-state.json")
 S(p3, exclusive=True)
 print("  a writable directory starts normally")
 PYLOCK
+
+# --- reading and repairing a responder --------------------------------------
+#
+# The state file is a lender's only record of their own moves, and until these
+# two commands existed nothing could read it: an operator asking "why has this
+# loan not moved" had a JSON file and a log. And the one repair a responder
+# cannot make for itself -- a send it recorded as in-flight and lost the answer
+# to -- was documented as "edit the state file", which a running responder
+# would overwrite on its next save.
+echo
+echo "== reading and repairing a responder =="
+python3 - "$WORK" "$BIN/pignus-cli" <<'PYSTATUS'
+import json, os, subprocess, sys
+work, cli = sys.argv[1], sys.argv[2]
+state = os.path.join(work, "responder-status.json")
+json.dump({
+    "take-live": {"t": "aa" * 32, "vault_txid": "bb" * 32,
+                  "disbursement_txid": "cc" * 32, "disbursement_vout": 0,
+                  "upgrade_txid": "dd" * 32, "disbursed_reported": True},
+    "take-stuck": {"t": "ee" * 32, "vault_txid": "ff" * 32,
+                   "disbursing": "0014" + "11" * 20},
+}, open(state, "w"))
+
+r = subprocess.run([sys.executable, cli, "btc-responder-status",
+                    "--state", state], capture_output=True, text=True)
+if r.returncode != 4:
+    sys.exit(f"FAIL: status exited {r.returncode}, wanted 4 (needs attention)\n"
+             + r.stderr[-300:])
+rows = {x["take_id"]: x for x in json.loads(r.stdout)["rows"]}
+if "live" not in rows["take-live"]["stage"]:
+    sys.exit(f"FAIL: a live loan reads as {rows['take-live']['stage']!r}")
+if "IN FLIGHT" not in rows["take-stuck"]["stage"]:
+    sys.exit(f"FAIL: a stuck send reads as {rows['take-stuck']['stage']!r}")
+print("  a responder's takes can be read, and a stuck one exits 4")
+
+# Clearing refuses without a way to check the chain: that check is the only
+# thing between this command and a second principal.
+r = subprocess.run([sys.executable, cli, "btc-responder-clear",
+                    "--state", state, "--take", "take-stuck"],
+                   capture_output=True, text=True)
+if r.returncode == 0 or "check the chain" not in r.stderr:
+    sys.exit("FAIL: clearing without node credentials was allowed\n"
+             + r.stderr[-300:])
+print("  clearing refuses without a way to check the chain first")
+
+r = subprocess.run([sys.executable, cli, "btc-responder-clear",
+                    "--state", state, "--take", "take-stuck", "--force"],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit(f"FAIL: --force did not clear: {r.stderr[-300:]}")
+if json.load(open(state))["take-stuck"].get("disbursing"):
+    sys.exit("FAIL: the flag is still set")
+print("  --force clears it, deliberately, and the flag is gone")
+
+# And a take that has nothing in flight is refused rather than touched.
+r = subprocess.run([sys.executable, cli, "btc-responder-clear",
+                    "--state", state, "--take", "take-live", "--force"],
+                   capture_output=True, text=True)
+if r.returncode == 0:
+    sys.exit("FAIL: clearing a take with nothing in flight was allowed")
+print("  a take with nothing in flight is left alone")
+PYSTATUS
 
 echo
 echo "all CLI drills passed"

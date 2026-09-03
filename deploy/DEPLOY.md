@@ -122,6 +122,19 @@ lender key that is gone costs the BORROWERS: their collateral can only be
 released by the secret that key's holder publishes, so it sits until the
 timeout. A responder state file that is gone can cost a principal paid twice.
 
+**Reading and repairing a responder.** `pignus-cli btc-responder-status
+--config /root/sequentia/pignus-responder.json` prints every take that key has
+touched, what stage it reached and what it is waiting on. It only reads, so it
+is safe against the running unit, and it exits 4 when something needs a person.
+
+The one thing a responder cannot repair for itself is a send it recorded as
+in-flight and then lost the answer to — the flag is deliberately left set,
+because clearing it blind would pay a second principal. `btc-responder-clear
+--take <id>` is how that is told: it takes the responder's own lock, so it
+refuses while the unit is running (stop it first), and it looks at the chain
+before it changes anything. If the payment IS there, it records it rather than
+clearing, with `--found <txid>:<vout>`.
+
 **Put that state file where the service may write.** The responder's unit runs
 with `ProtectHome=read-only` and one `ReadWritePaths=`, which is
 `/root/sequentia/pignus-data`. Its `state` must point inside that directory,
@@ -329,6 +342,15 @@ refuses to re-sign its numbers. `max_price_age` at the book, and
 attestation may be before it is treated as no price at all. Nothing in tapscript
 can check recency (section 5 of the design doc), so those two are the only
 places it is checked anywhere.
+
+`feed_max_age` is **off unless you set it**, and it needs the feed to publish
+`_meta.updated`. A feed that does not cannot be checked at all — it could be
+frozen at a price from a week ago and look perfectly current — so an oracle
+asked for that check against such a feed refuses to sign rather than treat an
+unanswerable question as a yes. The node repository's
+`contrib/price-server/mock-price-api.py` does not publish the field, so the
+shipped example configs leave the setting out; set it only against a feed that
+does.
 
 ## `pignusd` configuration
 

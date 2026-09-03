@@ -218,18 +218,45 @@ def main():
     check("and its lot is held while it is live",
           bk.btc_offer_lots_left("o1") == 0,
           str(bk.btc_offer_lots_left("o1")))
-    for replay in ("reserved", "pending", "signed", "live"):
+    # BACKWARDS is what a replay looks like. `reserved` is the one that costs a
+    # lender: `_holds_lot` reads it as a step before they committed, so a live
+    # loan rewritten to it hands its lot back out.
+    for replay in ("reserved", "pending", "signed", "disbursed"):
         try:
             bk.update_btc_take(tid, status=replay)
             check(f"a replayed {replay} report is refused", False, "accepted")
         except TakeMoved:
             check(f"a replayed {replay} report is refused", True)
+    # The SAME step is not backwards, and is allowed: see the two-report claim
+    # below, which is how a borrower's collateral is released at all.
+    bk.update_btc_take(tid, status="live")
+    check("...but re-reporting the step it is already on is not a replay",
+          bk.btc_takes[tid]["status"] == "live")
     check("...and the lot is still held afterwards",
           bk.btc_offer_lots_left("o1") == 0,
           str(bk.btc_offer_lots_left("o1")))
     bk.update_btc_take(tid, repay_txid="cc" * 32)
     check("a hint that sets no status still writes",
           bk.btc_takes[tid].get("repay_txid") == "cc" * 32)
+
+    # The SAME step, reported twice, with more in it the second time. This is
+    # not a replay -- it is how the secret reaches the borrower. `claim_pass`
+    # reports `claimed` the moment the claim is broadcast, with an empty
+    # secret; `publish_pass` reports `claimed` again once it is buried, WITH
+    # the secret that releases the collateral. A ratchet that refused the
+    # second would strand that collateral for ever.
+    bk.update_btc_take(tid, status="claimed", claim_txid="dd" * 32, secret_t="")
+    bk.update_btc_take(tid, status="claimed", claim_txid="dd" * 32,
+                       secret_t="ee" * 32)
+    check("a step re-reported with the secret is accepted, which is how the "
+          "borrower gets their collateral back",
+          bk.btc_takes[tid].get("secret_t") == "ee" * 32,
+          str(bk.btc_takes[tid].get("secret_t"))[:20])
+    # ...and re-reporting a step cannot extend the lot it holds.
+    was = bk.btc_takes[tid]["created"]
+    bk.update_btc_take(tid, status="claimed")
+    check("re-reporting does not restart the take's own clock",
+          bk.btc_takes[tid]["created"] == was)
     bk.update_btc_take(tid, status="refunded")
     try:
         bk.update_btc_take(tid, status="live")

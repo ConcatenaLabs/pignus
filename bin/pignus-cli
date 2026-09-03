@@ -1552,6 +1552,31 @@ def cmd_offer_take(args):
     if ver != base.borrower_ver:
         raise SystemExit(f"this offer is for witness-v{base.borrower_ver} "
                          f"borrowers and this wallet pays out at v{ver}")
+    # WHEN, as well as what. The offer's TAKE leaf carries no locktime -- only
+    # its REFUND does -- so a funded offer stays takeable for as long as the
+    # lender leaves the coin there, which is the whole point of an offer a
+    # lender can walk away from. But the LOAN it creates carries the maturity
+    # and the sweep the lender wrote when they published it, and taking one
+    # after those have passed is borrowing into a loan that can be called at
+    # any price the moment it exists. The page refuses this; the command line
+    # did not.
+    height = int(node.getblockcount())
+    if height >= int(base.maturity) and not args.force:
+        raise SystemExit(
+            f"this offer's loans mature at block {base.maturity} and the chain "
+            f"is at {height}. A loan taken now is one anybody may call at any "
+            f"price immediately, whatever the collateral is worth. Refusing; "
+            f"--force to take it anyway.")
+    if height >= int(base.recover_after) and not args.force:
+        raise SystemExit(
+            f"this offer's loans let the lender sweep the collateral without "
+            f"an oracle from block {base.recover_after}, and the chain is at "
+            f"{height}. There is no loan left in these terms. Refusing.")
+    if expiry and height >= int(expiry) and not args.force:
+        raise SystemExit(
+            f"this offer expired at block {expiry} and the chain is at "
+            f"{height}: the lender can take their coin back at any moment, and "
+            f"a take that races that loses the fee. Refusing; --force to try.")
     # Through the READER, not the constructor. `from_json` turns the oracle
     # list back into a tuple and coerces the numbers; the constructor leaves a
     # list, which makes the terms unhashable and is a different value from the
@@ -1813,6 +1838,11 @@ def add_wallet_commands(sub):
 
     p = sub.add_parser("offer-take", help="borrow from a funded offer")
     p.add_argument("--offer", required=True, help="offer id from the book")
+    p.add_argument("--force", action="store_true",
+                   help="take an offer whose loans have already matured, whose "
+                        "sweep has already opened, or that has expired. Each of "
+                        "those is a loan somebody else can end the moment it "
+                        "exists")
     common(p)
     p.set_defaults(fn=cmd_offer_take)
 
@@ -2049,13 +2079,14 @@ class _ResponderState:
         SECOND full principal into the same place. The lender pays twice and
         can claim neither repayment. A lock is cheaper than the arithmetic.
 
-        Beside the state file where that directory is writable, and in the
-        system's temporary directory where it is not -- a hardened unit often
-        gives a service its keys read-only, and refusing to start over that
-        would be this check costing more than it saves. Being UNABLE to make a
-        lock is not the same as somebody else holding one, and the two used to
-        report the same sentence: an operator was told to go and stop a second
-        responder that did not exist.
+        Beside the state file, which `_must_be_writable` has just proved this
+        process can write -- so in practice the fallback below never runs. It
+        is kept for the case that probe cannot cover: a directory writable when
+        the probe ran and not a moment later, and a filesystem that allows a
+        write but not an `flock`. Being UNABLE to make a lock is not the same
+        as somebody else holding one, and the two used to report the same
+        sentence: an operator was told to go and stop a second responder that
+        did not exist.
         """
         import fcntl
         import hashlib
@@ -2164,6 +2195,18 @@ def cmd_btc_propose(args):
         lender_prog=R.check_program(args.lender_prog, args.lender_ver),
         lender_ver=args.lender_ver,
         market=args.market or "", strike=args.strike or 0)
+    # A seizure is a 2-of-2 between the lender and the oracle, and the STRIKE
+    # is the only thing either of them can be held to afterwards. A loan with
+    # no strike is one where nothing constrains that decision at all: an oracle
+    # asked to co-sign has no number to compare a price against, and a borrower
+    # disputing it afterwards has nothing to point at. The relay refuses a
+    # cross-chain offer without one; a ticket passed by hand had no such check.
+    if not int(args.strike or 0):
+        raise SystemExit(
+            "this loan names no strike, so there would be nothing to hold the "
+            "lender and the oracle to if they took the collateral. A seizure "
+            "here is the two of them signing together, not a script computing "
+            "anything. Give --strike.")
     if args.oracle_x == loan.lender_x:
         raise SystemExit("the lender cannot be their own oracle: that is a "
                          "loan whose holder decides on their own when to seize "
@@ -2335,9 +2378,17 @@ def cmd_btc_disburse(args):
             f"payment never went out.")
     # ...and the chain, because a ticket can be an older copy. The address is
     # derived from the terms, so this finds a payment made from anywhere.
-    already = _find_output(seq, loan.disbursement_spk().hex(),
-                           asset=loan.debt_asset,
-                           amount=int(loan.principal) or int(loan.debt))
+    try:
+        already = _find_output(seq, loan.disbursement_spk().hex(),
+                               asset=loan.debt_asset,
+                               amount=int(loan.principal) or int(loan.debt))
+    except ScanFailed as e:
+        raise SystemExit(
+            f"cannot check whether a principal for this loan is already on "
+            f"chain: {e}\nRefusing rather than risk paying twice -- a second "
+            f"principal sits at the same address, opens to the same secret, "
+            f"and the borrower takes both. Try again, or --force if you know "
+            f"none went out.") from None
     if already and not args.force:
         raise SystemExit(
             f"a principal for this loan is already on chain, unspent, at "
@@ -2366,12 +2417,80 @@ def cmd_btc_disburse(args):
     return 0
 
 
+def _refresh_from_book(args, tk):
+    """Pull the LENDER's reported steps into a ticket, from a relay.
+
+    A ticket carries what its holder did. The other party's moves are reported
+    to the relay, and a borrower driving a loan from the command line had no
+    way to fetch them: the disbursement they are about to claim is recorded on
+    the relay and nowhere in their own file, so `btc-claim-principal` failed
+    with a KeyError on a loan that was proceeding perfectly.
+
+    Each field is taken only when the LENDER signed for it. The relay carries
+    messages and holds no key, so its copy of an outpoint is its word -- and
+    the outpoint a claim is built on decides where the money comes from.
+    """
+    take_id = tk.get("take_id")
+    book = getattr(args, "book", None)
+    if not take_id or not book:
+        return tk, []
+    try:
+        got = book_get(book, f"/v1/btc/take/{take_id}")
+    except Exception as e:                              # noqa: BLE001
+        print(f"could not read this take from {book}: {e}", file=sys.stderr)
+        return tk, []
+    from pignus import btc_relay as R
+    lender_x = str(tk.get("lender_x", ""))
+    pulled = []
+    for field, tag, fields in (
+            ("disbursement_txid", R.DISBURSED_TAG,
+             lambda g: {"txid": str(g.get("disbursement_txid", "")).lower(),
+                        "vout": int(g.get("disbursement_vout", 0))}),
+            ("upgrade_txid", R.UPGRADED_TAG,
+             lambda g: {"txid": str(g.get("upgrade_txid", "")).lower()}),
+            ("claim_txid", R.CLAIMED_TAG,
+             lambda g: {"txid": str(g.get("claim_txid", "")).lower(),
+                        "secret": str(g.get("secret_t", "")).lower()}),
+    ):
+        if tk.get(field) or not got.get(field):
+            continue
+        # The relay keeps each report's signature under the report's own name:
+        # `disbursed_auth`, `upgraded_auth`, `claimed_auth`.
+        auth = str(got.get({"disbursement_txid": "disbursed_auth",
+                            "upgrade_txid": "upgraded_auth",
+                            "claim_txid": "claimed_auth"}[field], ""))
+        if not R.verify_report(lender_x, tag, take_id, auth, **fields(got)):
+            print(f"the relay's {field} for this take is not signed by this "
+                  f"loan's lender, so it will not be believed. Ask the lender "
+                  f"for the outpoint directly.", file=sys.stderr)
+            continue
+        tk[field] = got[field]
+        if field == "disbursement_txid":
+            tk["disbursement_vout"] = int(got.get("disbursement_vout", 0))
+        if field == "claim_txid" and got.get("secret_t"):
+            tk["secret_t"] = got["secret_t"]
+        pulled.append(field)
+    if pulled:
+        _save_ticket(args, tk)
+        print("pulled from the book: " + ", ".join(pulled), file=sys.stderr)
+    return tk, pulled
+
+
 def cmd_btc_claim_principal(args):
     """BORROWER: take the principal. This publishes your secret, which is what
     starts the loan -- taking the money and starting the loan are one act."""
     from pignus.btc_collateral import claim_disbursement, loan_from_dict
     seq = node_from(args)
     tk = _ticket(args)
+    tk, _ = _refresh_from_book(args, tk)
+    if not tk.get("disbursement_txid"):
+        raise SystemExit(
+            "this ticket does not say where the principal was paid, and "
+            "nothing could be pulled from a book. The lender reports it once "
+            "they have paid: give --book, or ask them for the outpoint and "
+            "add `disbursement_txid` and `disbursement_vout` to the ticket. "
+            "Until then your collateral is still abortable at Bitcoin block "
+            f"{tk.get('abort_after', '?')}.")
     loan = loan_from_dict(tk)
     w = _read_key(args.borrower_key + ".w")
     txid = claim_disbursement(seq, loan, tk["disbursement_txid"],
@@ -2459,6 +2578,136 @@ def cmd_btc_refund_principal(args):
     return 0
 
 
+def cmd_btc_responder_status(args):
+    """What a responder has done, and what it is waiting on.
+
+    The state file is the only record of a lender's own moves, and until now
+    nothing could read it: an operator asking "why has this loan not moved"
+    had a JSON file and a log. This prints it, per take, with what each one is
+    waiting for -- and it is read-only, so it is safe to run against a live
+    responder.
+    """
+    path = args.state or (args.lender_key + ".state.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except OSError as e:
+        raise SystemExit(f"cannot read {path}: {e}") from None
+    except ValueError as e:
+        raise SystemExit(
+            f"{path} is not valid JSON ({e}). The responder refuses to start "
+            f"on it too, rather than begin from an empty one and pay every "
+            f"principal again. Restore it from a backup.") from None
+
+    def stage(h):
+        if h.get("secret_published"):
+            return "settled: the secret is published"
+        if h.get("claim_txid"):
+            return "claimed; publishing the secret once it is buried"
+        if h.get("claiming"):
+            return "CLAIM BROADCAST, not recorded -- recovering next pass"
+        if h.get("principal_refunded"):
+            return "the principal was taken back"
+        if h.get("upgrade_txid"):
+            return "live: the collateral is in the vault"
+        if h.get("disbursement_txid"):
+            return "disbursed; waiting for the borrower to claim it"
+        if h.get("disbursing"):
+            return "DISBURSEMENT IN FLIGHT -- sent, not recorded"
+        if h.get("vault_txid"):
+            return "signed; waiting for the collateral"
+        if h.get("t"):
+            return "reserved: this loan's secret is drawn"
+        return "nothing recorded"
+
+    rows = []
+    for take_id, h in sorted(data.items()):
+        rows.append({
+            "take_id": take_id,
+            "stage": stage(h),
+            "waiting_on": h.get("waiting") or None,
+            "has_secret": bool(h.get("t")),
+            "disbursement_txid": h.get("disbursement_txid"),
+            "upgrade_txid": h.get("upgrade_txid"),
+            "claim_txid": h.get("claim_txid"),
+            "secret_published": bool(h.get("secret_published")),
+            "reports_unsent": [k for k, flag in
+                               (("disbursed", "disbursed_reported"),
+                                ("upgraded", "upgraded_reported"),
+                                ("refunded", "refunded_reported"))
+                               if h.get({"disbursed": "disbursement_txid",
+                                         "upgraded": "upgrade_txid",
+                                         "refunded": "principal_refunded"}[k])
+                               and not h.get(flag)],
+            "last_error": h.get("last_error"),
+        })
+    stuck = [r for r in rows if "IN FLIGHT" in r["stage"]
+             or "not recorded" in r["stage"]]
+    print(json.dumps({"state": path, "takes": len(rows),
+                      "needing_attention": len(stuck), "rows": rows}, indent=2))
+    if stuck:
+        print(f"{len(stuck)} take(s) need attention: a send went out and was "
+              f"not recorded. The responder retries by looking at the chain; "
+              f"if it cannot find the payment it says so every pass and will "
+              f"not send again. `pignus-cli btc-responder-clear` is the only "
+              f"safe way to tell it to.", file=sys.stderr)
+    return 4 if stuck else 0
+
+
+def cmd_btc_responder_clear(args):
+    """Tell a responder that a send it recorded as in-flight never went out.
+
+    The one recovery a responder cannot make for itself, and the documentation
+    used to say "clear 'disbursing' in the state file" -- which a running
+    responder would overwrite on its next save, silently. This takes the lock
+    the responder holds, so it cannot run against a live one, and it looks at
+    the chain first.
+    """
+    path = args.state or (args.lender_key + ".state.json")
+    state = _ResponderState(path, exclusive=True)   # refuses if one is running
+    have = state.get(args.take)
+    if not have:
+        raise SystemExit(f"{path} has no record of take {args.take}")
+    if not have.get("disbursing"):
+        raise SystemExit(
+            f"take {args.take} has no disbursement in flight; there is nothing "
+            f"to clear. Its state: {json.dumps(have, sort_keys=True)[:200]}")
+    spk = have["disbursing"]
+    if args.rpc_user or args.rpc_password or args.rpc_cookie:
+        node = node_from(args)
+        try:
+            found = _find_output(node, spk)
+        except ScanFailed as e:
+            raise SystemExit(
+                f"the chain could not be checked ({e}). Refusing: clearing "
+                f"this flag while a payment might be on chain is how a second "
+                f"principal goes out.") from None
+        if found:
+            raise SystemExit(
+                f"a payment to {spk[:24]}… IS on chain at {found[0]}:{found[1]}. "
+                f"Do not clear this: record it instead, with "
+                f"`btc-responder-clear --take {args.take} --found "
+                f"{found[0]}:{found[1]}`.")
+    elif not args.force:
+        raise SystemExit(
+            "give node credentials so this can check the chain first, or "
+            "--force if you have checked by hand. Clearing the flag while a "
+            "payment is on chain pays a second principal.")
+    if args.found:
+        txid, _, vout = str(args.found).rpartition(":")
+        state.set(args.take, disbursing=None, disbursement_txid=txid,
+                  disbursement_vout=int(vout), disbursed_reported=False)
+        print(f"recorded the disbursement at {txid}:{vout}; the responder will "
+              f"report it on its next pass", file=sys.stderr)
+    else:
+        state.set(args.take, disbursing=None)
+        print(f"cleared the in-flight flag for {args.take}; the responder will "
+              f"consider paying it again", file=sys.stderr)
+    print(json.dumps({"take_id": args.take, "state": path,
+                      "cleared": True, "recorded": args.found or None}))
+    return 0
+
+
 def cmd_btc_check(args):
     """Where a loan stands, on both chains, and what each party can do next.
 
@@ -2526,7 +2775,11 @@ def cmd_btc_check(args):
                 pass
         out["vault"] = v
     if seq and tk.get("disbursement_txid"):
-        out["principal"] = {
+        # A different key from the AMOUNT above. This used to be `principal`
+        # too, so the moment a loan reached the one stage where a borrower most
+        # wants to see what they are owed, the figure vanished and an object
+        # took its place.
+        out["principal_output"] = {
             "outpoint": f"{tk['disbursement_txid']}:{tk.get('disbursement_vout', 0)}",
             "still_unclaimed": bool(seq.gettxout(tk["disbursement_txid"],
                                                  int(tk.get("disbursement_vout", 0)),
@@ -2536,7 +2789,7 @@ def cmd_btc_check(args):
                                           out.get("seq_height", 0)) or "sane"
     out["next"] = {
         "proposed": "borrower: btc-prepare",
-        "prepared": "lender: btc-adaptor",
+        "prepared": "lender: btc-release",
         "signed": "borrower: btc-originate",
         "funded": "lender: btc-disburse (or borrower: btc-abort, after "
                   f"Bitcoin block {loan.abort_after})",
@@ -3005,6 +3258,23 @@ def cmd_btc_respond(args):
     btc_node = (btc_node_from(args)
                 if (args.btc_rpc_user or args.btc_rpc_password
                     or args.btc_rpc_cookie) else None)
+    # A responder without BOTH nodes can still draw secrets and sign releases,
+    # and can do nothing else: `disburse_pass`, `upgrade_pass` and `claim_pass`
+    # all return immediately. That is the worst possible half-working state --
+    # borrowers commit collateral against releases this key signed, and nobody
+    # ever pays a principal or claims a repayment, so every one of those loans
+    # ends at its timeout with the lender sweeping collateral for a loan that
+    # never started. Refuse to start instead, and say which is missing.
+    missing = [n for n, v in (("--rpc (the Sequentia node)", seq_node),
+                              ("--btc-rpc (the Bitcoin node)", btc_node))
+               if v is None]
+    if missing and not args.sign_only:
+        raise SystemExit(
+            "a responder needs both chains: " + ", ".join(missing) + " is not "
+            "configured. Without it this key would sign releases and then "
+            "never pay a principal or claim a repayment, and every loan taken "
+            "against it would end at its timeout. Configure both, or pass "
+            "--sign-only if you really mean to run the signing half alone.")
 
     def ours(offer):
         """An offer is this responder's only if this key signed it. The relay
@@ -3282,9 +3552,18 @@ def cmd_btc_respond(args):
                 # two and concluding "never sent" is how a responder that was
                 # slow to restart pays a second principal into an address the
                 # borrower already holds the secret to.
-                found = _find_output(seq_node, have["disbursing"],
-                                     asset=loan.debt_asset,
-                                     amount=int(loan.principal) or int(loan.debt))
+                try:
+                    found = _find_output(seq_node, have["disbursing"],
+                                         asset=loan.debt_asset,
+                                         amount=int(loan.principal) or int(loan.debt))
+                except ScanFailed as e:
+                    # NOT "never sent". Coming back next pass costs a minute;
+                    # reading it as "nothing is there" and clearing the flag
+                    # would cost a second principal.
+                    print(f"take {tk['take_id']}: cannot check whether the "
+                          f"disbursement went out ({e}); leaving it alone",
+                          file=sys.stderr)
+                    continue
                 said = str(tk.get("principal_claim_txid") or "")
                 if not found and said:
                     # The borrower's signed report names the transaction that
@@ -3315,10 +3594,12 @@ def cmd_btc_respond(args):
                     print(f"take {tk['take_id']}: a disbursement was started "
                           "and cannot be found -- not unspent at "
                           f"{have['disbursing']}, and no claim of it reported. "
-                          "It will NOT be sent again until somebody says so: "
-                          "check the wallet, and clear 'disbursing' in the "
-                          "state file only once you are sure no payment went "
-                          "out.", file=sys.stderr)
+                          "It will NOT be sent again until somebody says so. "
+                          "Check the wallet, then: `pignus-cli "
+                          f"btc-responder-clear --take {tk['take_id']}`, which "
+                          "takes this responder's own lock so it cannot run "
+                          "against a live one and re-checks the chain first.",
+                          file=sys.stderr)
                 continue
             # An offer is for so many lots, and that number is the whole of a
             # lender's exposure to it. Counting from this responder's own
@@ -3377,6 +3658,8 @@ def cmd_btc_respond(args):
                 continue
             if have.get("waiting"):
                 state.set(tk["take_id"], waiting=None)
+                print(f"take {tk['take_id']}: no longer waiting; disbursing",
+                      file=sys.stderr)
             # Written BEFORE the send: the gap between paying and recording is
             # where a crash would otherwise cost a second principal.
             state.set(tk["take_id"], disbursing=loan.disbursement_spk().hex())
@@ -3394,9 +3677,15 @@ def cmd_btc_respond(args):
                 print(f"disburse {tk['take_id']}: {type(e).__name__}: {e}; "
                       "checking whether the payment went out anyway",
                       file=sys.stderr)
-                found = _find_output(seq_node, loan.disbursement_spk().hex(),
-                                     asset=loan.debt_asset,
-                                     amount=int(loan.principal) or int(loan.debt))
+                try:
+                    found = _find_output(seq_node, loan.disbursement_spk().hex(),
+                                         asset=loan.debt_asset,
+                                         amount=int(loan.principal) or int(loan.debt))
+                except ScanFailed as e:
+                    print(f"take {tk['take_id']}: and the chain could not be "
+                          f"checked either ({e}). The 'disbursing' flag stays; "
+                          f"the next pass looks again.", file=sys.stderr)
+                    continue
                 if found:
                     state.set(tk["take_id"], disbursing=None,
                               disbursement_txid=found[0],
@@ -3760,6 +4049,12 @@ def _sha256(b):
     return hashlib.sha256(b).hexdigest()
 
 
+class ScanFailed(RuntimeError):
+    """A UTXO scan could not RUN. Not the same as finding nothing, and the two
+    lead opposite ways: "nothing is there" is what tells a responder a
+    principal was never sent."""
+
+
 def _find_output(node, spk_hex, asset=None, amount=None, since_height=None,
                  min_conf=0):
     """Find an unspent output paying `spk_hex`, without a wallet and without a
@@ -3769,15 +4064,23 @@ def _find_output(node, spk_hex, asset=None, amount=None, since_height=None,
     to own, which is what this needs: every address here belongs to a covenant,
     not to anybody's wallet, so `listunspent` -- which only ever returns the
     wallet's own coins -- would find nothing however long it looked.
+
+    Returns (txid, vout), or None for "nothing is there". A scan that could not
+    RUN -- the node busy with another one, an RPC timeout -- raises `ScanFailed`
+    instead, because the two answers lead opposite ways: "nothing is there" is
+    what tells a responder a principal was never sent, and treating a failed
+    scan as that is how it sends a second one.
     """
     try:
         desc = node.getdescriptorinfo(f"raw({spk_hex})")["descriptor"]
-    except Exception:                                   # noqa: BLE001
-        return None
+    except Exception as e:                              # noqa: BLE001
+        raise ScanFailed(f"the node would not parse that address: {e}") from None
     try:
         res = node.scantxoutset("start", [desc])
-    except Exception:                                   # noqa: BLE001
-        return None
+    except Exception as e:                              # noqa: BLE001
+        raise ScanFailed(
+            f"the node would not scan the UTXO set: {e}. Only one scan runs at "
+            f"a time, so this is usually another one still going.") from None
     tip = int((res or {}).get("height", 0) or 0)
     best = None
     for u in (res or {}).get("unspents", []):
@@ -3877,8 +4180,14 @@ def _find_repayment(seq_node, loan, take, have, scan=True, min_conf=1):
     # report is what usually finds it; this is for when they never sent one.
     if not scan:
         return None
-    return _find_output(seq_node, spk, asset=loan.debt_asset, amount=loan.debt,
-                        min_conf=min_conf)
+    try:
+        return _find_output(seq_node, spk, asset=loan.debt_asset,
+                            amount=loan.debt, min_conf=min_conf)
+    except ScanFailed:
+        # "Not repaid yet" is the right thing to do with an unanswerable scan
+        # here: the caller's only action is to claim, and not claiming costs a
+        # pass. The borrower's own report is the fast path anyway.
+        return None
 
 
 def add_btc_commands(sub):
@@ -4013,6 +4322,11 @@ def add_btc_commands(sub):
     p.add_argument("--borrower-key", required=True)
     p.add_argument("--fee-asset")
     p.add_argument("--out")
+    # The lender reports where they paid the principal to a relay, so a
+    # borrower who took the offer through one can pull it into their ticket
+    # rather than being told to ask for an outpoint by hand. Each field is
+    # taken only when the lender's own signature covers it.
+    add_book_arg(p)
     add_node_args(p)
     p.set_defaults(fn=cmd_btc_claim_principal)
 
@@ -4187,6 +4501,31 @@ def add_btc_commands(sub):
     add_book_arg(p)
     p.set_defaults(fn=cmd_btc_offer_withdraw)
 
+    p = sub.add_parser("btc-responder-status",
+                       help="LENDER: what this responder has done, and what it "
+                            "is waiting on. Read-only and safe on a live one")
+    p.add_argument("--config", help="a responder config file")
+    p.add_argument("--lender-key")
+    p.add_argument("--state", help="the state file (default: beside the key)")
+    p.set_defaults(fn=cmd_btc_responder_status)
+
+    p = sub.add_parser("btc-responder-clear",
+                       help="LENDER: tell a responder that a send it recorded "
+                            "as in-flight never went out")
+    p.add_argument("--config", help="a responder config file")
+    p.add_argument("--lender-key")
+    p.add_argument("--state", help="the state file (default: beside the key)")
+    p.add_argument("--take", required=True, help="the take id to clear")
+    p.add_argument("--found", metavar="TXID:VOUT",
+                   help="record the payment at this outpoint instead of "
+                        "clearing: use this when the chain shows it DID go out")
+    p.add_argument("--force", action="store_true",
+                   help="clear without checking the chain. Only after checking "
+                        "by hand: a payment that is on chain and cleared here "
+                        "is a second principal about to go out")
+    add_node_args(p)
+    p.set_defaults(fn=cmd_btc_responder_clear)
+
     p = sub.add_parser("btc-respond",
                        help="LENDER responder: sign releases, pay principals, "
                             "start loans, claim repayments")
@@ -4194,6 +4533,12 @@ def add_btc_commands(sub):
                                     "credentials and the state file; nothing "
                                     "secret then appears in `ps`")
     p.add_argument("--lender-key")
+    p.add_argument("--sign-only", action="store_true",
+                   help="run without both chains' nodes: draw secrets and sign "
+                        "releases, and do nothing else. Every loan taken "
+                        "against a key running like this ends at its timeout, "
+                        "because no principal is ever paid and no repayment "
+                        "ever claimed. For a deliberate test, not for lending")
     p.add_argument("--state", help="where this responder records what it has "
                                    "already done (default: beside the key)")
     p.add_argument("--watch", action="store_true")

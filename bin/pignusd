@@ -94,6 +94,7 @@ Endpoints:
                                (?oracle=<x> for one other oracle's)
     GET  /v1/attestations/{market}    one verified attestation per oracle
     GET  /v1/stats             counts, live debt, positions near their strike
+    GET  /v1/unrenderable      records this book holds and cannot show, and why
     GET  /v1/oracle            the primary oracle key this book quotes against
     GET  /v1/oracles           every oracle key, for an m-of-n threshold loan
     GET  /v1/vectors           the golden vectors the browser pins itself to
@@ -159,10 +160,19 @@ MAX_BODY = 256 * 1024
 # count what is still LIVE: a book that has seen 2000 listings over its life is
 # not full, and a lifetime cap would eventually refuse everybody.
 MAX_OFFERS = 2000
-# How long a take that nobody has signed holds a lender's offer shut. A borrower
-# who asks for a release and walks away must not close an offer for ever; a
-# lender who has signed one has committed, and that take keeps its place.
-BTC_TAKE_TTL = 1800
+# How long a take nobody has signed holds a lender's lot.
+#
+# Short, because asking for a loan is free and anonymous: a request costs its
+# sender one signed-by-nobody POST, and every second it holds a lot is a second
+# a real borrower cannot take one. The handshake it is waiting for takes
+# SECONDS -- a running responder reserves within one poll, five by default --
+# so anything longer is not patience, it is an offer somebody else can hold
+# shut for nothing. The write rate limiter bounds how fast one client can make
+# them; this bounds how long each one costs.
+#
+# A take that WAS signed is a different thing and keeps its lot far longer
+# (`BTC_SIGNED_TAKE_TTL`): the lender has committed to that one.
+BTC_TAKE_TTL = 300
 # Every value `?status=` accepts on an offer listing. A misspelling is refused
 # rather than answered with an empty list, which reads as "there are none".
 OFFER_STATUS_NAMES = frozenset(
@@ -174,6 +184,10 @@ OFFER_STATUS_NAMES = frozenset(
 from pignus.btc_collateral import MIN_UPGRADE_FEE    # noqa: E402
 # What a Bitcoin output has to hold to be worth anything: below this the network
 # will not relay the transaction that spends it.
+# As many cross-chain offers as this book will hold at once. They cost their
+# publisher nothing -- a signature and no chain state -- and every one is
+# re-serialised on every write, so without a cap one script fills the file.
+MAX_BTC_OFFERS = 500
 BTC_DUST = 330
 # And how long a take that WAS signed holds one without the collateral ever
 # appearing. A lender has committed to a signed take, so it keeps its place --
@@ -1014,8 +1028,25 @@ class Service:
             raise NotOnChain(
                 "this book has no node, so it cannot check that a funded offer "
                 "is real, and it will not publish one it cannot check")
+        # An offer has TWO principals and they must be the same number. The
+        # one in the terms is decorative -- it enters no address -- while this
+        # one is baked into the TAKE leaf as `taken == principal` and is the
+        # only one the covenant enforces. Letting them differ publishes an
+        # offer that says one thing on the page and pays another on the chain,
+        # and the page reads whichever field happens to be nearest.
         principal = int(body.get("principal") or terms.principal)
         collateral = int(body.get("collateral") or terms.collateral_amount)
+        if principal != int(terms.principal):
+            raise ValueError(
+                f"this offer's terms say a principal of {terms.principal} and "
+                f"its listing says {principal}. Only the listing is enforced "
+                f"by the covenant, so the two differing is an offer that "
+                f"advertises one loan and makes another.")
+        if collateral != int(terms.collateral_amount):
+            raise ValueError(
+                f"this offer's terms lock {terms.collateral_amount} of "
+                f"collateral and its listing says {collateral}. They have to "
+                f"agree: the listing is what the covenant enforces.")
         expiry = int(body.get("expiry_locktime") or terms.maturity)
         want = offer_address(terms, principal, collateral, expiry)
         got = self._outpoint_holds(txid, vout, want, "offer")
@@ -1566,6 +1597,15 @@ class Service:
                            f"{int(now - self.last_poll)}s ago")
         if stale:
             reasons.append("stale price: " + ", ".join(stale))
+        if UNRENDERABLE:
+            # A record this book holds and cannot show. It is missing from
+            # every listing, so a lender looking for their own offer simply
+            # does not find it -- and the only trace was one log line, printed
+            # once, whenever the message changed. Health goes false, and
+            # `/v1/unrenderable` says which and why.
+            reasons.append(
+                f"{len(UNRENDERABLE)} record(s) cannot be rendered and are "
+                f"missing from every listing; see /v1/unrenderable")
         if self.event_backlog:
             # Not fatal on its own -- one poll can leave an event waiting for a
             # book write -- but a backlog that persists means loans an offer
@@ -1973,6 +2013,7 @@ class Handler(BaseHTTPRequestHandler):
             # never arrived, their node lost the claim, or they simply went
             # away. A page that could only read the relay's copy had one way to
             # learn it and no second one, and the collateral was the cost.
+            from pignus import btc_collateral as BC     # noqa: PLC0415
             parts = path[len("/v1/spend/"):].split("/")
             if not s.node:
                 return self._send(503, {"error": "no node configured; chain "
@@ -1987,7 +2028,18 @@ class Handler(BaseHTTPRequestHandler):
             # seconds, and so does everybody else's.
             hit = s.spend_cache.get((txid, vout))
             if hit is not None:
-                return self._send(200, hit)
+                # The SPEND is a fact about a block and does not change. Its
+                # DEPTH does, every ten minutes -- and a browser gates a
+                # reclaim on that depth, so serving a frozen one means the
+                # gate never opens and a borrower can never take their
+                # collateral back. Recomputed on every answer; only the walk
+                # that found the spend is saved.
+                out = dict(hit)
+                out["confirmations"] = BC.tx_confirmations(
+                    s.node, out["spend_txid"])
+                out["anchor_confirmations"] = s.anchor_depth_of(
+                    out["spend_txid"], out["confirmations"])
+                return self._send(200, out)
             try:
                 from pignus import btc_collateral as BC
                 if s.node.gettxout(txid, vout, True) is not None:
@@ -2033,7 +2085,10 @@ class Handler(BaseHTTPRequestHandler):
             if int(conf or 0) > 0:
                 if len(s.spend_cache) >= 2048:
                     s.spend_cache.clear()
-                s.spend_cache[(txid, vout)] = out
+                # Without the depths: they are recomputed on every read, above.
+                s.spend_cache[(txid, vout)] = {
+                    k: v for k, v in out.items()
+                    if k not in ("confirmations", "anchor_confirmations")}
             return self._send(200, out)
         if path.startswith("/v1/attestations/"):
             market = path[len("/v1/attestations/"):].replace("_", "/").upper()
@@ -2095,6 +2150,11 @@ class Handler(BaseHTTPRequestHandler):
             if not rec:
                 return self._send(404, {"error": "no such take"})
             return self._send(200, rec)
+        if path == "/v1/unrenderable":
+            # WHICH records this book cannot show, and why. Counting them in
+            # /healthz says something is wrong; this says what, so an operator
+            # can go and look at the record rather than at the whole book.
+            return self._send(200, {"unrenderable": dict(UNRENDERABLE)})
         if path == "/v1/stats":
             return self._send(200, s.book.stats(s.fresh_prices(),
                                                price_for=s.price_for))
@@ -2161,8 +2221,41 @@ class Handler(BaseHTTPRequestHandler):
                           "market", "strike"):
                     if loan.get(k) in (None, ""):
                         raise ValueError(f"the offer's loan is missing {k}")
+                # Every NUMBER is a number. These are stored verbatim and
+                # served back to a page that does BigInt arithmetic on them, so
+                # one offer carrying "lots" where an amount belongs throws out
+                # of the render and takes every other offer on the page down
+                # with it -- for every visitor, permanently, and it costs the
+                # publisher nothing to leave there. Coerced here, at the door.
+                for k in ("btc_amount", "debt", "principal", "repay_deadline",
+                          "recover_after", "abort_after", "d_refund",
+                          "upgrade_fee", "strike", "price_scale",
+                          "lender_ver"):
+                    if k not in loan or loan[k] in (None, ""):
+                        continue
+                    try:
+                        loan[k] = int(str(loan[k]).strip())
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"the offer's {k} is {loan[k]!r}, which is not a "
+                            f"whole number") from None
+                    if loan[k] < 0:
+                        raise ValueError(f"the offer's {k} cannot be negative")
                 market = str(body.get("market", ""))
                 lots = max(1, int(body.get("lots", 1)))
+                # A cap, the way `/v1/offers` has one. A cross-chain offer is
+                # published with a signature and no chain state, so it costs
+                # its publisher nothing -- and every one of them is
+                # re-serialised, sorted and fsynced on every write this book
+                # makes. Republishing an existing one adds none, so a lender
+                # refreshing their own listing is never turned away.
+                oid = R.offer_id(loan, market, lots)
+                if oid not in s.book.btc_offers and \
+                        len(s.book.list_btc_offers(status="open")) >= MAX_BTC_OFFERS:
+                    return self._send(429, {
+                        "error": "this book is holding as many cross-chain "
+                                 "offers as it will. Withdraw one, or wait for "
+                                 "an old one to be pruned."})
                 if not R.verify_offer(loan, market, lots,
                                       str(body.get("offer_sig", ""))):
                     return self._send(403, {
@@ -2439,7 +2532,25 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(400, {
                             "error": "that secret does not open this loan's "
                                      "repayment; refusing to publish it"})
-                s.book.update_btc_take(take["take_id"], **update(fields))
+                # A report always writes its FIELDS. It advances the status
+                # only when that is forward -- so a `disbursed` report that
+                # arrives (or is re-sent) after the loan is already `live`
+                # records the disbursement rather than being refused, and
+                # cannot drag the take backwards either. Without this a lender
+                # whose report the relay refused once could never get it in,
+                # and the borrower's page would show a step that had already
+                # happened.
+                wanted = update(fields)
+                # KEEP the signature. The relay verifies it and used to throw
+                # it away, which left a borrower with no way to check the one
+                # thing a lender's report decides: the outpoint their claim is
+                # built on. `hash_auth` and `adaptor_auth` are kept for exactly
+                # this reason; these are the same kind of fact.
+                wanted[f"{kind.replace('-', '_')}_auth"] = str(
+                    body.get("auth", ""))
+                s.book.update_btc_take(
+                    take["take_id"],
+                    **s.book.forward_only(take["take_id"], wanted))
                 return self._send(200, {"ok": True, "take_id": take["take_id"]})
             if path in ("/v1/btc/claimed-principal", "/v1/btc/repaid"):
                 # The BORROWER's own reports. Both are hints -- everything they
