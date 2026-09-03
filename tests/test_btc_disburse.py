@@ -152,6 +152,14 @@ def main():
                       "--abort-after", str(btch + 400),
                       "--d-refund", str(seqh + 1_440),
                       "--lender-prog", lender_prog, "--lots", "2",
+                      # The upgrade fee is PRICED from a Bitcoin node: it is
+                      # fixed at origination and can never be raised, so a
+                      # constant is an offer whose loans cannot be started when
+                      # the parent chain is busier than it was.
+                      "--btc-rpc", f"http://127.0.0.1:{rig.btc_rpcport}",
+                      "--btc-rpc-user", RPC_USER,
+                      "--btc-rpc-password", RPC_PASS,
+                      "--btc-rpc-wallet", "pignus",
                       "--market", "BTC/USDX", "--strike", "4200000000",
                       "--book", base)
             check("the lender publishes an offer carrying a principal",

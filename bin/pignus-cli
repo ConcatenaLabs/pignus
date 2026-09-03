@@ -2134,6 +2134,25 @@ def cmd_btc_propose(args):
     from pignus.btc_collateral import BtcLoan, loan_to_dict
     from pignus import btc_relay as R
     lender = _read_key(args.lender_key)
+    if args.upgrade_fee is None:
+        # Priced from a node where there is one, for the reason
+        # `btc-offer-publish` states: this fee is fixed at origination and can
+        # never be raised. A proposal is a DRAFT and nothing is broadcast by
+        # writing one, so with no node this falls back to the floor and says
+        # so -- refusing to write a ticket offline would be worse than a fee
+        # the sender can still change.
+        try:
+            from pignus.btc_collateral import upgrade_fee_now   # noqa: PLC0415
+            args.upgrade_fee = upgrade_fee_now(btc_node_from(args))
+            print(f"upgrade fee {args.upgrade_fee} satoshis, priced from the "
+                  "Bitcoin node. It cannot be raised later.", file=sys.stderr)
+        except Exception:                               # noqa: BLE001
+            args.upgrade_fee = MIN_UPGRADE_FEE
+            print(f"no Bitcoin node to price the upgrade fee: using the floor, "
+                  f"{MIN_UPGRADE_FEE} satoshis. That fee is fixed once this "
+                  f"loan is originated and can never be raised, so check it "
+                  f"against the parent chain before anybody funds anything.",
+                  file=sys.stderr)
     loan = BtcLoan(
         btc_amount=args.btc_amount, borrower_x="", 
         lender_x=A.xonly_pubkey(lender).hex(), oracle_x=args.oracle_x,
@@ -2772,6 +2791,30 @@ def cmd_btc_offer_take(args):
              borrower_ver=args.borrower_ver)
     loan = loan_from_dict(d)
 
+    # The upgrade's fee was fixed when this offer was PUBLISHED and can never be
+    # raised. If the parent chain has grown busier since, the transaction that
+    # starts this loan will not confirm -- and by then the borrower's collateral
+    # is committed, so the only way out is to wait for `abort_after`. This is
+    # the last moment anybody can decline it, so say so here.
+    try:
+        from pignus.btc_collateral import (btc_feerate,      # noqa: PLC0415
+                                           UPGRADE_VSIZE)
+        want = btc_feerate(btc) * UPGRADE_VSIZE
+        if int(loan.upgrade_fee) < want * 0.5:
+            msg = (f"this offer carries {loan.upgrade_fee} satoshis to pay for "
+                   f"moving your collateral into the loan, and the Bitcoin node "
+                   f"prices that transaction at about {int(want)}. It cannot be "
+                   f"replaced or bumped, so it may never confirm -- and your "
+                   f"collateral would then sit until you abort it at Bitcoin "
+                   f"block {loan.abort_after}.")
+            if not args.force:
+                raise SystemExit(msg + " Re-run with --force to take it anyway.")
+            print("warning: " + msg, file=sys.stderr)
+    except SystemExit:
+        raise
+    except Exception:                                   # noqa: BLE001
+        pass                    # no estimate: the floor check below still runs
+
     problems = timelocks_sane(loan, btc.getblockcount(), seq.getblockcount())
     if problems and not args.force:
         raise SystemExit("this offer's deadlines are not safe to enter:\n  - "
@@ -2868,6 +2911,26 @@ def cmd_btc_offer_publish(args):
     lender_x = A.xonly_pubkey(lender).hex()
     if args.oracle_x == lender_x:
         raise SystemExit("the lender cannot be their own oracle")
+    # The upgrade's fee, priced from a Bitcoin node rather than left at a
+    # constant. That transaction is signed in advance by both parties, spends
+    # a covenant leaf and sets a final sequence, so it can be neither replaced
+    # nor paid for by a child: whatever this offer commits to is the only fee
+    # it will ever have. A number chosen when the parent chain was quiet is an
+    # offer whose loans cannot be STARTED when it is busy -- the collateral
+    # sits in the pre-vault until the borrower aborts, and nobody is paid.
+    if args.upgrade_fee is None:
+        try:
+            from pignus.btc_collateral import upgrade_fee_now   # noqa: PLC0415
+            btc = btc_node_from(args)
+            args.upgrade_fee = upgrade_fee_now(btc)
+            print(f"upgrade fee {args.upgrade_fee} satoshis, priced from the "
+                  f"Bitcoin node. It cannot be raised later.", file=sys.stderr)
+        except Exception as e:                          # noqa: BLE001
+            raise SystemExit(
+                f"no --upgrade-fee given and this node would not price one "
+                f"({type(e).__name__}: {e}). That fee is fixed at origination "
+                f"and can never be raised, so it must not be guessed: give "
+                f"--upgrade-fee, or point --btc-rpc at a node.") from None
     loan = {
         "btc_amount": args.btc_amount, "lender_x": lender_x,
         "oracle_x": args.oracle_x, "recover_after": args.recover_after,
@@ -2926,7 +2989,8 @@ def cmd_btc_respond(args):
                                        preimage_from_spend, complete_upgrade,
                                        anchor_safe, claim_repayment,
                                        refund_disbursement, upgrade_tx,
-                                       effective_repay_deadline)
+                                       effective_repay_deadline,
+                                       btc_feerate, UPGRADE_VSIZE)
     _btc_cfg(args)
     if not args.lender_key:
         raise SystemExit("--lender-key, or a config file naming one, is required")
@@ -3280,6 +3344,26 @@ def cmd_btc_respond(args):
                     print(f"take {tk['take_id']}: not disbursing -- "
                           + "; ".join(late), file=sys.stderr)
                 continue
+            # Can the loan still be STARTED? The upgrade's fee was fixed when
+            # the offer was published and can never be raised, and the parent
+            # chain has had until now to get busier. Disbursing into a loan
+            # whose upgrade will not confirm is how a lender pays a principal
+            # for collateral that never reaches the vault: the borrower claims
+            # it, nobody can vault the collateral, and they abort it at their
+            # own deadline. This is the last moment that can be refused.
+            try:
+                want = btc_feerate(btc_node) * UPGRADE_VSIZE
+                if int(loan.upgrade_fee) < want * 0.5:
+                    msg = (f"the upgrade fee is {loan.upgrade_fee} satoshis and "
+                           f"this node prices that move at about {int(want)}. "
+                           f"It cannot be replaced or bumped, so the loan could "
+                           f"not be started. Not disbursing.")
+                    if have.get("waiting") != "upgrade-fee":
+                        state.set(tk["take_id"], waiting="upgrade-fee")
+                        print(f"take {tk['take_id']}: {msg}", file=sys.stderr)
+                    continue
+            except Exception:                           # noqa: BLE001
+                pass                    # no estimate: the floor still applied
             ok, why = collateral_committed(btc_node, loan, tk["prevault_txid"],
                                            int(tk["prevault_vout"]),
                                            min_conf=args.disburse_conf)
@@ -3822,14 +3906,16 @@ def add_btc_commands(sub):
         p.add_argument("--d-refund", type=int, required=True,
                        help="Sequentia height the lender may take an unclaimed "
                             "principal back at")
-        p.add_argument("--upgrade-fee", type=int, default=MIN_UPGRADE_FEE,
+        p.add_argument("--upgrade-fee", type=int, default=None,
                        help=f"satoshis the pre-vault carries to pay for moving "
                             f"the collateral into the loan. That transaction is "
-                            f"signed in advance and cannot be replaced or "
-                            f"fee-bumped, so this is deliberately generous: a "
-                            f"fee too low to confirm is a loan that cannot "
-                            f"start. Every party refuses anything under "
-                            f"{MIN_UPGRADE_FEE} (default {MIN_UPGRADE_FEE})")
+                            f"signed in advance and can be neither replaced nor "
+                            f"fee-bumped, so whatever is committed here is the "
+                            f"only fee it will ever have: a fee too low to "
+                            f"confirm is a loan that cannot start. Left unset "
+                            f"it is PRICED from the Bitcoin node, floored at "
+                            f"{MIN_UPGRADE_FEE}, which every party refuses "
+                            f"below")
         p.add_argument("--lender-prog", required=True,
                        help="the lender's Sequentia payout program, hex: 20 "
                             "bytes at witness version 0, 32 at version 1")
@@ -3861,8 +3947,12 @@ def add_btc_commands(sub):
     p.add_argument("--borrower-ver", type=int, default=0)
     p.add_argument("--reclaim-address", help="where the collateral comes back "
                                              "to (default: a new address)")
-    p.add_argument("--feerate", type=float, default=5.0,
-                   help="sat/vB for the funding transaction")
+    p.add_argument("--feerate", type=float, default=None,
+                   help="sat/vB for the funding transaction. Left unset, this "
+                        "ASKS the Bitcoin node: a constant confirms when the "
+                        "parent chain is quiet and sits in the mempool when it "
+                        "is not, and a collateral funding that never confirms "
+                        "is a loan that never starts")
     p.add_argument("--btc-fee", type=int, default=3000,
                    help="satoshis the reclaim transaction pays")
     p.add_argument("--seq-height", type=int,
@@ -4061,6 +4151,10 @@ def add_btc_commands(sub):
     p.add_argument("--price-scale", type=int, default=100000)
     p.add_argument("--note", default="")
     add_book_arg(p)
+    # A Bitcoin node, to PRICE the upgrade fee. That fee is fixed for the life
+    # of every loan taken from this offer and can never be raised, so it must
+    # come from the chain rather than from a constant.
+    add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_offer_publish)
 
     p = sub.add_parser("btc-offer-take",
@@ -4073,7 +4167,8 @@ def add_btc_commands(sub):
     p.add_argument("--reclaim-address",
                    help="where the collateral comes back to (default: a new "
                         "address from your Bitcoin wallet)")
-    p.add_argument("--feerate", type=float, default=5.0)
+    p.add_argument("--feerate", type=float, default=None,
+                   help="sat/vB; left unset this asks the Bitcoin node")
     p.add_argument("--btc-fee", type=int, default=3000)
     p.add_argument("--wait", type=float, default=90,
                    help="seconds to wait for the lender's release")

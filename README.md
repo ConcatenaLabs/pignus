@@ -317,11 +317,26 @@ program -- where the principal is paid and where a repayment refunds to -- and
 `--lender-prog` and `--lender-ver` the lender's; both are 20 bytes at witness
 version 0 and 32 at version 1, and both are baked into addresses, so neither can
 be changed afterwards. `--reclaim-address` is the Bitcoin address the collateral
-comes back to, a fresh one from the wallet by default. `--feerate` prices the
-Bitcoin funding in sat/vB. `--btc-fee` is the flat satoshi fee the transactions
-spending the vault carry, and `--upgrade-fee` is what the pre-vault holds on top
-of the collateral so the move into the vault can pay for itself even if the
-borrower has gone by then.
+comes back to, a fresh one from the wallet by default.
+
+**The Bitcoin fees are asked of the node, not assumed.** `--feerate` prices the
+funding in sat/vB and, left unset, comes from `estimatesmartfee`; so does
+`--upgrade-fee`, which is what the pre-vault holds on top of the collateral so
+the move into the vault can pay for itself even if the borrower has gone by
+then. Both defaults used to be constants, and a constant is a transaction that
+confirms when the parent chain is quiet and sits in the mempool when it is not.
+
+That is not a delay here, it is a loan that never starts. The funding is
+broadcast after the borrower has already signed the move into the vault, so a
+funding stuck in the mempool leaves their collateral committed with no way out
+until `abort_after`. And the upgrade is signed in advance by both parties,
+spends a covenant leaf and sets a final sequence, so it can be neither replaced
+nor paid for by a child: **whatever an offer commits to is the only fee that
+move will ever have.** An offer published when fees were low is an offer whose
+loans cannot be started when they are high, which is why `btc-offer-take`
+refuses one whose fee has fallen far behind the chain and says by how much.
+
+`--btc-fee` is the flat satoshi fee the transactions spending the vault carry.
 
 Several of these commands refuse before they act -- terms whose deadlines leave
 no margin, a claim too shallow to spend against, a timelock that has not opened

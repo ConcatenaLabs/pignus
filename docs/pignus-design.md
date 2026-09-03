@@ -546,9 +546,12 @@ parent chain will cost. It cannot be replaced -- the signature commits to the
 whole transaction -- and its only output is the vault, which nobody can spend
 to pay for it, so it cannot be bumped from either end either. A fee too low to
 confirm before `abort_after` is a loan the lender has paid for and cannot
-start. That is why the pre-vault carries a deliberately generous fee, why
-`timelocks_sane` -- which every party calls, relay or not -- refuses a loan
-whose upgrade fee is under a flat 10,000 satoshis, and why the
+start. That is why the pre-vault's fee is PRICED FROM A BITCOIN NODE when an
+offer is published rather than left at a constant -- a constant is a fee that
+was right when the parent chain was quiet -- why `timelocks_sane`, which every
+party calls, relay or not, refuses a loan whose upgrade fee is under a flat
+10,000 satoshis whatever the chain says, why a taker refuses an offer whose
+fixed fee has fallen far behind what the chain now wants, and why the
 margin above is measured in days rather than hours. The same function refuses a
 loan whose `recover_after` does not sit a day past `repay_deadline`, because a
 lender who could claim a repayment after the Bitcoin timeout had opened would
