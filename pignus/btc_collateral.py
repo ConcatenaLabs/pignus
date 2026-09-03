@@ -1210,7 +1210,60 @@ def anchor_safe(node, txid, min_depth=6, vout_hint=0, btc_node=None,
 
 # ------------------------------------------------------------- Bitcoin funding
 
-def fund_bitcoin(btc_node, loan, feerate=5, broadcast=True, prevault=None):
+# The upgrade is about this size: one taproot script-path input, one output.
+# Used to price its fee, which is fixed at origination and can never be raised.
+UPGRADE_VSIZE = 150
+# What to assume when a Bitcoin node will not estimate. Deliberately not low:
+# a funding that never confirms is a borrower's collateral committed to a loan
+# that cannot start, and the only way out of that is to wait for `abort_after`.
+FEERATE_FALLBACK = 20.0
+
+
+def btc_feerate(btc_node, blocks=3, fallback=FEERATE_FALLBACK):
+    """What a Bitcoin transaction has to pay right now, in sat/vB.
+
+    ASKED, not assumed. A constant here is a transaction that confirms when the
+    parent chain is quiet and sits in the mempool for ever when it is not --
+    and for this tier that is not a delay, it is a loan that never starts: the
+    borrower has already broadcast their collateral and signed the move into
+    the vault, so their only way out is to wait for `abort_after`.
+
+    Falls back only when the node will not answer, and never below the
+    mempool's own minimum, which is the floor for relaying at all.
+    """
+    rate = None
+    try:
+        got = btc_node.estimatesmartfee(int(blocks))
+        if got and got.get("feerate"):
+            rate = float(got["feerate"]) * 1e8 / 1000.0
+    except Exception:                                   # noqa: BLE001
+        pass
+    if not rate or rate <= 0:
+        rate = float(fallback)
+    try:
+        floor = float(btc_node.getmempoolinfo().get("mempoolminfee") or 0)
+        floor = floor * 1e8 / 1000.0
+        if floor > rate:
+            rate = floor
+    except Exception:                                   # noqa: BLE001
+        pass
+    return rate
+
+
+def upgrade_fee_now(btc_node, blocks=3, vsize=UPGRADE_VSIZE):
+    """What the upgrade should carry, priced from the node, floored.
+
+    That transaction is signed in advance by both parties, spends a covenant
+    leaf and sets a final sequence, so it can be neither replaced nor paid for
+    by a child: whatever is committed at origination is the only fee it will
+    ever have. Pricing it from a constant is how a lender publishes an offer
+    whose loans cannot be started.
+    """
+    return max(MIN_UPGRADE_FEE,
+               int(-(-btc_feerate(btc_node, blocks) * int(vsize) // 1)))
+
+
+def fund_bitcoin(btc_node, loan, feerate=None, broadcast=True, prevault=None):
     """Fund the Bitcoin side from a Bitcoin Core wallet.
 
     Funds the PRE-VAULT when the loan has one, which is what an abortable
@@ -1218,8 +1271,14 @@ def fund_bitcoin(btc_node, loan, feerate=5, broadcast=True, prevault=None):
     broadcasting when the caller wants the txid first: the lender's release
     signature commits to a reclaim that spends the vault outpoint, so both
     parties must know the ids BEFORE any collateral is committed.
+
+    `feerate` is sat/vB, and left unset it is ASKED of the node. A constant is
+    a funding that sits in the mempool whenever the parent chain is busy, and
+    a borrower whose collateral never confirms has a loan that never starts.
     Returns (txid, vout, hex).
     """
+    if feerate is None:
+        feerate = btc_feerate(btc_node)
     use_prevault = bool(loan.h_w and loan.abort_after) if prevault is None \
         else bool(prevault)
     spk = loan.prevault_spk() if use_prevault else loan.funding_spk()
@@ -1261,8 +1320,17 @@ def collateral_committed(btc_node, loan, funding_txid, funding_vout,
     except Exception as e:                              # noqa: BLE001
         return False, f"the Bitcoin node could not read that outpoint: {e}"
     if out is None:
-        return False, ("that outpoint is not unspent anywhere the node can see: "
-                       "it has been spent, or it was never broadcast")
+        # The ORDINARY case first. The origination order has the borrower
+        # broadcast last -- after the lender's release has verified -- so
+        # between signing and funding this is exactly what a correct take looks
+        # like, and reading it as "spent, or never broadcast" makes a lender's
+        # log look like something has gone wrong every time one is opened.
+        return False, ("the collateral is not on chain yet: the borrower "
+                       "broadcasts it last, after checking the release. If it "
+                       f"never comes, they abort at Bitcoin block "
+                       f"{loan.abort_after} and nothing here is at risk. (The "
+                       "node knows no unspent output at that outpoint, so it "
+                       "is either unbroadcast or already spent.)")
     got_spk = str(out.get("scriptPubKey", {}).get("hex", ""))
     if got_spk != want_spk:
         return False, ("that outpoint does not pay this loan's collateral "
