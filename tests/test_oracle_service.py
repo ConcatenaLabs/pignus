@@ -210,6 +210,8 @@ def test_documented_configs_start():
     print("the configs this repository prints as examples")
     import re                                             # noqa: PLC0415
     import glob                                           # noqa: PLC0415
+    import importlib.machinery                            # noqa: PLC0415
+    import importlib.util                                 # noqa: PLC0415
 
     def assets_of(cfg):
         return sorted({a for m in cfg.get("markets", []) for a in m.split("/")})
@@ -222,6 +224,31 @@ def test_documented_configs_start():
         missing = [a for a in assets_of(cfg) if a not in cfg.get("precisions", {})]
         check("and every asset its markets name has a precision",
               not missing, f"missing {missing}")
+
+    # A source setting that goes nowhere is a setting an operator believes is
+    # protecting them. `max_age` on an `http` source did exactly nothing.
+    spec = importlib.util.spec_from_loader(
+        "pignus_oracle_mod", importlib.machinery.SourceFileLoader(
+            "pignus_oracle_mod", os.path.join(BIN, "pignus-oracle")))
+    om = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(om)
+
+    def accepted(src):
+        try:
+            om.build_source({"source": src})
+            return True
+        except SystemExit:
+            return False
+
+    check("an http source may cache, and says so by accepting max_age",
+          accepted({"type": "http", "url": "http://x", "max_age": 60}))
+    check("a setting no source understands is refused, not ignored",
+          not accepted({"type": "http", "url": "http://x", "nonsense": 1}))
+    check("and an underscore key is a comment, which is welcome",
+          accepted({"type": "http", "url": "http://x", "_why": "because"}))
+    check("every documented source key is one its source understands",
+          all(accepted(json.loads(open(p2).read()).get("source", {}))
+              for p2 in glob.glob(os.path.join(ROOT, "deploy", "oracle*.json"))))
 
     for path in sorted(glob.glob(os.path.join(ROOT, "deploy", "oracle*.json"))):
         cfg = json.loads(open(path).read())

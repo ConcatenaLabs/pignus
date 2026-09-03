@@ -251,7 +251,7 @@ touches nothing.
 | `--loans FILE` | a JSON list of `{"terms": …, "txid": …, "vout": 0, "single_leaf": bool}` instead of a book |
 | `--taker-address` / `--taker-spk` | where seized collateral is paid |
 | `--fee-asset` / `--fee-amount` | the fee asset and atoms; by default the debt asset being spent, else anything held with a published rate |
-| `--min-profit ATOMS` | skip a seizure worth less than this much more than the debt it pays (default 0: never at a loss) |
+| `--min-profit ATOMS` | skip a seizure whose collateral, at the attested price, is worth less than this much more than the debt it pays AND the network fee it costs (default 0: never at a loss). The fee is priced with the same call the spend will use, so the two cannot drift |
 | `--max-attestation-age S` | ignore a price signed longer ago (default 600); the covenant cannot check recency, so this is the only place it is checked |
 | `--allow-stale` | act on older prices anyway |
 | `--call-due` | also call loans past maturity, through DEFAULT |
@@ -354,8 +354,8 @@ comes back to, a fresh one from the wallet by default.
 funding in sat/vB and, left unset, comes from `estimatesmartfee`; so does
 `--upgrade-fee`, which is what the pre-vault holds on top of the collateral so
 the move into the vault can pay for itself even if the borrower has gone by
-then. Both defaults used to be constants, and a constant is a transaction that
-confirms when the parent chain is quiet and sits in the mempool when it is not.
+then. A constant in either place would be a transaction that confirms when the
+parent chain is quiet and sits in the mempool when it is not.
 
 That is not a delay here, it is a loan that never starts. The funding is
 broadcast after the borrower has already signed the move into the vault, so a
@@ -365,7 +365,9 @@ spends a covenant leaf and sets a final sequence, so it can be neither replaced
 nor paid for by a child: **whatever an offer commits to is the only fee that
 move will ever have.** An offer published when fees were low is an offer whose
 loans cannot be started when they are high, which is why `btc-offer-take`
-refuses one whose fee has fallen far behind the chain and says by how much.
+refuses one whose fee has fallen far behind the chain and says by how much --
+and why the page refuses it too, at the same threshold, before a borrower has
+committed any Bitcoin.
 
 `--btc-fee` is the flat satoshi fee the transactions spending the vault carry.
 
@@ -596,8 +598,9 @@ pignus-oracle --config oracle.json
 and `pignusd` on 8741, see `deploy/DEPLOY.md`.
 
 `--once` signs one round, prints it and exits, without serving; `--print-pubkey`
-prints the x-only key and exits, and is the one path that will not create a key
-file, because asking what the key is must never answer with a new one.
+prints the x-only key and exits. Neither it nor `--sign-seize` will create a key
+file: asking what a key is, or asking it to co-sign, must never answer with a
+new one. Every other path does create one on first run.
 
 The key is created 0600 on first run and its mode is re-checked on every start.
 It is never logged and never served. Prices come from the price feed that

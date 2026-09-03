@@ -15,11 +15,10 @@
 #   test/functional/feature_pignus_hashlock.py
 #
 # Most of the half above the platform test also runs in CI on every push; see
-# .github/workflows/ci.yml for exactly which. Two of them need chains even
-# though they sit up here -- the BTC relay and disbursement groups drive a real
-# node -- so "everything above the platform test" is not the rule; the workflow
-# is. The rest needs a built sequentiad and a Bitcoin Core release, and is run
-# here.
+# .github/workflows/ci.yml for exactly which. One of them needs chains even
+# though it sits up here -- the BTC disbursement group drives a real node -- so
+# "everything above the platform test" is not the rule; the workflow is. The
+# rest needs a built sequentiad and a Bitcoin Core release, and is run here.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

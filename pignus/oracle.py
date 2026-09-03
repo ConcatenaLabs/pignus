@@ -464,11 +464,16 @@ class HttpPriceSource(PriceSource):
     one thing to be wrong."""
 
     def __init__(self, url: str, timeout: float = 5.0, field: str = "price",
-                 feed_max_age: float = 300.0):
+                 feed_max_age: float = 0.0, max_age: float = 0.0):
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.field = field
         self.feed_max_age = feed_max_age
+        # How long one symbol's answer may be reused, in seconds. Zero means
+        # every call fetches, which is the safe default for a source that
+        # fetches per symbol; the bulk source takes one snapshot per round and
+        # so has a different shape of the same question.
+        self.max_age = max_age
         self._cache = {}
 
     def reference_price(self, symbol: str) -> float:
@@ -476,6 +481,9 @@ class HttpPriceSource(PriceSource):
         # NOT upper-cased: feed tickers are case-sensitive (the Sequentia demo
         # feed serves `tBTC`, and `TBTC` is a 404).
         url = f"{self.url}/{symbol}"
+        hit = self._cache.get(symbol)
+        if hit and self.max_age and (time.time() - hit[0]) <= self.max_age:
+            return hit[1]
         with urllib.request.urlopen(url, timeout=self.timeout) as r:
             data = json.loads(r.read().decode())
         if isinstance(data, (int, float)):
@@ -485,14 +493,25 @@ class HttpPriceSource(PriceSource):
         # A feed that dates its own answer is taken at its word: re-signing a
         # price the feed itself says is hours old would put this oracle's
         # signature and a fresh timestamp on a number nobody stands behind.
-        updated = data.get("updated")
+        updated = data.get("updated") if isinstance(data, dict) else None
+        if self.feed_max_age and not updated:
+            # ASKED FOR and unanswerable, exactly as the bulk source treats it.
+            # `feed_max_age` is off unless an operator sets it; having set it,
+            # a feed that dates nothing cannot answer the question, and
+            # "cannot tell" must not be read as "fresh".
+            raise ValueError(
+                f"{url} publishes no `updated`, so this oracle cannot check "
+                f"how old its numbers are -- and feed_max_age asks it to. "
+                f"Point at a feed that dates its answers, or unset it.")
         if self.feed_max_age and updated:
             age = time.time() - float(updated)
             if age > self.feed_max_age:
                 raise ValueError(
                     f"{url} was last updated {int(age)}s ago (limit "
                     f"{int(self.feed_max_age)}s); refusing to sign a stale feed")
-        return float(data[self.field])
+        price = float(data[self.field])
+        self._cache[symbol] = (time.time(), price)
+        return price
 
 
 # ------------------------------------------------------------------- the log

@@ -65,7 +65,26 @@ export function missingMethods(caps) {
  * block is a minute and a Bitcoin block about ten -- so every comparison goes
  * through seconds.
  */
-export function timelockProblems(loan, btcHeight, seqHeight) {
+/**
+ * What the one unbumpable transaction in this loan would cost at the parent
+ * chain's current feerate, in satoshis, or null when no feerate is to hand.
+ *
+ * The move into the vault is signed at origination, spends a covenant leaf and
+ * sets a final sequence, so neither side can replace it or pay for a child:
+ * whatever the offer committed is the only fee it will ever have. A lender's
+ * responder refuses to pay a principal into a loan whose move will not confirm,
+ * so a borrower who commits Bitcoin against a fee the chain has outgrown ends
+ * up waiting for their own abort deadline with nothing to show for it. The
+ * lender's side already checks this; this is the borrower's half.
+ */
+export const UPGRADE_VSIZE = 150;
+
+export function upgradeFeeNeeded(feerateSatVb) {
+  const r = Number(feerateSatVb);
+  return Number.isFinite(r) && r > 0 ? Math.ceil(r * UPGRADE_VSIZE) : null;
+}
+
+export function timelockProblems(loan, btcHeight, seqHeight, feerateSatVb) {
   const problems = [];
   // Heights, and nothing else. Refuse first and return: every comparison after
   // this one subtracts a chain's tip height, so against a timestamp none of
@@ -126,6 +145,17 @@ export function timelockProblems(loan, btcHeight, seqHeight) {
       `satoshis to pay for moving your collateral into the loan. That ` +
       `transaction cannot be replaced or bumped, so under ${MIN_UPGRADE_FEE} ` +
       `risks a loan that can never start.`);
+  // ...and against what the parent chain is charging NOW, which is the same
+  // test the lender's responder applies before it pays a principal. Without
+  // it a borrower commits Bitcoin to a loan that will never be funded, and
+  // finds out by waiting for their own abort deadline.
+  const need = upgradeFeeNeeded(feerateSatVb);
+  if (loan.abort_after && need && Number(loan.upgrade_fee || 0) < need / 2)
+    problems.push(`this offer carries ${Number(loan.upgrade_fee || 0)} ` +
+      `satoshis for the move into the vault, and Bitcoin is charging about ` +
+      `${need} for it right now. That transaction cannot be bumped, so the ` +
+      `lender will not pay a principal into it -- and your collateral would ` +
+      `sit until you abort it.`);
   // One secret must not open both sides. If the hash that releases the
   // collateral is the hash that releases the principal, claiming the principal
   // would publish the secret that frees the collateral.
@@ -246,10 +276,11 @@ export function renderOffers(box, offers, ui, onBorrow, write) {
     : "";
   const html = '<table><thead><tr><th>collateral</th><th>you receive</th>' +
     '<th>you repay</th><th>seized below</th><th>repay by</th>' +
-    '<th>lender sweep</th><th></th></tr></thead><tbody>' +
+    '<th>lender sweep</th><th>left</th><th></th></tr></thead><tbody>' +
     open.map((o, i) => {
       const l = o.loan;
       const principal = BigInt(l.principal || 0) || BigInt(l.debt);
+      const left = o.lots_left == null ? null : Number(o.lots_left);
       return '<tr>' +
       '<td data-label="collateral">' + ui.atomsToBtc(l.btc_amount) + ' BTC</td>' +
       '<td data-label="you receive">' + ui.units(principal.toString(), l.debt_asset) +
@@ -273,10 +304,19 @@ export function renderOffers(box, offers, ui, onBorrow, write) {
       '</span></td>' +
       '<td data-label="lender sweep">Bitcoin block ' +
         Number(l.recover_after).toLocaleString() + '</td>' +
+      // How many of this offer's lots are still free. The book computes it
+      // live, counting the takes already holding one -- and a borrower who
+      // cannot see it learns an offer is spoken for by being refused after
+      // they have signed.
+      '<td data-label="left">' + (left === null ? '?' : String(left)) +
+        (left === 0 ? '<span class="sub2">every lot is taken</span>' : '') +
+        '</td>' +
       // `data-focus` keys the button to the OFFER, not to its row index, so
       // the keyboard comes back to the same offer even when the list has
       // reordered under it.
-      '<td data-label=""><button data-b="' + i + '" data-focus="btcb:' +
+      '<td data-label=""><button data-b="' + i + '"' +
+        (left === 0 ? ' disabled title="every lot of this offer is taken"' : '') +
+        ' data-focus="btcb:' +
         ui.esc(String(o.btc_offer_id || i)) +
         '" class="primary sm">Borrow</button></td>' +
       '</tr>';
@@ -356,7 +396,8 @@ export async function borrow(wallet, offer, ui) {
   };
 
   const heights = await ui.heights();
-  const late = timelockProblems(loan, heights.btc, heights.seq);
+  const late = timelockProblems(loan, heights.btc, heights.seq,
+                                heights.feerate);
   if (late.length) throw new Error(late.join(" "));
 
   const preAddr = btc.prevaultAddress(loan, ui.btcHrp || "tb");
@@ -724,7 +765,21 @@ export async function repay(wallet, rec, ui) {
  * reorgs, and spending Bitcoin on a secret a reorg could undo is how a borrower
  * loses both sides.
  */
-export async function reclaim(wallet, rec, ui, { minDepth = 6, force = false } = {}) {
+/**
+ * Take the collateral back, with the secret the lender published.
+ *
+ * There is no Sequentia-depth parameter, and that is deliberate rather than an
+ * omission: Sequentia reorgs whenever Bitcoin reorgs, so its confirmations
+ * measure the wrong thing entirely -- six of them are six minutes, about six
+ * tenths of one Bitcoin block, and one ordinary Bitcoin reorg undoes ten at
+ * once. What has to be buried is the BITCOIN header the secret's own block
+ * anchored to, and that is what is checked below. A Sequentia depth alongside
+ * it would read as a second protection and be none.
+ *
+ * `force` skips that wait, which is the borrower's to take: it is their
+ * Bitcoin, and the risk is theirs to weigh.
+ */
+export async function reclaim(wallet, rec, ui, { force = false } = {}) {
   const loan = rec.loan;
   const t = await ui.api("v1/btc/take/" + rec.take_id).catch(() => ({}));
   const found = await findSecret(rec, t, ui);
@@ -758,7 +813,6 @@ export async function reclaim(wallet, rec, ui, { minDepth = 6, force = false } =
       `Bitcoin block only ${anchor} deep. Sequentia reorgs when Bitcoin ` +
       `reorgs, so spending your Bitcoin on it now risks losing both. Wait ` +
       `for ${MIN_ANCHOR_DEPTH} Bitcoin confirmations behind it.`);
-  const depth = await ui.confirmations(claimTxid);
   const vaultTxid = rec.vault_txid
     || btc.upgradeTx(loan, rec.prevault_txid, rec.prevault_vout).txid();
   const sighash = hex(btc.reclaimSighash(loan, vaultTxid, 0,

@@ -32,12 +32,17 @@ With a node wallet, everything the page does:
 
 Native BTC collateral (Tier B), a two-party handshake carrying a ticket JSON:
 
-    btc-keygen, btc-propose, btc-prepare, btc-adaptor, btc-originate,
+    btc-keygen, btc-propose, btc-prepare, btc-release, btc-originate,
     btc-disburse, btc-claim-principal, btc-upgrade, btc-repay, btc-claim,
     btc-reclaim, and the endings btc-abort, btc-refund, btc-refund-principal,
     btc-seize-sighash, btc-seize, btc-timeout; btc-check says whose move it is.
-    Through a relay: btc-offer-publish, btc-offer-withdraw, btc-offer-take,
-    btc-respond
+    Through a relay: btc-offer-publish, btc-offer-take, btc-offer-resign,
+    btc-offer-withdraw, btc-respond, btc-responder-status,
+    btc-responder-clear.
+
+    `btc-adaptor` is the old name for `btc-release` and still works. The
+    signature it produces is a plain release the lender publishes, not an
+    adaptor signature, and the name said otherwise.
 
 Pledged collateral at an OpenAMP issuer (Tier C), where a signature rather than
 a key travels between the parties:
@@ -50,9 +55,13 @@ A repurchase against an OpenDAMP asset (Tier D, not a loan):
 
 `pignus-cli <command> --help` describes each. Exit status: 0 done, 1 the command
 could not run, 2 REFUSED -- a check failed and nothing was built or broadcast,
-3 the covenant is unavailable, 4 a CHECK command ran and reported a state that
-is not settled and not safe to act on (`repo-verify` uses this for `bond-only`
-and `funded-unburied`, which look like success and are not).
+3 the covenant is unavailable, 4 the command ran and reported a state that is
+not settled and not safe to act on. That last one is not only for the check
+commands: `repo-verify` uses it for `bond-only` and `funded-unburied`, which
+look like success and are not; `pledge-seize` uses it when an issuer accepted
+the request and has not delivered the collateral; and `btc-responder-status`
+uses it when a take needs a person. In every case the command did what it was
+asked -- what is not true is that the thing is finished.
 """
 
 import argparse
@@ -507,6 +516,7 @@ def cmd_pledge_sign(args):
         "message": OA.pledge_message(args.action, args.pledge, args.extra).hex(),
         "signature": sig,
     }, indent=2))
+    _say_tier_c()
 
 
 def _pledge_client(args):
@@ -522,6 +532,25 @@ def _pledge_client(args):
                                allow_insecure=bool(args.allow_insecure_issuer))
     except ValueError as e:
         refuse(str(e))
+
+
+def _say_tier_c(pledge=None):
+    """The one sentence that says what a Tier C lender's security actually is.
+
+    Printed by every pledge command, on stderr so it never lands in a JSON
+    pipeline. A Tier C pledge is not a covenant: the collateral is locked by an
+    issuer's policy server, and the lender's security is that issuer's promise.
+    Presenting that quietly beside a Tier A loan, which no one can undo, would
+    be a lie of omission -- and the moment it matters most is the moment
+    somebody is acting, not the moment they are browsing.
+    """
+    from pignus import openamp as OA                     # noqa: PLC0415
+    if pledge:
+        print(OA.describe(pledge), file=sys.stderr)
+        return
+    print("Tier C: issuer-permissioned. The collateral is locked by the "
+          "issuer's policy server, not by a covenant, so the lender's security "
+          "is that issuer's promise.", file=sys.stderr)
 
 
 def cmd_pledge_list(args):
@@ -561,6 +590,7 @@ def cmd_pledge_create(args):
     except ValueError as e:
         raise SystemExit(f"error: {e}") from None
     print(json.dumps(p, indent=2))
+    _say_tier_c(p)
 
 
 def cmd_pledge_release(args):
@@ -581,6 +611,7 @@ def cmd_pledge_release(args):
     except ValueError as e:
         raise SystemExit(f"error: {e}") from None
     print(json.dumps(out, indent=2))
+    _say_tier_c(out if isinstance(out, dict) and out.get("id") else None)
 
 
 def cmd_pledge_seize(args):
@@ -609,6 +640,7 @@ def cmd_pledge_seize(args):
     except ValueError as e:
         raise SystemExit(f"error: {e}") from None
     print(json.dumps(out, indent=2))
+    _say_tier_c(out if isinstance(out, dict) and out.get("id") else None)
     # Say what actually happened. A seizure before maturity is TWO phases --
     # the request, then the issuer's delivery once the borrower's
     # countersignature is in -- and reporting the first as "seized" tells a
@@ -781,7 +813,7 @@ def cmd_repo_fund(args):
     spk = t.script_pubkey()
     addr = node.deriveaddresses(
         node.getdescriptorinfo(f"raw({spk.hex()})")["descriptor"])[0]
-    fee_asset, fee, _rate = choose_fee(node, args, "fund", prefer=[t.debt_asset])
+    fee_asset, fee, rate = choose_fee(node, args, "fund", prefer=[t.debt_asset])
     if args.dry_run:
         print(json.dumps({"dry_run": True, "address": addr,
                           "scriptPubKey": spk.hex(), "bond": t.bond(),
@@ -849,14 +881,19 @@ def cmd_repo_forfeit(args):
     # never sells the asset back: comparing a timestamp to a block height
     # refuses it for ever and strands their equity in the vault.
     locktime_open(node, t.forfeit_after, "FORFEIT")
-    fee_asset, fee, _rate = choose_fee(node, args, "recover",
-                                       prefer=[t.debt_asset])
+    fee_asset, fee, rate = choose_fee(node, args, "recover",
+                                      prefer=[t.debt_asset])
     _ver, _prog, change = wallet_payout(node)
     funding = _funding_for(args, node, {fee_asset: fee},
                            exclude=[(coin.txid, coin.vout)], fee_asset=fee_asset)
     if funding is None:
         return 0
-    sp = RepurchaseSpender(node, t, fee_asset, fee)
+    # The NODE's threshold for this asset, not the composer's fallback: an
+    # asset the node prices differently has its dust somewhere else, and change
+    # folded at the wrong figure is either a dust output nobody can spend or a
+    # gift to the block producer.
+    sp = RepurchaseSpender(node, t, fee_asset, fee,
+                           dust_fold=dust_fold_for(rate))
     raw = sp.forfeit(coin, funding, change)
     if args.dry_run:
         print(raw); return 0
@@ -949,8 +986,10 @@ def cmd_repo_settle(args):
         if os.path.exists(raw):
             with open(raw) as f:
                 raw = f.read().strip()
-        # The fee is already in the transaction being witnessed; the spender is
-        # constructed only for the leaf and the control block.
+        # The fee is already in the transaction being witnessed; this spender
+        # COMPOSES NOTHING -- it is constructed only for the leaf and the
+        # control block, so it makes no change output and needs no dust
+        # threshold.
         sp = R.RepurchaseSpender(node, t, t.debt_asset, 0)
         # ...and the input being witnessed has to be THIS vault. --txid/--vout
         # were required and then ignored, so a witness could be attached to
@@ -982,7 +1021,7 @@ def cmd_repo_settle(args):
             "borrower's coin paying the debt")
 
     _RepurchaseSpender, vault = _repo_spender(args, node, t)
-    fee_asset, fee, _rate = choose_fee(node, args, "repay", prefer=[t.debt_asset])
+    fee_asset, fee, rate = choose_fee(node, args, "repay", prefer=[t.debt_asset])
     if fee_asset != t.debt_asset:
         refuse(f"a settlement pays its fee in the debt asset "
                f"{t.debt_asset[:12]}..., not {fee_asset[:12]}...: all four "
@@ -1008,7 +1047,8 @@ def cmd_repo_settle(args):
         # Output 4 is the BORROWER's change of the debt asset, so it defaults to
         # this wallet only because the borrower is who composes a settlement.
         _ver, _prog, change_spk = wallet_payout(node)
-    sp = R.RepurchaseSpender(node, t, fee_asset, fee)
+    sp = R.RepurchaseSpender(node, t, fee_asset, fee,
+                             dust_fold=dust_fold_for(rate))
     try:
         raw = sp.compose_settlement(vault, verifier,
                                     bytes.fromhex(args.verifier_spk),
@@ -2279,6 +2319,16 @@ class _ResponderState:
     def get(self, take_id):
         return self.data.get(take_id, {})
 
+    def items(self):
+        """Every take this responder has a record of, as (take_id, record).
+
+        Copies, so a caller that annotates one is not annotating the state.
+        This is the only enumeration of a lender's own moves that does not go
+        through a relay -- which matters wherever the answer bounds what the
+        lender may spend.
+        """
+        return [(k, dict(v)) for k, v in self.data.items()]
+
     def set(self, take_id, **fields):
         rec = dict(self.data.get(take_id, {}))
         rec.update(fields)
@@ -2287,6 +2337,18 @@ class _ResponderState:
         return rec
 
     def _save(self):
+        """Write via a temporary file and rename, and make the rename itself
+        durable.
+
+        This file is the only record of what this key has already sent, and
+        what it costs to lose is a principal paid twice. The bytes are fsynced
+        before the rename, and the DIRECTORY after it: the rename is atomic
+        against a process dying but not against a power cut, and without the
+        second flush it can reach the disk ahead of the bytes it renames --
+        leaving a state file that is empty or truncated exactly when the
+        machine has just been through the kind of event that loses writes. The
+        book's own writer does this and says so; this file matters more.
+        """
         if not self.path:
             return
         tmp = self.path + ".tmp"
@@ -2296,6 +2358,17 @@ class _ResponderState:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
+        try:
+            dirn = os.path.dirname(os.path.abspath(self.path)) or "."
+            dfd = os.open(dirn, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            # Written either way; only the durability of the rename is at
+            # stake, and some filesystems refuse a directory fsync outright.
+            pass
 
 
 def _loan_from_take(tk):
@@ -3802,19 +3875,28 @@ def cmd_btc_respond(args):
 
     def lots_committed(offers, except_take=None):
         """How many lots of each offer this responder has already put money
-        behind, counted from its OWN state.
+        behind, counted from its OWN state file.
 
-        `lots` is the one term that bounds a lender's total exposure, and until
-        now it was enforced only by the relay -- the party this responder is
-        written never to trust. Counted here, an offer for three lots funds
-        three loans however many takes a relay serves back.
+        `lots` is the one term that bounds a lender's total exposure, so the
+        count has to come from the one record a relay cannot edit. Enumerating
+        the relay's take list instead makes the cap the relay's to set: a take
+        it omits, prunes or never serves back is a lot this count does not see,
+        and the principal behind it is spent again.
+
+        `btc_offer_id` is written into the state the first time a take is
+        touched. A record from before that is counted through the relay's copy
+        as a fallback, which is worth less but is better than not counting it.
         """
         used = {}
-        for _o, tk, have in our_takes(offers):
-            if tk["take_id"] == except_take:
+        by_id = {tk["take_id"]: tk for _o, tk, _h in our_takes(offers)}
+        for take_id, have in state.items():
+            if take_id == except_take:
                 continue
-            if have.get("disbursement_txid") or have.get("disbursing"):
-                oid = tk.get("btc_offer_id")
+            if not (have.get("disbursement_txid") or have.get("disbursing")):
+                continue
+            oid = have.get("btc_offer_id") \
+                or (by_id.get(take_id) or {}).get("btc_offer_id")
+            if oid:
                 used[oid] = used.get(oid, 0) + 1
         return used
 
@@ -3872,7 +3954,11 @@ def cmd_btc_respond(args):
                 print(f"take {tk['take_id']}: not answering -- "
                       + "; ".join(problems), file=sys.stderr)
                 continue
-            state.set(tk["take_id"], t=t.hex(), payment_hash=_sha256(t))
+            # The OFFER, in this key's own record. Everything that bounds what
+            # this lender may spend is counted from the state file, and a take
+            # whose offer only the relay knows is a lot that count cannot see.
+            state.set(tk["take_id"], t=t.hex(), payment_hash=_sha256(t),
+                      btc_offer_id=tk.get("btc_offer_id"))
             code, r = report(R.HASH_TAG, tk["take_id"], "/v1/btc/hash",
                              payment_hash=_sha256(t),
                              adaptor_point=A.point(t).hex())
@@ -4174,7 +4260,12 @@ def cmd_btc_respond(args):
                       file=sys.stderr)
             # Written BEFORE the send: the gap between paying and recording is
             # where a crash would otherwise cost a second principal.
-            state.set(tk["take_id"], disbursing=loan.disbursement_spk().hex())
+            # The offer id goes with it, so a lot this key has committed is
+            # countable from the state alone even for a take reserved by an
+            # older version that did not record it.
+            state.set(tk["take_id"],
+                      disbursing=loan.disbursement_spk().hex(),
+                      btc_offer_id=tk.get("btc_offer_id"))
             used[tk.get("btc_offer_id")] = used.get(tk.get("btc_offer_id"), 0) + 1
             try:
                 txid, vout = pay_disbursement(seq_node, loan,

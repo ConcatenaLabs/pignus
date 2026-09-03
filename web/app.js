@@ -39,10 +39,6 @@ const BONUS = 5;                            // liquidation bonus, percent
 // own configuration; these defaults match the testnet host's layout.
 const DEFAULT_TX_URL = "/explorer/tx/{txid}";
 const DEFAULT_BTC_TX_URL = "/testnet4/tx/{txid}";
-// How deep a Bitcoin claim must be before this page reads the preimage off it
-// and hands the collateral back. Sequentia follows Bitcoin reorgs in real time,
-// so a secret read from a shallow claim can still be undone.
-const CLAIM_DEPTH = 6;
 
 const state = {
   wallet: null, account: null, utxos: [], balances: {}, mine: null,
@@ -445,6 +441,10 @@ async function refresh() {
     state.txUrl = m.explorer_tx_url || DEFAULT_TX_URL;
     state.btcTxUrl = m.btc_explorer_tx_url || DEFAULT_BTC_TX_URL;
     if (m.btc_height != null) state.btcHeight = m.btc_height;
+    // What the parent chain charges now. Absent rather than guessed when the
+    // book has no Bitcoin node: the checks that use it skip instead of
+    // judging an unbumpable fee against a made-up number.
+    state.btcFeerate = m.btc_feerate_sat_vb ?? null;
   }
   if (a) state.assets = a.assets || {};
   if (f) state.fees = f;
@@ -788,6 +788,29 @@ function derived(key, fn) {
   return v;
 }
 
+// ...and DEFERRED until the row that shows it is opened. The address lives in a
+// details row that starts collapsed, so on a book with a few hundred loans the
+// eager form spent seconds of a frozen tab deriving text nobody had asked to
+// see -- on first paint, with no busy indicator. What is registered here is the
+// thunk; `fillDeferred` runs it when a row is expanded, and `derived` still
+// caches the answer, so opening a row twice costs one tweak.
+const _spkLater = new Map();
+function deferSpk(key, fn) {
+  _spkLater.set(key, fn);
+  return key;
+}
+
+function fillDeferred(root) {
+  if (!root) return;
+  root.querySelectorAll("[data-spk]").forEach(el => {
+    const key = el.dataset.spk;
+    const fn = _spkLater.get(key);
+    if (!fn) return;
+    el.textContent = derived(key, fn);
+    el.removeAttribute("data-spk");
+  });
+}
+
 function detailsRow(key, cols, body) {
   const open = state.details.has(key);
   return `<tr class="det"${open ? "" : " hidden"} data-det-row="${esc(key)}">
@@ -811,7 +834,7 @@ function detailsBlock({ idLabel, id, copyId, outpoint, spk, terms, t, warnings,
   return `<div class="kv">
       <span class="k">${esc(idLabel)}</span><span class="mono">${esc(id)}</span>
       <span class="k">Outpoint</span><span class="mono">${esc(outpoint || "—")}</span>
-      <span class="k">Address these terms compile to</span><span class="mono">${esc(spk)}</span>
+      <span class="k">Address these terms compile to</span><span class="mono" data-spk="${esc(spk)}">…</span>
       <span class="k">Price feed</span><span class="mono">${esc(t.market || "")} · ${esc(pig._internals.bytesToHex(pig.feedId(t.market || "")))}</span>
       <span class="k">Oracle key${keys.length === 1 ? "" : "s"}</span><span>${oracleRows}</span>
       <span class="k">Attestations valid from</span><span>${esc(notBefore)}</span>
@@ -844,13 +867,18 @@ function wireCopy(box, textFor) {
 }
 
 function wireDetails(box) {
+  // A row that is ALREADY open across a redraw still needs its address.
+  box.querySelectorAll("[data-det-row]:not([hidden])").forEach(fillDeferred);
   box.querySelectorAll("[data-det]").forEach(b => {
     b.onclick = () => {
       const key = b.dataset.det;
       const row = box.querySelector(`[data-det-row="${CSS.escape(key)}"]`);
       const open = state.details.has(key);
       if (open) state.details.delete(key); else state.details.add(key);
-      if (row) row.hidden = open;
+      if (row) {
+        row.hidden = open;
+        if (!open) fillDeferred(row);      // derive it the moment it is shown
+      }
       b.setAttribute("aria-expanded", open ? "false" : "true");
     };
   });
@@ -975,7 +1003,11 @@ function exitBlock(x, t) {
 }
 
 // One fetch per closed loan. The tables redraw every half minute and a closing
-// transaction never changes, so the answer is worth keeping.
+// transaction that is IN A BLOCK never changes, so that answer is worth
+// keeping. One still in the mempool is not: it has no height, its attestations
+// are read from a transaction that can still be replaced, and caching it means
+// the page keeps showing the provisional account long after the real one is
+// available.
 const _exits = new Map();
 
 function wireExits(box, rows) {
@@ -990,9 +1022,10 @@ function wireExits(box, rows) {
     const l = rows.find(r => (r.loan_id || r.txid) === id);
     if (!l) { el.innerHTML = ""; return; }   // the list moved under the fetch
     try {
-      const html = exitBlock(await api(`v1/loans/${encodeURIComponent(id)}/exit`),
-                             JSON.parse(l.terms));
-      _exits.set(id, html);
+      const got = await api(`v1/loans/${encodeURIComponent(id)}/exit`);
+      const html = exitBlock(got, JSON.parse(l.terms));
+      if (Number(got.height || 0) > 0) _exits.set(id, html);
+      else el.dataset.done = "";      // ask again once it is in a block
       el.innerHTML = html;
     } catch (e) {
       // Not cached: a book that was unreachable, or a close still in the
@@ -1124,7 +1157,9 @@ function renderOffers() {
         ? `<span class="tag ${status === "ghost" ? "bad" : "dim"}" title="${
             esc(OFFER_STATUS_WHY[status] || "")}">${esc(status)}</span>` : "";
       offer.requirePinned();
-      const spk = derived(`offer:${o.outpoint}`, () => offer.offerTree({
+      // Registered, not computed: the address only appears in the details row,
+      // which starts collapsed.
+      const spk = deferSpk(`offer:${o.outpoint}`, () => offer.offerTree({
         terms: t, principal: big(o.principal || t.principal),
         collateral: big(o.collateral || t.collateral_amount),
         expiryLocktime: o.expiry_locktime }).scriptPubKey);
@@ -1218,7 +1253,21 @@ function renderLoans() {
       const cls = h == null ? "dim" : h < 1 ? "bad" : h < 1.15 ? "warn" : "ok";
       const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
       const m = marketFor(t);
-      const now = m?.unit_price != null ? Number(m.unit_price) : null;
+      // The price this loan's OWN health was computed from, which is not
+      // always the market's: a loan built on a rotated oracle, or on a
+      // threshold set, is judged by the keys its vault bakes in, and the book
+      // says so by serving `price` beside `health`. Printing the market's
+      // number next to that health puts two figures side by side that do not
+      // describe each other -- and the one a borrower would act on is the
+      // health.
+      const now = l.price != null
+        ? unitPrice(l.price, t.price_scale || 100000, t.collateral_asset,
+                    t.debt_asset)
+        : (m?.unit_price != null ? Number(m.unit_price) : null);
+      const ownPrice = l.price != null && m?.unit_price != null
+        && Math.abs(Number(unitPrice(l.price, t.price_scale || 100000,
+                                     t.collateral_asset, t.debt_asset))
+                    - Number(m.unit_price)) > 1e-9;
       const live = l.state === "LIVE";
       const yours = mine(l.borrower_prog);
       const key = detKey("loan", l.loan_id || l.txid);
@@ -1252,7 +1301,7 @@ function renderLoans() {
         : "";
       const oracle = (t.oracles && t.oracles.length)
         ? `<span class="sub2">${esc(l.oracle || "")} oracles</span>` : "";
-      const spk = derived(`vault:${l.txid}:${l.vout}`, () => l.single_leaf
+      const spk = deferSpk(`vault:${l.txid}:${l.vout}`, () => l.single_leaf
         ? (offer.requirePinned(), offer.offerVaultScriptPubKey(t))
         : pig.vaultScriptPubKey(t));
       return `<tr>
@@ -1260,7 +1309,7 @@ function renderLoans() {
         <td data-label="market">${esc(l.collateral_ticker)} / ${esc(l.debt_ticker)}${oracle}</td>
         <td data-label="owed">${amount(t.debt, t.debt_asset)}<span class="sub2">borrowed ${units(t.principal, t.debt_asset)}</span></td>
         <td data-label="collateral">${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}</span></td>
-        <td data-label="price / liq.">${now != null ? money(now, now < 10 ? 4 : 2) : "—"} / ${money(liq, liq < 10 ? 4 : 2)}<span class="sub2">${esc(l.debt_ticker)} per ${esc(l.collateral_ticker)}${l.ltv != null ? ` · LTV ${(l.ltv * 100).toFixed(0)}%` : ""}</span></td>
+        <td data-label="price / liq.">${now != null ? money(now, now < 10 ? 4 : 2) : "—"} / ${money(liq, liq < 10 ? 4 : 2)}<span class="sub2">${esc(l.debt_ticker)} per ${esc(l.collateral_ticker)}${l.ltv != null ? ` · LTV ${(l.ltv * 100).toFixed(0)}%` : ""}${ownPrice ? ` · <span title="this loan is judged by the oracle keys its own vault bakes in, which are not the ones this book quotes the market at">its own oracle</span>` : ""}</span></td>
         <td data-label="health"><span class="tag health ${cls}">${h == null ? "no price" : h.toFixed(3)}</span></td>
         <td data-label="matures">${whenBlock(t.maturity)}</td>
         <td data-label="state"><span class="tag ${STATE_CLS[l.state] || "dim"}" title="${esc(STATE_WHY[l.state] || "")}">${esc(l.state)}</span>${l.state === "UNCONFIRMED" && l.confirmations != null ? ` <span class="small">${l.confirmations}/${depth}</span>` : ""}${shallow}${l.note ? `<span class="sub2">${esc(l.note)}</span>` : ""}<br>${closed}</td>
@@ -1544,8 +1593,23 @@ async function confirmAndSend(label, make, opts = {}) {
       </div>`, "info");
   };
 
-  const answer = await new Promise((resolve) => {
-    const wire = () => {
+  const answer = await new Promise((settle) => {
+    // Every way out of this dialog goes through one place, so the document
+    // listener below is taken off however it ends -- Escape, a button, or a
+    // redraw. A listener left behind outlives the question it was asked for.
+    let done = false;
+    const resolve = (v) => {
+      if (done) return;
+      done = true;
+      document.removeEventListener("keydown", esckey);
+      settle(v);
+    };
+    // `want` names the control the keyboard was on before a redraw. Changing
+    // the fee asset rebuilds this whole dialog, so without putting focus back
+    // the reader is dropped on <body> -- and note() scrolls, so they are also
+    // somewhere else on the page. They then cannot keep arrowing through the
+    // assets, and have to tab from the top of the document to try another.
+    const wire = (want) => {
       const sel = $("#feeasset");
       if (sel) sel.onchange = () => {
         const wasFee = fee, wasBuilt = built;
@@ -1559,7 +1623,7 @@ async function confirmAndSend(label, make, opts = {}) {
           fee = wasFee; built = wasBuilt;
           draw(explain(e));
         }
-        wire();
+        wire("#feeasset");
       };
       const go = $("#go");
       if (go) go.onclick = () => {
@@ -1568,14 +1632,21 @@ async function confirmAndSend(label, make, opts = {}) {
         resolve(true);
       };
       $("#nogo").onclick = () => resolve(false);
-      // Escape cancels, as it does in every dialog anyone has used.
-      const esckey = (ev) => {
-        if (ev.key !== "Escape") return;
-        document.removeEventListener("keydown", esckey);
-        resolve(false);
-      };
-      document.addEventListener("keydown", esckey);
+      // The redraw destroyed whatever had the keyboard; put it back on the
+      // control that was being used.
+      if (want) {
+        const back = $(want);
+        if (back) { try { back.focus(); } catch { /* not focusable */ } }
+      }
     };
+    // Escape cancels, as it does in every dialog anyone has used. Registered
+    // ONCE, for the life of this dialog: `wire()` runs again on every fee
+    // change, and a listener added there accumulates one per change and is
+    // never taken off the document.
+    function esckey(ev) {
+      if (ev.key === "Escape") resolve(false);
+    }
+    document.addEventListener("keydown", esckey);
     draw();
     wire();
     // This asks a question and waits for an answer, so it is a DIALOG. It
@@ -2078,7 +2149,8 @@ function btcUi({ flow = "btcrepay", prefer = [], committed = {} } = {}) {
       return null;
     },
     payoutProgram: async () => state.payout,
-    heights: async () => ({ btc: state.btcHeight, seq: state.height }),
+    heights: async () => ({ btc: state.btcHeight, seq: state.height,
+                            feerate: state.btcFeerate }),
     confirmations,
     btcHrp: btcHrp(),
     addressToSpk: async (addr) => programFromAddress(addr).spk,
@@ -2300,7 +2372,7 @@ async function btcStep(rec, force) {
         "your Bitcoin; once that claim is buried, reclaim from here.", "ok");
     } else if (step.action === "reclaim") {
       const txid = await btcborrow.reclaim(state.wallet, rec, btcUi(),
-                                           { minDepth: CLAIM_DEPTH, force });
+                                           { force });
       note(`<b>Collateral reclaimed.</b> <a href="${txLink(txid, true)}" class="mono">${esc(txid)}</a>`, "ok");
     } else {
       note("There is nothing to do with that loan right now.", "info");
@@ -2465,7 +2537,8 @@ async function checkBtc(ev) {
     // leave everybody the time they need.
     const problems = btcborrow.offerProblems(loan).concat(
       state.btcHeight != null && state.height != null
-        ? btcborrow.timelockProblems(loan, state.btcHeight, state.height) : []);
+        ? btcborrow.timelockProblems(loan, state.btcHeight, state.height,
+                                     state.btcFeerate) : []);
     if (vaultTxid && loan.vault_txid && loan.vault_txid !== vaultTxid)
       problems.push("this ticket's vault does not follow from its own " +
                     "pre-vault and terms, so something in it has been altered " +

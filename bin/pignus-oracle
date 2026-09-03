@@ -118,15 +118,39 @@ def load_or_create_key(path, create=True):
     return sec
 
 
+# What each kind of price source understands. A key outside its set is a key
+# the operator believes is doing something and is not: `max_age` on an `http`
+# source went nowhere at all, so a config asking for a cache got one request
+# per market per round and said nothing about it.
+SOURCE_KEYS = {
+    "static": {"type", "prices"},
+    "http": {"type", "url", "timeout", "field", "feed_max_age", "max_age"},
+    "http_bulk": {"type", "url", "timeout", "field", "max_age",
+                  "feed_max_age"},
+}
+
+
 def build_source(cfg):
     s = cfg.get("source", {})
     kind = s.get("type", "static")
+    known = SOURCE_KEYS.get(kind)
+    if known is not None:
+        # Comments are welcome; anything else is a mistake worth naming.
+        odd = sorted(k for k in s
+                     if k not in known and not k.startswith("_"))
+        if odd:
+            raise SystemExit(
+                f"the {kind!r} price source does not understand "
+                f"{', '.join(odd)}. It takes: {', '.join(sorted(known))}. A "
+                f"setting that goes nowhere is one you believe is protecting "
+                f"you.")
     if kind == "static":
         return O.StaticPriceSource(s.get("prices", {}))
     if kind == "http":
         return O.HttpPriceSource(s["url"], timeout=float(s.get("timeout", 5)),
                                  field=s.get("field", "price"),
-                                 feed_max_age=float(s.get("feed_max_age", 0)))
+                                 feed_max_age=float(s.get("feed_max_age", 0)),
+                                 max_age=float(s.get("max_age", 0)))
     if kind == "http_bulk":
         return O.BulkHttpPriceSource(s["url"], timeout=float(s.get("timeout", 8)),
                                      field=s.get("field", "price"),
@@ -735,8 +759,6 @@ def main():
 
     with open(args.config) as f:
         cfg = json.load(f)
-    # Only the serving and signing paths may create a key; asking what the key
-    # is must never answer with a new one.
     # Only the SERVING path may create a key. Asking what the key is must never
     # answer with a new one -- and neither must signing a seizure: an oracle
     # whose keyfile has gone missing and signs with a fresh key produces a
