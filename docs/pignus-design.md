@@ -584,9 +584,14 @@ worth stating plainly rather than being left as "nobody is robbed":
 | borrower repays, lender stalls past `repay_deadline` | the repayment back, less two fees; the collateral is lost at TIMEOUT | the collateral, worth more than the debt on an over-collateralised loan |
 | borrower never repays | nothing | the collateral, at TIMEOUT |
 | price crosses the strike | the collateral, less what SEIZE took | the debt, if the oracle co-signs |
+| the lender LOSES their key | the repayment back at its own refund leaf; the collateral is stuck in the vault for ever | nothing: they can neither claim nor sweep |
 
 The second row is the honest one: a lender who stalls gives up the repayment and
 takes collateral worth more, so on an over-collateralised loan stalling **pays**.
+The last row is the one nobody plans for: a lost lender key is not a loss
+confined to the lender, because the vault's two exits both need it, and there
+is no timeout that opens for anybody else. It is why `deploy/DEPLOY.md` treats
+that key as the money it is.
 The borrower's protection is not the lender's incentive; it is the margin
 `timelocks_sane()` enforces plus the borrower's own duty to repay early enough
 that the claim is buried well before `recover_after`. A borrower who repays at

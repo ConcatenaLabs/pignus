@@ -170,9 +170,19 @@ function money(n, digits = 2) {
  * height of zero is worse than no date at all -- so the height is shown bare
  * until a tip is known.
  */
-function whenBlock(h) {
+/**
+ * A Sequentia height, as a date and a countdown.
+ *
+ * `chain` names the chain in the parenthesis. Everywhere but the cross-chain
+ * tier there is only one chain in sight and naming it is noise; there, a
+ * Sequentia deadline sits in the same table row as a Bitcoin one, and an
+ * unqualified "block 163,388" is a number a borrower can act on as if it were
+ * the other chain's.
+ */
+function whenBlock(h, chain = "") {
   const n = Number(h);
-  if (state.height == null) return `block ${n.toLocaleString()}`;
+  const at = `${chain ? chain + " " : ""}block ${n.toLocaleString()}`;
+  if (state.height == null) return at;
   const dt = (n - state.height) * blockSeconds() * 1000;
   const d = new Date(Date.now() + dt);
   const ms = Math.abs(dt);
@@ -187,12 +197,12 @@ function whenBlock(h) {
     : ` ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`;
   const stale = state.bookDownSince ? ", stale" : "";
   return `${date}${time} <span class="small">(${dt < 0 ? rel + " ago" : "in " + rel}` +
-         `${stale}, block ${n.toLocaleString()})</span>`;
+         `${stale}, ${at})</span>`;
 }
 
 /** The same, as plain text for a summary line. */
-function whenText(h) {
-  return whenBlock(h).replace(/<[^>]*>/g, "");
+function whenText(h, chain = "") {
+  return whenBlock(h, chain).replace(/<[^>]*>/g, "");
 }
 
 // ------------------------------------------------------------------ fees
@@ -479,7 +489,14 @@ async function refresh() {
                             ["loans", renderLoans], ["alerts", renderAlerts],
                             ["lendform", renderLendForm],
                             ["wallet", renderWallet]]) {
-    try { fn(); } catch (e) { panelFailed(name, e); }
+    try {
+      fn();
+      // It drew. Clear any error slot left from a previous failure, so a
+      // panel that recovers says so instead of keeping a stale complaint
+      // beside working content.
+      const slot = $("#" + name + "_err");
+      if (slot && slot.innerHTML) slot.innerHTML = "";
+    } catch (e) { panelFailed(name, e); }
   }
   renderBtcLoans().catch((e) => panelFailed("btcloans", e));
 }
@@ -491,12 +508,21 @@ async function refresh() {
  */
 function panelFailed(name, e) {
   console.error(`pignus: the ${name} panel could not draw`, e);
-  const el = $("#" + name);
+  // A slot BESIDE the panel where there is one. Writing the error over the
+  // panel itself destroys whatever was in it -- for a form, that is every
+  // control, and the next render then throws on the elements it expects to
+  // find, for the rest of the session.
+  const el = $("#" + name + "_err") || $("#" + name);
   if (!el) return;
+  // paint() skips a render whose markup matches what it last wrote, and this
+  // writes straight to the element behind its back. Without dropping that
+  // entry, a panel that recovers to the same markup it had before is never
+  // repainted, and the error box stays up for ever.
+  _painted.delete("#" + name);
   el.innerHTML = `<div class="note bad">This section could not be drawn: ` +
     `${esc(explain(e))}<br><span class="small">Something this book is ` +
-    `serving cannot be read. The rest of the page is unaffected; reload to ` +
-    `try again.</span></div>`;
+    `serving cannot be read. The rest of the page is unaffected; it will try ` +
+    `again on the next refresh.</span></div>`;
 }
 
 // ------------------------------------------------------------------ wallet
@@ -769,7 +795,8 @@ function detailsRow(key, cols, body) {
 }
 
 /** The whole of what a person is asked to trust, in one block they can copy. */
-function detailsBlock({ idLabel, id, outpoint, spk, terms, t, warnings, extra = "" }) {
+function detailsBlock({ idLabel, id, copyId, outpoint, spk, terms, t, warnings,
+                       extra = "" }) {
   const keys = oracleKeys(t);
   const odd = new Set(unknownOracles(t));
   const oracleRows = keys.length
@@ -794,7 +821,7 @@ function detailsBlock({ idLabel, id, outpoint, spk, terms, t, warnings, extra = 
     </div>
     <pre>${esc(terms)}</pre>
     <div class="row" style="margin-top:8px">
-      <button class="sm" data-copy="${esc(id)}">Copy terms</button>
+      <button class="sm" data-copy="${esc(copyId ?? id)}">Copy terms</button>
       <span class="hint" style="margin:0">Check it yourself:
       <code>pignus-cli verify --terms terms.json --txid &lt;txid&gt;</code></span>
     </div>`;
@@ -1114,6 +1141,11 @@ function renderOffers() {
         <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>` +
       detailsRow(key, 9, detailsBlock({
         idLabel: "offer id", id: o.offer_id || "not listed in this book",
+        // The DISPLAYED id is not an identity: two offers a book has refused
+        // to list both read "not listed in this book", and keying Copy terms
+        // off that hands the reader whichever of them the lookup finds first.
+        // `key` is this row's own, and is already unique.
+        copyId: key,
         outpoint: o.outpoint, spk, terms: o.terms, t, warnings: o.warnings }));
     }).join("") + "</tbody></table>";
   paint("#offers", html, (b) => {
@@ -1125,7 +1157,11 @@ function renderOffers() {
     hook("cancel", cancelListing);
     hook("list", listPending);
     wireDetails(b);
-    wireCopy(b, (id) => (view.find(o => (o.offer_id || "not listed in this book") === id) || {}).terms || "");
+    // Looked up by the ROW's own key, which is unique, rather than by the id
+    // displayed -- two unlisted offers display the same words.
+    wireCopy(b, (key) => (view.find(
+      (o, i) => detKey("offer", o.offer_id || o.outpoint || i) === key) || {}
+    ).terms || "");
   });
 }
 
@@ -2029,9 +2065,8 @@ async function confirmations(txid, maxVout = 4) {
 function btcUi({ flow = "btcrepay", prefer = [], committed = {} } = {}) {
   return {
     esc, units, ticker: (a) => meta(a).ticker,
-    atomsToBtc: (n) => pig.fixed(BigInt(n), 8, 8)
-      .toLocaleString(undefined, { maximumFractionDigits: 8 }),
-    blockTime: (h) => whenBlock(h),
+    atomsToBtc: (n) => pig.fixed(BigInt(n), 8, 8),
+    blockTime: (h, chain = "") => whenBlock(h, chain),
     busy, api, post,
     poll: async (path, pick, { tries = 40, gap = 2000 } = {}) => {
       for (let i = 0; i < tries; i++) {
@@ -2063,8 +2098,11 @@ function btcUi({ flow = "btcrepay", prefer = [], committed = {} } = {}) {
 
 function renderBtcOffers() {
   const box = document.querySelector("#btcoffers"); if (!box) return;
+  // Through paint(), so an unchanged table is not rewritten and the keyboard
+  // survives the thirty-second refresh.
   btcborrow.renderOffers(box, state.btcOffers || [], btcUi(),
-                         (off) => runBtcBorrow(off));
+                         (off) => runBtcBorrow(off),
+                         (html, wire) => paint("#btcoffers", html, wire));
 }
 
 /**
@@ -2119,32 +2157,69 @@ async function loadBtcLoans() {
   state.btcLoans = state.btcLoans.filter(r => r && r.loan && r.take_id);
 }
 
+/**
+ * The current price of one whole Bitcoin, in the units a cross-chain loan's
+ * debt asset is quoted in, or null.
+ *
+ * Matched on the loan's OWN market name, not on "whichever cross-chain market
+ * has a price": a BTC/EURX quote read as dollars would put a borrower's
+ * seizure warning out by the exchange rate.
+ */
+function btcPriceFor(market) {
+  const want = String(market || "").toUpperCase();
+  const m = (state.markets || []).find(
+    x => x.cross_chain && x.unit_price != null && !x.stale &&
+         String(x.market || "").toUpperCase() === want);
+  return m ? Number(m.unit_price) : null;
+}
+
 async function renderBtcLoans() {
   const box = $("#btcloans");
   if (!box) return;
   await loadBtcLoans().catch(() => { state.btcLoans = btcborrow.savedLoans(); });
-  const rows = state.btcLoans;
+  // A record whose numbers are not numbers costs ONE ROW, not the table. One
+  // take a book is serving with, say, no btc_amount would otherwise throw out
+  // of the map below and replace every live loan a borrower has with an error
+  // box -- including the ones they are in the middle of repaying.
+  const all = state.btcLoans;
+  const rows = all.filter(r => r && r.loan && btcborrow.loanReadable(r.loan));
+  const unreadable = all.length - rows.length;
+  const dropped = unreadable
+    ? `<div class="hint">${unreadable} of your loan record(s) are not shown: ` +
+      `their terms carry a value that is not a number, so nothing here can ` +
+      `read them. That is the book serving a malformed record, not a loan ` +
+      `you have lost -- the covenant behind it is on chain either way, and ` +
+      `<code>pignus-cli btc-check</code> reads it from the ticket.</div>`
+    : "";
   if (!rows.length) {
-    paint("#btcloans", `<div class="empty">${state.account
+    paint("#btcloans", dropped + `<div class="empty">${state.account
       ? "No Bitcoin-collateral loans for this wallet yet."
       : "Connect a wallet to see your Bitcoin-collateral loans."}</div>`);
     return;
   }
   const heights = { btc: state.btcHeight, seq: state.height };
   const html = `<table><thead><tr><th>collateral</th><th>you owe</th>
+      <th>seized below</th><th>health</th>
       <th>repay by</th><th>lender sweep</th><th>where it stands</th><th></th>
       </tr></thead><tbody>` +
     rows.map((rec, i) => {
       const l = rec.loan;
       const step = btcborrow.nextStep(rec, heights);
       const d = esc(meta(l.debt_asset).ticker);
+      // How close this loan is to the price a seizure of it would be judged
+      // against. There is no price test in any script on this tier -- the
+      // lender and the oracle sign together and the collateral moves -- so
+      // this is the whole of a borrower's warning, and the page showed none.
+      const health = btcborrow.seizeHealth(l, btcPriceFor(l.market));
       const acts = [];
+      if (health != null && health < 1 && !rec.terminal)
+        acts.push('<span class="tag bad" title="the lender and the oracle can co-sign a seizure of your collateral at this price. Repaying is what stops it">seizable now</span>');
       if (step.action)
-        acts.push(`<button data-btcstep="${i}" class="primary sm">${esc(step.label)}</button>`);
+        acts.push(`<button data-btcstep="${i}" data-focus="bs:${esc(rec.take_id || i)}" class="primary sm">${esc(step.label)}</button>`);
       if (step.action === "reclaim")
-        acts.push(`<button data-btcforce="${i}" class="sm" title="skip the wait for the Bitcoin block your secret's Sequentia block anchored to. That wait is there because a Bitcoin reorg can undo the secret, and spending your Bitcoin on one that is undone loses both sides">Reclaim anyway</button>`);
+        acts.push(`<button data-btcforce="${i}" data-focus="bf:${esc(rec.take_id || i)}" class="sm" title="skip the wait for the Bitcoin block your secret's Sequentia block anchored to. That wait is there because a Bitcoin reorg can undo the secret, and spending your Bitcoin on one that is undone loses both sides">Reclaim anyway</button>`);
       if (btcborrow.canAbort(rec, heights))
-        acts.push(`<button data-btcabort="${i}" class="warnbtn sm">Take the collateral back</button>`);
+        acts.push(`<button data-btcabort="${i}" data-focus="ba:${esc(rec.take_id || i)}" class="warnbtn sm">Take the collateral back</button>`);
       // The repayment's own REFUND leaf: if the lender never took the money,
       // it comes home after the deadline, and needs no signature from them.
       // Decided from the facts, not from a word: the repayment went out, no
@@ -2152,19 +2227,24 @@ async function renderBtcLoans() {
       if (rec.repay_txid && !rec.secret_t && !rec.lender_claim_txid
           && !rec.terminal && state.height != null
           && state.height >= Number(l.repay_deadline))
-        acts.push(`<button data-btcunpay="${i}" class="sm" title="the lender never claimed it, so the repayment's refund leaf is open">Take the repayment back</button>`);
+        acts.push(`<button data-btcunpay="${i}" data-focus="bu:${esc(rec.take_id || i)}" class="sm" title="the lender never claimed it, so the repayment's refund leaf is open">Take the repayment back</button>`);
       const funded = rec.prevault_txid || rec.funding_txid;
       return `<tr>
         <td data-label="collateral">${pig.fixed(BigInt(l.btc_amount), 8, 8)} BTC
           ${funded ? `<span class="sub2"><a href="${txLink(funded, true)}" class="mono">${shortHex(funded, 12)}</a></span>` : ""}</td>
         <td data-label="you owe">${units(l.debt, l.debt_asset)} ${d}</td>
-        <td data-label="repay by">${whenBlock(btcborrow.effectiveRepayDeadline(l))}
+        <td data-label="seized below">${esc(btcborrow.seizePrice(l, {
+          units, ticker: (a) => meta(a).ticker }))}</td>
+        <td data-label="health">${health == null
+          ? '<span class="small" title="no current price for this loan\'s own market, so nothing here can say how close it is">—</span>'
+          : `<span class="tag ${health < 1 ? "bad" : health < 1.15 ? "warn" : "ok"}" title="the current price over the price a seizure would be judged against. Under 1.00 the lender and the oracle can co-sign one">${health.toFixed(3)}</span>`}</td>
+        <td data-label="repay by">${whenBlock(btcborrow.effectiveRepayDeadline(l), "Sequentia")}
           <span class="sub2">the lender stops claiming after this; the written
           deadline is block ${Number(l.repay_deadline).toLocaleString()}</span></td>
         <td data-label="lender sweep">Bitcoin block ${Number(l.recover_after).toLocaleString()}</td>
         <td data-label="where it stands">${esc(rec.status || "funded")}${step.note ? `<span class="sub2">${esc(step.note)}</span>` : ""}</td>
         <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>`;
-    }).join("") + "</tbody></table>" +
+    }).join("") + "</tbody></table>" + dropped +
     `<p class="hint" style="margin:10px 0 0">Repaying pays a hashlocked output the
      lender can only open by publishing the secret that releases your Bitcoin.
      Before spending Bitcoin on that secret, this page waits for the BITCOIN
@@ -2209,7 +2289,7 @@ async function btcStep(rec, force) {
         "loan by moving your collateral into its vault, which takes a " +
         "confirmation or two. Until then your collateral is still abortable at " +
         `Bitcoin block ${Number(l.abort_after).toLocaleString()}. Once the loan ` +
-        `is live, repay by ${whenText(btcborrow.effectiveRepayDeadline(l))} to ` +
+        `is live, repay by ${whenText(btcborrow.effectiveRepayDeadline(l), "Sequentia")} to ` +
         "get the Bitcoin back.", "ok");
     } else if (step.action === "repay") {
       const ui = btcUi({ flow: "btcrepay", prefer: [l.debt_asset],

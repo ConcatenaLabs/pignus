@@ -10,6 +10,30 @@ __version__ = "0.2.0"
 COIN = 100_000_000
 
 
+#: Where a node stops reading an absolute locktime as a block HEIGHT and starts
+#: reading it as a Unix TIME. Consensus, not convention: a deadline on the wrong
+#: side of it means something entirely different from what was intended.
+LOCKTIME_THRESHOLD = 500_000_000
+
+
+def locktime_open(deadline, height, now=None) -> bool:
+    """Has an absolute locktime passed, in whichever unit it is written in?
+
+    Every tier gates an exit on one of these -- a loan's maturity, a
+    repurchase's forfeit, a cross-chain sweep -- and comparing a Unix time to a
+    block height says the exit opens about nine thousand years from now, which
+    silently removes somebody's only remedy.
+
+    Unknown is NOT open: a time-valued deadline with no clock to compare it to
+    is reported closed, because telling somebody a spend is available when the
+    node would reject it as `non-final` costs them the fee to find out.
+    """
+    deadline = int(deadline)
+    if deadline < LOCKTIME_THRESHOLD:
+        return int(height) >= deadline
+    return now is not None and int(now) >= deadline
+
+
 def atoms(amount) -> int:
     """Whole units, as the RPC states them, converted to atoms.
 

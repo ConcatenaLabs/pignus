@@ -219,5 +219,32 @@ const offer = {
 ok("a transaction can name itself, which binding the reclaim to the vault needs",
    typeof new btc.Tx(2, 0).txid === "function");
 
+
+// --- how close a live cross-chain loan is to being seized ------------------
+//
+// There is no price test in any script on this tier: the lender and the oracle
+// sign a seizure together and the collateral moves. So this number is the whole
+// of a borrower's warning, and the page showed none of it once the loan was
+// live -- the first they would know was that their Bitcoin was gone.
+{
+  const loan = { strike: String(60000 * 100000), price_scale: 100000 };
+  ok("above the strike is healthy",
+     Math.abs(bb.seizeHealth(loan, 90000) - 1.5) < 1e-9,
+     String(bb.seizeHealth(loan, 90000)));
+  ok("at the strike it is exactly one",
+     Math.abs(bb.seizeHealth(loan, 60000) - 1) < 1e-9);
+  ok("below it, under one -- which is when the two of them can sign",
+     bb.seizeHealth(loan, 45000) < 1);
+  // Unknown must not read as zero. A health of zero says "about to be seized",
+  // which is the one thing it must not say when the truth is "nobody knows".
+  ok("no price for the market is not a health of zero",
+     bb.seizeHealth(loan, null) === null);
+  ok("and neither is a loan that states no strike",
+     bb.seizeHealth({ strike: "0", price_scale: 100000 }, 90000) === null);
+  ok("a strike past 2^53 is still read exactly",
+     bb.seizeHealth({ strike: "9007199254740993", price_scale: 1 },
+                    9007199254740993) != null);
+}
+
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -33,13 +33,12 @@ outright rather than compute a debt `JSON.parse` may already have rounded, so a
 book that served them as numbers would hold loans its own page could not
 price. Heights,
 locktimes, timestamps, confirmations, counts, prices, `price_scale` and
-`expiry_locktime` are JSON numbers. The exceptions, all of them derived rather
-than agreed: `seizure_if_liquidated` and `surplus_if_liquidated` on a loan,
-every amount inside `/v1/loans/{id}/exit` (`seize_paid`, `seize_expected`,
-`surplus_paid`, `surplus_expected`, `lender_paid`, `debt`), and
-`live_debt_by_asset` in `/v1/stats`, which is keyed by asset id with number
-values. Read them as indicative; the string amounts are the ones to compute
-against.
+`expiry_locktime` are JSON numbers. That holds for the amounts a book derives
+as well as the ones it stores: `seizure_if_liquidated` and
+`surplus_if_liquidated` on a loan, every amount inside `/v1/loans/{id}/exit`,
+and the totals in `live_debt_by_asset` are all decimal strings too. Those are
+the figures a lender checks a payout against, and a rounded one reads as a
+shortfall that is not there.
 
 The `terms` field of an offer or a loan is the JSON **string** that was
 submitted, stored and served back byte for byte -- not a nested object. That is
@@ -138,8 +137,13 @@ latest verified price.
 ```
 
 `lendable` is false when either ticker is unknown to the registry, when the
-price is older than `max_price_age`, or when the precisions disagree; `stale` is
-true when a price is held but is past that age. `cross_chain` marks a market
+price is not current, or when the precisions disagree; `stale` is true when a
+price is held and is not current. Current means BOTH young enough -- no older
+than `max_price_age` -- and not dated more than a two-minute clock skew ahead
+of the book's own clock. The second half matters as much as the first: an
+oracle host running fast signs a real price, its feed then dies, and for as
+long as the drift lasts a one-sided test reads that dead number as infinitely
+fresh. `cross_chain` marks a market
 whose collateral is native Bitcoin: those are never lendable through the
 covenant offers and are traded through `/v1/btc/*` instead.
 `oracles_available` counts the oracles that have a currently verified
@@ -234,9 +238,12 @@ baked into the vault's leaf instead, which is why a price quoted at one scale
 and read at another is a hundredfold error the covenant cannot notice, and why
 every consumer here compares the scale to the loan's own before using a price.
 
-`oracle_x`, `age` (seconds) and `stale` (older than `max_price_age`) are added
-beside them. Age is not a signed property and cannot be, but a reader acting on
-a price needs it: a signature stays valid however old the number under it is.
+`oracle_x`, `age` (seconds) and `stale` are added beside them. Age is not a
+signed property and cannot be, but a reader acting on a price needs it: a
+signature stays valid however old the number under it is. It is SIGNED -- a
+negative age is an attestation dated ahead of this book's clock, which is
+exactly the case a reader most needs to see, and `stale` is true for one that
+is far enough ahead to be a broken clock rather than drift.
 Verify against the key the **vault** bakes in, not against whichever oracle
 served it. 404 when the book holds none.
 
@@ -253,7 +260,7 @@ signed by the key a particular loan bakes in.
 ```json
 {"loans_by_state": {"LIVE": 12, "REPAID": 40},
  "offers": 7, "offers_all": 31, "unreadable": 0,
- "live_debt_by_asset": {"<asset id>": 150000000000},
+ "live_debt_by_asset": {"<asset id>": "150000000000"},
  "at_risk": [{"loan_id": "…", "market": "GOLD/USDX", "health": 1.02}]}
 ```
 
@@ -503,6 +510,9 @@ right place for it.
 `{"removed": true}` on success. 404 if there is no such listing, 403 without the
 token, 429 if this client is writing too fast.
 
+From the command line: `pignus-cli offer-delist --offer <id> --token <token>`,
+which sends the token in the header.
+
 ## Loans
 
 A loan is a vault on chain. The book usually discovers one by itself — an
@@ -556,7 +566,7 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
   "height": 118432, "past_maturity": false, "recover_open": false,
   "price": 300000000, "health": 1.6667, "ltv": 0.525,
   "liquidatable": false,
-  "seizure_if_liquidated": 3675000, "surplus_if_liquidated": 6662991666,
+  "seizure_if_liquidated": "3675000", "surplus_if_liquidated": "6662991666",
   "spent_by": "", "spent_height": 0, "closed_confirmations": 0, "note": "",
   "min_depth": 2,
  "funding_height": 118289, "funding_block": "…"
@@ -630,14 +640,14 @@ say that price buys.
 {"loan_id": "…", "exit": "LIQUIDATED", "spent_by": "…", "input_index": 0,
  "height": 118500, "market": "GOLD/USDX",
  "strike": 18000000, "price_scale": 100000, "not_before": 1799000000,
- "maturity": 119000, "debt": 10500000000, "collateral": 6666666666,
+ "maturity": 119000, "debt": "10500000000", "collateral": "6666666666",
  "attestations": [{"oracle_x": "…", "price": 17500000,
                    "timestamp": 1799999940, "signature": "…",
                    "present": true, "verified": true}],
  "price_used": 17500000,
- "seize_expected": 3675000, "seize_paid": 3675000,
- "surplus_expected": 6662991666, "surplus_paid": 6662991666,
- "lender_paid": 10500000000,
+ "seize_expected": "3675000", "seize_paid": "3675000",
+ "surplus_expected": "6662991666", "surplus_paid": "6662991666",
+ "lender_paid": "10500000000",
  "problems": []}
 ```
 
@@ -729,7 +739,15 @@ one client can make requests at all.
 `?status=` (`open` by default, or `taken`, `withdrawn`, `gone`, `ghost`,
 `expired`, or `all`). A value outside that set is a 400 listing them, not an
 empty result -- an empty list reads as "there are no offers". Each row is the stored
-offer plus `lots_left`, computed live:
+offer plus `lots_left`, computed live.
+
+A cross-chain offer carries no coin, so nothing on a chain ends one. The book
+ends it instead: an offer whose own four deadlines no longer leave both sides
+the margins a take is checked against becomes `expired` on the next poll, and
+is pruned with the other dead records. That is the same rule that would refuse
+the take, applied one step earlier -- and it is what keeps the ceiling on open
+offers from being a one-way door, since publishing one costs nothing but a
+self-signature.
 
 ```json
 {"offers": [{
@@ -795,6 +813,26 @@ different offers can never collide.
 Body: `{"sig": "…"}`, the lender's signature over the withdrawal. Sets the
 offer's status to `withdrawn`. 404 for an unknown offer, 403 if the signature is
 not the publishing lender's.
+
+### `POST /v1/btc/offers/{id}/resign`
+
+Body: `{"offer_sig": "…"}`, a fresh signature over the terms this book already
+holds for that offer. Nothing else changes -- not a term, not the id, not the
+status -- and the book verifies the signature over the stored payload, under
+the key those terms name, before it accepts one. So it can only ever replace a
+signature that does not check out with one that does, and nobody without the
+lender's key can use it.
+
+It exists because an offer whose signature stops verifying stops every loan
+under it. A lender's responder checks that signature before acting on any take,
+so a live loan under a disowned offer is one whose repayment is never claimed
+and whose collateral is never released -- and the responder cannot tell that
+apart from having no work to do. `pignus-cli btc-responder-status --book …`
+names such an offer and exits 4; `pignus-cli btc-offer-resign --offer <id>`
+repairs it.
+
+404 for an unknown offer. 403 if the signature does not check out over the
+stored terms.
 
 ### `POST /v1/btc/take`
 
@@ -864,6 +902,11 @@ not move that collateral into that vault.
 `?status=`, `?offer_id=`, `?borrower_x=`. `{"takes": [ … ]}`, newest first.
 Asking by borrower key is what lets somebody who cleared their browser storage,
 or moved to another machine, find their own loans again.
+
+`?oracle_x=` narrows to the takes whose loan names one oracle key, which is what an
+operator retiring a key checks before they stop the instance: on this tier the
+oracle's signature IS the liquidation, so a live take still naming a retired key
+has lost its lender's only way to seize.
 
 ### `GET /v1/btc/take/{id}`
 
@@ -1060,19 +1103,6 @@ liquidation decision — there is no covenant to refuse it. This log is the whol
 of that tier's accountability: anyone can check afterwards that the price behind
 a seizure was really under the strike. 404 from `/v1/seizure/{sighash}` if this
 oracle co-signed no such seizure.
-
-### `GET /v1/unrenderable`
-
-The records this book holds and cannot show, and why:
-
-```json
-{"unrenderable": {"<offer or loan id>": "ValueError: debt must be at least 1 atom"}}
-```
-
-A record that will not parse is missing from every listing, so a lender looking
-for their own offer simply does not find it. `/healthz` counts them and turns
-unhealthy; this says which, so an operator can look at the record rather than
-at the whole book.
 
 ### `GET /healthz`
 

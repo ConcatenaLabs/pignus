@@ -39,18 +39,15 @@ from dataclasses import dataclass, asdict, fields
 import json
 
 from . import atoms as _atoms
+from . import LOCKTIME_THRESHOLD, locktime_open as _locktime_open
 from .compat import load_covenant
 from .terms import _internal
 
 PRODUCT = "repurchase"
 TIER = "D"
 
-# Where a node stops reading an absolute locktime as a block height and starts
-# reading it as a Unix time. Consensus, not convention: a deadline on the wrong
-# side of it means something entirely different from what was intended.
-LOCKTIME_THRESHOLD = 500_000_000
-# ...and the earliest Unix time anybody would deliberately write, so a number
-# just above the threshold is caught as the height it was meant to be.
+# The earliest Unix time anybody would deliberately write, so a number just
+# above LOCKTIME_THRESHOLD is caught as the height it was meant to be.
 _PLAUSIBLE_TIME = 1_600_000_000
 
 # The OpenDAMP SHAPE this settlement is built for, and it is a choice rather
@@ -323,10 +320,15 @@ class RepurchaseTerms:
         o = _find_output(node, txid, vout,
                          lambda got: got["scriptPubKey"]["hex"] == want_spk)
         if o is None:
-            raise ValueError(
+            # NOT the same as a coin that pays the wrong thing. "Nothing pays
+            # this address" is a repurchase whose bond has not been funded --
+            # a STATE, and one a borrower who transferred the asset first most
+            # needs to be told. Refusing it as a bad terms document told them
+            # their document was wrong when the truth was that their
+            # counterparty had posted no security at all.
+            raise NotFunded(
                 "no unspent output of this transaction pays the address these "
-                "terms compile to; the repurchase you were shown is not the one "
-                "being funded")
+                "terms compile to: nothing has funded this bond")
         if o["scriptPubKey"]["hex"] != want_spk:
             raise ValueError(
                 f"the coin at {txid}:{o['n']} does not pay the address these "
@@ -467,8 +469,19 @@ def verify_leg_one(node, txid, cu_lender_spk_hex, collateral_asset, atoms,
     return o
 
 
+class NotFunded(ValueError):
+    """No coin pays the bond vault at all.
+
+    Distinct from every other refusal `verify_funding` makes, which are all
+    about a coin that IS there and does not match. This one is a state of the
+    world rather than a fault in the document, and the two lead opposite ways:
+    one says "the terms you were shown are not the ones being funded", the
+    other says "your counterparty has posted no bond".
+    """
+
+
 def repurchase_state(terms, height, bond=None, leg_one=None, bond_spent=False,
-                     min_confirmations=BURIAL_DEPTH) -> str:
+                     min_confirmations=BURIAL_DEPTH, now=None) -> str:
     """One word for where a repurchase stands, from the two halves checked.
 
     `bond` and `leg_one` are what `verify_funding` and `verify_leg_one`
@@ -476,6 +489,12 @@ def repurchase_state(terms, height, bond=None, leg_one=None, bond_spent=False,
     with only one half checked is `bond-only` and never `live`: a bond against a
     collateral leg nobody looked at secures nothing, and calling that "ok" is
     the failure this exists to prevent.
+
+    `now` is the chain's median time, needed only when `forfeit_after` is
+    written as a Unix time rather than a block height. Without it such a
+    repurchase is reported `live` rather than `forfeitable`, because saying a
+    bond can be swept when the node would reject the sweep as `non-final` is
+    the worse of the two mistakes.
     """
     if bond_spent:
         return "settled"
@@ -490,7 +509,12 @@ def repurchase_state(terms, height, bond=None, leg_one=None, bond_spent=False,
     if min(int(bond.get("confirmations") or 0),
            int(leg_one.get("confirmations") or 0)) < min_confirmations:
         return "funded-unburied"
-    if height >= terms.forfeit_after:
+    # In the deadline's OWN units: at or above LOCKTIME_THRESHOLD a node reads
+    # `forfeit_after` as a Unix time, and comparing a height to a timestamp
+    # says the sweep opens thousands of years from now -- so a borrower whose
+    # lender never sold the asset back would never be told they can take the
+    # bond, which is their only remedy.
+    if _locktime_open(terms.forfeit_after, height, now):
         return "forfeitable"
     return "live"
 

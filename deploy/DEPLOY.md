@@ -118,9 +118,16 @@ What each piece costs to lose is worth knowing before it happens. An oracle key
 that is gone leaves every loan baked to it unliquidatable until it matures --
 nobody is robbed, because a vault whose oracle is dead still has its oracle-free
 repayment exit and its lender's backstop, but it is a slow, ugly failure. A
-lender key that is gone costs the BORROWERS: their collateral can only be
-released by the secret that key's holder publishes, so it sits until the
-timeout. A responder state file that is gone can cost a principal paid twice.
+lender key that is gone is worse, and it is worth being exact about who it
+costs. A loan that has not STARTED costs nobody: the borrower's collateral is
+still in a pre-vault they alone can take back, and they abort it at their own
+deadline. A loan that IS live costs the borrower their collateral,
+permanently — both ways out of that vault need the missing key. RECLAIM needs
+the secret, which only a claim by that key publishes; TIMEOUT needs that key's
+signature. The borrower's repayment is not lost, because its own refund leaf
+opens for them at the repay deadline, so they keep the debt and the collateral
+sits in the vault for ever. A responder state file that is gone can cost a
+principal paid twice.
 
 **Reading and repairing a responder.** `pignus-cli btc-responder-status
 --config /root/sequentia/pignus-responder.json` prints every take that key has
@@ -134,6 +141,17 @@ because clearing it blind would pay a second principal. `btc-responder-clear
 refuses while the unit is running (stop it first), and it looks at the chain
 before it changes anything. If the payment IS there, it records it rather than
 clearing, with `--found <txid>:<vout>`.
+
+The other repair is an offer whose signature no longer verifies. A responder
+checks that signature before acting on any take of the offer, so one that stops
+verifying stops every loan under it — live ones included, whose borrowers then
+never get their collateral back — and the responder cannot tell that apart from
+an idle night. Add `--book http://127.0.0.1:8741` to `btc-responder-status` and
+it names any such offer and exits 4; `pignus-cli btc-offer-resign --offer <id>
+--config /root/sequentia/pignus-responder.json` repairs it by handing the book
+a fresh signature over the terms it already holds. That is the one thing it can
+change: the book verifies the new signature over the stored payload before
+accepting it, so no term can move and nobody without the key can use it.
 
 **Put that state file where the service may write.** The responder's unit runs
 with `ProtectHome=read-only` and one `ReadWritePaths=`, which is
@@ -163,8 +181,12 @@ What each piece costs to lose:
   risk, but a liquidation can no longer be checked afterwards, which is the
   whole of what bounds the oracle's trust.
 - **`lender.key`** — the lender can no longer sign a release, disburse, start a
-  loan or claim a repayment. Borrowers can still abort or take their collateral
-  back once the timeouts open, so nobody is robbed; the lender is.
+  loan or claim a repayment. A borrower whose loan never started aborts their
+  pre-vault and loses nothing. A borrower whose loan IS live loses the
+  collateral for good: RECLAIM needs the secret only a claim by this key
+  publishes, and TIMEOUT needs this key's signature, so nothing can ever spend
+  that vault again. They do get the debt back, at the repayment's own refund
+  leaf. Back this key up like the money it is.
 - **the responder's state file** — losing it while the key survives risks paying
   a principal twice, because the state file is the only record of what has
   already been sent. Restore it only from a copy newer than the last
@@ -440,9 +462,20 @@ the old key must keep signing until the last vault that names it has matured.
    its own keyfile and logfile.
 2. Add it to `pignusd.json` and make it the primary; the old instance stays in
    `oracles` and goes on signing.
-3. List what still depends on the old key with
-   `/v1/loans?oracle_x=<old key>`. Every one of those must reach maturity, or be
-   repaid, before the old instance stops.
+3. List what still depends on the old key. That is **both** tiers, and the
+   cross-chain one matters more: there the oracle's signature *is* the
+   liquidation, with no script that can stand in for it, so retiring a key
+   still named by a live cross-chain loan takes that loan's liquidation away
+   from the lender for good.
+
+   ```bash
+   curl -s "http://127.0.0.1:8741/v1/loans?oracle_x=<old key>" | jq '.loans|length'
+   curl -s "http://127.0.0.1:8741/v1/btc/takes?oracle_x=<old key>" \
+     | jq '[.takes[]|select(.status|IN("live","disbursed","signed"))]|length'
+   ```
+
+   Every one of those must reach maturity, be repaid, or be settled before the
+   old instance stops.
 4. Retire the old instance, and move its key into the new instance's
    `previous_keys` so `/v1/pubkey` still names it. That is what lets a
    borrower's page tell a rotation from a stranger.
@@ -496,10 +529,13 @@ ticket file that names it:
 pignus-cli btc-check loan.json
 ```
 
-**Back up the lender key AND the state file.** Losing the key loses the ability
-to claim repayments — borrowers can still take their collateral back once the
-loans time out, so nobody is robbed, but the lender is. Losing the state file
-without losing the key risks paying a principal twice.
+**Back up the lender key AND the state file.** Losing the key loses more than
+the ability to claim: every LIVE loan's collateral is frozen for good, because
+both ways out of that vault need this key — RECLAIM needs the secret only a
+claim by it publishes, and TIMEOUT needs its signature. A loan that has not
+started yet costs nobody, since the borrower aborts their own pre-vault. Losing
+the state file without losing the key risks paying a principal twice. See
+"What each piece costs to lose" above.
 
 Publishing an offer, from the lender's machine:
 

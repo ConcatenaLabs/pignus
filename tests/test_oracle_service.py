@@ -29,7 +29,9 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+BIN = os.path.join(ROOT, "bin")
+sys.path.insert(0, ROOT)
 
 from pignus import oracle as O            # noqa: E402
 from pignus.terms import feed_id          # noqa: E402
@@ -192,6 +194,48 @@ def test_log_rotation():
               fresh.latest("NOSUCH/USDX") is None)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def test_documented_configs_start():
+    """Every example config in this repository must actually start the oracle.
+
+    The nearest documentation to a binary is its own docstring, and an operator
+    installing a second oracle copies that block and edits the paths. The one
+    in `pignus-oracle` named four markets and gave precisions for two of the
+    five assets in them, so the unit died at start with "precisions missing for
+    OILX, SEQ, SILVR" -- under systemd, a service that fails immediately with
+    no page and no attestations. A config that is printed as an example is a
+    config somebody will run.
+    """
+    print("the configs this repository prints as examples")
+    import re                                             # noqa: PLC0415
+    import glob                                           # noqa: PLC0415
+
+    def assets_of(cfg):
+        return sorted({a for m in cfg.get("markets", []) for a in m.split("/")})
+
+    src = open(os.path.join(BIN, "pignus-oracle")).read()
+    m = re.search(r"\{\n      \"keyfile\".*?\n    \}", src, re.S)
+    check("the binary's own docstring carries an example config", bool(m))
+    if m:
+        cfg = json.loads(m.group(0))
+        missing = [a for a in assets_of(cfg) if a not in cfg.get("precisions", {})]
+        check("and every asset its markets name has a precision",
+              not missing, f"missing {missing}")
+
+    for path in sorted(glob.glob(os.path.join(ROOT, "deploy", "oracle*.json"))):
+        cfg = json.loads(open(path).read())
+        missing = [a for a in assets_of(cfg) if a not in cfg.get("precisions", {})]
+        check(f"{os.path.basename(path)} gives a precision for every asset",
+              not missing, f"missing {missing}")
+        # A feed_max_age the price source cannot answer makes the oracle refuse
+        # to sign anything, which is a key no loan can ever be liquidated under.
+        check(f"{os.path.basename(path)} asks its feed for no check it cannot "
+              f"answer",
+              not (cfg.get("source", {}).get("type") == "http_bulk"
+                   and float(cfg.get("source", {}).get("feed_max_age", 0)) > 0
+                   and "_meta" not in json.dumps(cfg)),
+              json.dumps(cfg.get("source", {}))[:160])
 
 
 def main():
@@ -485,6 +529,7 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
 
     test_log_rotation()
+    test_documented_configs_start()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0
 

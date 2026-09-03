@@ -540,8 +540,97 @@ def _raises(fn):
     return False
 
 
+def test_price_freshness_is_two_sided():
+    """A price dated AHEAD of the clock is not a fresh price.
+
+    Every recency test here was `now - timestamp <= max_age`, which is true for
+    every timestamp in the future -- infinitely fresh. An oracle host whose
+    clock runs six hours fast signs at the real price and its feed then dies:
+    for six hours that dead number is quoted as current, the market stays
+    lendable, health keeps being computed from it, and a liquidation is judged
+    on a price nobody stands behind any more. Nothing about a signature says
+    when it was made, so this is the only place it can be caught.
+    """
+    print("prices from the future are not fresh")
+    from pignus import oracle as O                       # noqa: PLC0415
+
+    class Att:
+        pass
+    a = Att()
+    a.timestamp = 1_800_000_000
+    check("a recent price is current",
+          O.current(a, 600, now=a.timestamp + 300))
+    check("an old one is not", not O.current(a, 600, now=a.timestamp + 601))
+    check("a little clock drift between honest hosts is tolerated",
+          O.current(a, 600, now=a.timestamp - O.CLOCK_SKEW + 1))
+    check("but a price dated well ahead of the clock is refused",
+          not O.current(a, 600, now=a.timestamp - O.CLOCK_SKEW - 1))
+    check("a six-hour-fast clock cannot keep a dead price alive",
+          not O.current(a, 600, now=a.timestamp - 6 * 3600))
+    check("and the age it reports is signed, so a reader can see which side "
+          "of the clock it is on",
+          O.age_of(a, now=a.timestamp - 60) == -60
+          and O.age_of(a, now=a.timestamp + 60) == 60)
+
+
+def test_repurchase_states():
+    """Every word `repurchase_state` can return, and what each one means.
+
+    Two of them were reachable from no command at all. `repo-verify` refused
+    outright when nothing paid the bond vault, so `not-funded` and
+    `leg-one-only` -- both documented -- could never be printed, and a borrower
+    who transferred the asset before their counterparty posted any security was
+    told their terms document was wrong rather than that no bond existed. The
+    distinction is the whole value of the command, so it is held here.
+    """
+    print("where a repurchase stands")
+    from pignus.repurchase import RepurchaseTerms, repurchase_state  # noqa: PLC0415
+
+    t = RepurchaseTerms(
+        collateral_asset="aa" * 32, collateral_amount=1000 * COIN,
+        debt_asset="bb" * 32, principal=900 * COIN, debt=950 * COIN,
+        collateral_value=1000 * COIN, borrower_cu="cc" * 32,
+        borrower_prog="dd" * 20, lender_prog="ee" * 20, forfeit_after=119_000)
+    deep = {"confirmations": 10}
+    shallow = {"confirmations": 1}
+
+    check("nothing funded at all",
+          repurchase_state(t, 100, bond=None, leg_one=None) == "not-funded")
+    check("the asset moved and no bond was posted -- the arrangement neither "
+          "party should be told looks like the beginning",
+          repurchase_state(t, 100, bond=None, leg_one=deep) == "leg-one-only")
+    check("a bond against a leg nobody looked at is never `live`",
+          repurchase_state(t, 100, bond=deep, leg_one=None) == "bond-only")
+    check("both halves, not yet buried",
+          repurchase_state(t, 100, bond=deep, leg_one=shallow)
+          == "funded-unburied")
+    check("both halves, buried, before the deadline",
+          repurchase_state(t, 100, bond=deep, leg_one=deep) == "live")
+    check("and after it, the borrower may sweep",
+          repurchase_state(t, 119_000, bond=deep, leg_one=deep)
+          == "forfeitable")
+    check("a spent bond is a finished repurchase, whatever else is true",
+          repurchase_state(t, 100, bond=None, leg_one=None, bond_spent=True)
+          == "settled")
+
+    # A time-valued deadline is judged against the chain's median time, and
+    # never against a height: comparing one to the other says the sweep opens
+    # thousands of years from now, and the borrower's only remedy disappears.
+    tt = RepurchaseTerms(**{**t.__dict__, "forfeit_after": 1_790_000_000})
+    check("a time-valued deadline is not open merely because a height passed",
+          repurchase_state(tt, 2_000_000_000, bond=deep, leg_one=deep) == "live")
+    check("with no clock to compare it to it stays closed, which is the safe "
+          "way to be wrong",
+          repurchase_state(tt, 100, bond=deep, leg_one=deep) == "live")
+    check("and the chain's median time opens it",
+          repurchase_state(tt, 100, bond=deep, leg_one=deep,
+                           now=1_790_000_001) == "forfeitable")
+
+
 def main():
     for fn in (test_vectors, test_terms, test_amount_strings,
+               test_price_freshness_is_two_sided,
+               test_repurchase_states,
                test_cross_chain_amount_strings,
                test_page_shaped_terms, test_oracle,
                test_amounts,

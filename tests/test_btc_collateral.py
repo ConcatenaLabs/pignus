@@ -325,6 +325,19 @@ def scenario_solvent(ctx):
     log(f"  collateral reclaimed on Bitcoin: {got}")
     assert ctx.btc.gettxout(got, 0) is not None
 
+    # WHICH leaf the spend used is on the chain, in the witness, and it is what
+    # a borrower most needs from a vault that has emptied: a reclaim is their
+    # own collateral coming back, a seizure is one they may want to dispute,
+    # and a timeout sweep is a deadline they missed. `btc-check` fetched this
+    # witness and threw it away, and told them it was "one of these three".
+    found = BC.spend_witness(ctx.btc, txid, vout)
+    assert found, "the spend of the vault could not be found"
+    tree = loan.funding_tree()
+    used = bytes.fromhex(str(found[1][-2]))
+    named = [k for k, v in tree.leaves.items() if bytes(v) == used]
+    assert named == ["reclaim"], f"the witness names {named}, not a reclaim"
+    log("  ...and the witness says WHICH leaf did it: reclaim")
+
 
 def scenario_default(ctx):
     log("\n== the borrower never repays: the lender sweeps on TIMEOUT ==")
@@ -431,11 +444,38 @@ def scenario_dlc(ctx):
     borrower_cets = dlc.adaptor_sign_cets(
         loan, ann, buckets, ctx.borrower_sec, txid, vout, lender_spk,
         borrower_spk, BTC_FEE, locktime, PRICE_SCALE, bucket_price)
-    ok, bad = dlc.verify_cets(loan, ann, lender_cets, loan.lender_x)
+    ok, bad = dlc.verify_cets(loan, ann, lender_cets, loan.lender_x,
+                              mine=borrower_cets)
     assert ok, f"lender CET {bad} did not verify"
-    ok, bad = dlc.verify_cets(loan, ann, borrower_cets, loan.borrower_x)
+    ok, bad = dlc.verify_cets(loan, ann, borrower_cets, loan.borrower_x,
+                              mine=lender_cets)
     assert ok, f"borrower CET {bad} did not verify"
     log(f"  both sides adaptor-signed all {len(buckets)} outcomes, all verified")
+
+    # A counterparty is free to adaptor-sign a set that verifies perfectly and
+    # pays them the whole collateral in every outcome. The signature check
+    # cannot see that; comparing the transactions is the only thing that can,
+    # and funding is the step after this one.
+    greedy = dlc.adaptor_sign_cets(
+        loan, ann, buckets, ctx.lender_sec, txid, vout, lender_spk,
+        lender_spk,                     # both legs to the LENDER
+        BTC_FEE, locktime, PRICE_SCALE, bucket_price)
+    ok, bad = dlc.verify_cets(loan, ann, greedy, loan.lender_x)
+    assert ok, "the greedy set's own signatures should still verify"
+    ok, bad = dlc.verify_cets(loan, ann, greedy, loan.lender_x,
+                              mine=borrower_cets)
+    assert not ok, ("a CET set paying the counterparty everything was accepted "
+                    "because its signatures happened to be valid")
+    log(f"  ...and a set that pays one side everything is refused at {bad}")
+
+    # An outcome left out is an outcome nobody can settle, which is the same
+    # loss by omission.
+    short = {k: v for k, v in lender_cets.items()
+             if k != sorted(lender_cets)[0]}
+    ok, bad = dlc.verify_cets(loan, ann, short, loan.lender_x,
+                              mine=borrower_cets)
+    assert not ok, "a CET set missing an outcome was accepted"
+    log(f"  ...and one with {bad} missing is refused too")
 
     settle_price = 30_000 * PRICE_SCALE
     outcome = dlc.bucket_for(buckets, settle_price)

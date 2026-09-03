@@ -43,23 +43,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from . import atoms as _atoms
+from . import LOCKTIME_THRESHOLD, locktime_open as _locktime_open  # noqa: F401
 
-# Where a node stops reading an absolute locktime as a block height and starts
-# reading it as a Unix time. Consensus, not convention.
-LOCKTIME_THRESHOLD = 500_000_000
-
-
-def _locktime_open(deadline, height, now=None):
-    """Has an absolute locktime passed, in whichever unit it is written in?
-
-    Unknown is NOT open: a time-locked deadline with no clock to compare it to
-    returns False, because reporting a loan callable when it is not is how a
-    liquidator broadcasts a transaction the node rejects as `non-final`.
-    """
-    deadline = int(deadline)
-    if deadline < LOCKTIME_THRESHOLD:
-        return int(height) >= deadline
-    return now is not None and int(now) >= deadline
 
 # Any RPC layer will do -- this module is handed either pignus.node.Node or a
 # test framework proxy, and they raise different exception types for the same
@@ -705,6 +690,15 @@ class VaultWatcher:
             return
         if not unburied and not self._search_exhausted(o, tip):
             return          # the walk has further to go; ask again next poll
+        # ...and never while the FORWARD scan is behind. One failed getblock
+        # leaves `scanned_height` short of the tip, and an unburied offer skips
+        # the backward walk entirely -- so a take in a block the scan has not
+        # reached looks like an offer that was never spent by anyone, and the
+        # next line calls it a ghost. A ghost is terminal and `--rescan-from`
+        # does not undo one: a lender's principal would be delisted for good
+        # over a single RPC hiccup. Coming back next poll costs nothing.
+        if self.scanned_height is not None and int(self.scanned_height) < tip:
+            return
         # No coin and no spender anywhere we can reach. If the offer never
         # buried, a Bitcoin-driven reorg undid its funding -- the same first
         # principle the vault side calls GHOST, and a ghost can come back. If it

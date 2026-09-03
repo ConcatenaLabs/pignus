@@ -150,6 +150,24 @@ want("the Bitcoin tab describes the tier it actually implements",
 want("the offers table rendered rather than staying on 'loading'",
      "Open offers" in dom and dom.count("loading&hellip;") == 0)
 
+# A phone's viewport is about 360px and the content box inside a card is about
+# 296. An address or a 64-hex hash has no spaces in it, so without an explicit
+# break rule one of them widens EVERY row and the whole page gets a horizontal
+# scrollbar -- which reads as a site that does not work rather than as a line
+# that does not wrap. Chrome's --dump-dom cannot report a layout width, so this
+# checks the rule rather than the rendering; it is the deletion of the rule
+# that would bring the overflow back.
+css = re.search(r"<style>(.*?)</style>", dom, re.S)
+css = css.group(1) if css else ""
+def breaks(selector):
+    m = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", css)
+    return bool(m) and ("overflow-wrap:anywhere" in m.group(1).replace(" ", "")
+                        or "word-break:break-all" in m.group(1).replace(" ", ""))
+want("hashes and addresses are allowed to break, so a phone can hold them",
+     breaks(".mono"), css[:0])
+want("and so are the values beside them in a details block",
+     breaks(".kv>*") or breaks(".kv > *"), css[:0])
+
 # The seeded cross-chain offer carries a debt of 2**53+1 atoms. If any of it
 # went through a JSON number the browser has already rounded it to 2**53, and
 # the page is quoting a borrower a debt that is not the one in the covenant.

@@ -266,6 +266,40 @@ def main():
             B.claim_disbursement(n, signed_loan, tk["disbursement_txid"],
                                  int(tk.get("disbursement_vout", 0)), w)
             rig.seq_mine(2)
+            # A relay that swaps the pre-vault after the release is published.
+            # Every later move -- paying the principal, broadcasting the move
+            # into the vault -- used to read that outpoint back out of the
+            # relay's copy, which is the party this responder is written never
+            # to believe. The state file is the record of what was actually
+            # signed against, and a disagreement has to stop the pass.
+            state_path = lkey + ".state.json"
+            st = json.load(open(state_path))
+            saved = dict(st[take["take_id"]])
+            st[take["take_id"]]["prevault_txid"] = "ff" * 32
+            json.dump(st, open(state_path, "w"))
+            r = respond()
+            check("a responder refuses to act when the relay's pre-vault is "
+                  "not the one it signed against",
+                  "Refusing to act on it" in r.stderr, r.stderr.strip()[-300:])
+            # ...and a state file that PREDATES that record must not stall a
+            # loan already under way. `vault_txid` is this key's own, and it is
+            # the txid of the move out of one particular outpoint, so an
+            # outpoint that reproduces it is the one that was signed against --
+            # whoever handed it over. That is proved once and then recorded.
+            st = json.load(open(state_path))
+            st[take["take_id"]] = {k: v for k, v in saved.items()
+                                   if k not in ("prevault_txid",
+                                                "prevault_vout",
+                                                "upgrade_presig")}
+            json.dump(st, open(state_path, "w"))
+
+            r = respond()
+            check("and one whose state file predates that record rebuilds it "
+                  "from its own release rather than stalling",
+                  json.load(open(state_path))[take["take_id"]]
+                  .get("prevault_txid") == saved.get("prevault_txid"),
+                  r.stderr.strip()[-300:])
+
             after = bw.getbalances()["mine"]["trusted"].get(usdx, 0)
             check("the borrower's own address received the principal",
                   float(after) - float(before) >= 99.9,
@@ -303,6 +337,14 @@ def main():
                   and rig.btc.gettxout(taken["funding_txid"], 0) is not None
                   or rig.btc.gettxout(taken["funding_txid"], 1) is not None,
                   json.dumps(taken)[:200])
+
+            # ...and one whose state file predates that record proves the
+            # relay's copy against its own release rather than stalling on it,
+            # because a lender upgrading mid-loan must not have to abandon it.
+            st = json.load(open(state_path))
+            for k in ("prevault_txid", "prevault_vout", "upgrade_presig"):
+                st[take["take_id"]].pop(k, None)
+            json.dump(st, open(state_path, "w"))
 
             respond()                       # reads w off the chain, upgrades
             rig.btc_mine(1)

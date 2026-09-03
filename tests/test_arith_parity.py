@@ -272,6 +272,20 @@ def timelocks(node):
                              d_refund=seq_h + 1))
     for fee in (0, 9999, 10_000, 10_001):
         docs.append(one_rule(upgrade_fee=fee))
+    # The locktime KIND, at the boundary where a node changes how it reads one.
+    # Below 500,000,000 it is a block height; at or above, a Unix time. This
+    # tier's margins are all measured in blocks, so a time-valued deadline has
+    # to be refused rather than measured -- and refused identically by both, or
+    # a page tells a borrower an offer is sound that no responder will answer.
+    T = 500_000_000
+    for field in ("d_refund", "repay_deadline", "abort_after", "recover_after"):
+        for v in (T - 1, T, T + 1, 1_790_000_000):
+            docs.append(one_rule(**{field: v}))
+    # And every deadline time-valued at once, which is the shape a lender would
+    # actually publish if they meant times.
+    docs.append(one_rule(d_refund=1_790_000_000, abort_after=1_790_000_120,
+                         repay_deadline=1_790_100_000,
+                         recover_after=1_790_100_060))
     for gap in (0, 1, 1439, 1440, 1441):
         # The term minimum: the gap between the last moment a loan can start
         # and the moment its repayment window shuts.
@@ -315,6 +329,55 @@ def timelocks(node):
         print("        " + line)
     check("the sweep contains loans that ARE refused, so it can fail",
           0 < refused < len(docs), f"{refused} of {len(docs)} refused")
+
+
+def reclaim_fee_cap(node):
+    """The most a book may take out of a borrower's collateral, in two places.
+
+    The reclaim fee is not covered by the lender's offer signature and not
+    chosen by the borrower: it arrives on the relay's word and decides how much
+    of the collateral the one transaction that returns it actually returns. Two
+    bounds hold it -- an absolute ceiling, and a fifth of the collateral -- and
+    BOTH have to bind. Taking the larger of them, which is what a `Math.max`
+    here does, defeats the ceiling on a large collateral and the proportion on a
+    small one, and a relay could keep a fifth of a Bitcoin as a "fee" on a
+    150-vbyte transaction. So the two implementations are compared here, and the
+    wrong-way-round version is shown to fail.
+    """
+    print("\nthe reclaim-fee cap, in two languages")
+    import subprocess                                   # noqa: PLC0415
+    sizes = [1, 330, 1000, 3300, 16_499, 16_500, 16_501, 20_000, 100_000,
+             249_999, 250_000, 250_001, 1_000_000, 100_000_000,
+             2_100_000_000_000_000]
+    js = subprocess.run(
+        [node, "--input-type=module", "-e",
+         "import * as b from '../web/btcborrow.js';"
+         f"process.stdout.write(JSON.stringify({sizes}.map(b.reclaimFeeCap)));"],
+        cwd=HERE, capture_output=True, text=True, timeout=60)
+    check("the page computes a cap for every collateral size",
+          js.returncode == 0, js.stderr.strip()[:200])
+    if js.returncode != 0:
+        return
+    theirs = json.loads(js.stdout)
+    mine = [_relay_cap(c) for c in sizes]
+    bad = [(c, a, b) for c, a, b in zip(sizes, mine, theirs) if a != b]
+    check("the relay and the page cap it identically, at every size",
+          not bad, str(bad[:3]))
+    check("the ceiling binds on a large collateral",
+          _relay_cap(100_000_000) == 50_000, str(_relay_cap(100_000_000)))
+    check("the proportion binds on a small one",
+          _relay_cap(100_000) == 20_000, str(_relay_cap(100_000)))
+    check("and the default fee is allowed even on a tiny collateral",
+          _relay_cap(1) >= 3000, str(_relay_cap(1)))
+    # The bug this replaced, stated as the thing it let through.
+    wrong = max(50_000, 100_000_000 // 5)
+    check("taking the LARGER bound would have allowed a fifth of a Bitcoin",
+          wrong > _relay_cap(100_000_000) and wrong == 20_000_000, str(wrong))
+
+
+def _relay_cap(collateral):
+    """The relay's own cap, read out of bin/pignusd rather than reimplemented."""
+    return min(50_000, max(330 * 10, int(collateral) // 5))
 
 
 def main():
@@ -387,6 +450,7 @@ def main():
 
     addresses(node)
     timelocks(node)
+    reclaim_fee_cap(node)
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0
 

@@ -35,6 +35,12 @@ const SEQ_BLOCK_SECONDS = 60;
 const UPGRADE_MARGIN_SECONDS = 24 * 3600;
 const REPAY_MARGIN_SECONDS = 24 * 3600;
 const CLAIM_MARGIN_SECONDS = 2 * 3600;
+// Where a node stops reading an absolute locktime as a block HEIGHT and starts
+// reading it as a Unix TIME. Every margin below is measured in blocks, so a
+// time-valued deadline would make each gap look thousands of years wide and
+// every check pass. This tier takes heights only, and this is where the page
+// says so -- the same rule, in the same words, as the library's.
+const LOCKTIME_THRESHOLD = 500_000_000;
 
 const REQUIRED = ["getBtcPublicKey", "getBtcAddress", "signBtcTaproot",
                   "prepareBtcSend", "broadcast", "getUtxos", "signPset"];
@@ -61,6 +67,20 @@ export function missingMethods(caps) {
  */
 export function timelockProblems(loan, btcHeight, seqHeight) {
   const problems = [];
+  // Heights, and nothing else. Refuse first and return: every comparison after
+  // this one subtracts a chain's tip height, so against a timestamp none of
+  // them mean anything, and an offer whose Bitcoin sweep opens seconds after
+  // your own Sequentia refund would pass all of them.
+  for (const [name, v] of [["d_refund", loan.d_refund],
+                           ["repay_deadline", loan.repay_deadline],
+                           ["abort_after", loan.abort_after],
+                           ["recover_after", loan.recover_after]]) {
+    if (Number(v || 0) >= LOCKTIME_THRESHOLD)
+      problems.push(`this offer's ${name} is ${Number(v)}, which a node reads ` +
+        "as a clock time rather than a block height. The deadlines that " +
+        "protect you are measured in blocks, so nothing here can check them.");
+  }
+  if (problems.length) return problems;
   const btcS = (h) => (Number(h) - Number(btcHeight)) * BTC_BLOCK_SECONDS;
   const seqS = (h) => (Number(h) - Number(seqHeight)) * SEQ_BLOCK_SECONDS;
   const hours = (s) => Math.round(s / 360) / 10;
@@ -171,30 +191,52 @@ function u32be(n) {
 
 // ------------------------------------------------------------------- the list
 
-export function renderOffers(box, offers, ui, onBorrow) {
-  // An offer whose numbers are not numbers is DROPPED, not rendered and not
-  // fatal. A book refuses to store one now, but one published before that
-  // still sits in an older book -- and a single such record used to throw out
-  // of this function and blank the whole table for every visitor.
-  const readable = (l) => {
-    try {
-      for (const k of ["btc_amount", "debt", "principal"])
-        if (l[k] !== undefined && l[k] !== "") BigInt(l[k]);
-      // Only what is PRESENT. `abort_after` and `d_refund` are absent from a
-      // loan with no pre-vault, and an absent field is not a malformed one.
-      for (const k of ["repay_deadline", "recover_after", "abort_after",
-                       "d_refund", "upgrade_fee", "strike", "price_scale"])
-        if (l[k] !== undefined && l[k] !== null && l[k] !== ""
-            && !Number.isFinite(Number(l[k]))) return false;
-      return true;
-    } catch { return false; }
+/**
+ * A loan whose numbers are numbers.
+ *
+ * A record that fails this is DROPPED from a list -- never rendered, never
+ * fatal. A book refuses to store one, but one published under an older rule
+ * still sits in an older book, and a single such record throwing out of a
+ * render blanks the whole table for every visitor. One bad record costs one
+ * row.
+ *
+ * Exported because the same rule has to hold wherever a list is drawn from a
+ * book's records: the offers table and a borrower's own loans both. Two copies
+ * of it would be two rules, and the second one would be the one that lapsed.
+ */
+export function loanReadable(l) {
+  try {
+    for (const k of ["btc_amount", "debt", "principal"])
+      if (l[k] !== undefined && l[k] !== "") BigInt(l[k]);
+    // Only what is PRESENT. `abort_after` and `d_refund` are absent from a
+    // loan with no pre-vault, and an absent field is not a malformed one.
+    for (const k of ["repay_deadline", "recover_after", "abort_after",
+                     "d_refund", "upgrade_fee", "strike", "price_scale"])
+      if (l[k] !== undefined && l[k] !== null && l[k] !== ""
+          && !Number.isFinite(Number(l[k]))) return false;
+    return true;
+  } catch { return false; }
+}
+
+export function renderOffers(box, offers, ui, onBorrow, write) {
+  // The page redraws this on a timer. Given a writer, the caller's own paint
+  // is used: it skips a render whose markup has not changed and puts the
+  // keyboard back where it was, so a reader tabbed to a Borrow button does not
+  // lose it -- and their text selection with it -- every thirty seconds.
+  // Without one, the element is written directly, which is what a test with a
+  // stand-in box needs.
+  const put = (html, wire) => {
+    if (write) return write(html, wire);
+    box.innerHTML = html;
+    if (wire) wire(box);
   };
+  const readable = loanReadable;
   const all = offers.filter(o => (o.status || "open") === "open");
   const open = all.filter(o => o.loan && readable(o.loan));
   const dropped = all.length - open.length;
   if (!open.length) {
-    box.innerHTML = '<div class="empty">No Bitcoin-collateral offers are open. ' +
-      'A lender publishes one, and keeps a responder online while it rests.</div>';
+    put('<div class="empty">No Bitcoin-collateral offers are open. ' +
+        'A lender publishes one, and keeps a responder online while it rests.</div>');
     return;
   }
   const note = dropped
@@ -202,7 +244,7 @@ export function renderOffers(box, offers, ui, onBorrow) {
       'a value that is not a number, so nothing here can price them. That is ' +
       'the book serving a malformed record, not a loan you are missing.</div>'
     : "";
-  box.innerHTML = '<table><thead><tr><th>collateral</th><th>you receive</th>' +
+  const html = '<table><thead><tr><th>collateral</th><th>you receive</th>' +
     '<th>you repay</th><th>seized below</th><th>repay by</th>' +
     '<th>lender sweep</th><th></th></tr></thead><tbody>' +
     open.map((o, i) => {
@@ -223,17 +265,26 @@ export function renderOffers(box, offers, ui, onBorrow) {
       // a lender stops claiming a margin before the written one, and a
       // repayment nobody claims releases no collateral. Quoting the written
       // figure invites somebody to pay into a window nobody will answer.
-      '<td data-label="repay by">' + ui.blockTime(effectiveRepayDeadline(l)) +
+      '<td data-label="repay by">' +
+        ui.blockTime(effectiveRepayDeadline(l), "Sequentia") +
       '<span class="sub2">the lender stops claiming after this; the written ' +
-      'deadline is block ' + Number(l.repay_deadline).toLocaleString() +
+      'deadline is Sequentia block ' +
+      Number(l.repay_deadline).toLocaleString() +
       '</span></td>' +
       '<td data-label="lender sweep">Bitcoin block ' +
         Number(l.recover_after).toLocaleString() + '</td>' +
-      '<td data-label=""><button data-b="' + i + '" class="primary sm">Borrow</button></td>' +
+      // `data-focus` keys the button to the OFFER, not to its row index, so
+      // the keyboard comes back to the same offer even when the list has
+      // reordered under it.
+      '<td data-label=""><button data-b="' + i + '" data-focus="btcb:' +
+        ui.esc(String(o.btc_offer_id || i)) +
+        '" class="primary sm">Borrow</button></td>' +
       '</tr>';
     }).join("") + "</tbody></table>" + note;
-  box.querySelectorAll("[data-b]").forEach(btn => {
-    btn.onclick = () => onBorrow(open[Number(btn.dataset.b)]);
+  put(html, (el) => {
+    el.querySelectorAll("[data-b]").forEach(btn => {
+      btn.onclick = () => onBorrow(open[Number(btn.dataset.b)]);
+    });
   });
 }
 
@@ -256,7 +307,7 @@ export function renderOffers(box, offers, ui, onBorrow) {
  */
 /** The price a seizure of this loan would be judged against, per whole
  *  Bitcoin, which is the way a borrower reads a price. */
-function seizePrice(loan, ui) {
+export function seizePrice(loan, ui) {
   const strike = BigInt(loan.strike || 0);
   if (strike <= 0n) return "not stated";
   const scale = BigInt(loan.price_scale || 100000);
@@ -334,10 +385,14 @@ export async function borrow(wallet, offer, ui) {
   if (!Number.isInteger(reclaimFee) || reclaimFee <= 0)
     throw new Error("this book named a reclaim fee that is not a whole "
       + "positive number of satoshis. Nothing has been broadcast.");
-  // A cap in BOTH directions: a fifth of the collateral, and never so little
-  // that the reclaim cannot relay. Neither number is subtle -- an honest fee
-  // here is a few thousand satoshis on a transaction of about 150 vbytes.
-  if (reclaimFee > Math.max(RECLAIM_FEE_FLOOR, collateral / 5))
+  // A cap in BOTH directions: never more than RECLAIM_FEE_CEILING whatever the
+  // collateral, never more than a fifth of it, and never so little that an
+  // honest reclaim cannot relay. Both bounds have to BIND, so this is the
+  // smaller of them -- taking the larger would let a big collateral pay any
+  // fee under a fifth of itself, and a small one pay the whole ceiling.
+  // Neither number is subtle: an honest fee here is a few thousand satoshis on
+  // a transaction of about 150 vbytes.
+  if (reclaimFee > reclaimFeeCap(collateral))
     throw new Error(`this book wants ${reclaimFee} satoshis of your ` +
       `${collateral}-satoshi collateral as the fee on the one transaction ` +
       `that gives it back. That is not a fee. Nothing has been broadcast.`);
@@ -941,11 +996,39 @@ export const MIN_UPGRADE_FEE = 10000;
 const BTC_DUST = 330;
 // The most a reclaim fee may be in absolute terms, whatever the collateral.
 // A reclaim is about 150 vbytes; this is roomy at any plausible feerate.
-const RECLAIM_FEE_FLOOR = 50_000;
+export const RECLAIM_FEE_CEILING = 50_000;
 // How deep the PARENT chain must be behind a Sequentia block before its
 // contents are worth spending Bitcoin on. Two Bitcoin blocks is the shortest
 // depth that survives an ordinary one-block reorg of the parent chain.
 export const MIN_ANCHOR_DEPTH = 2;
+
+/**
+ * Where this loan stands against the price a seizure of it would be justified
+ * below: `price / strike`, per whole Bitcoin, at the loan's OWN scale.
+ *
+ * Under 1 the lender and the oracle can co-sign a seizure. There is no price
+ * test in any script on this tier -- the two of them sign together and the
+ * collateral moves -- so this number is the whole of a borrower's warning, and
+ * the whole of what they can hold them to afterwards.
+ *
+ * Null when the loan states no strike, or when no current price for its market
+ * is to hand: a health of zero would read as "about to be seized", which is the
+ * one thing it must not say when the truth is "nobody knows".
+ */
+export function seizeHealth(loan, unitPriceBtc) {
+  const strike = BigInt(loan.strike || 0);
+  if (strike <= 0n || unitPriceBtc == null) return null;
+  const scale = Number(loan.price_scale || 100000);
+  const strikePerBtc = (Number(strike) / scale) * 1e8 / 1e8;
+  if (!(strikePerBtc > 0)) return null;
+  return Number(unitPriceBtc) / strikePerBtc;
+}
+
+/** The most a book may take as a reclaim fee on `collateral` satoshis. */
+export function reclaimFeeCap(collateral) {
+  return Math.min(RECLAIM_FEE_CEILING,
+                  Math.max(BTC_DUST * 10, Math.floor(Number(collateral) / 5)));
+}
 
 export function effectiveRepayDeadline(loan) {
   return Number(loan.repay_deadline) - CLAIM_MARGIN_BLOCKS;
