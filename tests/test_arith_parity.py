@@ -325,6 +325,37 @@ def timelocks(node):
                     f"{'refuses' if page_says else 'accepts'}")
     check(f"both refuse the same loans, across {len(docs)} sets of deadlines",
           disagree == 0, f"{disagree} disagree")
+
+    # The locktime-KIND gate, field by field. Comparing accept/refuse cannot
+    # see whether a field is in that gate at all: a time-valued deadline is an
+    # absurd number, so the ordinary margin rules refuse it anyway, and
+    # dropping any one field from either implementation's list changes no
+    # verdict at all. What has to agree is that each is NAMED -- which is what
+    # makes a field quietly missing from one side visible.
+    named = []
+    for field in ("d_refund", "repay_deadline", "abort_after", "recover_after"):
+        d = one_rule(**{field: 1_790_000_000})
+        # The field AND the reason. Naming the field alone is not enough: with
+        # a deadline that large the ordinary ordering rules also refuse it, and
+        # one of their messages says "Move recover_after past abort_after" --
+        # so a check that only looked for the field name passed while the gate
+        # had been removed.
+        def kind_gate(problems):
+            return any(field in p and "block height" in p for p in problems)
+
+        if not kind_gate(timelocks_sane(loan_from_dict(d), btc_h, seq_h)):
+            named.append(f"the library does not refuse {field} for its KIND")
+        got = subprocess.run(
+            [node, "--input-type=module", "-e",
+             "import * as bb from '../web/btcborrow.js';"
+             "process.stdout.write(JSON.stringify(bb.timelockProblems("
+             + json.dumps(d) + f", {btc_h}, {seq_h})));"],
+            cwd=HERE, capture_output=True, text=True, timeout=60)
+        page = json.loads(got.stdout) if got.returncode == 0 else []
+        if not kind_gate(page):
+            named.append(f"the page does not refuse {field} for its KIND")
+    check("and both NAME every deadline they refuse for being a clock time",
+          not named, "; ".join(named))
     for line in examples:
         print("        " + line)
     check("the sweep contains loans that ARE refused, so it can fail",
@@ -374,10 +405,71 @@ def reclaim_fee_cap(node):
     check("taking the LARGER bound would have allowed a fifth of a Bitcoin",
           wrong > _relay_cap(100_000_000) and wrong == 20_000_000, str(wrong))
 
+    # And the FLOOR, which is the other half and was missing entirely. The cap
+    # bounds what a relay may take; nothing bounded what it may leave, and a
+    # fee too small to relay makes the lender's release worthless -- it covers
+    # exactly one transaction, which nobody can bump, so the collateral sits in
+    # the vault until the lender sweeps it.
+    rates = [None, 0, 1, 5, 20, 376.678, 1000]
+    js2 = subprocess.run(
+        [node, "--input-type=module", "-e",
+         "import * as b from '../web/btcborrow.js';"
+         f"process.stdout.write(JSON.stringify({json.dumps(rates)}"
+         ".map(b.reclaimFeeFloor)));"],
+        cwd=HERE, capture_output=True, text=True, timeout=60)
+    check("the page computes a floor at every feerate",
+          js2.returncode == 0, js2.stderr.strip()[:200])
+    if js2.returncode == 0:
+        theirs2 = json.loads(js2.stdout)
+        mine2 = [_relay_floor(r) for r in rates]
+        bad2 = [(r, a, b) for r, a, b in zip(rates, mine2, theirs2) if a != b]
+        check("the relay and the page floor it identically, at every feerate",
+              not bad2, str(bad2[:3]))
+    check("a chain nobody can price still has a floor, not none",
+          _relay_floor(None) >= 150 and _relay_floor(0) >= 150,
+          f"{_relay_floor(None)} {_relay_floor(0)}")
+    check("and a busy chain raises it above that",
+          _relay_floor(376.678) > _relay_floor(None))
+    check("the floor never crosses the cap on an ordinary collateral",
+          _relay_floor(20) < _relay_cap(100_000_000))
+    # The bug this replaced: a fee of 100 satoshis on a tenth of a Bitcoin
+    # passed every check there was.
+    check("a fee too small to relay was accepted before the floor existed",
+          100 <= _relay_cap(10_000_000) and 100 < _relay_floor(5),
+          f"cap {_relay_cap(10_000_000)} floor {_relay_floor(5)}")
+
+
+_relay_mod = None
+
+
+def _relay():
+    """bin/pignusd itself, loaded as a module.
+
+    Reimplementing its arithmetic here would make this test agree with a copy
+    rather than with the relay: the two could drift apart and every check would
+    still pass. The docstring above used to say this file read the relay's own
+    cap while a line below it computed one, which is the failure this test
+    exists to catch, in the test.
+    """
+    global _relay_mod                                    # noqa: PLW0603
+    if _relay_mod is None:
+        import importlib.machinery                       # noqa: PLC0415
+        import importlib.util                            # noqa: PLC0415
+        path = os.path.join(HERE, "..", "bin", "pignusd")
+        spec = importlib.util.spec_from_loader(
+            "pignusd_parity",
+            importlib.machinery.SourceFileLoader("pignusd_parity", path))
+        _relay_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_relay_mod)
+    return _relay_mod
+
 
 def _relay_cap(collateral):
-    """The relay's own cap, read out of bin/pignusd rather than reimplemented."""
-    return min(50_000, max(330 * 10, int(collateral) // 5))
+    return _relay().reclaim_fee_cap(collateral)
+
+
+def _relay_floor(feerate):
+    return _relay().reclaim_fee_floor(feerate)
 
 
 def main():

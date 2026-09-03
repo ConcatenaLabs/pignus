@@ -824,8 +824,6 @@ def _seq_explicit(node, asset, atoms):
     return select_funding(node, {asset: atoms})
 
 
-def seq_bitcoin_label(node):
-    return node.dumpassetlabels()["bitcoin"]
 
 
 def _utxo_spk(node, outpoint):

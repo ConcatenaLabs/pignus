@@ -19,6 +19,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as bb from "../web/btcborrow.js";
 import * as btc from "../web/btc.js";
+import { _internals as P } from "../web/pignus.js";
+const toHex = P.bytesToHex;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const v = JSON.parse(readFileSync(join(here, "..", "web", "btc_vectors.json")));
@@ -44,13 +46,17 @@ const ALL = ["getBtcPublicKey", "getBtcAddress", "signBtcTaproot",
   const caps = (m) => ({ capabilities: async () => ({ methods: m }) });
   ok("a wallet with every Bitcoin method can borrow",
      await bb.walletCanBtc(caps(ALL)) === true);
+  // Reports the LOOP's outcome, not the literal `true`. As written before,
+  // this line passed whether or not the loop had found anything -- and the
+  // loop's own failure report only fired for the first method it got to.
+  const accepted = [];
   for (const drop of ALL) {
     const some = ALL.filter(x => x !== drop);
-    if (await bb.walletCanBtc(caps(some)) !== false) {
-      ok(`a wallet with no ${drop} is refused`, false); break;
-    }
+    if (await bb.walletCanBtc(caps(some)) !== false) accepted.push(drop);
   }
-  ok("a wallet missing any one of them is not", true);
+  ok(`a wallet missing any one of the ${ALL.length} is not`,
+     accepted.length === 0,
+     `accepted without: ${accepted.join(", ")}`);
   ok("no wallet at all is not", await bb.walletCanBtc(null) === false);
   ok("a wallet whose capabilities call throws is not",
      await bb.walletCanBtc({ capabilities: async () => { throw new Error("x"); } })
@@ -244,6 +250,23 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
   ok("a strike past 2^53 is still read exactly",
      bb.seizeHealth({ strike: "9007199254740993", price_scale: 1 },
                     9007199254740993) != null);
+  // The strike is debt ATOMS per collateral ATOM, and a price a person reads
+  // is whole units per whole Bitcoin -- so getting between them crosses BOTH
+  // precisions. Assuming the debt asset has eight decimals is right only when
+  // it does; against a six-decimal one the answer is out by a hundred, and
+  // this number is the whole of a borrower's liquidation warning on a tier
+  // where no script tests the price.
+  const strikeFor = (perBtc, prec) =>
+    String(BigInt(perBtc) * (10n ** BigInt(prec)) * 100000n / 100000000n);
+  for (const prec of [2, 6, 8, 10]) {
+    const loan = { strike: strikeFor(60000, prec), price_scale: 100000 };
+    const h = bb.seizeHealth(loan, 90000, prec);
+    ok(`a ${prec}-decimal debt asset gives the same health as any other`,
+       Math.abs(h - 1.5) < 1e-6, `${prec} decimals -> ${h}`);
+  }
+  ok("and assuming eight against a six-decimal asset is out by a hundred",
+     Math.abs(bb.seizeHealth({ strike: strikeFor(60000, 6),
+                               price_scale: 100000 }, 90000) - 150) < 1e-6);
 }
 
 
@@ -308,15 +331,82 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
      render(376.678).slice(0, 200));
   ok("a book with no feerate judges nothing and leaves it takeable",
      !render(null).includes("disabled"));
-  ok("an offer with every lot taken is disabled for its own reason",
+  ok("the fixture is one the page would render at all",
      bb.loanReadable(offer.loan));
-  // lots_left of zero, on a quiet chain, is the other reason.
+  // lots_left of zero, on a quiet chain, is the other reason -- and it must
+  // give its OWN reason, not the fee one.
   const spent = { ...offer, lots_left: 0 };
   let html = "";
   bb.renderOffers({}, [spent], ui, () => {}, (h) => { html = h; }, 5);
   ok("every lot taken disables it and says which reason it is",
-     html.includes("disabled") && html.includes("every lot of this offer is taken"),
+     html.includes("disabled") && html.includes("every lot of this offer is taken")
+     && !html.includes("Bitcoin wants about"),
      html.slice(0, 200));
+}
+
+
+// --- a vault the lender emptied ---------------------------------------------
+//
+// Two of a cross-chain vault's three leaves belong to the lender: SEIZE, which
+// they and the oracle sign together with NO price test in any script, and
+// TIMEOUT. Either empties it at a moment the borrower is never told about. A
+// page that cannot learn this shows the loan as live with a Repay button for
+// ever -- and a borrower who repays has paid the debt for collateral that was
+// taken before they paid it. The answer is on the parent chain: a taproot
+// script spend carries the leaf it used.
+{
+  const loan = { borrower_x: "aa".repeat(32), lender_x: "bb".repeat(32),
+                 oracle_x: "cc".repeat(32), payment_hash: "dd".repeat(32),
+                 recover_after: 900000, abort_after: 899000,
+                 repay_deadline: 260000, d_refund: 205000,
+                 btc_amount: "100000", debt: "1000", upgrade_fee: 60000,
+                 debt_asset: "ee".repeat(32), strike: "1",
+                 price_scale: 100000 };
+  const tree = btc.fundingTree(loan);
+  const witnessFor = (name) => ["sig", "sig", toHex(tree.scripts[name]),
+                                toHex(tree.controlBlock(name))];
+
+  for (const name of ["reclaim", "seize", "timeout"])
+    ok(`the witness names the ${name} leaf`,
+       bb.vaultExit(loan, witnessFor(name)) === name,
+       String(bb.vaultExit(loan, witnessFor(name))));
+  ok("a spend of something else names no leaf of this vault",
+     bb.vaultExit(loan, ["x", "y", "00".repeat(20), "cb"]) === null);
+  ok("and neither does an empty witness", bb.vaultExit(loan, []) === null);
+
+  const heights = { btc: 900000, seq: 200000 };
+  const live = { take_id: "t", loan, upgrade_txid: "ff".repeat(32) };
+  ok("a live loan offers Repay", bb.nextStep(live, heights).action === "repay");
+  ok("a SEIZED one does not, and says the collateral is already gone",
+     bb.nextStep({ ...live, vault_exit: "seize" }, heights).action === null
+     && /already gone/.test(bb.nextStep({ ...live, vault_exit: "seize" },
+                                        heights).note));
+  ok("nor does a swept one, for its own reason",
+     /timeout/.test(bb.nextStep({ ...live, vault_exit: "timeout" },
+                                heights).note));
+  ok("a reclaim is the borrower's own and does not change the stage",
+     bb.stageOf({ ...live, vault_exit: "reclaim" }) === "live");
+
+  // The fetch itself: silent on every failure, because a book that cannot
+  // answer must not turn a running loan into a seized one.
+  const api = (reply) => ({ api: async () => reply });
+  const seized = { ...live };
+  await bb.checkVault(seized, api({ unspent: false, spend_txid: "ab".repeat(32),
+                                    witness: witnessFor("seize") }));
+  ok("a seized vault is learned from the book and remembered",
+     seized.vault_exit === "seize" && seized.vault_spent_by === "ab".repeat(32));
+  const still = { ...live };
+  await bb.checkVault(still, api({ unspent: true, confirmations: 9 }));
+  ok("an unspent vault leaves the loan alone", still.vault_exit === undefined);
+  const blind = { ...live };
+  await bb.checkVault(blind, { api: async () => { throw new Error("503"); } });
+  ok("a book that cannot answer leaves it alone too",
+     blind.vault_exit === undefined);
+  const early = { take_id: "t", loan };
+  await bb.checkVault(early, api({ unspent: false, spend_txid: "cd".repeat(32),
+                                   witness: witnessFor("seize") }));
+  ok("a loan with no vault yet is not asked about at all",
+     early.vault_exit === undefined);
 }
 
 console.log(`\n${pass} checks passed, ${fail} failed`);

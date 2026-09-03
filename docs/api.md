@@ -358,6 +358,31 @@ tip as far as `back_scan_cap`.
 - 404 if the output is still unspent, or its spend is outside the scan window.
 - 503 if this book has no node.
 
+### `GET /v1/btc/outpoint/{txid}/{vout}`
+
+Is a **Bitcoin** outpoint still unspent, and if not, what spent it:
+
+```json
+{"txid": "…", "vout": 0, "unspent": false, "spend_txid": "…",
+ "witness": ["…", "…"], "confirmations": 12}
+```
+
+`{"unspent": true, "confirmations": n}` while it is still there. This book stays
+ignorant of any loan, exactly as `/v1/spend` does: it returns the outpoint's
+state and the raw witness, and the caller names the leaf from its own copy of
+the tree.
+
+It exists because a cross-chain vault has three leaves and two of them are the
+lender's — SEIZE, which they and the oracle sign together with no price test in
+any script, and TIMEOUT. Either empties the vault at a moment nobody tells the
+borrower about, so a page that cannot read this shows a seized loan as live,
+with a Repay button, and the borrower pays a debt for collateral that was taken
+before they paid it.
+
+- 400 if the txid is not 64 hex or the vout is not a number.
+- 503 if this book has no Bitcoin node.
+- 429 if this client is reading the chain too fast.
+
 ### `GET /v1/unrenderable`
 
 The records this book holds and cannot show, and why:
@@ -790,11 +815,15 @@ One offer, with `lots_left`. 404 if there is none.
 
 ### `POST /v1/btc/offers`
 
-A lender publishes an offer. Body: `loan` (the fields above; `btc_amount`,
-`lender_x`, `oracle_x`, `recover_after`, `debt_asset`, `debt`, `repay_deadline`,
-`abort_after`, `d_refund` and `lender_prog` are all required and must be
-non-empty), `market`, `lots`, `offer_sig`, and optionally `responder` and a
-`note` of up to 200 characters.
+A lender publishes an offer. Body: `loan`, `market`, `lots`, `offer_sig`, and
+optionally `responder` and a `note` of up to 200 characters.
+
+Thirteen fields of `loan` are required and must be non-empty: `btc_amount`,
+`lender_x`, `oracle_x`, `recover_after`, `debt_asset`, `debt`,
+`repay_deadline`, `abort_after`, `d_refund`, `lender_prog`, `upgrade_fee`,
+`market` (the loan's own copy, beside the sibling `market`) and `strike`. The
+rest of the fields shown above are optional; the borrower's own -- `borrower_x`
+and `h_w` -- belong to a take and are never in an offer.
 
 `btc_amount`, `debt`, `principal` and `strike` are decimal strings, for the
 reason every other amount on this book is one. The rest of the loan -- heights,

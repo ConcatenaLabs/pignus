@@ -342,6 +342,18 @@ class LoanTerms:
         if self.bonus_num <= self.bonus_den:
             w.append("no liquidation bonus: nobody is paid to liquidate this "
                      "position, so it may sit underwater until maturity")
+        elif self.bonus_num > self.bonus_den * 12 // 10:
+            # The bonus is what a liquidator keeps ON TOP of the debt, so it
+            # comes out of the borrower's surplus. Five per cent is what pays
+            # somebody to watch; a fifth is a term nobody would agree to
+            # knowingly, and it is in no address a borrower checks -- it is
+            # inside the terms, and the only thing that would tell them is a
+            # sentence like this one.
+            pct = (self.bonus_num * 100 // self.bonus_den) - 100
+            w.append(f"the liquidation bonus is {pct}% of the debt, which the "
+                     f"liquidator keeps out of YOUR collateral on top of what "
+                     f"they repay. A few per cent is what pays somebody to "
+                     f"watch; this is a term to read twice")
         if self.oracles and self.threshold == 1:
             w.append(f"a 1-of-{len(self.oracles)} oracle set is not a threshold: "
                      "ANY one of those keys can trigger a liquidation alone, so "

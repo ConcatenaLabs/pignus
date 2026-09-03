@@ -86,6 +86,8 @@ Endpoints:
     GET  /v1/loans/{id}        one loan, with health at the current price
     GET  /v1/loans/{id}/exit   how a closed loan ended, read back off the chain
     GET  /v1/outpoint/{txid}/{vout}   what an outpoint holds (mempool included)
+    GET  /v1/btc/outpoint/{txid}/{vout}  is a Bitcoin outpoint still there,
+                               and if not, the witness that spent it
     GET  /v1/spend/{txid}/{vout}      the spend of an outpoint, and the
                                       preimages its witness published
     GET  /v1/scan/{scriptPubKey}      an unspent output at an address
@@ -223,10 +225,34 @@ STATE_NAMES = {s.value for s in State}
 # is why this is the smaller of them. `reclaimFeeCap` in web/btcborrow.js is
 # the same function; a borrower's page refuses anything above it.
 RECLAIM_FEE_CEILING = 50_000
+# A reclaim is about this many vbytes: one taproot script-path input, one
+# output, and a witness carrying two signatures and a 32-byte preimage.
+RECLAIM_VSIZE = 150
+# ...and the least a reclaim fee may be, whatever the chain says: below about
+# 1 sat/vB nothing relays it at all.
+MIN_RECLAIM_FEE = RECLAIM_VSIZE
 
 
 def reclaim_fee_cap(collateral):
     return min(RECLAIM_FEE_CEILING, max(BTC_DUST * 10, int(collateral) // 5))
+
+
+def reclaim_fee_floor(feerate_sat_vb=None):
+    """The LEAST a reclaim fee may be, on a chain charging `feerate_sat_vb`.
+
+    The cap bounds what a relay may TAKE; this bounds what it may LEAVE, and
+    the second half was missing. The lender signs a release over exactly one
+    transaction, paying the collateral less this fee, and it can be neither
+    replaced nor fee-bumped -- so a fee too small to relay is not a slow
+    reclaim, it is a reclaim that never happens and a collateral that sits in
+    the vault until the lender's own timeout sweep takes it.
+    """
+    try:
+        r = float(feerate_sat_vb or 0)
+    except (TypeError, ValueError):
+        r = 0.0
+    priced = int(r * RECLAIM_VSIZE + 0.999) if r > 0 else 0
+    return max(MIN_RECLAIM_FEE, priced)
 
 
 DERIVED_AMOUNTS = ("seizure_if_liquidated", "surplus_if_liquidated",
@@ -1051,12 +1077,35 @@ class Service:
             return 0                    # no parent chain: judge nothing
         n = 0
         for o in self.book.list_btc_offers(status="open"):
-            loan = o.get("loan") or {}
+            # An offer is the LENDER's half of a loan. The borrower's key and
+            # their origination commitment arrive on the take, so an offer
+            # carries neither -- and `loan_from_dict` cannot build a BtcLoan
+            # without `borrower_x` at all. Stand in for both.
+            #
+            # Neither stand-in is used as a value: `timelocks_sane` never reads
+            # `borrower_x`, and reads `h_w` only for presence, to know the
+            # origination is the abortable shape. What gets judged is the
+            # offer's own four deadlines, which is the whole point. Standing in
+            # for only one of them is worse than neither -- an offer with
+            # `abort_after` and `d_refund` but no `h_w` collects "an abortable
+            # origination needs h_w, abort_after and d_refund together", and
+            # every honest offer on the board would be expired on the first
+            # poll.
+            loan = dict(o.get("loan") or {})
+            loan["borrower_x"] = "00" * 32
+            loan["h_w"] = "00" * 32
             try:
                 problems = BC.timelocks_sane(BC.loan_from_dict(loan), btc_h,
                                              int(self.height))
-            except Exception:                           # noqa: BLE001
-                continue                # unreadable is UNRENDERABLE's business
+            except Exception as e:                      # noqa: BLE001
+                # LOUD. An offer this cannot read is one no borrower can take,
+                # but it is not this sweep's to end. Passing it over in silence
+                # is how this loop came to do nothing whatever, for every offer
+                # on the book, while reporting success.
+                print(f"pignusd: cross-chain offer {o.get('btc_offer_id')} "
+                      f"cannot be judged: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+                continue
             if not problems:
                 continue
             self.book.update_btc_offer(o["btc_offer_id"], status="expired")
@@ -1069,26 +1118,30 @@ class Service:
         first = True
         while True:
             started = time.time()
-            try:
-                self.refresh_registry(force=first)
-                self.refresh_prices()
-                self.refresh_fees()
-                self.refresh_chain()
-                self.expire_btc_offers()
-                self.prune_book()
-            except Exception as e:                      # noqa: BLE001
-                # A poll that raises must not end the thread. Everything this
-                # book knows is refreshed here -- prices, fees, the chain, the
-                # pruning -- and nothing restarts it: the process stays up and
-                # /healthz keeps answering while a repaid loan reads LIVE for
-                # ever. The oracles this polls are third parties by design, so
-                # a reply this code did not anticipate is a thing that happens
-                # rather than a bug in the caller. Record it and come round.
-                self.poll_error = f"{type(e).__name__}: {e}"
-                print(f"pignusd: poll failed: {self.poll_error}",
-                      file=sys.stderr)
-            else:
-                self.poll_error = None
+            # EACH STEP ITS OWN GUARD. One try around all six was enough to
+            # keep the thread alive and not enough to keep the book working: an
+            # oracle -- a third party by design -- serving a reply this code
+            # did not anticipate would raise in `refresh_prices` and every
+            # later step would be skipped for ever after. The chain would never
+            # be reconciled again, so a repaid loan reads LIVE indefinitely
+            # while /healthz reports only a poll error. A failing source must
+            # cost its own step and nothing else.
+            errors = {}
+            for name, step in (("registry",
+                                lambda: self.refresh_registry(force=first)),
+                               ("prices", self.refresh_prices),
+                               ("fees", self.refresh_fees),
+                               ("chain", self.refresh_chain),
+                               ("offer-expiry", self.expire_btc_offers),
+                               ("prune", self.prune_book)):
+                try:
+                    step()
+                except Exception as e:                  # noqa: BLE001
+                    errors[name] = f"{type(e).__name__}: {e}"
+                    print(f"pignusd: the {name} step of the poll failed: "
+                          f"{errors[name]}", file=sys.stderr)
+            self.poll_error = ("; ".join(f"{k}: {v}" for k, v in errors.items())
+                               if errors else None)
             self.last_poll = int(time.time())
             if first:
                 # The first pass re-tracks every loan and walks back for spends
@@ -1577,7 +1630,20 @@ class Service:
             raise ValueError(
                 f"a reclaim fee of {fee} satoshis on {loan.btc_amount} of "
                 f"collateral is more than the {cap} this book will record. "
-                "The reclaim is one transaction of about 150 vbytes")
+                f"The reclaim is one transaction of about {RECLAIM_VSIZE} "
+                f"vbytes")
+        # And a FLOOR, priced from the parent chain. A fee too small to relay
+        # makes the release the lender is about to sign worthless: it covers
+        # exactly one transaction, which nobody can bump, so the collateral
+        # would sit in the vault until the lender swept it at the timeout.
+        floor = reclaim_fee_floor(self.btc_feerate())
+        if fee < floor:
+            raise ValueError(
+                f"a reclaim fee of {fee} satoshis would not relay: a reclaim "
+                f"is about {RECLAIM_VSIZE} vbytes and this chain wants around "
+                f"{floor} for one. The release is signed over exactly that "
+                f"transaction and can never be bumped, so the collateral "
+                f"would never come back")
 
         # Heights this daemon read itself. A height a client sends is a height
         # an attacker chooses, and every cross-chain margin is measured against
@@ -1766,6 +1832,24 @@ class Service:
             reasons.append(f"the last poll failed: {self.poll_error}")
         if stale:
             reasons.append("stale price: " + ", ".join(stale))
+        # A market with a fresh, verified price that STILL cannot be lent
+        # against. The usual cause is the registry: without it neither ticker
+        # resolves to an asset id, so `lendable` is false for every market at
+        # once, the lend form has nothing in it and the borrow tab is empty --
+        # and every other health signal is green, because the prices are fine
+        # and the chain is fine. Naming them is the difference between an
+        # operator seeing a broken deployment and seeing a quiet one.
+        try:
+            dead = [r["market"] for r in self.market_rows()
+                    if not r.get("cross_chain") and not r.get("lendable")
+                    and not r.get("stale")]
+        except Exception:                               # noqa: BLE001
+            dead = []
+        if dead:
+            reasons.append(
+                "priced but not lendable: " + ", ".join(sorted(dead)[:8])
+                + " -- their tickers do not resolve to assets, or the "
+                  "precisions disagree. Check the registry")
         if UNRENDERABLE:
             # A record this book holds and cannot show. It is missing from
             # every listing, so a lender looking for their own offer simply
@@ -2186,6 +2270,52 @@ class Handler(BaseHTTPRequestHandler):
                 "value": str(atoms(best.get("amount", 0))),
                 "confirmations": (tip - int(best.get("height", 0)) + 1
                                   if tip and best.get("height") else 0)})
+        if path.startswith("/v1/btc/outpoint/"):
+            # Is a BITCOIN outpoint still unspent, and if not, what spent it?
+            #
+            # A cross-chain vault has three leaves and two of them belong to
+            # the lender: SEIZE, which they and the oracle sign together with
+            # no price test in any script, and TIMEOUT. Either empties the
+            # vault at a moment the borrower is never told about -- so without
+            # this a page shows a seized loan as live, with a Repay button, and
+            # a borrower pays a debt for collateral that was taken before they
+            # paid it.
+            #
+            # This book stays ignorant of the loan, exactly as `/v1/spend`
+            # does: it returns the outpoint's state and the spend's witness,
+            # and the page names the leaf from its own copy of the tree.
+            if s.btc_node is None:
+                return self._send(503, {"error": "this book has no Bitcoin "
+                                                 "node, so it cannot say"})
+            if self._scan_limited():
+                return self._send(429, {
+                    "error": "too many chain reads; slow down"})
+            parts = path[len("/v1/btc/outpoint/"):].split("/")
+            if len(parts) != 2 or len(parts[0]) != 64 \
+                    or not parts[1].isdigit():
+                return self._send(400, {"error": "expected "
+                                                 "/v1/btc/outpoint/<txid>/<vout>"})
+            btxid, bvout = parts[0].lower(), int(parts[1])
+            from pignus import btc_collateral as BC
+            try:
+                got = s.btc_node.gettxout(btxid, bvout, True)
+            except Exception as e:                      # noqa: BLE001
+                return self._send(400, {"error": f"the Bitcoin node would not "
+                                                 f"read that outpoint: {e}"})
+            if got is not None:
+                return self._send(200, {
+                    "txid": btxid, "vout": bvout, "unspent": True,
+                    "confirmations": int(got.get("confirmations", 0) or 0)})
+            out = {"txid": btxid, "vout": bvout, "unspent": False,
+                   "spend_txid": "", "witness": [], "confirmations": 0}
+            try:
+                found = BC.spend_witness(s.btc_node, btxid, bvout,
+                                         scan_depth=s.back_scan_cap)
+            except Exception:                           # noqa: BLE001
+                found = None
+            if found:
+                out["spend_txid"], out["witness"], out["confirmations"] = found
+            return self._send(200, out)
         if path.startswith("/v1/spend/"):
             if self._scan_limited():
                 return self._send(429, {
@@ -2291,9 +2421,25 @@ class Handler(BaseHTTPRequestHandler):
                 # recomputing them arithmetic rather than another walk. The
                 # hash goes with the height so a reorg invalidates the entry
                 # instead of quietly changing what it means.
-                height = int(s.height or 0) - int(conf) + 1
+                # From the NODE's tip, not the poll's. `conf` came back from
+                # a walk that used the node's live height, and this book's own
+                # `self.height` is whatever the last poll saw -- minutes old
+                # after a restart, and arbitrarily old while a poll step is
+                # failing. Subtracting one from the other names a block the
+                # spend is not in, and `getblockhash` answers for it happily,
+                # so the wrong block would be cached as a fact and every depth
+                # computed from it afterwards would be wrong. That depth is
+                # what a borrower's reclaim waits on.
+                #
+                # And then CHECKED: the block is fetched once, on the miss
+                # path, and the spend must actually be in it. A height derived
+                # by arithmetic is a guess until something confirms it.
+                block_hash = None
                 try:
-                    block_hash = s.node.getblockhash(height)
+                    height = int(s.node.getblockcount()) - int(conf) + 1
+                    bh = s.node.getblockhash(height)
+                    if spend_txid in (s.node.getblock(bh, 1).get("tx") or []):
+                        block_hash = bh
                 except Exception:                       # noqa: BLE001
                     block_hash = None
                 if block_hash:

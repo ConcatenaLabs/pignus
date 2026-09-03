@@ -88,6 +88,24 @@ Path(out).write_text(json.dumps({
         "btc_offer_id": "0" * 24, "loan": loan, "market": "BTC/USDX",
         "lots": 1, "offer_sig": "", "responder": "", "note": "",
         "status": "open", "created": 1799990000}}}, indent=1))
+
+# ...and a SAME-CHAIN offer, so the checks about the offers table have a row to
+# be about. Without one the table renders empty and every assertion on it
+# passes by describing nothing -- which is how the deferred-address check came
+# to be satisfied by a book with no such offers in it.
+from pignus.book import Book                              # noqa: E402
+from pignus.terms import LoanTerms                        # noqa: E402
+terms = LoanTerms(
+    collateral_asset="aa" * 32, debt_asset="bb" * 32,
+    collateral_amount=10 * 10 ** 8, principal=1450 * 10 ** 8,
+    debt=1500 * 10 ** 8, borrower_x="dd" * 32, lender_x="ee" * 32,
+    market="GOLD/USDX", oracle_x="22" * 32, strike=180 * 100000,
+    not_before=1700000000, maturity=100000, recover_after=143200,
+    max_price=10 ** 6 * 100000)
+b = Book(out)
+b.put_offer({"terms": terms.to_json(), "kind": "funded",
+             "outpoint": "11" * 32 + ":0", "manage_token": "t",
+             "funded_value": str(1450 * 10 ** 8), "confirmations": 6})
 SEED
 
 python3 "$ROOT/bin/pignus-oracle" --config "$WORK/oracle.json" >"$WORK/o.log" 2>&1 &
@@ -171,9 +189,13 @@ want("hashes and addresses are allowed to break, so a phone can hold them",
 # on a book with a few hundred loans, computing text nobody had asked to see.
 # The placeholder is what says the work is deferred; the thunk runs when a row
 # is opened.
+# Unconditional now: the book above holds a same-chain offer, so the offers
+# table has a row and that row has a details block. Allowing "or the book is
+# empty" made this pass by describing nothing at all.
+want("the offers table drew a row from the seeded book",
+     "GOLD" in dom, "no same-chain offer rendered")
 want("the address in a collapsed details row is not derived until it is shown",
-     'data-spk="' in dom or "No open offers" in dom or "empty" in dom,
-     "no deferred address placeholder and no empty book")
+     'data-spk="' in dom, "no deferred address placeholder")
 want("and so are the values beside them in a details block",
      breaks(".kv>*") or breaks(".kv > *"), css[:0])
 

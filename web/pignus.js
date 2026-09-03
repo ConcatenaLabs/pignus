@@ -129,6 +129,27 @@ export function decimalMark() {
   return _mark;
 }
 
+/**
+ * A decimal string as an exact atom count, at `dp` decimal places.
+ *
+ * Never through a Number: `parseFloat(x) * 10**dp` loses atoms above 2^53,
+ * which at eight places is about ninety million units -- a figure a lender's
+ * offer can easily be, and one this chain's own treasury passed long ago. The
+ * fractional part is padded and truncated as a string, so what comes out is
+ * what was typed.
+ */
+export function atomsFromDecimal(text, dp) {
+  const m = /^\s*(\d*)(?:\.(\d*))?\s*$/.exec(String(text));
+  if (!m || (!m[1] && !m[2]))
+    throw new Error(`"${text}" is not an amount`);
+  const frac = (m[2] || "").slice(0, dp).padEnd(dp, "0");
+  if ((m[2] || "").length > dp)
+    throw new Error(`this asset has ${dp} decimal places, and "${text}" ` +
+                    `names more than that -- the extra digits are not atoms ` +
+                    `and would be silently dropped`);
+  return BigInt((m[1] || "0") + frac);
+}
+
 /** A 64-bit little-endian operand, the on-stack form the covenant compares. */
 function le8(n) {
   const v = BigInt(n);

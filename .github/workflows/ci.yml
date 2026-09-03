@@ -138,3 +138,4 @@ jobs:
           python3 tests/test_btc_relay.py
           python3 tests/test_btc_relay_auth.py
           python3 tests/test_spend_depth.py
+          python3 tests/test_offer_expiry.py

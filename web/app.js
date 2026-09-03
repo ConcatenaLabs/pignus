@@ -1459,7 +1459,12 @@ function lendTerms() {
   const openPct = BigInt(Math.round(Number(f2.get("open_ltv"))));   // step=1
   const liqPct = BigInt(Math.round(Number(f2.get("liq_ltv"))));     // step=1
   const rateBps = BigInt(Math.round(Number(f2.get("rate")) * 100)); // % -> bps
-  const principal = BigInt(Math.round(i.principal * 10 ** dp));
+  // The principal DECIMALLY, from the form's own string. `i.principal` has
+  // already been through a Number, and `Number * 10**dp` is the one line this
+  // whole block was written to avoid: at eight decimals it loses atoms above
+  // about ninety million units, which the comment above says outright while
+  // the code did it anyway.
+  const principal = pig.atomsFromDecimal(String(f2.get("principal") ?? ""), dp);
   const debt = principal + ceilDiv(principal * rateBps, 10000n);
   // collateral value = principal * 100 / openPct, in debt atoms; collateral
   // atoms = value * scale / price, rounded up so the borrower is never short.
@@ -1790,11 +1795,26 @@ async function borrow(o) {
     const soon = state.height != null &&
       (Number(t.maturity) - state.height) < blocksPerDay();
     const odd = unknownOracles(t);
+    // The principal any ADDRESS commits to. The offer's address is built from
+    // the listing's figure and the take leaf pins it, so that is the number
+    // enforced; the terms' own copy enters no leaf at all (see
+    // `_covenant_kwargs` in pignus/terms.py, which passes debt, strike, bonus,
+    // scale and the programs, and never a principal). Composing from one and
+    // quoting the other in the confirmation shows a borrower a different loan
+    // from the one they are signing.
+    const drawn = big(o.principal ?? t.principal);
+    if (o.principal != null && big(o.principal) !== big(t.principal))
+      throw new Error(
+        `this offer's terms name a principal of ` +
+        `${units(t.principal, t.debt_asset)} ${d} and its listing names ` +
+        `${units(o.principal, t.debt_asset)} ${d}. Only the listing is what ` +
+        `any address commits to, so the two disagreeing means the terms you ` +
+        `were shown are not the loan. Nothing has been composed.`);
     let vaultTerms = null;          // the terms the vault address came from
     const sent = await confirmAndSend("Borrow", (fee) => {
       const built = flows.buildTakeOffer({
         terms: t, offerOutpoint: { txid, vout: Number(vout), scriptPubkey: out.scriptPubKey },
-        offerValue: out.value, principal: big(o.principal || t.principal),
+        offerValue: out.value, principal: drawn,
         collateral,
         expiryLocktime: o.expiry_locktime,
         borrowerProg: state.payout.prog, borrowerVer: state.payout.ver,
@@ -1804,7 +1824,7 @@ async function borrow(o) {
       vaultTerms = built.terms;
       built.summary = [
         ...(soon ? ["This loan matures in under a day"] : []),
-        `Borrow ${units(t.principal, t.debt_asset)} ${d}`,
+        `Borrow ${units(drawn, t.debt_asset)} ${d}`,
         `Lock ${units(collateral, t.collateral_asset)} ${c} as collateral ${ref(collateral, t.collateral_asset)}`,
         `Repay ${units(t.debt, t.debt_asset)} ${d} by ${whenText(t.maturity)} to get it back`,
         // ...or ALREADY. An offer whose strike sits above the current price
@@ -1816,6 +1836,13 @@ async function borrow(o) {
             `loan may be liquidated below ${money(liq, 4)} ${d}. Anyone can ` +
             "close it the moment you open it."
           : `Liquidatable if ${c} falls below ${money(liq, 4)} ${d}`),
+        // What a liquidator KEEPS, out of the collateral, on top of the debt
+        // they repay. It is in the terms and in no address, so a borrower has
+        // no way to see it except by being told -- and at the strike, which is
+        // the first price a seizure is possible at, the figure is exact.
+        `A liquidator keeps ${(((Number(t.bonus_num ?? 105) /
+           Number(t.bonus_den ?? 100)) - 1) * 100).toFixed(1)}% of the debt ` +
+          `out of your collateral as their bonus`,
         "After maturity anyone may call the loan at any price",
         `The lender may sweep the vault without an oracle after ${whenText(t.recover_after)}, ${gapDays} days past maturity`,
         ...(o.warnings || []).map(w => `Warning: ${w}`),
@@ -2228,6 +2255,13 @@ async function loadBtcLoans() {
     state.btcLoans = btcborrow.savedLoans();
   }
   state.btcLoans = state.btcLoans.filter(r => r && r.loan && r.take_id);
+  // Is each live loan's collateral still in its vault? Two of that vault's
+  // three leaves are the lender's, and either empties it at a moment nobody
+  // tells the borrower about -- so without asking, the page shows a seized
+  // loan as live with a Repay button, and the borrower pays a debt for
+  // collateral that was taken before they paid it.
+  await Promise.all(state.btcLoans.map(
+    (r) => btcborrow.checkVault(r, btcUi()).catch(() => false)));
 }
 
 /**
@@ -2283,7 +2317,8 @@ async function renderBtcLoans() {
       // against. There is no price test in any script on this tier -- the
       // lender and the oracle sign together and the collateral moves -- so
       // this is the whole of a borrower's warning, and the page showed none.
-      const health = btcborrow.seizeHealth(l, btcPriceFor(l.market));
+      const health = btcborrow.seizeHealth(l, btcPriceFor(l.market),
+                                           meta(l.debt_asset).precision ?? 8);
       const acts = [];
       if (health != null && health < 1 && !rec.terminal)
         acts.push('<span class="tag bad" title="the lender and the oracle can co-sign a seizure of your collateral at this price. Repaying is what stops it">seizable now</span>');

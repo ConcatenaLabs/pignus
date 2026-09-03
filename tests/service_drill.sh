@@ -390,5 +390,89 @@ d = json.load(open(sys.argv[1]))
 assert d["stats"]["offers"] == 0, d["stats"]' "$WORK/fresh.json"
 echo "  and an absent book starts empty, which is what a fresh install is"
 
+# --- a hostile oracle must not stop the book from working --------------------
+#
+# The oracles a book polls are third parties by design: `oracles` is documented
+# as "further independent endpoints". One of them serving a reply this code did
+# not anticipate is a thing that happens, not a bug in the caller. Two ways that
+# used to go wrong, and both are held here: it ended the poll THREAD, so every
+# price froze and every repaid loan read LIVE for ever behind a daemon that kept
+# answering; and then, once the thread survived, one try around all six refresh
+# steps meant a raising oracle still skipped the chain reconciliation for ever
+# after. A failing source costs its own step and nothing else.
+echo
+echo "-- a book whose oracle replies with nonsense"
+HPORT=$(port)
+python3 - "$HPORT" "$OPORT" <<'HOSTILE' &
+import http.server, json, sys, urllib.request
+port, real = int(sys.argv[1]), int(sys.argv[2])
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        # A real oracle in every respect but one: its PUBKEY is a number.
+        # Everything else has to be well formed, or the book discards the
+        # attestation before it ever gets to the check that breaks.
+        if self.path.startswith("/v1/pubkey"):
+            body = {"oracle_x": 12345}
+        else:
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{real}{self.path}", timeout=5) as r:
+                    body = json.loads(r.read().decode())
+            except Exception:
+                body = {}
+        raw = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+HOSTILE
+PIDS+=($!)
+sleep 1
+
+HPORTD=$(port)
+cat > "$WORK/hostile-cfg.json" <<J
+{"listen":"127.0.0.1:$HPORTD","book":"$WORK/hostile-book.json",
+ "oracle":"http://127.0.0.1:$OPORT","oracles":["http://127.0.0.1:$HPORT"],
+ "registry":"","poll":2,"markets":["GOLD/USDX"]}
+J
+"$BIN/pignusd" --config "$WORK/hostile-cfg.json" >"$WORK/hostile.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 60); do
+    curl -sf "http://127.0.0.1:$HPORTD/healthz" >/dev/null && break
+    sleep 0.25
+done
+# Long enough for several polls: if the first one killed the thread, last_poll
+# stops moving and the second reading equals the first.
+first=$(curl -s "http://127.0.0.1:$HPORTD/healthz" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("last_poll",0))')
+sleep 7
+second=$(curl -s "http://127.0.0.1:$HPORTD/healthz" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("last_poll",0))')
+test "$second" -gt "$first" || {
+    echo "the poll thread stopped after a malformed oracle reply" >&2
+    echo "  last_poll was $first and is still $second" >&2
+    tail -5 "$WORK/hostile.log" >&2; exit 1; }
+echo "  the poll thread kept going, so prices and loan states keep updating"
+
+curl -s "http://127.0.0.1:$HPORTD/healthz" > "$WORK/hostile-health.json"
+python3 - "$WORK/hostile-health.json" <<'STEPS'
+import json, sys
+d = json.load(open(sys.argv[1]))
+blob = json.dumps(d)
+if d.get("ok"):
+    sys.exit(f"health says ok while an oracle is unusable: {blob[:400]}")
+# The failing step is NAMED, and it is the prices one -- not "a poll failed".
+if "prices:" not in blob:
+    sys.exit(f"health does not say which step failed: {blob[:400]}")
+# ...and no other step is named, so one bad source did not starve the rest.
+also = [w for w in ("registry:", "fees:", "chain:", "offer-expiry:", "prune:")
+        if w in blob]
+if also:
+    sys.exit(f"other steps failed too, so they are not independently "
+             f"guarded: {also} in {blob[:400]}")
+STEPS
+echo "  health names the failing step, and only that step"
+
 echo
 echo "all service drills passed"

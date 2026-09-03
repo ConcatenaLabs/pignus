@@ -1,0 +1,8 @@
+{
+  "terms": "{\"bonus_den\":100,\"bonus_num\":105,\"borrower_prog\":\"0000000000000000000000000000000000000000\",\"borrower_ver\":0,\"borrower_x\":\"0000000000000000000000000000000000000000\",\"collateral_amount\":\"6666667\",\"collateral_asset\":\"9ccc649a41caeda5a7c44459fad583db9f4331b1412baaf2a2d2ccf5574fb437\",\"debt\":\"10300000000\",\"debt_asset\":\"b1170d84891d04459ff1651d9f704f58fbb8af2e6795a4283664dbac9e977b3e\",\"lender_prog\":\"8064ef2383bec1463845092d27140731d2abb81e\",\"lender_ver\":0,\"lender_x\":\"8064ef2383bec1463845092d27140731d2abb81e\",\"market\":\"GOLD/USDX\",\"maturity\":825,\"max_price\":\"0\",\"memo\":\"\",\"not_before\":\"1788428653\",\"oracle_threshold\":2,\"oracle_x\":\"\",\"oracles\":[\"acab965d0b9278d677274d0bdc9fd2c64e26377591bb84048022ec0b0cfaf8de\",\"29534c5e7ac1f054337011af796d497cea2d7ec7771b68c50f0eb41c8ffb9604\",\"e4b216869bf2e9316176c273961ae04e68473d786d9a46a440dba8e99c1127f5\"],\"price_scale\":100000,\"principal\":\"10000000000\",\"recover_after\":44025,\"strike\":\"205999990\"}",
+  "kind": "funded",
+  "outpoint": "000985be7672a16330c614917ab5f7104919d9463c2abca8cf9b1fc21714b4c1:0",
+  "principal": "10000000000",
+  "collateral": "6666667",
+  "expiry_locktime": 825
+}
