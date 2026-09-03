@@ -40,6 +40,7 @@ import time
 from contextlib import contextmanager
 
 from .terms import LoanTerms
+from .offers import offer_vault_address
 from .watcher import CLOSED
 
 # The states a vault is closed in, by name. Taken from the watcher rather than
@@ -282,7 +283,14 @@ class Book:
             "terms": offer["terms"],
             "kind": "funded",
             "outpoint": outpoint,
-            "vault_address": terms.script_pubkey().hex(),
+            # The address a loan drawn from this offer will actually live at,
+            # which is the SINGLE-LEAF vault: an offer's own script rebuilds
+            # exactly that address and refuses anything else. Publishing the
+            # four-leaf one -- what these terms compile to when a loan is
+            # originated directly -- named a coin no take from this offer would
+            # ever create, so a borrower checking the offer against the chain
+            # was checking against the wrong address.
+            "vault_address": offer_vault_address(terms).hex(),
             "market": terms.market,
             "principal": str(offer.get("principal") or terms.principal),
             "collateral": str(offer.get("collateral")
@@ -342,10 +350,11 @@ class Book:
         return gone
 
     def list_offers(self, market=None, kind=None, status="open"):
-        """Open offers by default. `status="all"` includes taken, withdrawn
-        and vanished ones, which are history rather than something to take."""
+        """Open offers by default, as COPIES. `status="all"` includes taken,
+        withdrawn and vanished ones, which are history rather than something
+        to take."""
         with self._lock:
-            out = list(self.offers.values())
+            out = [dict(o) for o in self.offers.values()]
         if status and status != "all":
             out = [o for o in out if o.get("status", "open") == status]
         if market:
@@ -468,12 +477,17 @@ class Book:
                    - int(rec.get("lots_taken") or 0) - held)
 
     def list_btc_offers(self, status="open"):
+        """The offers, as COPIES.
+
+        The stored records themselves used to come back, so a caller that
+        added a computed field -- `lots_left`, say -- wrote it into the book,
+        and the next save persisted a number true only for the instant it was
+        computed. A view is a view.
+        """
         with self._lock:
-            out = list(self.btc_offers.values())
+            out = [dict(o) for o in self.btc_offers.values()]
         if status and status != "all":
             out = [o for o in out if o.get("status", "open") == status]
-        for o in out:
-            o = o  # noqa: PLW2901  -- views are the stored records
         return sorted(out, key=lambda o: o.get("created", 0), reverse=True)
 
     def btc_take_by_funding(self, txid, vout):
@@ -570,8 +584,10 @@ class Book:
             return rec
 
     def list_btc_takes(self, offer_id=None, status=None):
+        """The takes, as COPIES: a caller that annotates a view must not be
+        annotating the book."""
         with self._lock:
-            out = list(self.btc_takes.values())
+            out = [dict(t) for t in self.btc_takes.values()]
         if offer_id:
             out = [t for t in out if t.get("btc_offer_id") == offer_id]
         if status:
@@ -634,24 +650,46 @@ class Book:
                 self._save()
         return out
 
-    def stats(self, prices=None):
+    def stats(self, prices=None, price_for=None):
         """A summary a page can render. Health figures need prices, and are
         simply omitted for markets with none rather than shown as zero -- a
-        health of 0 reads as 'about to be liquidated', which would be a lie."""
+        health of 0 reads as 'about to be liquidated', which would be a lie.
+
+        `price_for(terms)` prices ONE loan by the keys baked into its own
+        vault, which is what every other view here uses. A market-wide price
+        from whichever oracle the book currently calls primary is a number a
+        loan built on a rotated key, or on a threshold set, cannot be judged
+        by: it says a loan is at risk when its own oracle says otherwise. The
+        `prices` mapping is the fallback for a caller with nothing better.
+        """
         prices = prices or {}
         by_state, at_risk, total_debt = {}, [], {}
+        unreadable = 0
         with self._lock:
             records = list(self.loans.values())
         for rec in records:
             by_state[rec["state"]] = by_state.get(rec["state"], 0) + 1
             if rec["state"] != "LIVE":
                 continue
-            t = LoanTerms.from_json(rec["terms"])
+            try:
+                t = LoanTerms.from_json(rec["terms"])
+            except (ValueError, TypeError):
+                # One unreadable record must not take the whole summary down.
+                # `/v1/loans` already skips them; this used to raise, so a
+                # single bad record turned every stats read into a 500.
+                unreadable += 1
+                continue
             total_debt[t.debt_asset] = total_debt.get(t.debt_asset, 0) + t.debt
-            price = prices.get(t.market)
+            price = price_for(t) if price_for else prices.get(t.market)
             if price is not None and t.health(price) < 1.15:
                 at_risk.append({"loan_id": rec["loan_id"], "market": t.market,
                                 "health": round(t.health(price), 4)})
-        return {"loans_by_state": by_state, "offers": len(self.offers),
+        # OPEN offers, the same count `/healthz` reports. Counting every offer
+        # ever recorded made the two disagree for no reason a reader could see.
+        open_offers = sum(1 for o in self.offers.values()
+                          if o.get("status", "open") == "open")
+        return {"loans_by_state": by_state, "offers": open_offers,
+                "offers_all": len(self.offers),
+                "unreadable": unreadable,
                 "live_debt_by_asset": total_debt,
                 "at_risk": sorted(at_risk, key=lambda r: r["health"])}

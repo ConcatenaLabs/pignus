@@ -345,7 +345,15 @@ export function buildTakeOffer({ terms, offerOutpoint, offerValue, principal,
     outs.push(filler);
     change.splice(change.indexOf(filler), 1);
   }
-  outs.push({ asset: terms.debt_asset, value: b(principal), script: changeSpk });
+  // The principal goes to the borrower's OWN pinned payout program, which is
+  // the same program the vault's leaves commit to -- not to whatever change
+  // address the wallet happened to offer. The two are usually the same value
+  // and the composer must not depend on that: `take_offer` in Python takes
+  // them as separate arguments for exactly this reason, and a caller that
+  // passed a fresh change address would have drawn a principal to a key the
+  // loan does not name.
+  outs.push({ asset: terms.debt_asset, value: b(principal),
+              script: scriptPubKeyFor(borrowerVer, borrowerProg) });
   outs.push(...change);
   if (!feePlaced) outs.push(feeOutput(feeAsset, fee));
 
@@ -361,6 +369,10 @@ export function buildTakeOffer({ terms, offerOutpoint, offerValue, principal,
                       outputs: outs }),
     vaultScriptPubKey: vaultSpk,
     terms: full,
+    // The outputs as composed, so a caller -- or a test -- can see WHAT went
+    // into the slot the covenant reads as the remainder, rather than only that
+    // something did.
+    outputs: outs,
     fee, folded,
     summary: [
       `Borrow ${fmt(principal)} of ${short(terms.debt_asset)}`,
@@ -452,11 +464,17 @@ export function thresholdEvidence(terms, attestations, { liquidate }) {
   const strike = b(terms.strike);
   const scale = b(terms.price_scale ?? 100000);
   const feed = feedId(terms.market);
+  // Keyed in lower case. These are hex strings, and hex is the same value
+  // whatever its case -- `pignus/oracle.py` normalises for exactly this
+  // reason. A capital letter anywhere in a served key silently dropped that
+  // oracle's slot, and a threshold vault then closed at a price computed from
+  // fewer signatures than the loan names.
   const byKey = {};
-  for (const a of attestations) byKey[a.oracle_x] = a;
+  for (const a of attestations)
+    byKey[String(a.oracle_x || "").toLowerCase()] = a;
   const usable = [];
   keys.forEach((k, i) => {
-    const a = byKey[k];
+    const a = byKey[String(k || "").toLowerCase()];
     if (!a) return;
     // The scale is baked into the leaf and is not signed, so the same number
     // means a different price at a different scale. An attestation quoted at

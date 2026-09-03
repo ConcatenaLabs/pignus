@@ -382,7 +382,10 @@ class VaultSpender:
         broadcast and paid for. The CLI checks this; a caller using the library
         directly had nothing.
         """
-        want = bytes(self.tap.scriptPubKey).hex()
+        # `vault_tap`, not `tap`: an offer-originated loan lives in the
+        # SINGLE-LEAF vault, a different address built from the same terms, and
+        # comparing against the four-leaf one would refuse every real exit.
+        want = bytes(self.vault_tap.scriptPubKey).hex()
         try:
             got = self.node.gettxout(vault.txid, int(vault.vout), True)
         except Exception:                               # noqa: BLE001
@@ -636,10 +639,18 @@ def select_funding(node, wants, exclude=(), prepare=True, prep_fee_asset=None,
         full = {a: want[a] for a in short}
         # A preparing send selects from every spendable coin, so it can swallow
         # the explicit coins already counted for the OTHER assets and leave the
-        # second pass short again. Locked coins are still listed, so pick() sees
-        # them; sendtoaddress does not spend them.
+        # second pass short again. Locking them is what stops that -- and the
+        # locks are RELEASED before the re-pick below, which is what matters:
+        # `listunspent` does not report a locked coin, so a pick taken while
+        # they were still locked would report short for coins the wallet
+        # visibly holds.
+        #
+        # ...but NOT the coins of the asset that send is paying its own fee in.
+        # Locking those makes the preparing send fail for want of a fee, and
+        # the error names a balance the wallet visibly has. The re-pick below
+        # is what recovers from a send that swallowed one of them.
         locks = [{"txid": c.txid, "vout": c.vout}
-                 for c in chosen if c.asset not in short]
+                 for c in chosen if c.asset not in short and c.asset != asset]
         if locks:
             node.lockunspent(False, locks)
         try:

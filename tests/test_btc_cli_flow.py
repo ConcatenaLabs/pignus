@@ -113,7 +113,7 @@ def main():
               and rig.btc.gettxout(tk["prevault_txid"], tk["prevault_vout"]) is None,
               "the funding should NOT be on chain yet")
 
-        run("btc-adaptor", ticket, "--lender-key", lk)
+        run("btc-release", ticket, "--lender-key", lk)
         tk = json.load(open(ticket))
         check("the lender drew this loan's secret and signed the release",
               bool(tk.get("release_sig")) and bool(tk.get("payment_hash")))
@@ -182,7 +182,7 @@ def main():
             *terms(**{"--abort-after": str(btc_tip + 3)}), "--out", t2)
         run("btc-prepare", t2, "--borrower-key", bk,
             "--borrower-prog", borrower_prog, "--force", *seq, *btc)
-        run("btc-adaptor", t2, "--lender-key", lk)
+        run("btc-release", t2, "--lender-key", lk)
         run("btc-originate", t2, "--borrower-key", bk, *btc)
         rig.btc_mine(5)
         out = run("btc-abort", t2, "--borrower-key", bk, *btc)
@@ -199,6 +199,9 @@ def main():
             *terms(**{"--recover-after": str(btc_tip + 8)}), "--out", t3)
         run("btc-prepare", t3, "--borrower-key", bk,
             "--borrower-prog", borrower_prog, "--force", *seq, *btc)
+        # The OLD name, deliberately: it is what every script written against
+        # the previous protocol says, and an alias that quietly stopped
+        # working would break them with a "no such command".
         run("btc-adaptor", t3, "--lender-key", lk)
         run("btc-originate", t3, "--borrower-key", bk, *btc)
         rig.btc_mine(1)

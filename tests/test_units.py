@@ -389,8 +389,65 @@ def test_dlc():
           ann.attestation_point(label) == A.point(s))
 
 
+def test_page_shaped_terms():
+    """The exact document the browser posts, through the exact reader that
+    takes it.
+
+    JavaScript loses integers above 2^53, so the page serialises every amount
+    as a decimal STRING -- that is the correct wire form, not a mistake to be
+    fixed at the sender. Nothing in this suite ever fed one to `from_json`:
+    every test built terms in Python and posted numbers. So a reader that could
+    not take a string went unnoticed, and it broke the whole browser lend flow:
+    the offer covenant was funded on chain and could then never be listed, with
+    "Retry listing" failing for ever.
+    """
+    print("the terms document a browser actually sends")
+    import json
+    from pignus.terms import LoanTerms
+    base = LoanTerms(
+        market="GOLD/USDX", collateral_asset="aa" * 32, debt_asset="bb" * 32,
+        collateral_amount=1_000_000_000, principal=50_000_000_000,
+        debt=52_000_000_000, strike=180 * 100_000, maturity=200_000,
+        recover_after=250_000, not_before=1_700_000_000,
+        borrower_x="11" * 32, lender_x="22" * 32,
+        borrower_prog="cc" * 32, lender_prog="dd" * 32, oracle_x="ee" * 32)
+    doc = json.loads(base.to_json())
+    # ...exactly the fields web/app.js stringifies, and only those.
+    for k in ("collateral_amount", "principal", "debt", "strike", "not_before"):
+        doc[k] = str(doc[k])
+    got = LoanTerms.from_json(json.dumps(doc))
+    check("the page's own terms document is accepted", got.debt == base.debt)
+    check("and compiles to the same address, byte for byte",
+          got.script_pubkey() == base.script_pubkey())
+    check("and to the same loan id", got.loan_id() == base.loan_id())
+
+    big = dict(doc)
+    big["collateral_amount"] = str(2 ** 55)
+    check("a value above 2^53 survives exactly, which is why they are strings",
+          LoanTerms.from_json(json.dumps(big)).collateral_amount == 2 ** 55)
+
+    for bad, why in (("1.5", "a fraction"), ("abc", "letters"),
+                     ("", "an empty string"), (True, "a boolean")):
+        d = dict(doc)
+        d["debt"] = bad
+        try:
+            LoanTerms.from_json(json.dumps(d))
+            check(f"{why} is refused as a debt", False, "accepted")
+        except (ValueError, TypeError):
+            check(f"{why} is refused as a debt", True)
+
+    d = dict(doc)
+    d["surprise"] = 1
+    try:
+        LoanTerms.from_json(json.dumps(d))
+        check("a field this book does not know is refused", False, "accepted")
+    except ValueError as e:
+        check("a field this book does not know is refused", "surprise" in str(e))
+
+
 def main():
-    for fn in (test_vectors, test_terms, test_oracle, test_amounts,
+    for fn in (test_vectors, test_terms, test_page_shaped_terms, test_oracle,
+               test_amounts,
                test_attestation_log, test_adaptor, test_dlc):
         fn()
     print(f"\n{PASS} checks passed, {FAIL} failed")

@@ -87,6 +87,11 @@ jobs:
           python3 tests/test_watcher.py
           python3 tests/test_oracle_service.py
           python3 tests/test_liquidator.py
+          python3 tests/test_btc_relay_auth.py
+          # The Python repurchase composer against the same golden vectors the
+          # browser is pinned to. Without it, two of the three implementations
+          # were checked here and the third was not.
+          python3 tests/test_tiers.py --offline
 
       # The browser and the CLI must derive the same bytes from the same terms.
       # These are the pins that say so, and they are why a change to web/*.js
@@ -98,7 +103,7 @@ jobs:
         run: |
           set -e
           for f in test_web test_offer_web test_repurchase_web test_btc_web \
-                   test_adaptor_web test_btcborrow_web; do
+                   test_adaptor_web test_btcborrow_web test_takeoffer_web; do
             echo "== $f"
             node "tests/$f.mjs"
           done

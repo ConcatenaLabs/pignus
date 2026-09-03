@@ -12,10 +12,14 @@
 #   test/functional/feature_pignus_oracle_set.py
 #   test/functional/feature_pignus_offer.py
 #   test/functional/feature_pignus_attack.py
+#   test/functional/feature_pignus_hashlock.py
 #
-# The offline half -- everything down to the platform test -- also runs in CI on
-# every push; see .github/workflows/ci.yml. The chain half needs a built
-# sequentiad and a Bitcoin Core release and is run here.
+# Most of the half above the platform test also runs in CI on every push; see
+# .github/workflows/ci.yml for exactly which. Two of them need chains even
+# though they sit up here -- the BTC relay and disbursement groups drive a real
+# node -- so "everything above the platform test" is not the rule; the workflow
+# is. The rest needs a built sequentiad and a Bitcoin Core release, and is run
+# here.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,6 +68,7 @@ run "browser: repurchase vs vectors"  node tests/test_repurchase_web.mjs
 run "browser: BTC taproot vs vectors" node tests/test_btc_web.mjs
 run "browser: adaptor vs vectors"     node tests/test_adaptor_web.mjs
 run "browser: what the BTC borrow flow refuses" node tests/test_btcborrow_web.mjs
+run "browser: what a take puts at index 1" node tests/test_takeoffer_web.mjs
 run "BTC relay: what it may be believed about" python3 tests/test_btc_relay_auth.py
 run "BTC relay + lender responder"     python3 tests/test_btc_relay.py
 run "BTC principal disbursement"       python3 tests/test_btc_disburse.py

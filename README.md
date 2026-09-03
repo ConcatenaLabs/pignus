@@ -172,8 +172,12 @@ one. `--prep-fee-asset` names the asset for the preparing sends -- the ones that
 give the wallet explicit coins, since a covenant cannot spend a blinded input
 and a node wallet's change is blinded -- and defaults to `--fee-asset`. The
 cross-chain `btc-*` commands take `--fee-asset` on its own, their Sequentia legs
-being one plain payment each. `--dry-run` composes and prints without
-broadcasting anything, preparing sends included.
+being one plain payment each. `--dry-run` broadcasts nothing at
+all, preparing sends included. Most commands compose the transaction and print
+its hex; `offer-fund` and `offer-take` print the TERMS instead, because the
+transaction they would build needs explicit coins that only a real preparing
+send can produce, and `repo-fund` prints the address and the amounts. In every
+case the promise is the same: nothing left this machine.
 
 `liquidate` and `default` take their price from the book, or from
 `--attestation`, `--attestations` (for an m-of-n loan) or `--oracle`. It is
@@ -289,7 +293,7 @@ pignus-cli btc-propose --lender-key lender.key --oracle-x <x> \
     --repay-deadline <seq-height> --d-refund <seq-height> --out loan.json
 pignus-cli btc-prepare  loan.json --borrower-key borrower.key \
     --borrower-prog <hex> --btc-rpc ...   # fund the pre-vault, unbroadcast
-pignus-cli btc-adaptor  loan.json --lender-key lender.key   # draw the secret,
+pignus-cli btc-release  loan.json --lender-key lender.key   # draw the secret,
                                                             # publish its hash,
                                                             # sign the release
 pignus-cli btc-originate loan.json --borrower-key borrower.key --btc-rpc ...
@@ -433,6 +437,13 @@ pignus-cli repo-verify terms.json --txid <bond funding> \
     --leg-txid <the transfer to the lender> --lender-cu <hex>
 ```
 
+**Origination is not atomic.** Leg one (the asset to the lender) and leg two
+(the bond into the vault) are separate transactions, and between them one party
+is exposed. Fund the BOND first: a bond funded against an asset that never
+arrives is at least swept back by the borrower at `forfeit_after`, whereas an
+asset transferred against a bond that never arrives has no remedy at all in the
+covenant. `docs/pignus-design.md` §8.1 states the window in full.
+
 `repo-verify` is the check that matters, and it reports a **state** rather than
 an "ok": `not-funded`, `leg-one-only` (the lender has the asset and no bond
 secures its return), `bond-only` (the bond is there and nobody has looked at the
@@ -467,7 +478,7 @@ names one anywhere, and is taken as a decision rather than a hint, so a wrong
 one is reported instead of silently falling back.
 
 ```
-tests/cli_drill.sh        # offline, no node, ~2 seconds
+tests/cli_drill.sh        # offline, no node, a few seconds
 pignus-cli selftest                      # vectors + an oracle round trip
 ```
 
@@ -576,7 +587,8 @@ Anyone can check one afterwards, with nothing privileged:
 2. Fetch the exact signed bytes:
    `GET /v1/attestation/{market}/at/{timestamp}`.
 3. `pignus-cli check-attestation --attestation att.json --oracle-x <the key the
-   VAULT bakes in>`, and confirm the attestation's `price_scale` is the loan's.
+   VAULT bakes in> --price-scale <the loan's>`, which prints the attestation's
+   own scale and refuses when it is not the loan's.
    A signature by another key, or a price quoted at another scale, is a number
    about a different loan.
 4. Download the log file it is in from `/v1/log/raw`, hash it, and compare with

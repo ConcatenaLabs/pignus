@@ -146,7 +146,9 @@ from pignus.offers import (                         # noqa: E402
     NotOnChain, check_outpoint, offer_address, offer_vault_address,
 )
 from pignus.terms import LoanTerms, feed_id         # noqa: E402
-from pignus.watcher import State, VaultWatcher, CLOSED   # noqa: E402
+from pignus.watcher import (                            # noqa: E402
+    State, VaultWatcher, CLOSED, _locktime_open,
+)
 
 WEB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "web")
 MAX_BODY = 256 * 1024
@@ -164,6 +166,11 @@ BTC_TAKE_TTL = 1800
 # roughly 180 vbytes this is about 55 sat/vB, which is generous on testnet4 and
 # is the point: an upgrade that cannot confirm before the collateral becomes
 # abortable is a loan the lender has paid for and cannot start.
+# Every value `?status=` accepts on an offer listing. A misspelling is refused
+# rather than answered with an empty list, which reads as "there are none".
+OFFER_STATUS_NAMES = frozenset(
+    ("open", "taken", "withdrawn", "gone", "ghost", "expired", "all"))
+
 MIN_UPGRADE_FEE = 10_000
 # What a Bitcoin output has to hold to be worth anything: below this the network
 # will not relay the transaction that spends it.
@@ -385,6 +392,12 @@ class Service:
         # else would say so.
         self.event_errors = []
         self.event_backlog = 0
+        self._mtp = None
+        self._mtp_at = 0
+        # Closed-loan accounts, keyed by (loan, spend, height). A mined close
+        # is a fact about a block and cannot change, and rebuilding one pulls a
+        # whole verbose block.
+        self._exit_cache = {}
         self.last_poll = 0
         self.height = None
         self.assets = {}            # asset id -> {ticker, name, precision}
@@ -850,8 +863,12 @@ class Service:
         if kind == "taken":
             base = json.loads(off["terms"])
             prog = ev["borrower_prog"]
-            terms = LoanTerms(**{**base, "borrower_prog": prog,
-                                 "borrower_x": prog})
+            # Through the READER. It turns the oracle list back into a tuple
+            # and coerces amounts a browser sent as decimal strings; the
+            # constructor does neither, and the terms this writes into the book
+            # are the ones every later reader rebuilds an address from.
+            terms = LoanTerms.from_json(json.dumps(
+                {**base, "borrower_prog": prog, "borrower_x": prog}))
             v = ev["vault"]
             rec = self.book.put_loan(terms.to_json(), v["txid"], v["vout"],
                                      single_leaf=True, offer_id=off["offer_id"],
@@ -1179,8 +1196,14 @@ class Service:
             t, rec.get("terms_id") or t.loan_id(), single)
         if self.height is not None:
             out["height"] = self.height
-            out["past_maturity"] = self.height >= t.maturity
-            out["recover_open"] = self.height >= t.recover_after
+            # In the LOCKTIME's own units: a deadline at or above 500,000,000
+            # is a Unix time to a node, not a height, and comparing one to a
+            # block height puts it thousands of years away. The chain's median
+            # time is what consensus compares a time locktime to.
+            mtp = self.median_time()
+            out["past_maturity"] = _locktime_open(t.maturity, self.height, mtp)
+            out["recover_open"] = _locktime_open(t.recover_after, self.height,
+                                                 mtp)
         # How deep the CLOSE is, which is a different question from how deep the
         # funding was. A repayment or a liquidation one block old can still be
         # reorged out, and showing it as simply settled tells a borrower their
@@ -1246,10 +1269,31 @@ class Service:
         evidence out of the witness, checked against the key the vault itself
         bakes in, beside what the terms say that price buys and what the
         transaction actually paid.
+
+        CACHED, because the answer cannot change: a mined close is a fact about
+        a block. Without a cache every unauthenticated GET pulled a whole
+        verbose block from the node, which is by far the most expensive thing
+        this daemon can be asked to do and is one request away from anybody.
         """
         v = self.watcher.vaults.get(loan_id) if self.watcher else None
         if v is None or not v.spent_by:
             return None
+        # Keyed by the spend AND its height, so a close undone by a reorg and
+        # replaced by a different one is a different key rather than a stale
+        # answer.
+        key = (loan_id, v.spent_by, int(v.spent_height or 0))
+        hit = self._exit_cache.get(key)
+        if hit is not None:
+            return hit
+        out = self._explain_exit_uncached(v, loan_id)
+        # A close still in the mempool can change; only a mined one is a fact.
+        if out is not None and int(v.spent_height or 0) > 0:
+            if len(self._exit_cache) >= 512:
+                self._exit_cache.clear()
+            self._exit_cache[key] = out
+        return out
+
+    def _explain_exit_uncached(self, v, loan_id):
         tx = self.spending_tx(v)
         if tx is None:
             return {"loan_id": loan_id, "spent_by": v.spent_by,
@@ -1311,7 +1355,7 @@ class Service:
 
     def btc_reclaim_sighash(self, loan, vault_txid, vault_vout,
                             reclaim_dest_hex, fee):
-        """Recompute the reclaim sighash the lender's adaptor signature must
+        """Recompute the reclaim sighash the lender's RELEASE signature must
         commit to, so the relay never passes on a request to sign something
         other than the loan it claims to be."""
         from pignus import btc_collateral as BC
@@ -1417,6 +1461,28 @@ class Service:
             return int(node.getblockcount())
         except Exception:                               # noqa: BLE001
             return None
+
+    def median_time(self):
+        """The chain's median time past, which is what consensus compares a
+        TIME locktime to.
+
+        None when it cannot be read. Unknown is not "open": a loan reported
+        callable when it is not sends a liquidator to broadcast a transaction
+        the node rejects as `non-final`, and it pays for the preparing sends
+        first. Cached for a poll, because it moves once a block.
+        """
+        if self.node is None:
+            return None
+        now = time.time()
+        if self._mtp_at and now - self._mtp_at < 30:
+            return self._mtp
+        try:
+            h = self.node.getbestblockhash()
+            self._mtp = int(self.node.getblockheader(h)["mediantime"])
+        except Exception:                               # noqa: BLE001
+            self._mtp = None
+        self._mtp_at = now
+        return self._mtp
 
     def btc_take_loan(self, take, payment_hash=None):
         """The loan a take is for, as the RELAY understands it.
@@ -1700,8 +1766,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"oracles": list(s.oracle_keys),
                                     "urls": list(s.oracle_urls)})
         if path == "/v1/offers":
+            # A misspelt status returned an empty list, which reads as "there
+            # are no offers" rather than "that is not a status" -- the same
+            # trap `/v1/loans` already refuses for `state`.
+            status = q.get("status", ["open"])[0]
+            if status not in OFFER_STATUS_NAMES:
+                raise ValueError("status must be one of "
+                                 + ", ".join(sorted(OFFER_STATUS_NAMES)))
             rows = s.book.list_offers(market=q.get("market", [None])[0],
-                                      status=q.get("status", ["open"])[0])
+                                      status=status)
             return self._send(200, {"offers": _views(s.offer_view,
                                                      _limit(rows, q))})
         if path.startswith("/v1/offer/") or path.startswith("/v1/offers/"):
@@ -1849,10 +1922,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, _attested(att, ox or s.oracle_x,
                                              s.max_price_age))
         if path == "/v1/btc/offers":
-            offers = s.book.list_btc_offers(status=q.get("status", ["open"])[0])
-            for o in offers:
-                o["lots_left"] = s.book.btc_offer_lots_left(
-                    o["btc_offer_id"], BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)
+            status = q.get("status", ["open"])[0]
+            if status not in OFFER_STATUS_NAMES:
+                raise ValueError("status must be one of "
+                                 + ", ".join(sorted(OFFER_STATUS_NAMES)))
+            # COPIES. `list_btc_offers` hands out the stored records
+            # themselves, so writing a computed field onto one wrote it into
+            # the book -- and the next save persisted a number that is only
+            # true for an instant.
+            offers = [dict(o, lots_left=s.book.btc_offer_lots_left(
+                o["btc_offer_id"], BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL))
+                for o in s.book.list_btc_offers(status=status)]
             return self._send(200, {"offers": offers})
         if path.startswith("/v1/btc/offer/"):
             rec = s.book.btc_offers.get(path[len("/v1/btc/offer/"):])
@@ -1879,7 +1959,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "no such take"})
             return self._send(200, rec)
         if path == "/v1/stats":
-            return self._send(200, s.book.stats(s.fresh_prices()))
+            return self._send(200, s.book.stats(s.fresh_prices(),
+                                               price_for=s.price_for))
         return self._send(404, {"error": "no such endpoint", "path": path})
 
     def do_GET(self):

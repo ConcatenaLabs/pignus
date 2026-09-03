@@ -162,13 +162,21 @@ def main():
                 except Exception:
                     time.sleep(0.25)
 
-            tj = terms.to_json()
+            # The document the PAGE sends, not one built in Python. Its
+            # amounts are decimal strings, because JavaScript loses integers
+            # above 2^53 -- so this shape is the browser's normal case and not
+            # an edge one, and it is the shape no test here had ever posted.
+            page_doc = json.loads(terms.to_json())
+            for k in ("collateral_amount", "principal", "debt", "strike",
+                      "not_before"):
+                page_doc[k] = str(page_doc[k])
+            tj = json.dumps(page_doc)
             good = {"terms": tj, "kind": "funded",
                     "outpoint": f"{txid}:{vout}", "expiry_locktime": expiry}
 
             code, body = post(base + "/v1/offers", good)
-            check("a genuinely funded offer is accepted", code == 200,
-                  json.dumps(body)[:160])
+            check("an offer in the shape the page posts it is accepted",
+                  code == 200, json.dumps(body)[:160])
             check("and its on-chain value is recorded from the chain, not the "
                   "claim", body.get("funded_value") == str(2900 * COIN),
                   str(body.get("funded_value")))
@@ -237,15 +245,19 @@ def main():
                   code == 400 and "does not hold" in body.get("error", ""),
                   json.dumps(body)[:120])
 
-            altered = LoanTerms.from_json(tj)
-            altered = LoanTerms(**{**json.loads(tj), "debt": terms.debt + 1})
+            # Through `from_json`, because `tj` is now the PAGE's document and
+            # its amounts are decimal strings. The dataclass constructor takes
+            # integers; the reader is what turns one into the other.
+            altered = LoanTerms.from_json(
+                json.dumps({**json.loads(tj), "debt": str(terms.debt + 1)}))
             code, body = post(base + "/v1/offers", {
                 **good, "terms": altered.to_json()})
             check("the real offer output described with ALTERED terms is "
                   "refused", code == 400 and "does not hold" in body.get("error", ""),
                   json.dumps(body)[:120])
 
-            big = LoanTerms(**{**json.loads(tj), "principal": 5000 * COIN})
+            big = LoanTerms.from_json(json.dumps(
+                {**json.loads(tj), "principal": str(5000 * COIN)}))
             code, body = post(base + "/v1/offers", {
                 **good, "terms": big.to_json()})
             check("an offer holding less than one principal is refused",
@@ -279,8 +291,8 @@ def main():
             # compute -- health, LTV, what a seizure takes -- is derived from
             # the terms, so a vault that does not hold what they say puts a
             # whole fictional position in front of everyone.
-            thin = LoanTerms(**{**json.loads(tj),
-                                "maturity": terms.maturity + 1})
+            thin = LoanTerms.from_json(json.dumps(
+                {**json.loads(tj), "maturity": terms.maturity + 1}))
             thin_spk = thin.script_pubkey()
             thin_addr = n.deriveaddresses(
                 n.getdescriptorinfo(f"raw({thin_spk.hex()})")["descriptor"])[0]
@@ -296,8 +308,8 @@ def main():
                   code == 400 and "atoms, but the terms lock" in body.get("error", ""),
                   json.dumps(body)[:160])
 
-            wrong = LoanTerms(**{**json.loads(tj),
-                                 "maturity": terms.maturity + 2})
+            wrong = LoanTerms.from_json(json.dumps(
+                {**json.loads(tj), "maturity": terms.maturity + 2}))
             wrong_spk = wrong.script_pubkey()
             wrong_addr = n.deriveaddresses(
                 n.getdescriptorinfo(f"raw({wrong_spk.hex()})")["descriptor"])[0]

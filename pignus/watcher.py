@@ -44,6 +44,23 @@ from enum import Enum
 
 from . import atoms as _atoms
 
+# Where a node stops reading an absolute locktime as a block height and starts
+# reading it as a Unix time. Consensus, not convention.
+LOCKTIME_THRESHOLD = 500_000_000
+
+
+def _locktime_open(deadline, height, now=None):
+    """Has an absolute locktime passed, in whichever unit it is written in?
+
+    Unknown is NOT open: a time-locked deadline with no clock to compare it to
+    returns False, because reporting a loan callable when it is not is how a
+    liquidator broadcasts a transaction the node rejects as `non-final`.
+    """
+    deadline = int(deadline)
+    if deadline < LOCKTIME_THRESHOLD:
+        return int(height) >= deadline
+    return now is not None and int(now) >= deadline
+
 # Any RPC layer will do -- this module is handed either pignus.node.Node or a
 # test framework proxy, and they raise different exception types for the same
 # "the node said no". The narrow try blocks below catch broadly on purpose; each
@@ -178,6 +195,14 @@ class VaultWatcher:
         self._seen_hashes = {}    # height -> the block hash we scanned there
         self._block_cache = {}    # height -> block, for the current poll only
         self._blocks_fetched = 0
+        # How many blocks THIS phase of the poll may fetch. The forward scan
+        # and the backward walk are different jobs with different budgets: the
+        # forward scan must keep up with the chain or the watcher falls behind
+        # for ever, while the backward walk is a bounded search for one spend
+        # and is what `back_scan_cap` names. Sharing one number made a busy
+        # catch-up starve every backward search, and made `back_scan_cap` mean
+        # something other than what three documents say it does.
+        self._block_budget = back_scan_cap
         self._mempool_txs = None
 
     # --------------------------------------------------------------- tracking
@@ -271,7 +296,15 @@ class VaultWatcher:
         self._blocks_fetched = 0
         self._mempool_txs = None
         tip = self.node.getblockcount()
+        # The forward scan gets its own budget, generous enough to catch a
+        # restart up rather than crawl: falling behind the tip is the one
+        # failure that compounds, because every later poll starts further back.
+        self._block_budget = max(self.back_scan_cap, self.rescan_depth)
         self._scan_new_blocks(tip, changed)
+        # ...and the backward searches get the one `back_scan_cap` names,
+        # counted afresh so a long catch-up does not starve them.
+        self._blocks_fetched = 0
+        self._block_budget = self.back_scan_cap
         for v in self.vaults.values():
             if self._refresh(v, tip):
                 changed.append(v)
@@ -300,7 +333,7 @@ class VaultWatcher:
         block = self._block_cache.get(h)
         if block is not None:
             return block
-        if self._blocks_fetched >= self.back_scan_cap:
+        if self._blocks_fetched >= self._block_budget:
             return None
         try:
             block = self.node.getblock(self.node.getblockhash(h), 2)
@@ -851,6 +884,15 @@ class VaultWatcher:
         reorged = self._funding_reorged(v, tip)
         never_buried = reorged is None and v.confirmations < self.min_depth
         decided = reorged is True or (never_buried and v.last_seen_height)
+        # ...but never while the forward scan is behind the tip. `never_buried`
+        # rests on there being no spender to find, and the spender may simply
+        # be in a block this poll has not read yet -- one `getblock` failure,
+        # or a scan that hit its budget, leaves `scanned_height` short. Calling
+        # that a Bitcoin-driven reorg is inventing the one event this file
+        # exists to report, and a GHOST is never looked at again.
+        if (never_buried and self.scanned_height is not None
+                and self.scanned_height < tip):
+            return before != (v.state, v.confirmations)     # blocks unread
         if not decided and not self._search_exhausted(v, tip):
             return before != (v.state, v.confirmations)     # still looking
         if reorged is True:
@@ -1075,10 +1117,18 @@ class VaultWatcher:
                 out.append((v, price))
         return out
 
-    def due(self, height):
-        """Live vaults past maturity: callable via DEFAULT at any price."""
+    def due(self, height, now=None):
+        """Live vaults past maturity: callable via DEFAULT at any price.
+
+        `now` is the chain's median time, for a loan whose maturity is a Unix
+        TIME rather than a block height -- which the terms accept, and which a
+        node reads as a time for every locktime at or above 500,000,000. Left
+        out, such a loan is never reported due, because comparing its deadline
+        to a block height puts it thousands of years away.
+        """
         return [v for v in self.vaults.values()
-                if v.state is State.LIVE and height >= v.terms.maturity]
+                if v.state is State.LIVE
+                and _locktime_open(v.terms.maturity, height, now)]
 
     def at_risk(self, price_by_market, margin=1.15):
         """Live vaults within `margin` of their strike -- the warning a borrower

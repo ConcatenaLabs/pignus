@@ -219,8 +219,9 @@ a lender who is online.</p>
   LIVE means the funding is buried as deep as this book requires; Sequentia
   follows Bitcoin reorgs, so treat a fresh loan as provisional until it is
   deeper than you would accept a Bitcoin payment at. To add collateral, repay
-  and take a new offer; the new vault also retires every attestation older than
-  the day it opens.<br>
+  and take a new offer; the new vault refuses every attestation signed before
+  the moment it was written, so no price from before the loan existed can close
+  it.<br>
   Details on a closed loan show how it ended: which exit was taken, the price it
   was closed at with the oracle's signature checked here against the key that
   loan's own vault address commits to, and what that price should have paid

@@ -681,8 +681,10 @@ class RepurchaseSpender:
         ]
         if change > 0:
             outs.append((change, change_spk, t.debt_asset))       # 4 the change
-        # A borrower whose debt input needs no change leaves five outputs, which
-        # a narrower OpenDAMP shape accepts. Six is the ceiling either way.
+        # A borrower whose debt input needs no change leaves five outputs. That
+        # is fewer, not narrower: a leaf is chosen for a SHAPE, and this
+        # settlement still spends four inputs, which p3x5 and p3x4 do not
+        # allow. Six outputs is the ceiling either way.
         check_settlement(len(ins), len(outs) + 1)                 # +1 for the fee
 
         from .vault import _tf, asset_out
