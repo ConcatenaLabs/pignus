@@ -1208,11 +1208,84 @@ export function effectiveRepayDeadline(loan) {
   return Number(loan.repay_deadline) - CLAIM_MARGIN_BLOCKS;
 }
 
+/**
+ * How far off a block is, in words, when the chain's height is known.
+ *
+ * A deadline is the only number in any of these notes that a borrower has to
+ * ACT on, and a bare height is not something anybody can act on: it takes an
+ * explorer and arithmetic to learn whether "Bitcoin block 4,152,300" is this
+ * afternoon or next month. `nextStep` was already handed both chains' heights
+ * and threw them away, so every deadline it names was a number with no scale.
+ *
+ * Deliberately vague -- "about 3 days" -- because it IS vague: Bitcoin's ten
+ * minutes is an average over a fortnight, not a promise about the next block.
+ * Precision here would be a lie in the direction that costs a borrower their
+ * collateral, so this rounds and says "about".
+ */
+export function whenBlock(height, now, secondsPerBlock) {
+  height = Number(height);
+  now = Number(now);
+  if (!Number.isFinite(height) || !Number.isFinite(now) || !now) return "";
+  const secs = (height - now) * secondsPerBlock;
+  if (secs <= 0) return " (reached)";
+  if (secs < 90 * 60) return ` (in about ${Math.max(1, Math.round(secs / 60))} minutes)`;
+  if (secs < 36 * 3600) return ` (in about ${Math.round(secs / 3600)} hours)`;
+  return ` (in about ${Math.round(secs / 86400)} days)`;
+}
+
+// How long a Bitcoin height may go unrefreshed before it stops being a tip and
+// becomes a memory. Three blocks' worth: enough drift to move a deadline by
+// half an hour, which is more than any of the numbers here can be wrong by and
+// still be worth showing.
+export const BTC_HEIGHT_MAX_AGE_MS = 30 * 60e3;
+
+/**
+ * The Bitcoin height to reason with, or null when there is not one any more.
+ *
+ * A book whose Bitcoin node has gone away keeps answering everything else
+ * perfectly: the offers, the loans, the prices, all fine, and no Bitcoin
+ * height in any of them. Keeping the last one is right for a single slow RPC
+ * and wrong an hour later, when the page would still be dating a lender's
+ * sweep against a height frozen at the moment the node went -- confidently,
+ * and more wrongly every hour, on the tier where that number is when a
+ * borrower's collateral can be taken.
+ *
+ * So a kept height expires, and what it expires INTO is the case every caller
+ * already handles: no Bitcoin height, say so, and refuse to originate rather
+ * than check half a loan's timelocks.
+ */
+export function freshBtcHeight(height, at, now = Date.now(),
+                               maxAge = BTC_HEIGHT_MAX_AGE_MS) {
+  if (height == null) return null;
+  if (!at) return null;                 // undatable is not fresh
+  return (now - at) > maxAge ? null : height;
+}
+
 /** What the borrower can do with a loan right now, and what it is waiting for. */
 export function nextStep(rec, heights) {
   const l = rec.loan || {};
+  const h = heights || {};
+  // The upgrade fee was fixed when the offer was published and can never be
+  // raised or replaced. If the parent chain has grown busier since, the lender
+  // will not pay a principal into a loan whose start cannot confirm -- and
+  // they are right not to -- so the take stops where it is, for good. The
+  // borrower's collateral is committed by then, and nothing told them: the
+  // reason lives in the lender's private state, and the page showed the same
+  // "the lender pays the principal next" it shows a loan that is fine.
+  //
+  // It does not have to come from the lender. The page already knows the
+  // offer's fee and the book already publishes what Bitcoin is charging, so
+  // the borrower can be told the same thing at the same moment their lender
+  // works it out -- and told the one thing they can act on, which is that the
+  // collateral comes back.
+  const feeNeed = upgradeFeeNeeded(h.feerate);
+  const feeStuck = !!(feeNeed && Number(l.upgrade_fee || 0) < feeNeed / 2);
+  const btcAt = (b) => Number(b).toLocaleString()
+    + whenBlock(b, h.btc, BTC_BLOCK_SECONDS);
+  const seqAt = (b) => Number(b).toLocaleString()
+    + whenBlock(b, h.seq, SEQ_BLOCK_SECONDS);
   const abortable = "Your collateral becomes abortable at Bitcoin block " +
-    Number(l.abort_after).toLocaleString() + ".";
+    btcAt(l.abort_after) + ".";
   switch (stageOf(rec)) {
     case "requested":
     case "reserved":
@@ -1222,12 +1295,21 @@ export function nextStep(rec, heights) {
                      "Nothing of yours is committed yet." };
     case "funded":
     case "signed":
-      return { action: null, label: "",
-               note: "Your collateral is committed. The lender pays the " +
-                     "principal next; you claim it, and claiming it is what " +
-                     "starts the loan. If it never comes you can take the " +
-                     "collateral back after Bitcoin block " +
-                     Number(l.abort_after).toLocaleString() + "." };
+      return { action: null, label: "", warn: feeStuck,
+               note: feeStuck
+                 ? "This loan carries " + Number(l.upgrade_fee || 0) +
+                   " satoshis to pay for moving your collateral into its " +
+                   "vault, and Bitcoin is now charging about " + feeNeed +
+                   " for that transaction. It cannot be replaced or bumped, " +
+                   "so the lender may never be able to start this loan -- " +
+                   "and a careful one will not pay the principal into it. " +
+                   "You are not stuck: take the collateral back after " +
+                   "Bitcoin block " + btcAt(l.abort_after) + "."
+                 : "Your collateral is committed. The lender pays the " +
+                   "principal next; you claim it, and claiming it is what " +
+                   "starts the loan. If it never comes you can take the " +
+                   "collateral back after Bitcoin block " +
+                   btcAt(l.abort_after) + "." };
     case "disbursed":
       return { action: "claim", label: "Claim the principal",
                note: "The principal is waiting in an output only you can " +
@@ -1263,7 +1345,7 @@ export function nextStep(rec, heights) {
     case "live":
       return { action: "repay", label: "Repay",
                note: "Repay before Sequentia block " +
-                     effectiveRepayDeadline(l).toLocaleString() + ". A lender " +
+                     seqAt(effectiveRepayDeadline(l)) + ". A lender " +
                      "stops claiming after that, and a repayment nobody " +
                      "claims releases no collateral." };
     case "repaid":
@@ -1272,7 +1354,7 @@ export function nextStep(rec, heights) {
                      "is what publishes the secret that releases your " +
                      "collateral. If they never do, you can take the " +
                      "repayment back after Sequentia block " +
-                     Number(l.repay_deadline).toLocaleString() + "." };
+                     seqAt(l.repay_deadline) + "." };
     case "repayment-claimed":
       return { action: "reclaim", label: "Take the collateral back",
                note: "Your debt is settled and the secret that releases your " +
@@ -1294,7 +1376,7 @@ export function nextStep(rec, heights) {
                      "secret that releases your collateral will never be " +
                      "published, so the Bitcoin stays in the vault until the " +
                      "lender sweeps it at Bitcoin block " +
-                     Number(l.recover_after).toLocaleString() + ". If your " +
+                     btcAt(l.recover_after) + ". If your " +
                      "lender comes back and claims after all, the secret " +
                      "appears on chain and this page will offer the reclaim." };
     default:

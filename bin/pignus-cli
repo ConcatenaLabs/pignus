@@ -2467,6 +2467,37 @@ class _ResponderState:
 
     def set(self, take_id, **fields):
         rec = dict(self.data.get(take_id, {}))
+        # A wait gets a DATE, here rather than at each of the eleven places
+        # one is recorded. Without it the state file says what a take is
+        # waiting on and never how long, so the two cases an operator has to
+        # tell apart look identical: a pass that has just found the pre-vault
+        # unconfirmed, and a take that has been blocked since Tuesday on
+        # something that will not change by itself -- an upgrade fee fixed
+        # below what the parent chain now charges, a deadline already too
+        # close -- while a borrower's collateral sits committed. The stamp
+        # moves only when the REASON changes, so a wait's clock is the clock
+        # of that reason and not of the last poll.
+        if "waiting" in fields:
+            if not fields["waiting"]:
+                rec.pop("waiting_since", None)
+            elif fields["waiting"] != rec.get("waiting"):
+                rec["waiting_since"] = int(time.time())
+        # A step that SUCCEEDED clears the last failure -- BEFORE the stamping
+        # below, so the date goes with it. These four are the only things this
+        # responder does, so recording one is the proof that whatever failed
+        # before is not what is happening now.
+        if any(fields.get(k) for k in ("disbursement_txid", "upgrade_txid",
+                                       "claim_txid", "principal_refunded")):
+            fields.setdefault("last_error", None)
+        # `last_error` gets a date for the same reason a wait does. It was
+        # written and never cleared, so an operator reading one had no way to
+        # tell a failure from a minute ago from one sitting there since last
+        # week, beside a take that recovered on its own an hour later.
+        if "last_error" in fields:
+            if not fields["last_error"]:
+                rec.pop("last_error_at", None)
+            elif fields["last_error"] != rec.get("last_error"):
+                rec["last_error_at"] = int(time.time())
         rec.update(fields)
         self.data[take_id] = rec
         self._save()
@@ -3091,6 +3122,9 @@ def cmd_btc_responder_status(args):
             "take_id": take_id,
             "stage": stage(h),
             "waiting_on": h.get("waiting") or None,
+            "waiting_hours": (None if not h.get("waiting_since")
+                              else round((time.time()
+                                          - int(h["waiting_since"])) / 3600, 1)),
             "has_secret": bool(h.get("t")),
             "disbursement_txid": h.get("disbursement_txid"),
             "upgrade_txid": h.get("upgrade_txid"),
@@ -3105,6 +3139,10 @@ def cmd_btc_responder_status(args):
                                          "refunded": "principal_refunded"}[k])
                                and not h.get(flag)],
             "last_error": h.get("last_error"),
+            "last_error_hours": (None if not h.get("last_error_at")
+                                 else round((time.time()
+                                             - int(h["last_error_at"])) / 3600,
+                                            1)),
         })
     # A send that went out and was NOT recorded: the one thing a responder
     # cannot repair for itself, because clearing the flag blind pays a second
@@ -3114,6 +3152,19 @@ def cmd_btc_responder_status(args):
     # operator to `btc-responder-clear`, which refuses them, for something that
     # was already fixing itself.
     stuck = [r for r in rows if "DISBURSEMENT IN FLIGHT" in r["stage"]]
+    # And a wait that has stopped being a wait. Most reasons here clear
+    # themselves within a block or two -- a pre-vault not yet confirmed, an
+    # anchor not yet buried -- so a take still on the same one hours later is
+    # on one that will not clear: an upgrade fee fixed below what the parent
+    # chain now charges, a deadline already too close, a secret this key never
+    # had. Nothing reported those, because the state file looked no different
+    # from a take that had been waiting ten seconds; and every one of them has
+    # a borrower's collateral committed behind it. What the lender does about
+    # it is usually to withdraw the OFFER, since a reason like that repeats for
+    # every take of it.
+    slow = [r for r in rows
+            if r not in stuck and r["waiting_on"]
+            and (r["waiting_hours"] or 0) >= args.waiting_hours]
     healing = [r for r in rows
                if r not in stuck and "not recorded" in r["stage"]]
     # And the offers this key signed that a book is now serving with a
@@ -3123,7 +3174,8 @@ def cmd_btc_responder_status(args):
     # because the state file looks exactly as it did the day before.
     disowned = _disowned_offers(args, lender_x_of(args))
     print(json.dumps({"state": path, "takes": len(rows),
-                      "needing_attention": len(stuck) + len(disowned),
+                      "needing_attention": (len(stuck) + len(disowned)
+                                            + len(slow)),
                       "recovering": len(healing),
                       "disowned_offers": disowned, "rows": rows}, indent=2))
     if disowned:
@@ -3139,6 +3191,19 @@ def cmd_btc_responder_status(args):
               f"this key would stand behind twice the lots it meant to. "
               f"Re-signing keeps the id, the takes and the loans already under "
               f"it.", file=sys.stderr)
+    if slow:
+        print(f"{len(slow)} take(s) have been waiting on the same thing for "
+              f"{args.waiting_hours}h or more, with a borrower's collateral "
+              f"committed behind each:", file=sys.stderr)
+        for r in slow:
+            print(f"  {r['take_id']}: {r['waiting_on']} "
+                  f"({r['waiting_hours']}h)", file=sys.stderr)
+        print("  Most reasons here clear on their own within a block or two, "
+              "so one this old is one that will not. If it is `upgrade-fee` or "
+              "a deadline, it will repeat for every take of that offer: "
+              "withdraw the offer and publish a new one, and tell the borrower "
+              "they can abort their pre-vault and take their Bitcoin back.",
+              file=sys.stderr)
     if healing:
         print(f"{len(healing)} take(s) are recovering on their own: a claim or "
               f"a refund was broadcast and the answer lost, and each wrote the "
@@ -3157,7 +3222,11 @@ def cmd_btc_responder_status(args):
     # will not move, and neither clears itself.
     # 4 means "a person is needed". A take recovering on its own does not need
     # one, so it is reported and does not raise the alarm.
-    return 4 if (stuck or disowned) else 0
+    # Status 4 is "the command ran and reported a state that is not settled and
+    # not safe to act on", which a take blocked on an unclearing reason is: a
+    # borrower's collateral is committed and nothing is going to move it. A
+    # timer that only looks at the exit code was told everything was fine.
+    return 4 if (stuck or disowned or slow) else 0
 
 
 def cmd_btc_responder_clear(args):
@@ -3788,8 +3857,17 @@ def cmd_btc_offer_take(args):
             print("warning: " + msg, file=sys.stderr)
     except SystemExit:
         raise
-    except Exception:                                   # noqa: BLE001
-        pass                    # no estimate: the floor check below still runs
+    except Exception as e:                              # noqa: BLE001
+        # The estimate could not be had, so this check did not happen. The
+        # constant floor below still does, and that is why this is not a
+        # refusal -- but the difference between "your fee was priced against
+        # the chain and is fine" and "your fee clears a constant" is the whole
+        # value of the check, and saying nothing lets a borrower commit
+        # Bitcoin believing the first when they got the second.
+        print(f"warning: this node would not price the upgrade "
+              f"({type(e).__name__}: {e}), so the offer's fee has only been "
+              f"checked against a fixed floor and not against what Bitcoin is "
+              f"charging now. That fee can never be raised.", file=sys.stderr)
 
     problems = timelocks_sane(loan, btc.getblockcount(), seq.getblockcount())
     if problems and not args.force:
@@ -4540,8 +4618,21 @@ def cmd_btc_respond(args):
                         state.set(tk["take_id"], waiting="upgrade-fee")
                         print(f"take {tk['take_id']}: {msg}", file=sys.stderr)
                     continue
-            except Exception:                           # noqa: BLE001
-                pass                    # no estimate: the floor still applied
+            except Exception as e:                      # noqa: BLE001
+                # No estimate, so this check did not happen: the constant floor
+                # still applied, which is why this is not a refusal. But a
+                # principal is about to be paid into a loan whose start cannot
+                # be replaced or bumped, and the difference between a fee
+                # priced against the chain and one that merely clears a
+                # constant is the whole of the check. Recorded rather than
+                # passed over, so `btc-responder-status` shows a lender that
+                # their Bitcoin node has stopped answering.
+                why = f"btc-feerate-unavailable: {type(e).__name__}: {e}"
+                if have.get("last_error") != why:
+                    state.set(tk["take_id"], last_error=why)
+                    print(f"take {tk['take_id']}: {why} -- the upgrade fee has "
+                          f"only been checked against a fixed floor",
+                          file=sys.stderr)
             # The pre-vault this key checked the advance signature against,
             # not the one the relay is serving today.
             try:
@@ -5557,6 +5648,11 @@ def add_btc_commands(sub):
     p.add_argument("--config", help="a responder config file")
     p.add_argument("--lender-key")
     p.add_argument("--state", help="the state file (default: beside the key)")
+    p.add_argument("--waiting-hours", type=float, default=6.0, metavar="H",
+                   help="how long a take may wait on ONE reason before this "
+                        "reports it (default 6). Most reasons clear within a "
+                        "block or two, so an older one is a reason that will "
+                        "not clear on its own")
     # With a book and the key, this also checks that the offers the book serves
     # under that key still verify under it -- one that does not is one whose
     # takes the responder is silently skipping.

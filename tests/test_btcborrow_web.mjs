@@ -387,6 +387,77 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
   ok("a reclaim is the borrower's own and does not change the stage",
      bb.stageOf({ ...live, vault_exit: "reclaim" }) === "live");
 
+  // An upgrade fee the parent chain has outgrown stops the loan for good: it
+  // cannot be replaced or bumped, so a careful lender will not pay a principal
+  // into it. The borrower's collateral is committed by then, and the page told
+  // them the same "the lender pays the principal next" it tells a loan that is
+  // fine. The reason lives in the lender's private state -- but the page knows
+  // the fee and the book publishes what Bitcoin charges, so it need not.
+  const stuckFee = { take_id: "t", release_sig: "aa",
+                     loan: { ...loan, upgrade_fee: 200 } };
+  const withFee = { ...heights, btc: Number(loan.abort_after) - 300,
+                    feerate: 50 };
+  ok("a fee the chain has outgrown is named, with what Bitcoin now charges",
+     /200 satoshis/.test(bb.nextStep(stuckFee, withFee).note)
+     && /now charging about/.test(bb.nextStep(stuckFee, withFee).note),
+     bb.nextStep(stuckFee, withFee).note);
+  ok("...and the one thing the borrower can act on: the collateral comes back",
+     /take the collateral back/.test(bb.nextStep(stuckFee, withFee).note));
+  ok("...and it is flagged, not buried in prose",
+     bb.nextStep(stuckFee, withFee).warn === true);
+  ok("a fee that is fine says the ordinary thing",
+     !bb.nextStep({ take_id: "t", loan, release_sig: "aa" }, withFee).warn);
+  ok("and with no feerate published nothing is claimed either way",
+     !bb.nextStep(stuckFee, { ...withFee, feerate: null }).warn);
+
+  // A DEADLINE is the only number in any of these notes a borrower has to act
+  // on, and a bare block height is not one anybody can act on without an
+  // explorer and arithmetic. `nextStep` was handed both chains' heights and
+  // used neither, so every deadline it named was a number with no scale.
+  ok("a live loan's repay deadline says how far off it is",
+     / \(in about \d+ (minutes|hours|days)\)/.test(
+       bb.nextStep(live, heights).note),
+     bb.nextStep(live, heights).note);
+  const waiting = { take_id: "t", loan, release_sig: "aa" };
+  ok("and so does the abort deadline a committed borrower is waiting on",
+     / \(in about \d+ (minutes|hours|days)\)/.test(
+       bb.nextStep(waiting, { ...heights, btc: Number(loan.abort_after) - 300 })
+         .note),
+     bb.nextStep(waiting, { ...heights, btc: Number(loan.abort_after) - 300 })
+       .note);
+  // ...and when it has arrived it says THAT, which for a borrower whose loan
+  // never started is the sentence that matters: the money can come back now.
+  ok("an abort deadline already reached says so rather than a bare number",
+     /\(reached\)/.test(bb.nextStep(waiting, heights).note),
+     bb.nextStep(waiting, heights).note);
+  ok("a chain whose height is unknown says nothing rather than guessing",
+     !/in about/.test(bb.nextStep(waiting, {}).note)
+     && /Bitcoin block/.test(bb.nextStep(waiting, {}).note));
+  ok("a deadline already passed says so", bb.whenBlock(10, 20, 600) === " (reached)");
+  ok("minutes, not '0 hours', just before one", 
+     /minutes/.test(bb.whenBlock(101, 100, 600)));
+  ok("and the wording is deliberately approximate, because ten minutes is an "
+     + "average rather than a promise",
+     bb.whenBlock(1000, 100, 600).includes("about"));
+
+  // A book whose Bitcoin node has gone away keeps answering everything else
+  // perfectly and carries no height at all, so the page's last one goes on
+  // being used -- confidently, and more wrongly every hour, for the number
+  // that says when a borrower's collateral can be swept.
+  const now = 1_700_000_000_000;
+  ok("a height that has just arrived is used",
+     bb.freshBtcHeight(900000, now - 1000, now) === 900000);
+  ok("one from a minute ago still is",
+     bb.freshBtcHeight(900000, now - 60e3, now) === 900000);
+  ok("one from an hour ago is not a tip any more, it is a memory",
+     bb.freshBtcHeight(900000, now - 3600e3, now) === null);
+  ok("a height with no arrival time cannot be shown to be fresh, so it is not",
+     bb.freshBtcHeight(900000, null, now) === null);
+  ok("and no height at all stays no height",
+     bb.freshBtcHeight(null, now, now) === null);
+  ok("the age it expires at is three Bitcoin blocks' worth",
+     bb.BTC_HEIGHT_MAX_AGE_MS === 30 * 60e3);
+
   // The fetch itself: silent on every failure, because a book that cannot
   // answer must not turn a running loan into a seized one.
   const api = (reply) => ({ api: async () => reply });

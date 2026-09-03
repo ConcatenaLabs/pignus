@@ -139,8 +139,19 @@ principal paid twice.
 
 **Reading and repairing a responder.** `pignus-cli btc-responder-status
 --config /root/sequentia/pignus-responder.json` prints every take that key has
-touched, what stage it reached and what it is waiting on. It only reads, so it
-is safe against the running unit, and it exits 4 when something needs a person.
+touched, what stage it reached, what it is waiting on and for how long. It only
+reads, so it is safe against the running unit, and it exits 4 when something
+needs a person.
+
+Most reasons a take waits on clear on their own within a block or two — a
+pre-vault not yet confirmed, an anchor not yet buried — so one that has sat on
+the same reason for hours is on a reason that will not clear: an upgrade fee
+fixed below what the parent chain now charges, a deadline already too close, a
+secret this key never had. Each has a borrower's collateral committed behind
+it, so those are reported too, with `--waiting-hours` setting how patient to
+be. A reason like that repeats for every take of the same offer, so the answer
+is usually to withdraw that offer and publish a new one, and to tell the
+borrower they may abort their pre-vault and take their Bitcoin back.
 
 The one thing a responder cannot repair for itself is a send it recorded as
 in-flight and then lost the answer to — the flag is deliberately left set,

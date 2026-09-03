@@ -48,7 +48,8 @@ const state = {
   reference: "USDX", blockSeconds: DEFAULT_BLOCK_SECONDS,
   offersFilter: "open", minDepth: 2, bookDownSince: null,
   txUrl: DEFAULT_TX_URL, btcTxUrl: DEFAULT_BTC_TX_URL,
-  btcOffers: [], btcLoans: [], btcHeight: null, details: new Set(),
+  btcOffers: [], btcLoans: [], btcHeight: null, btcHeightAt: null,
+  details: new Set(),
 };
 
 async function api(p) {
@@ -179,11 +180,20 @@ function money(n, digits = 2) {
  * unqualified "block 163,388" is a number a borrower can act on as if it were
  * the other chain's.
  */
+// Bitcoin's ten minutes, for a deadline on the parent chain. `whenBlock` reads
+// state.height and blockSeconds(), which are Sequentia's, so a Bitcoin height
+// passed to it would be dated against the wrong chain -- which is why the
+// Bitcoin deadlines below were left as bare numbers instead, and why the one
+// place that did date one grew its own copy of the arithmetic.
+const BTC_BLOCK_SECONDS = 600;
+
 function whenBlock(h, chain = "") {
+  const btc = chain === "Bitcoin";
+  const now = btc ? state.btcHeight : state.height;
   const n = Number(h);
   const at = `${chain ? chain + " " : ""}block ${n.toLocaleString()}`;
-  if (state.height == null) return at;
-  const dt = (n - state.height) * blockSeconds() * 1000;
+  if (now == null) return at;
+  const dt = (n - now) * (btc ? BTC_BLOCK_SECONDS : blockSeconds()) * 1000;
   const d = new Date(Date.now() + dt);
   const ms = Math.abs(dt);
   const rel = ms < 3600e3 ? `${Math.round(ms / 60e3)} min`
@@ -460,7 +470,25 @@ async function refresh() {
   // The Bitcoin height, for the half of a cross-chain loan's deadlines that
   // this chain cannot see. A book without a Bitcoin node publishes none, and
   // the page then refuses to originate rather than check half the timelocks.
-  state.btcHeight = hz?.btc_height ?? m?.btc_height ?? state.btcHeight;
+  //
+  // The last known value is KEPT when a poll does not carry one, because one
+  // missing answer is usually one slow RPC; but it is kept with the time it
+  // arrived. A book whose Bitcoin node has gone away keeps answering
+  // everything else perfectly, so without that stamp the page would go on
+  // dating Bitcoin deadlines against a height frozen at the moment the node
+  // went -- confidently, and more wrongly every hour, on the tier where the
+  // number in question is when a borrower's collateral can be swept.
+  const gotBtc = hz?.btc_height ?? m?.btc_height ?? null;
+  if (gotBtc != null) {
+    state.btcHeight = gotBtc;
+    state.btcHeightAt = Date.now();
+  }
+  // The rule itself lives in btcborrow.js, where it is under test: this file
+  // is bound to the DOM and nothing here can be exercised without a browser.
+  if (btcborrow.freshBtcHeight(state.btcHeight, state.btcHeightAt) == null) {
+    state.btcHeight = null;
+    state.btcHeightAt = null;
+  }
 
   const failed = r.map((x, i) => x.status === "rejected"
     ? `${FEEDS[i]}: ${x.reason?.message || x.reason}` : null).filter(Boolean);
@@ -2332,7 +2360,8 @@ async function renderBtcLoans() {
       : "Connect a wallet to see your Bitcoin-collateral loans."}</div>`);
     return;
   }
-  const heights = { btc: state.btcHeight, seq: state.height };
+  const heights = { btc: state.btcHeight, seq: state.height,
+                    feerate: state.btcFeerate };
   const html = `<table><thead><tr><th>collateral</th><th>you owe</th>
       <th>seized below</th><th>health</th>
       <th>repay by</th><th>lender sweep</th><th>where it stands</th><th></th>
@@ -2377,8 +2406,10 @@ async function renderBtcLoans() {
         <td data-label="repay by">${whenBlock(btcborrow.effectiveRepayDeadline(l), "Sequentia")}
           <span class="sub2">the lender stops claiming after this; the written
           deadline is block ${Number(l.repay_deadline).toLocaleString()}</span></td>
-        <td data-label="lender sweep">Bitcoin block ${Number(l.recover_after).toLocaleString()}</td>
-        <td data-label="where it stands">${esc(rec.status || "funded")}${step.note ? `<span class="sub2">${esc(step.note)}</span>` : ""}</td>
+        <td data-label="lender sweep">${whenBlock(l.recover_after, "Bitcoin")}</td>
+        <td data-label="where it stands">${step.warn
+          ? `<span class="tag warn">${esc(rec.status || "funded")}</span>`
+          : esc(rec.status || "funded")}${step.note ? `<span class="sub2">${esc(step.note)}</span>` : ""}</td>
         <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>`;
     }).join("") + "</tbody></table>" + dropped +
     `<p class="hint" style="margin:10px 0 0">Repaying pays a hashlocked output the
@@ -2407,7 +2438,9 @@ async function renderBtcLoans() {
 async function btcStep(rec, force) {
   if (needWallet()) return;
   const l = rec.loan;
-  const step = btcborrow.nextStep(rec, { btc: state.btcHeight, seq: state.height });
+  const step = btcborrow.nextStep(rec, { btc: state.btcHeight,
+                                         seq: state.height,
+                                         feerate: state.btcFeerate });
   const principal = (BigInt(l.principal || 0) || BigInt(l.debt)).toString();
   const d = esc(meta(l.debt_asset).ticker);
   try {
@@ -2646,9 +2679,9 @@ async function checkBtc(ev) {
       <span class="k">Repay deadline</span><span>Sequentia block ${Number(loan.repay_deadline).toLocaleString()}${state.height == null ? ""
         : rdOk ? ` — in the future (now block ${Number(state.height).toLocaleString()})`
         : ` — <b>ALREADY PAST</b> (now block ${Number(state.height).toLocaleString()}): the lender's Sequentia refund is open, so do not fund`}</span>
-      <span class="k">Lender sweep</span><span>Bitcoin block ${Number(loan.recover_after).toLocaleString()}${state.btcHeight == null
+      <span class="k">Lender sweep</span><span>${whenBlock(loan.recover_after, "Bitcoin")}${state.btcHeight == null
         ? " — this book publishes no Bitcoin height, so nothing here can say how far away that is; confirm in a Bitcoin explorer that it is well after your repayment deadline"
-        : ` — about ${Math.max(0, Math.round((Number(loan.recover_after) - Number(state.btcHeight)) * 10 / 1440 * 10) / 10)} days away (now Bitcoin block ${Number(state.btcHeight).toLocaleString()}), and it must sit well after your repayment deadline`}</span>
+        : " — and it must sit well after your repayment deadline"}</span>
       </div>
       <p class="hint">That one hash stands in the Bitcoin vault's reclaim leaf and
       in the Sequentia repayment output above. It is the whole of the binding
