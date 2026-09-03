@@ -1830,10 +1830,28 @@ class Service:
         except Exception:                               # noqa: BLE001
             dead = []
         if dead:
-            reasons.append(
-                "priced but not lendable: " + ", ".join(sorted(dead)[:8])
-                + " -- their tickers do not resolve to assets, or the "
-                  "precisions disagree. Check the registry")
+            # WHY, distinguished. A book that has not fetched the registry yet
+            # -- the first seconds after a start, or a registry that is not
+            # answering -- has every market unlendable for a reason that is
+            # about to fix itself, and sending an operator to "check the
+            # registry" then is sending them to look at the one thing that is
+            # not the problem. That is exactly when they are reading this.
+            named = "priced but not lendable: " + ", ".join(sorted(dead)[:8])
+            if not self._registry_at:
+                why = (" -- this book has not read the asset registry yet, so "
+                       "no ticker resolves to anything. A start-up clears this "
+                       "on its own; if it does not, the registry is the thing "
+                       "to look at")
+            elif not self.assets:
+                why = (" -- this book knows of NO assets at all: the registry "
+                       "has been read and gave none, and no node answered "
+                       "`dumpassetlabels` either. Nothing can be lent until "
+                       "one of them does")
+            else:
+                why = (" -- their tickers do not resolve to any of the assets "
+                       "this book knows, or the precisions disagree. Check "
+                       "the registry")
+            reasons.append(named + why)
         if UNRENDERABLE:
             # A record this book holds and cannot show. It is missing from
             # every listing, so a lender looking for their own offer simply
@@ -2114,10 +2132,24 @@ class Handler(BaseHTTPRequestHandler):
             # PUBLIC urls, empty where none is configured. The book's own
             # addresses for its oracles are loopback, and answering "where is
             # this oracle" with 127.0.0.1 sends a reader to their own machine.
-            pub = list(s.oracle_public_urls)
-            pub += [""] * max(0, len(s.oracle_keys) - len(pub))
-            return self._send(200, {"oracles": list(s.oracle_keys),
-                                    "urls": pub[:len(s.oracle_keys)]})
+            #
+            # Paired through the CONFIGURED url, never by position. `oracle_keys`
+            # holds only the oracles that answered, so the moment one is
+            # unreachable -- a restart is enough -- the two lists stop lining
+            # up and every key after the gap is served with the next oracle's
+            # address. An auditor sent to the wrong oracle finds no attestation
+            # for a seizure and concludes it was never published, which is the
+            # exact thing this endpoint exists to prevent.
+            pairs = []
+            for i, url in enumerate(s.oracle_urls):
+                key = s.oracle_key_by_url.get(url)
+                if not key:
+                    continue            # has not answered; not something to
+                                        # name an address for
+                pairs.append((key, s.oracle_public_urls[i]
+                              if i < len(s.oracle_public_urls) else ""))
+            return self._send(200, {"oracles": [k for k, _u in pairs],
+                                    "urls": [u for _k, u in pairs]})
         if path == "/v1/offers":
             # A misspelt status returned an empty list, which reads as "there
             # are no offers" rather than "that is not a status" -- the same

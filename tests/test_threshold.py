@@ -157,6 +157,13 @@ def main():
                            "book": os.path.join(rig.root, "book.json"),
                            "oracle": f"http://127.0.0.1:{oports[0]}",
                            "oracles": [f"http://127.0.0.1:{p}" for p in oports[1:]],
+                           # Distinguishable, and deliberately NOT the loopback
+                           # addresses above: what /v1/oracles must serve is
+                           # where a reader can reach each oracle, which is
+                           # never where this book reaches it.
+                           "oracle_public_urls":
+                               [f"https://example.invalid/o{i}"
+                                for i in range(len(oports))],
                            "registry": feed, "markets": ["GOLD/USDX"], "poll": 1,
                            "rpc": {"url": f"http://127.0.0.1:{rig.seq_rpcport}",
                                    "user": RPC_USER, "password": RPC_PASS}}, f)
@@ -171,7 +178,15 @@ def main():
             ors = wait_for(lambda: len(get(book + "/v1/oracles")["oracles"]) == 3
                            and get(book + "/v1/oracles"))
             check("/v1/oracles lists three distinct keys",
-                  bool(ors) and len(set(ors["oracles"])) == 3)
+                  bool(ors) and len(set(ors["oracles"])) == 3,
+                  json.dumps(ors) if ors else "it never listed three")
+            # Everything below reads that answer, so stop here rather than
+            # crashing on a `False` and reporting an AttributeError in place of
+            # the check that actually failed. `return` rather than `raise`, so
+            # the cleanup runs, the service log is printed and the totals are
+            # still reported.
+            if not ors:
+                return 1
             # The book talks to its oracles over loopback, and it used to serve
             # those addresses as the answer to "where is this oracle". A page
             # that followed one would be fetching from the READER's machine --
@@ -184,9 +199,21 @@ def main():
             check("...and never with the book's own loopback addresses",
                   not any("127.0.0.1" in u or "localhost" in u for u in urls),
                   json.dumps(urls))
-            check("...saying nothing where no public address is configured, "
-                  "rather than guessing one",
-                  all(u == "" for u in urls), json.dumps(urls))
+            # Each key must be paired with ITS OWN oracle's address. The book
+            # lists only the oracles that ANSWERED, so pairing the two lists by
+            # position breaks the moment one is unreachable -- a restart is
+            # enough -- and every key after the gap is served with the next
+            # oracle's address. An auditor sent to the wrong oracle finds no
+            # attestation for a seizure and concludes it was never published,
+            # which is the one thing this endpoint exists to prevent.
+            by_port = {}
+            for i, port in enumerate(oports):
+                by_port[get(f"http://127.0.0.1:{port}/v1/pubkey")["oracle_x"]] = i
+            wrong = [(k, u) for k, u in zip(ors["oracles"], urls)
+                     if u != f"https://example.invalid/o{by_port.get(k, -1)}"]
+            check("every key is served with the address of the oracle that "
+                  "holds it, not the one that happens to sit beside it",
+                  not wrong, json.dumps(wrong))
             atts = wait_for(lambda: len(get(book + "/v1/attestations/GOLD_USDX")
                                         ["attestations"]) == 3 and
                             get(book + "/v1/attestations/GOLD_USDX"))

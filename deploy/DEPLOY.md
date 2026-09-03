@@ -438,7 +438,7 @@ does.
 | `explorer_url` | — | where the page's breadcrumb points. A self-hosted book is not behind the testnet's reverse proxy, so it can say where its explorer really is |
 | `explorer_tx_url` | `/explorer/tx/{txid}` | the link a Sequentia transaction id becomes on the page |
 | `btc_explorer_tx_url` | `/testnet4/tx/{txid}` | the same for a parent-chain transaction |
-| `oracle_public_url` | — | where the page's link to the primary oracle's log points |
+| `oracle_public_url` | — | the primary oracle's public ADDRESS, the same shape as an entry in `oracle_public_urls`; the page links to its `/v1/log` |
 | `oracle_public_urls` | `[]` | where each oracle can be reached from OUTSIDE, in the same order as `oracle` then `oracles`. Served by `/v1/oracles`; the loopback addresses above never are, since a browser told to fetch `127.0.0.1` fetches from the reader's own machine. An m-of-n seizure is signed by oracles that are not the primary, and the attestation behind it is at that oracle's `/v1/seizures`, so a threshold oracle with no public address is one whose seizures nobody outside can check |
 
 A watcher that was down for longer than `rescan_depth` blocks cannot reach the
