@@ -510,7 +510,7 @@ function normaliseTerms(terms) {
     ? (terms.oracle_threshold || oracles.length) : 1;
   if (threshold < 1 || threshold > oracleKeys.length)
     throw new Error("oracle threshold outside 1.." + oracleKeys.length);
-  return {
+  const out = {
     // asset ids arrive in RPC display order and the covenant compares the
     // internal (reversed) order
     assetC: reverse(hexToBytes(terms.collateral_asset)),
@@ -547,6 +547,34 @@ function normaliseTerms(terms) {
     bonusDen: terms.bonus_den ?? 100,
     priceScale: big(terms.price_scale ?? PRICE_SCALE, "price_scale"),
   };
+  // The covenant builder's own preconditions, in the words the Python states
+  // them. They were checked in `pignus/terms.py` and nowhere here, so a
+  // browser could compile a vault the proven builder refuses: an address whose
+  // exits the interpreter rejects, which nobody discovers until they try to
+  // leave the loan. This is the one place every derivation passes through.
+  if (out.debt < 1n) throw new Error("debt must be at least 1 atom");
+  if (!(out.strike >= 1n && out.strike < (1n << 63n)))
+    throw new Error(`strike ${out.strike} is outside 1..2^63-1`);
+  if (out.bonusDen < 1 || out.bonusNum < out.bonusDen)
+    throw new Error(`the liquidation bonus ${out.bonusNum}/${out.bonusDen} is ` +
+      "below 1: a seizure could not even cover the debt");
+  if (out.priceScale < 1n) throw new Error("price_scale must be at least 1");
+  if (out.recoverAfter <= out.maturity)
+    throw new Error(`recover_after ${out.recoverAfter} must sit strictly ` +
+      `after maturity ${out.maturity}: RECOVER is the backstop for a loan the ` +
+      "oracle never resolved, not a second way to call it early");
+  // The 64-bit bound the seizure arithmetic works inside, with the same three
+  // terms Python takes the maximum of: an explicit max_price BELOW the strike
+  // would otherwise pass and still overflow on the branch most likely to run.
+  const maxPrice = big(terms.max_price ?? 0, "max_price");
+  const bound = [maxPrice || (1n << 40n), out.strike, 1n]
+    .reduce((a, b) => (b > a ? b : a));
+  const gross = grossOwed(out.debt, BigInt(out.bonusNum), BigInt(out.bonusDen));
+  if (gross * out.priceScale + bound >= (1n << 63n))
+    throw new Error(`gross ${gross} x price_scale ${out.priceScale} + ` +
+      `${bound} exceeds 2^63: lower price_scale, the debt, or max_price, or ` +
+      "the covenant's seizure arithmetic overflows");
+  return out;
 }
 
 /** The 32-byte feed identifier the oracle signs into every attestation. */

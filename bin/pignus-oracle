@@ -192,6 +192,12 @@ class Oracle:
                                    or cfg["logfile"] + ".seizures")
         self.source = build_source(cfg)
         self.markets = list(cfg.get("markets", []))
+        # The peers whose `X-Forwarded-For` this oracle believes. Behind a
+        # reverse proxy every request arrives from loopback, and keying a rate
+        # limit on that gives the whole internet one bucket -- so one flooder
+        # locks every auditor out of the log that exists to be audited.
+        self.trusted_proxies = tuple(
+            cfg.get("trusted_proxies", ["127.0.0.1", "::1"]))
         self.precisions = {k.upper(): int(v)
                            for k, v in cfg.get("precisions", {}).items()}
         self._check_precisions()
@@ -319,6 +325,7 @@ class Oracle:
     # ---------------------------------------------------------- Tier B seizure
 
     def sign_seizure(self, sighash: bytes, market: str, strike: int,
+                     loan=None, offer_sig="", offer_lots=1,
                      max_age=600, allow_stale=False):
         """Co-sign a native-BTC seizure, and publish what justified it.
 
@@ -363,7 +370,17 @@ class Oracle:
         rec = {"sighash": sighash.hex(), "signature": sig.hex(),
                "market": market, "strike": int(strike),
                "attestation": att.to_dict(), "ts": int(time.time()),
-               "oracle_x": self.xonly.hex()}
+               "oracle_x": self.xonly.hex(),
+               # Enough for a third party to re-check the whole judgement, not
+               # just the price. The published record used to carry the strike
+               # and no way to tell whose strike it was -- so a borrower
+               # disputing a seizure could see the number the oracle judged by
+               # and had nothing to hold it to. The loan says which loan, and
+               # the lender's offer signature says the strike is the one they
+               # published rather than one they typed on the day.
+               "loan": loan or {},
+               "offer_sig": str(offer_sig or ""),
+               "offer_lots": int(offer_lots or 1)}
         self.seizures.append(rec)
         return rec
 
@@ -434,8 +451,34 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             fh.close()
 
+    def _client_key(self):
+        """Who to charge a log query to.
+
+        Behind a reverse proxy every request arrives from loopback, so keying
+        on the socket peer gives the WHOLE INTERNET one bucket: one flooder
+        then locks every auditor out of the log that exists to be audited. The
+        forwarded-for header is believed only from a peer configured as a
+        proxy, and then only its LAST hop -- earlier entries are whatever the
+        client claimed. A trusted peer with no such header is the box's own
+        tooling, which is not a public client and is not limited.
+
+        The same rule `pignusd` uses, deliberately: two answers to this
+        question is one of them being wrong.
+        """
+        peer = self.client_address[0] if self.client_address else ""
+        if peer in getattr(self.oracle, "trusted_proxies",
+                           ("127.0.0.1", "::1")):
+            fwd = (self.headers.get("X-Forwarded-For")
+                   or self.headers.get("X-Real-IP") or "")
+            hop = fwd.split(",")[-1].strip()
+            return hop or None
+        return peer
+
     def _archive_ok(self):
-        if ARCHIVE_LIMIT.allow(self.client_address[0], time.time()):
+        key = self._client_key()
+        if key is None:
+            return True                 # the box's own tooling
+        if ARCHIVE_LIMIT.allow(key, time.time()):
             return True
         self._send(429, {"error": "too many log queries from this address; "
                                   "the log is append-only, so a page at a time "
@@ -631,6 +674,14 @@ def main():
                                       "rebuilds the sighash from the terms "
                                       "rather than signing a number somebody "
                                       "else computed")
+    ap.add_argument("--allow-unpinned-strike", action="store_true",
+                    help="with --sign-seize --request: co-sign a request that "
+                         "carries no lender-signed offer. The strike is in no "
+                         "Bitcoin script, so without that signature nothing "
+                         "stops the lender naming any strike they like and "
+                         "having a healthy loan judged against it. Only for a "
+                         "loan arranged entirely by hand, where the operator "
+                         "is the one vouching for the terms")
     ap.add_argument("--market", help="with --sign-seize: the market the loan "
                                      "is priced in")
     ap.add_argument("--strike", type=int,
@@ -667,7 +718,8 @@ def main():
             from pignus import btc_collateral as _BC
             with open(args.request) as fh:
                 req = _json.load(fh)
-            loan, want = _BC.check_seize_request(req)
+            loan, want = _BC.check_seize_request(
+                req, require_offer=not args.allow_unpinned_strike)
             args.sighash = want
             # The LOAN's own market and strike, always. These are what the
             # signature is logged against and what a borrower later holds the
@@ -682,6 +734,11 @@ def main():
                         f"{theirs}. The loan decides: remove {name}.")
             args.market = loan.market
             args.strike = int(loan.strike)
+            # Kept for the published record, so a third party can re-check the
+            # judgement rather than only the price.
+            seize_loan = dict(req.get("loan") or {})
+            seize_offer_sig = str(req.get("offer_sig") or "")
+            seize_offer_lots = int(req.get("offer_lots", 1) or 1)
         missing = [f for f, v in (("--sighash", args.sighash),
                                   ("--market", args.market),
                                   ("--strike", args.strike)) if not v]
@@ -692,6 +749,9 @@ def main():
         except ValueError:
             raise SystemExit("--sighash is hex") from None
         rec = o.sign_seizure(sighash, args.market, args.strike,
+                             loan=locals().get("seize_loan"),
+                             offer_sig=locals().get("seize_offer_sig", ""),
+                             offer_lots=locals().get("seize_offer_lots", 1),
                              max_age=args.max_age,
                              allow_stale=args.allow_stale)
         print(json.dumps(rec, indent=2))

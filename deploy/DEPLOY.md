@@ -46,7 +46,7 @@ fee rates and no chain state, and `/healthz` says so.
 ssh root@<the testnet box>
 cd /root/sequentia
 git clone https://github.com/ConcatenaLabs/pignus.git
-mkdir -p /root/sequentia/pignus-data /root/backups
+mkdir -p /root/sequentia/pignus-data
 
 # the node source the covenant is imported from (NOT the committee run
 # directory; nothing here needs the running nodes)
@@ -73,12 +73,13 @@ systemctl enable --now pignus-backup.timer pignus-check.timer
 Every unit runs as root with its state under `/root`, which is exactly where
 `ProtectSystem=` does not reach — so each one mounts `/root` read-only instead
 and hands back the single directory it has to write: `/root/sequentia/pignus-data`
-for the three services, `/root/backups` for the backup. **Move one of those
+for the three services, and `/var/lib/pignus-backup` for the backup, which
+systemd creates from `StateDirectory=`. **Move one of those
 paths and the matching `ReadWritePaths=` moves with it.** Otherwise the service
 starts cleanly and fails at its first write, which for `pignusd` is hours later
 and reads as a bug rather than as a mount.
 
-Both directories have to exist before the units start, which is what the `mkdir`
+The services' directory has to exist before they start, which is what the `mkdir`
 above is for: the mount namespace is built before the unit's first command runs,
 so a `ReadWritePaths=` naming a directory that is not there fails the unit
 outright and nothing inside it can create one.
@@ -108,7 +109,6 @@ the box:
 mkdir -p /var/lib/pignus-backup
 tar czf /var/lib/pignus-backup/pignus-$(date +%F).tgz \
     /root/sequentia/pignus-data \
-    /root/sequentia/pignus-btc-keys \
     /root/sequentia/pignusd.json \
     /root/sequentia/pignus-oracle*.json \
     /root/sequentia/pignus-responder.json
@@ -229,10 +229,23 @@ sequentiatestnet.com {
 
 **`pignusd` must not be reachable except through Caddy.** It believes an
 `X-Forwarded-For` header only from a peer in `trusted_proxies`, and keys its
-write rate limit on that header's last hop. A request that arrives from a
-trusted peer *without* the header is taken for the box's own tooling — the
-responder and the CLI on loopback — and is not rate-limited at all. Exposed
-directly, every public client would arrive looking like that.
+rate limits on that header's last hop. A request that arrives from a trusted
+peer *without* the header is taken for the box's own tooling — the responder
+and the CLI on loopback — and is not rate-limited at all. Exposed directly,
+every public client would arrive looking like that.
+
+There are two limits, and they meter different costs. Writes are metered
+because they change the book. Reads that touch the NODE — `/v1/spend`, which
+walks blocks backwards, and `/v1/outpoint`, which asks per call — are metered
+because they cost the node work, and both must stay unauthenticated: a borrower
+recovering their own collateral has no account here. Everything else is served
+from memory and is not worth limiting.
+
+**`pignus-oracle` takes the same `trusted_proxies` setting**, and for a sharper
+reason. Its log endpoints read off disk, so they are rate-limited — and keyed on
+the socket peer behind a proxy, that limit gives the whole internet one bucket:
+one flooder locks every auditor out of the log that exists to be audited. Set
+it in each oracle's config, the same way.
 
 ## Updating
 
@@ -493,11 +506,24 @@ lender and the oracle, and the oracle's signature is the decision. It is an
 operator's command rather than an endpoint, and it refuses unless the oracle's
 own published price is under the strike:
 
+**What the oracle is really checking.** The strike is the number a seizure is
+judged by, and it is in no Bitcoin script — Bitcoin cannot read it. So
+rebuilding the sighash from the terms, which catches a lender who edits an
+amount or a payout, does *not* catch one who raises the strike: the sighash
+comes out byte for byte identical. The lender's signature over the offer the
+loan was taken from is the only thing that pins it, so the request carries that
+signature and the oracle refuses without it. A loan arranged entirely by hand
+has no offer, and an operator who is willing to vouch for the terms themselves
+can pass `--allow-unpinned-strike` — after which nothing holds the lender to
+any strike at all.
+
 ```bash
-# lender: build the request, which carries the loan, not just a number
+# lender: build the request, which carries the loan and the offer signature
+# that fixed its strike, not just a number
 pignus-cli btc-seize-sighash loan.json --dest <btc address> --out seizure.json
 
-# oracle operator: rebuild the sighash from the terms and co-sign
+# oracle operator: rebuild the sighash from the terms, check the strike against
+# the lender's own signed offer, and co-sign
 pignus-oracle --config /root/sequentia/pignus-oracle.json \
     --sign-seize --request seizure.json
 

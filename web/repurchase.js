@@ -109,6 +109,16 @@ export function normaliseRepurchase(terms) {
     throw new Error("forfeit_after is required: without it the borrower has no " +
                     "date on which they may stop waiting for the lender");
   }
+  // An absolute locktime is a HEIGHT below 500,000,000 and a Unix TIME at or
+  // above it, and the two are not interchangeable. A deadline just over that
+  // line -- typed by somebody thinking in heights -- is read by a node as a
+  // time already thousands of years in the past, so the FORFEIT it guards can
+  // never be taken. The Python refuses it; this had not.
+  if (forfeitAfter >= 500000000 && forfeitAfter < 1600000000) {
+    throw new Error(`forfeit_after is ${forfeitAfter}, at or above 500000000, ` +
+      `so a node reads it as a Unix TIME rather than a block height -- and as ` +
+      `a time it is in the past. Give a block height, or a real timestamp.`);
+  }
   const cu = hexToBytes(need("borrower_cu"));
   if (cu.length !== 32) {
     throw new Error(`borrower_cu must be a 32-byte v1 program (C_U is a P2TR), ` +

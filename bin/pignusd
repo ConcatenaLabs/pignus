@@ -88,6 +88,8 @@ Endpoints:
     GET  /v1/outpoint/{txid}/{vout}   what an outpoint holds (mempool included)
     GET  /v1/spend/{txid}/{vout}      the spend of an outpoint, and the
                                       preimages its witness published
+    GET  /v1/scan/{scriptPubKey}      an unspent output at an address
+                                      (?asset=, ?amount= in atoms)
     GET  /v1/attestation/{market}     the primary oracle's latest attestation
                                (?oracle=<x> for one other oracle's)
     GET  /v1/attestations/{market}    one verified attestation per oracle
@@ -140,7 +142,7 @@ from pignus import __version__, atoms               # noqa: E402
 from pignus import compat                           # noqa: E402
 from pignus import oracle as O                      # noqa: E402
 from pignus import fees as F                        # noqa: E402
-from pignus.book import Book, OfferExists           # noqa: E402
+from pignus.book import Book, OfferExists, TakeMoved  # noqa: E402
 from pignus.node import Node, RpcError              # noqa: E402
 from pignus.offers import (                         # noqa: E402
     NotOnChain, check_outpoint, offer_address, offer_vault_address,
@@ -161,11 +163,6 @@ MAX_OFFERS = 2000
 # who asks for a release and walks away must not close an offer for ever; a
 # lender who has signed one has committed, and that take keeps its place.
 BTC_TAKE_TTL = 1800
-# The move into the vault is signed at origination and cannot be replaced, so
-# its fee is decided before anyone knows what the parent chain will cost. At
-# roughly 180 vbytes this is about 55 sat/vB, which is generous on testnet4 and
-# is the point: an upgrade that cannot confirm before the collateral becomes
-# abortable is a loan the lender has paid for and cannot start.
 # Every value `?status=` accepts on an offer listing. A misspelling is refused
 # rather than answered with an empty list, which reads as "there are none".
 OFFER_STATUS_NAMES = frozenset(
@@ -249,6 +246,14 @@ WRITE_LIMIT = _RateLimiter()
 # A second bucket for everyone together, so a flood spread over many source
 # addresses still cannot rewrite the book file thousands of times a second.
 GLOBAL_WRITE_LIMIT = _RateLimiter(rate=20.0, burst=200)
+# Reads that touch the NODE, which is a different cost from reads served out of
+# memory: `/v1/spend` walks blocks backwards and `/v1/outpoint` asks the node
+# per call. Both are unauthenticated and both must stay so -- a borrower
+# recovering their own collateral has no account here -- so they are rationed
+# instead. Roomier than the write limit, because a page legitimately makes a
+# handful in a row.
+SCAN_LIMIT = _RateLimiter(rate=2.0, burst=30)
+GLOBAL_SCAN_LIMIT = _RateLimiter(rate=40.0, burst=400)
 
 # Records that cannot be rendered, and the error each last failed with. Every
 # list is fetched every few seconds by every open page and by the liquidator,
@@ -401,6 +406,9 @@ class Service:
         # is a fact about a block and cannot change, and rebuilding one pulls a
         # whole verbose block.
         self._exit_cache = {}
+        # And the spends `/v1/spend` finds, which walk blocks to find. Mined
+        # ones only: a mempool spend can be replaced.
+        self.spend_cache = {}
         self.last_poll = 0
         self.height = None
         self.assets = {}            # asset id -> {ticker, name, precision}
@@ -1465,6 +1473,35 @@ class Service:
         except Exception:                               # noqa: BLE001
             return None
 
+    def anchor_depth_of(self, txid, conf, vout_hint=0):
+        """How deep the PARENT chain is behind the block a transaction is in.
+
+        None when it cannot be answered -- no Bitcoin node, an unconfirmed
+        transaction, a chain without anchoring, or an anchor this node cannot
+        find. A caller must treat None as "not established", never as safe:
+        the whole point of the number is that Sequentia depth does not measure
+        a Bitcoin reorg.
+        """
+        if self.node is None or conf is None or int(conf) <= 0:
+            return None
+        btc = getattr(self, "btc_node", None)
+        if btc is None:
+            return None
+        try:
+            height = int(self.node.getblockcount()) - int(conf) + 1
+            block = self.node.getblock(self.node.getblockhash(height), 1)
+        except Exception:                               # noqa: BLE001
+            return None
+        anchor = block.get("anchorhash") or ""
+        if not anchor or int(anchor, 16) == 0:
+            return None                 # a chain without anchoring
+        try:
+            return int(btc.getblockheader(anchor, True).get("confirmations", -1))
+        except Exception:                               # noqa: BLE001
+            # Not in the parent chain this node follows: reorged away, or
+            # unseen. Either way it is not a depth.
+            return None
+
     def median_time(self):
         """The chain's median time past, which is what consensus compares a
         TIME locktime to.
@@ -1650,6 +1687,21 @@ class Handler(BaseHTTPRequestHandler):
         return not WRITE_LIMIT.allow(key, now) or \
             not GLOBAL_WRITE_LIMIT.allow("all", now)
 
+    def _scan_limited(self):
+        """A read that costs the NODE work, rather than one served from memory.
+
+        `/v1/spend` walks up to `back_scan_cap` verbose blocks and `/v1/outpoint`
+        asks the node per call. Anyone can reach both, and must be able to --
+        a borrower recovering their own collateral has no account here -- so
+        the answer is a ration rather than a gate.
+        """
+        key = self._client_key()
+        if key is None:
+            return False
+        now = time.time()
+        return not SCAN_LIMIT.allow(key, now) or \
+            not GLOBAL_SCAN_LIMIT.allow("all", now)
+
     # The site is plain ES modules with no build step, so the browser fetches
     # them by name. Only files that actually exist in web/ are served, and only
     # by their bare name -- no path traversal, no directory listing, nothing
@@ -1781,7 +1833,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"offers": _views(s.offer_view,
                                                      _limit(rows, q))})
         if path.startswith("/v1/offer/") or path.startswith("/v1/offers/"):
-            rec = s.book.offers.get(path.partition("/v1/")[2].partition("/")[2])
+            rec = s.book.offer(path.partition("/v1/")[2].partition("/")[2])
             if not rec:
                 return self._send(404, {"error": "no such offer"})
             return self._send(200, s.offer_view(rec))
@@ -1807,7 +1859,7 @@ class Handler(BaseHTTPRequestHandler):
             # How a loan ended, read back off the chain. A liquidated borrower
             # has no other way to see the price they were liquidated at.
             loan_id = path.partition("/v1/")[2].partition("/")[2][:-len("/exit")]
-            if not s.book.loans.get(loan_id):
+            if not s.book.loan(loan_id):
                 return self._send(404, {"error": "no such loan"})
             if not s.watcher:
                 return self._send(503, {"error": "no node configured; a close "
@@ -1819,11 +1871,14 @@ class Handler(BaseHTTPRequestHandler):
                                                  "close"})
             return self._send(200, out)
         if path.startswith("/v1/loan/") or path.startswith("/v1/loans/"):
-            rec = s.book.loans.get(path.partition("/v1/")[2].partition("/")[2])
+            rec = s.book.loan(path.partition("/v1/")[2].partition("/")[2])
             if not rec:
                 return self._send(404, {"error": "no such loan"})
             return self._send(200, s.loan_view(rec))
         if path.startswith("/v1/outpoint/"):
+            if self._scan_limited():
+                return self._send(429, {
+                    "error": "too many chain reads; slow down"})
             # What is actually at an outpoint right now, mempool included. The
             # browser uses this to confirm an offer still exists and holds what
             # the book says before composing anything against it.
@@ -1853,7 +1908,62 @@ class Handler(BaseHTTPRequestHandler):
                 "asset": got.get("asset"),
                 "value": str(atoms(got["value"])),
                 "confirmations": got.get("confirmations", 0)})
+        if path.startswith("/v1/scan/"):
+            # Is there an unspent output at this address, in this asset, for
+            # exactly this amount?
+            #
+            # The one question a browser cannot answer for itself and must be
+            # able to: a payment whose report was lost -- the relay down, the
+            # tab closed between broadcast and report -- is invisible to a page
+            # rebuilding from the relay, and the page would then take the same
+            # debt a second time. The address is derived from the terms, so
+            # asking about it reveals nothing the asker did not already know.
+            if self._scan_limited():
+                return self._send(429, {
+                    "error": "too many chain scans; slow down. This one walks "
+                             "the whole UTXO set, so it is rationed"})
+            if not s.node:
+                return self._send(503, {"error": "no node configured; chain "
+                                                 "lookups are unavailable"})
+            spk = path[len("/v1/scan/"):]
+            if not (2 <= len(spk) <= 200) or not _is_hex(spk):
+                return self._send(400, {"error": "that is not a scriptPubKey"})
+            asset = (q.get("asset", [None])[0] or "").lower()
+            amount = q.get("amount", [None])[0]
+            if asset and (len(asset) != 64 or not _is_hex(asset)):
+                return self._send(400, {"error": "asset must be a 64-hex id"})
+            if amount is not None and not str(amount).isdigit():
+                return self._send(400, {"error": "amount is in atoms"})
+            try:
+                desc = s.node.getdescriptorinfo(f"raw({spk.lower()})")["descriptor"]
+                res = s.node.scantxoutset("start", [desc]) or {}
+            except RpcError as e:
+                return self._send(400, {"error": f"the node would not scan "
+                                                 f"that: {e}"})
+            best = None
+            for u in res.get("unspents", []):
+                if asset and str(u.get("asset", "")).lower() != asset:
+                    continue
+                if amount is not None and atoms(u.get("amount", 0)) != int(amount):
+                    continue
+                if best is None or int(u.get("height", 0)) > int(best.get("height", 0)):
+                    best = u
+            if best is None:
+                return self._send(200, {"found": False,
+                                        "scriptPubKey": spk.lower()})
+            tip = int(res.get("height", 0) or 0)
+            return self._send(200, {
+                "found": True, "scriptPubKey": spk.lower(),
+                "txid": best["txid"], "vout": int(best["vout"]),
+                "asset": best.get("asset"),
+                "value": str(atoms(best.get("amount", 0))),
+                "confirmations": (tip - int(best.get("height", 0)) + 1
+                                  if tip and best.get("height") else 0)})
         if path.startswith("/v1/spend/"):
+            if self._scan_limited():
+                return self._send(429, {
+                    "error": "too many chain scans; slow down. This one walks "
+                             "blocks, so it is rationed"})
             # WHO spent an outpoint, and what they put in the witness to do it.
             #
             # This is how a borrower gets their collateral back when nobody
@@ -1872,6 +1982,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "an outpoint is a 64-hex txid "
                                                  "and a vout number"})
             txid, vout = parts[0].lower(), int(parts[1])
+            # A spend, once found, is a fact about a block: cache it. Without
+            # this, a page polling for a secret walks the same blocks every few
+            # seconds, and so does everybody else's.
+            hit = s.spend_cache.get((txid, vout))
+            if hit is not None:
+                return self._send(200, hit)
             try:
                 from pignus import btc_collateral as BC
                 if s.node.gettxout(txid, vout, True) is not None:
@@ -1900,9 +2016,25 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 if len(raw) == 32:
                     preimages[hashlib.sha256(raw).hexdigest()] = item
-            return self._send(200, {
-                "txid": txid, "vout": vout, "spend_txid": spend_txid,
-                "confirmations": conf, "preimages": preimages})
+            # And how deep the PARENT chain is behind it. Sequentia reorgs
+            # whenever Bitcoin reorgs, so Sequentia confirmations measure the
+            # wrong thing: six of them are six minutes, about six tenths of
+            # one Bitcoin block, and an ordinary single-block Bitcoin reorg
+            # undoes ten at once. What has to be buried is the Bitcoin header
+            # the spend's own block anchored to, and this book holds a Bitcoin
+            # node precisely so it can say.
+            out = {"txid": txid, "vout": vout, "spend_txid": spend_txid,
+                   "confirmations": conf,
+                   "anchor_confirmations": s.anchor_depth_of(spend_txid, conf),
+                   "preimages": preimages}
+            # Only a MINED spend is a fact. One in the mempool can be replaced,
+            # and caching that would serve a secret from a transaction that no
+            # longer exists.
+            if int(conf or 0) > 0:
+                if len(s.spend_cache) >= 2048:
+                    s.spend_cache.clear()
+                s.spend_cache[(txid, vout)] = out
+            return self._send(200, out)
         if path.startswith("/v1/attestations/"):
             market = path[len("/v1/attestations/"):].replace("_", "/").upper()
             out = []
@@ -1938,10 +2070,9 @@ class Handler(BaseHTTPRequestHandler):
                 for o in s.book.list_btc_offers(status=status)]
             return self._send(200, {"offers": offers})
         if path.startswith("/v1/btc/offer/"):
-            rec = s.book.btc_offers.get(path[len("/v1/btc/offer/"):])
+            rec = s.book.btc_offer(path[len("/v1/btc/offer/"):])
             if not rec:
                 return self._send(404, {"error": "no such BTC offer"})
-            rec = dict(rec)
             rec["lots_left"] = s.book.btc_offer_lots_left(
                 rec["btc_offer_id"], BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)
             return self._send(200, rec)
@@ -1957,7 +2088,10 @@ class Handler(BaseHTTPRequestHandler):
                 takes = [t for t in takes if t.get("borrower_x", "") == who]
             return self._send(200, {"takes": takes})
         if path.startswith("/v1/btc/take/"):
-            rec = s.book.btc_takes.get(path[len("/v1/btc/take/"):])
+            # A COPY. Serialising the stored record hands `json.dumps` a dict
+            # another thread is writing to, which raises mid-response on a
+            # threaded server and answers a routine poll with a 500.
+            rec = s.book.btc_take(path[len("/v1/btc/take/"):])
             if not rec:
                 return self._send(404, {"error": "no such take"})
             return self._send(200, rec)
@@ -2011,7 +2145,7 @@ class Handler(BaseHTTPRequestHandler):
                 s.verify_offer(offer)
                 rec = s.book.put_offer(offer)     # carries manage_token once
                 s.refresh_chain(wait=2)
-                view = s.offer_view(s.book.offers.get(rec["offer_id"], rec))
+                view = s.offer_view(s.book.offer(rec["offer_id"]) or rec)
                 view["manage_token"] = rec.get("manage_token")
                 return self._send(200, view)
             if path == "/v1/btc/offers":
@@ -2383,6 +2517,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "no such endpoint", "path": path})
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
+        except TakeMoved as e:
+            # The state has moved on, which is what a replayed report meets.
+            return self._send(409, {"error": str(e)})
         except OfferExists as e:
             # Not a bad request: the coin is listed and this caller did not
             # prove it owns the listing.

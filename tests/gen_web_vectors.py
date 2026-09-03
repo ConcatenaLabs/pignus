@@ -55,7 +55,7 @@ def loan():
         payment_hash=BC.sha256(t).hex(),
         h_w=BC.sha256(w).hex(),
         abort_after=190_000,
-        upgrade_fee=3_000,
+        upgrade_fee=10_000,
         d_refund=120_000,
         market="BTC/USDX",
         strike=42_000 * 100_000,

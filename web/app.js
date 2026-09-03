@@ -2094,7 +2094,7 @@ async function renderBtcLoans() {
       if (step.action)
         acts.push(`<button data-btcstep="${i}" class="primary sm">${esc(step.label)}</button>`);
       if (step.action === "reclaim")
-        acts.push(`<button data-btcforce="${i}" class="sm" title="Sequentia follows Bitcoin reorgs in real time, so a secret read from a shallow claim can still be undone">Reclaim anyway</button>`);
+        acts.push(`<button data-btcforce="${i}" class="sm" title="the Bitcoin block your secret's Sequentia block anchored to is not buried yet, so a Bitcoin reorg could still undo it and you would lose both sides">Reclaim anyway</button>`);
       if (btcborrow.canAbort(rec, heights))
         acts.push(`<button data-btcabort="${i}" class="warnbtn sm">Take the collateral back</button>`);
       // The repayment's own REFUND leaf: if the lender never took the money,
@@ -2119,9 +2119,10 @@ async function renderBtcLoans() {
     }).join("") + "</tbody></table>" +
     `<p class="hint" style="margin:10px 0 0">Repaying pays a hashlocked output the
      lender can only open by publishing the secret that releases your Bitcoin.
-     This page waits until that claim is ${CLAIM_DEPTH} blocks deep before it
-     spends on the secret, because Sequentia follows Bitcoin reorgs in real
-     time.</p>`;
+     Before spending Bitcoin on that secret, this page waits for the BITCOIN
+     block its Sequentia block anchored to. Sequentia follows Bitcoin reorgs in
+     real time, so Sequentia confirmations measure the wrong thing: six of them
+     are six minutes, and one ordinary Bitcoin reorg undoes ten at once.</p>`;
   paint("#btcloans", html, (b) => {
     b.querySelectorAll("[data-btcstep]").forEach(btn => {
       btn.onclick = () => btcStep(rows[Number(btn.dataset.btcstep)], false);
@@ -2149,10 +2150,19 @@ async function btcStep(rec, force) {
     if (step.action === "claim") {
       const ui = btcUi({ flow: "btcclaim", prefer: [l.debt_asset] });
       const txid = await btcborrow.claimPrincipal(state.wallet, rec, ui);
+      // What actually happened, and what has NOT. Claiming publishes the
+      // secret the lender needs; the lender is the one who then moves the
+      // collateral into the vault, and until they do the collateral is still
+      // in the pre-vault and still abortable. Saying it is already vaulted
+      // told a borrower to repay a loan that had not begun.
       note(`<b>Principal claimed.</b> ${units(principal, l.debt_asset)} ${d} is ` +
-        `yours (<a href="${txLink(txid)}" class="mono">${esc(txid)}</a>), and ` +
-        "claiming it is what moved your collateral into the loan vault. Repay " +
-        `by ${whenText(l.repay_deadline)} to get the Bitcoin back.`, "ok");
+        `yours (<a href="${txLink(txid)}" class="mono">${esc(txid)}</a>). ` +
+        "Claiming it published the secret the lender needs, and they start the " +
+        "loan by moving your collateral into its vault, which takes a " +
+        "confirmation or two. Until then your collateral is still abortable at " +
+        `Bitcoin block ${Number(l.abort_after).toLocaleString()}. Once the loan ` +
+        `is live, repay by ${whenText(btcborrow.effectiveRepayDeadline(l))} to ` +
+        "get the Bitcoin back.", "ok");
     } else if (step.action === "repay") {
       const ui = btcUi({ flow: "btcrepay", prefer: [l.debt_asset],
                          committed: { [l.debt_asset]: big(l.debt) } });

@@ -578,6 +578,18 @@ hand-fed alternative, and they are worse for exactly that reason. `--max-age`
 (600 seconds by default) is how recent the justifying price must be, and
 `--allow-stale` co-signs against an older one.
 
+It also carries the **lender's signature over the offer** the loan was taken
+from, and without it the oracle refuses. The strike is the number a seizure is
+judged by and it is in no Bitcoin script — Bitcoin cannot read it — so
+recomputing the sighash cannot check it: a lender can raise the strike in the
+request and the sighash comes out byte for byte identical. That signature is
+the only thing that pins the strike to the one they published. A loan arranged
+entirely by hand has no offer to point at, and an operator willing to vouch for
+the terms themselves can pass `--allow-unpinned-strike`; nothing then holds the
+lender to any strike at all. The published record carries the loan and that
+signature too, so a borrower disputing a seizure can re-check the judgement and
+not only the price.
+
 ### Verifying a liquidation
 
 Anyone can check one afterwards, with nothing privileged:
@@ -681,6 +693,9 @@ tests/test_repurchase_web.mjs      web/repurchase.js against them
 tests/test_btc_web.mjs             web/btc.js against web/btc_vectors.json
 tests/test_adaptor_web.mjs         web/adaptor.js against adaptor_vectors.json
 tests/test_btcborrow_web.mjs       what the browser's BTC borrow flow refuses
+tests/test_takeoffer_web.mjs       what a take puts at output index 1
+tests/test_arith_parity.py         the same arithmetic, addresses and refusals
+                                   in both languages, over a sweep
 tests/page_check.sh                the page, in a real browser; it skips
                                    itself where there is no headless Chromium
 ```

@@ -67,6 +67,12 @@ FINISHED_TAKES = frozenset(("claimed", "refunded", "aborted", "expired",
                             "requested", "reserved"))
 
 
+class TakeMoved(ValueError):
+    """A report would move a take's status backwards, which is what a replayed
+    one looks like: the signature is valid for ever and the relay serves it to
+    anybody who asks for the take."""
+
+
 class OfferExists(ValueError):
     """That coin is already listed, and the request did not prove it owns the
     listing."""
@@ -504,6 +510,37 @@ class Book:
                 return t
         return None
 
+    def loan(self, loan_id):
+        """One loan, as a COPY taken under the lock.
+
+        `dict(rec)` outside it is not safe either: copying a dict another
+        thread is writing raises "dictionary changed size during iteration",
+        and a routine page load then answers 500.
+        """
+        with self._lock:
+            rec = self.loans.get(loan_id)
+            return dict(rec) if rec is not None else None
+
+    def offer(self, offer_id):
+        """One offer, as a copy, for the same reason."""
+        with self._lock:
+            rec = self.offers.get(offer_id)
+            return dict(rec) if rec is not None else None
+
+    def btc_take(self, take_id):
+        """One take, as a COPY. Handing out the stored record lets a caller
+        serialise a dict another thread is writing to, which raises mid-answer
+        on a threaded server."""
+        with self._lock:
+            rec = self.btc_takes.get(take_id)
+            return dict(rec) if rec is not None else None
+
+    def btc_offer(self, offer_id):
+        """One cross-chain offer, as a copy, for the same reason."""
+        with self._lock:
+            rec = self.btc_offers.get(offer_id)
+            return dict(rec) if rec is not None else None
+
     def btc_hash_in_use(self, digest, except_take=None):
         """Is this 32-byte commitment already spoken for by another loan?
 
@@ -573,11 +610,57 @@ class Book:
             self._save()
         return rec
 
+    # A take's status only ever moves FORWARD. Every report that sets one is a
+    # signature over `{take_id, fields}` with no nonce and no expiry, so it is
+    # valid for ever -- and the relay serves those signatures to anybody who
+    # asks for the take. Without a ratchet, anyone could copy a lender's own
+    # `hash_auth` off `/v1/btc/takes` and post it back: the signature verifies,
+    # the hash is unchanged so the duplicate guard passes, and a LIVE take is
+    # rewritten to `reserved`. `_holds_lot` reads `reserved` as one of the
+    # steps before a lender has committed, so an offer whose only lot is
+    # already lent would advertise that lot as free, and a second borrower
+    # would take a loan the responder has no offer left to fund.
+    #
+    # Ranking them costs nothing on the happy path, where every report is the
+    # first of its kind to arrive.
+    TAKE_ORDER = ("requested", "reserved", "pending", "signed", "disbursed",
+                  "live", "repaid", "claimed")
+    # These end a take from wherever it was: a borrower walking away, a
+    # principal taken back, a pre-vault aborted. Reachable from any rank, and
+    # nothing moves afterwards.
+    TAKE_TERMINAL = frozenset(("refunded", "aborted", "expired"))
+
+    def _rank(self, status):
+        try:
+            return self.TAKE_ORDER.index(status)
+        except ValueError:
+            return None                 # terminal, or a name from the future
+
     def update_btc_take(self, take_id, **fields):
+        """Write fields onto a take. A status may only go forward.
+
+        Returns the record, or None when there is no such take. Raises
+        ValueError when the status offered is one this take has already passed
+        -- which is what a replayed report looks like.
+        """
         with self._lock:
             rec = self.btc_takes.get(take_id)
             if rec is None:
                 return None
+            want = fields.get("status")
+            if want is not None:
+                now = rec.get("status") or "requested"
+                if now in self.TAKE_TERMINAL and want != now:
+                    raise TakeMoved(
+                        f"this take is {now}, which is where it ends; it "
+                        f"cannot become {want}")
+                if want not in self.TAKE_TERMINAL:
+                    a, b = self._rank(now), self._rank(want)
+                    if a is not None and b is not None and b <= a:
+                        raise TakeMoved(
+                            f"this take is already {now}; a report that would "
+                            f"move it back to {want} is one that has already "
+                            f"been applied")
             rec.update(fields)
             rec["updated"] = int(time.time())
             self._save()

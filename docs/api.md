@@ -170,15 +170,16 @@ holds:
   "relay_floor_rfa_per_kvb": 100,
   "rate_scale": 100000000,
   "feerate_rfa_per_kvb": 2000,
-  "dust_relay_rfa_per_kvb": 300,
-  "dust_output_vsize": 67,
+  "dust_relay_rfa_per_kvb": 100,
+  "dust_output_vsize": 145,
   "vsize": {"repay": 2000, "repay4": 600, "take": 3000, "…": 0}
 }
 ```
 
-`rate_scale`, `dust_relay_rfa_per_kvb` and `dust_output_vsize` are the node's
-own policy numbers, published here because the browser prices a fee and folds
-change to dust from exactly them. Writing them down a second time in JavaScript
+`rate_scale`, `dust_relay_rfa_per_kvb` and `dust_output_vsize` MIRROR the
+node's policy: they are constants in `pignus/fees.py`, not values read back
+from the node, and they are published here because the browser prices a fee and
+folds change to dust from exactly them. Writing them down a second time in JavaScript
 would give two copies of the node's arithmetic to drift apart the day its
 policy changes, with neither side noticing.
 
@@ -283,6 +284,27 @@ transaction index is needed:
 - 404 if the output is unspent nowhere — it may already be spent.
 - 503 if this book has no node.
 
+### `GET /v1/scan/{scriptPubKey}`
+
+Is there an unspent output at this address? `?asset=` (64 hex) and `?amount=`
+(atoms) narrow it, and the newest match is returned.
+
+```json
+{"found": true, "scriptPubKey": "…hex…",
+ "txid": "…", "vout": 0, "asset": "…64 hex…",
+ "value": "4160000000", "confirmations": 3}
+```
+
+`{"found": false, "scriptPubKey": "…"}` when there is none. This is the one
+question a browser cannot answer for itself and must be able to: a payment
+whose report was lost — the relay down, a tab closed between broadcasting and
+reporting — is invisible to a page rebuilding from this book, and the page
+would then make the same payment twice. Every address here is derived from
+terms the asker already holds, so asking about one reveals nothing.
+
+It walks the whole UTXO set, so it is rationed like `/v1/spend` (429 when a
+client asks too often), and 503 when this book has no node.
+
 ### `GET /v1/spend/{txid}/{vout}`
 
 Who spent an outpoint, and what their witness published. This is how a borrower
@@ -293,9 +315,18 @@ witness.
 
 ```json
 {"txid": "…", "vout": 0, "spend_txid": "…",
- "confirmations": 12,
+ "confirmations": 12, "anchor_confirmations": 3,
  "preimages": {"<sha256 of the item>": "<32-byte item, hex>"}}
 ```
+
+`anchor_confirmations` is how deep the PARENT chain is behind the Bitcoin block
+that the spend's own Sequentia block anchored to, and it is the number to act
+on. Sequentia reorgs whenever Bitcoin reorgs, so `confirmations` measures the
+wrong thing: six of them are six minutes, about six tenths of one Bitcoin
+block, and one ordinary single-block Bitcoin reorg undoes ten at once. It is
+`null` when this book has no Bitcoin node, when the spend is unconfirmed, or
+when the anchor is not in the parent chain this book follows — and `null` means
+"not established", never "safe".
 
 `preimages` is every 32-byte witness item keyed by its SHA-256, so a caller
 picks by the hash its own loan commits to and this book needs to know nothing
@@ -312,7 +343,7 @@ tip as far as `back_scan_cap`.
 {"ok": false,
  "error": "stale price: SILVR/USDX",
  "version": "0.2.0", "git_rev": "0aa3fbb1",
- "covenant_vectors": 13,
+ "covenant_vectors": 15,
  "height": 118432, "last_poll": 1799999950,
  "markets": 6, "priced": 5, "stale_markets": ["SILVR/USDX"],
  "max_price_age": 600, "min_depth": 2,
@@ -686,7 +717,7 @@ offer plus `lots_left`, computed live:
   "loan": {"btc_amount": 100000, "lender_x": "…", "oracle_x": "…",
            "recover_after": 900000, "debt_asset": "…", "debt": 5250000000,
            "principal": 5000000000, "repay_deadline": 125000,
-           "abort_after": 902000, "upgrade_fee": 3000, "d_refund": 124000,
+           "abort_after": 902000, "upgrade_fee": 10000, "d_refund": 124000,
            "lender_prog": "…", "lender_ver": 0,
            "market": "BTC/USDX", "strike": 0, "price_scale": 100000},
   "market": "BTC/USDX", "lots": 3, "lots_taken": 1, "lots_left": 2,
