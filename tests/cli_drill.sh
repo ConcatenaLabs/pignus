@@ -87,7 +87,9 @@ echo "== verify: debt altered by ONE atom must be refused =="
 python3 - "$WORK/loan.json" "$WORK/tampered.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-d["debt"] += 1
+# Amounts are decimal STRINGS on the wire -- an atom count passes what a JSON
+# number holds exactly -- so tampering with one means tampering with a string.
+d["debt"] = str(int(d["debt"]) + 1)
 json.dump(d, open(sys.argv[2], "w"))
 PY
 if "$BIN/pignus-cli" verify --terms "$WORK/tampered.json" --spk "$SPK" 2>"$WORK/err"; then
