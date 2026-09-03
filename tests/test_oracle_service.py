@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
 from pignus import oracle as O            # noqa: E402
+from pignus.terms import feed_id          # noqa: E402
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.join(HERE, "..")
@@ -114,6 +115,76 @@ def run_oracle(cfg_path, *extra):
     return subprocess.run(
         [sys.executable, os.path.join(REPO, "bin", "pignus-oracle"),
          "--config", cfg_path, *extra], capture_output=True, text=True)
+
+
+def test_log_rotation():
+    """The log's files, its digest chain, and finding a price in an old one.
+
+    An attestation that justified a liquidation is exactly the one old enough
+    to have been rotated away, so the rotation and the reads that cross it are
+    the parts an auditor depends on -- and nothing here had ever tested them.
+    """
+    print("\nthe attestation log across a rotation")
+    work = tempfile.mkdtemp(prefix="pignus-log-")
+    try:
+        path = os.path.join(work, "attestations.log")
+        # Small enough that a handful of lines rotates it several times.
+        log = O.AttestationLog(path, max_bytes=400, keep=4)
+        seed = log.digest()
+        made = []
+        for i in range(40):
+            att = O.Attestation(
+                market="GOLD/USDX", feed_id=feed_id("GOLD/USDX").hex(),
+                timestamp=1_800_000_000 + i, price=300_000 + i,
+                price_scale=100_000, signature="ab" * 32)
+            log.append(att)
+            made.append(att)
+        rows = log.files()
+        check("the log rotated into several files", len(rows) > 1,
+              f"{len(rows)} file(s)")
+        check("exactly one of them is the current file",
+              sum(1 for r in rows if r["current"]) == 1)
+        check("the digest moved as the log was written",
+              log.digest() != seed)
+
+        # Every closed file's recorded digest is the sha256 of its own bytes,
+        # which is what makes the chain checkable by a downloader.
+        ok = True
+        for r in rows:
+            if r["current"]:
+                continue
+            f = os.path.join(work, r["file"])
+            try:
+                with open(f + ".sha256") as fh:
+                    said = fh.read().strip()
+            except OSError:
+                ok = False
+                break
+            if len(said) != 64:
+                ok = False
+        check("every closed file carries a 64-hex digest beside it", ok)
+
+        # The oldest attestation is long out of the in-memory ring.
+        old = made[0]
+        got = log.at("GOLD/USDX", old.timestamp)
+        check("an attestation rotated out of the current file is still findable",
+              got is not None and got.price == old.price,
+              "not found" if got is None else str(got.price))
+        check("...and the signed bytes come back unchanged",
+              got is not None and got.message() == old.message())
+
+        # And `latest` answers from the files when the ring cannot.
+        fresh = O.AttestationLog(path, max_bytes=400, keep=4)
+        fresh._by_market.clear()
+        fresh._all.clear()
+        newest = fresh.latest("GOLD/USDX")
+        check("latest() falls through to the files rather than saying 'never'",
+              newest is not None and newest.timestamp == made[-1].timestamp,
+              "None" if newest is None else str(newest.timestamp))
+        check("a market nobody ever signed is still None",
+              fresh.latest("NOSUCH/USDX") is None)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def main():
@@ -359,6 +430,7 @@ def main():
         feed.shutdown()
         shutil.rmtree(work, ignore_errors=True)
 
+    test_log_rotation()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0
 

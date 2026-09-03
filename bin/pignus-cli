@@ -229,9 +229,16 @@ def cmd_quote(args):
         "reads_as": f"1 {c} = {back:,.8f} {d}",
         "opened_at_ltv": f"{args.open_ltv:g}%",
         # The strike a loan opened at --open-ltv implies for each liquidation
-        # ratio: price * open / liq, the same arithmetic offer-fund does.
+        # ratio. `offer-fund` measures the ratio against the DEBT, which is the
+        # principal plus the whole term's interest -- so a strike computed from
+        # the principal alone sits below the one actually baked in, and quotes
+        # a liquidation price a borrower would never see.
+        "interest_pct": args.interest,
+        # Within a rounding step of what `offer-fund` bakes: both sides ceil,
+        # at different points. It is a quote, not the number that goes in.
         "strike_at_liq_ltv": {
-            f"{liq}%": math.ceil(price * args.open_ltv / liq)
+            f"{liq}%": math.ceil(price * args.open_ltv
+                                 * (1 + args.interest / 100) / liq)
             for liq in (60, 70, 75, 80)},
     }, indent=2))
     return 0
@@ -386,6 +393,15 @@ def cmd_check_attestation(args):
                          "key it was signed with")
     att = O.Attestation.from_dict({k: v for k, v in d.items() if k != "oracle_x"})
     ok = O.verify(oracle_x, att)
+    # The SCALE, printed and optionally checked. It is not inside the
+    # signature -- it is baked into the vault's leaf instead -- so a price
+    # quoted at one scale and read at another is a hundredfold error the
+    # covenant cannot notice. This command is where a person is told to go and
+    # confirm it, and it could not, because it never printed the number.
+    scale = getattr(att, "price_scale", None)
+    scale_ok = None
+    if args.price_scale is not None:
+        scale_ok = scale is not None and int(scale) == int(args.price_scale)
     print(json.dumps({
         "valid": ok,
         "oracle_x": oracle_x,
@@ -393,9 +409,18 @@ def cmd_check_attestation(args):
         "feed_id": att.feed_id,
         "feed_matches_market": feed_id(att.market).hex() == att.feed_id,
         "price": att.price,
+        "price_scale": scale,
+        "price_scale_matches": scale_ok,
         "timestamp": att.timestamp,
         "message": att.message().hex(),
     }, indent=2))
+    if scale_ok is False:
+        print(f"the attestation quotes at price scale {scale} and --price-scale "
+              f"says {args.price_scale}. The scale is NOT signed: it is baked "
+              "into the vault's leaf, so the same number means a different "
+              "price at each. This price cannot close that loan.",
+              file=sys.stderr)
+        return 2
     return 0 if ok else 2
 
 
@@ -482,7 +507,11 @@ def _pledge_client(args):
             "an issuer token is required (--token, or PIGNUS_ISSUER_TOKEN in the "
             "environment). It authenticates the caller; it does NOT authorise a "
             "release or a seizure, which need the parties' own signatures.")
-    return OA.PledgeClient(args.issuer, tok)
+    try:
+        return OA.PledgeClient(args.issuer, tok,
+                               allow_insecure=bool(args.allow_insecure_issuer))
+    except ValueError as e:
+        refuse(str(e))
 
 
 def cmd_pledge_list(args):
@@ -632,11 +661,24 @@ def cmd_repo_verify(args):
         raise SystemExit("--leg-txid and --lender-cu go together: leg one is "
                          "checked by finding the collateral asset at the "
                          "lender's own C_U address, which needs both")
-    try:
-        bond = t.verify_funding(node, args.txid,
-                                None if args.vout is None else args.vout)
-    except ValueError as e:
-        refuse(str(e))
+    # A SPENT bond is not a failed check, it is a finished repurchase -- the
+    # settlement or the forfeit took it. `verify_funding` cannot tell the two
+    # apart (both look like "no such unspent output"), so the outpoint is asked
+    # about first. Without this the `settled` state, which the documentation
+    # lists, was reachable from no command at all.
+    spent = False
+    if args.vout is not None:
+        try:
+            spent = node.gettxout(args.txid, int(args.vout), True) is None
+        except Exception:                               # noqa: BLE001
+            spent = False
+    bond = None
+    if not spent:
+        try:
+            bond = t.verify_funding(node, args.txid,
+                                    None if args.vout is None else args.vout)
+        except ValueError as e:
+            refuse(str(e))
     leg = None
     if args.leg_txid:
         # C_U(Y) is a taproot output: the OpenDAMP verifier only ever pays the
@@ -649,15 +691,17 @@ def cmd_repo_verify(args):
         except ValueError as e:
             refuse(str(e))
     state = R.repurchase_state(t, node.getblockcount(), bond=bond, leg_one=leg,
+                               bond_spent=spent,
                                min_confirmations=args.min_confirmations)
     print(json.dumps({
         "product": "repurchase",
         "state": state,
         "bond": t.bond(),
         "bond_txid": args.txid,
-        "bond_vout": bond["n"],
-        "bond_asset": bond.get("asset"),
-        "bond_confirmations": int(bond.get("confirmations") or 0),
+        "bond_vout": (args.vout if bond is None else bond["n"]),
+        "bond_asset": None if bond is None else bond.get("asset"),
+        "bond_confirmations": (0 if bond is None
+                               else int(bond.get("confirmations") or 0)),
         "leg_one": None if leg is None else {
             "txid": args.leg_txid,
             "vout": leg["n"],
@@ -666,7 +710,11 @@ def cmd_repo_verify(args):
         },
         "min_confirmations": args.min_confirmations,
     }, indent=2))
-    if leg is None:
+    if state == "settled":
+        print("settled: the bond vault has been spent, which is what a "
+              "settlement or a forfeit does. Read the spending transaction to "
+              "see which.", file=sys.stderr)
+    elif leg is None:
         print("bond-only: nothing here has checked that the collateral reached "
               "the lender. Pass --leg-txid and --lender-cu to check leg one.",
               file=sys.stderr)
@@ -970,6 +1018,9 @@ from pignus.vault import (                                   # noqa: E402
 )
 
 RECOVER_GAP_DAYS = 30          # how long after maturity RECOVER opens
+# Where a node stops reading an absolute locktime as a block height and starts
+# reading it as a Unix time. Consensus, not convention.
+LOCKTIME_THRESHOLD = 500_000_000
 
 
 def book_get(base, path):
@@ -1284,6 +1335,9 @@ def cmd_offer_fund(args):
     for w in terms.sanity_check():
         print(f"  ! {w}", file=sys.stderr)
     if args.dry_run:
+        print("dry run: nothing broadcast. The terms follow; the funding "
+              "transaction is not composed here, because it needs explicit "
+              "coins only a real preparing send can produce.", file=sys.stderr)
         print(terms.to_json())
         return 0
     raw, _spk = fund_offer(node, terms, principal, collateral, expiry, args.lots,
@@ -1385,11 +1439,23 @@ def cmd_explain(args):
     A liquidated borrower is owed the evidence rather than a state tag, and all
     of it is in the closing transaction: the leaf the spender had to reveal
     names the exit, and a seizure's witness carries the oracle's own price,
-    timestamp and signature. Every attestation is checked here against the key
-    baked into the vault address itself, so nothing in the account is taken on
-    the book's word -- and with --terms the book is not asked at all.
+    timestamp and signature.
+
+    WHERE the checking happens depends on which way it is asked. With `--terms`
+    this reads the chain through a node and verifies every attestation here,
+    against the key baked into the vault address itself. With `--loan` it asks
+    the book for its own account, and the book did that checking -- the answer
+    is the book's, not this machine's. Both print the same fields; only one of
+    them is independent of the book, and a borrower disputing a liquidation
+    wants that one.
     """
     if args.loan:
+        # Say whose account this is. `--terms` verifies locally; this does not,
+        # and a reader deciding whether to believe a liquidation needs to know
+        # which of the two they asked for.
+        print(f"reading {args.book}'s own account of this loan. It did the "
+              "checking, not this machine -- re-run with --terms and --rpc to "
+              "verify every signature here.", file=sys.stderr)
         try:
             out = book_get(args.book, f"/v1/loan/{args.loan}/exit")
         except urllib.error.HTTPError as e:
@@ -1485,8 +1551,14 @@ def cmd_offer_take(args):
     if ver != base.borrower_ver:
         raise SystemExit(f"this offer is for witness-v{base.borrower_ver} "
                          f"borrowers and this wallet pays out at v{ver}")
-    terms = LoanTerms(**{**json.loads(base.to_json()),
-                         "borrower_x": prog, "borrower_prog": prog})
+    # Through the READER, not the constructor. `from_json` turns the oracle
+    # list back into a tuple and coerces the numbers; the constructor leaves a
+    # list, which makes the terms unhashable and is a different value from the
+    # one every other party built. The address happens to come out the same
+    # today, and relying on that is how the two drift apart.
+    terms = LoanTerms.from_json(json.dumps(
+        {**json.loads(base.to_json()),
+         "borrower_x": prog, "borrower_prog": prog}))
     vault = offer_vault_address(terms)
     print(f"taking offer {off['offer_id'][:12]}: borrow "
           f"{fmt_atoms(principal, off['debt_precision'])} {off['debt_ticker']}, "
@@ -1498,6 +1570,9 @@ def cmd_offer_take(args):
     fee_asset, fee, rate = choose_fee(
         node, args, "take", prefer=[terms.collateral_asset, terms.debt_asset])
     if args.dry_run:
+        print("dry run: nothing broadcast. The terms follow; the take is not "
+              "composed here, because it needs explicit coins only a real "
+              "preparing send can produce.", file=sys.stderr)
         print(terms.to_json())
         return 0
     raw, vault_spk = take_offer(node, terms, coin, coin.amount, principal,
@@ -1596,11 +1671,38 @@ def _exit(args, exit_name):
     height = node.getblockcount()
     # DEFAULT and RECOVER carry a locktime, so building one early only wastes a
     # preparing send and dies on the node's `non-final`; say so first instead.
-    if exit_name == "default" and height < terms.maturity:
-        raise SystemExit(f"DEFAULT opens at block {terms.maturity}; it is {height}")
-    if exit_name == "recover" and height < terms.recover_after:
-        raise SystemExit(f"RECOVER opens at block {terms.recover_after}; it is "
-                         f"{height}")
+    #
+    # In the LOCKTIME's own units. A deadline at or above 500,000,000 is a Unix
+    # TIME to a node, not a block height, and comparing one to `getblockcount`
+    # said such a loan opened about nine thousand years from now -- so a
+    # time-locked loan could never be defaulted or recovered from here at all.
+    # The node's median-time-past is what consensus compares a time locktime
+    # to, so it is what this compares to.
+    def opened(deadline, name):
+        deadline = int(deadline)
+        if deadline < LOCKTIME_THRESHOLD:
+            if height >= deadline:
+                return
+            raise SystemExit(f"{name} opens at block {deadline}; it is {height}")
+        try:
+            mtp = int(node.getblockheader(node.getblockhash(height))["mediantime"])
+        except Exception as e:                          # noqa: BLE001
+            raise SystemExit(
+                f"{name} opens at Unix time {deadline} and this node would not "
+                f"say what its median time is ({e}), so nothing here can tell "
+                "whether it is open yet") from None
+        if mtp >= deadline:
+            return
+        raise SystemExit(
+            f"{name} opens at Unix time {deadline}; this chain's median time "
+            f"is {mtp}. A locktime at or above {LOCKTIME_THRESHOLD} is a time, "
+            "not a height, and consensus compares it to the median of the last "
+            "eleven blocks -- which lags the wall clock by about an hour.")
+
+    if exit_name == "default":
+        opened(terms.maturity, "DEFAULT")
+    if exit_name == "recover":
+        opened(terms.recover_after, "RECOVER")
     _ver, _prog, spk = wallet_payout(node)
     flow = exit_name if single else exit_name + "4"
     fee_asset, fee, rate = choose_fee(node, args, flow, prefer=[terms.debt_asset])
@@ -1773,7 +1875,10 @@ COIN = 100_000_000
 # --- Tier B: native BTC collateral, the cross-chain loan ----------------------
 #
 # A two-party protocol: the loan lives half on Bitcoin (the collateral) and half
-# on Sequentia (the debt), bound by an adaptor signature. Each party holds a
+# on Sequentia (the debt), bound by ONE HASH appearing in both chains' scripts.
+# It is deliberately not an adaptor signature: nothing can check that a point
+# and a hash came from one secret, so a lender could publish an unrelated hash
+# and take the repayment and the collateral both. Each party holds a
 # keyfile; a `ticket` JSON carries the PUBLIC state between them (never a secret,
 # never `t`). The commands below are each one party's move. The oracle's only
 # move is to sign a seize sighash, which `btc-seize-sighash` prints for it.
@@ -3463,9 +3568,14 @@ def add_btc_commands(sub):
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_prepare)
 
-    p = sub.add_parser("btc-adaptor",
-                       help="LENDER: draw this loan's secret and hand over the "
-                            "release")
+    # Named for what it does. `btc-adaptor` is kept as an alias because it is
+    # the name in every script written against the old protocol -- where this
+    # really did produce an adaptor signature. It no longer does: the two
+    # chains are bound by one hash, and what this hands over is an ordinary
+    # release signature.
+    p = sub.add_parser("btc-release", aliases=["btc-adaptor"],
+                       help="LENDER: draw this loan's secret, publish its hash "
+                            "and hand over the release signature")
     p.add_argument("ticket")
     p.add_argument("--lender-key", required=True)
     p.add_argument("--btc-fee", type=int, default=3000)
@@ -3707,6 +3817,11 @@ def main():
             help="the issuer's openampd base url")
         q.add_argument("--token", default=os.environ.get("PIGNUS_ISSUER_TOKEN", ""),
                        help="issuer token; authenticates the caller only")
+        q.add_argument("--allow-insecure-issuer", action="store_true",
+                       help="talk to a non-https issuer that is not on this "
+                            "machine. The token goes on every call, so anything "
+                            "in between could read and reuse it; this exists "
+                            "for a deliberate test and nothing else")
 
     p = sub.add_parser("pledge-sign",
                        help="sign a Tier C release or seizure with your own key")
@@ -3894,6 +4009,11 @@ def main():
     p.add_argument("--open-ltv", type=float, default=50.0,
                    help="the loan-to-value a loan opens at, which with each "
                         "liquidation ratio gives the strike (default 50)")
+    p.add_argument("--interest", type=float, default=3.0,
+                   help="%% over the whole term, the same figure offer-fund "
+                        "takes (default 3). The liquidation ratio is measured "
+                        "against the DEBT, so leaving this out quotes a strike "
+                        "below the one that would be baked in")
     p.set_defaults(fn=cmd_quote)
 
     p = sub.add_parser("propose", help="write a loan terms document")
@@ -3959,6 +4079,12 @@ def main():
     p = sub.add_parser("check-attestation", help="verify a signed price")
     p.add_argument("--oracle-x", help="the oracle's x-only key; a row from a "
                    "book's /v1/attestations already names it")
+    p.add_argument("--price-scale", type=int, default=None,
+                   help="the scale the LOAN was built at, to check this price "
+                        "against. The scale is not inside the signature -- it "
+                        "is in the vault's leaf -- so the same number means a "
+                        "different price at a different scale, and this is the "
+                        "only place the two are compared")
     p.add_argument("--attestation", required=True)
     p.set_defaults(fn=cmd_check_attestation)
 

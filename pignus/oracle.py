@@ -602,9 +602,50 @@ class AttestationLog:
             return list(src)[-int(n):] if n else []
 
     def latest(self, market):
+        """The newest attestation this log holds for a market, from anywhere.
+
+        The in-memory ring first, because that is the answer nearly every time
+        and it costs nothing. But the ring holds only what THIS process has
+        seen, bounded by `keep` and by the tail of the current file -- so after
+        a restart, or once a market's prices have been rotated away, it says
+        None. That reads as "this oracle has never signed a price for that
+        market", which is a different fact entirely, and `--sign-seize` refused
+        seizures on the strength of it. So a miss falls through to the files.
+        """
         with self._lock:
             d = self._by_market.get(market)
-            return d[-1] if d else None
+            if d:
+                return d[-1]
+        return self._latest_on_disk(market)
+
+    def _latest_on_disk(self, market):
+        """The newest attestation for a market in the log FILES.
+
+        Every file, and the newest TIMESTAMP across all of them -- not the
+        first hit in whatever order the files happen to be named. Rotation
+        stamps files by the second, so several can share one, and the
+        tie-breaking suffix sorts lexically rather than numerically: `-10`
+        before `-2`. Reading order is therefore not chronological order, and
+        the only reliable answer is the largest timestamp.
+        """
+        d = os.path.dirname(self.path) or "."
+        paths = [self.path]
+        for r in self.files():
+            if not r["current"]:
+                paths.append(os.path.join(d, r["file"]))
+        best = None
+        for path in dict.fromkeys(paths):
+            try:
+                with open(path, "rb") as f:
+                    for line in f:
+                        att = _parse_line(line)
+                        if att is None or att.market != market:
+                            continue
+                        if best is None or att.timestamp > best.timestamp:
+                            best = att
+            except OSError:
+                continue
+        return best
 
     def digest(self) -> str:
         """A hash over the whole log, so an operator can publish a short value

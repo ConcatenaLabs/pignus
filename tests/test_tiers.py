@@ -125,6 +125,75 @@ def tier_d_pure():
             lambda: check_settlement(5, 6), "at most 4")
     refuses("a seventh output is refused before it is signed",
             lambda: check_settlement(4, 7), "at most 6")
+
+    # --- the settlement itself, composed. The whole of Tier D's happy path,
+    # and until now the whole of what nothing tested: `compose_settlement` was
+    # exercised by no test at any level.
+    from pignus.repurchase import RepurchaseSpender, SETTLEMENT_VAULT_INDEX
+    from pignus.vault import Outpoint, _tf
+    m, _ = _tf()
+    t = RepurchaseTerms(
+        collateral_asset="aa" * 32, collateral_amount=1000 * COIN,
+        debt_asset="bb" * 32, principal=700 * COIN, debt=730 * COIN,
+        collateral_value=1000 * COIN, borrower_cu="cc" * 32,
+        borrower_prog="dd" * 32, lender_prog="ee" * 32, forfeit_after=200_000)
+    sp = RepurchaseSpender(None, t, t.debt_asset, 5_000)
+    verifier = Outpoint("11" * 32, 0, 1000, "ff" * 32)
+    vault = Outpoint("22" * 32, 0, t.bond(), t.debt_asset)
+    cu = Outpoint("33" * 32, 1, t.collateral_amount, t.collateral_asset)
+    debt_in = Outpoint("44" * 32, 2, 800 * COIN, t.debt_asset)
+    vspk = bytes.fromhex("5120" + "ab" * 32)
+    raw = sp.compose_settlement(vault, verifier, vspk, cu, debt_in,
+                                bytes.fromhex("0014" + "cd" * 20))
+    tx = m.tx_from_hex(raw)
+    check("a settlement spends exactly four inputs", len(tx.vin) == 4,
+          str(len(tx.vin)))
+    check("the bond vault is at input 1, where the covenant needs it",
+          SETTLEMENT_VAULT_INDEX == 1
+          and f"{tx.vin[1].prevout.hash:064x}" == vault.txid)
+    check("the verifier is at input 0",
+          f"{tx.vin[0].prevout.hash:064x}" == verifier.txid)
+    check("output 0 returns the verifier's coin to its own script",
+          bytes(tx.vout[0].scriptPubKey) == vspk)
+    check("output 2 delivers the asset to the borrower's C_U (2k)",
+          bytes(tx.vout[2].scriptPubKey).hex() == "5120" + t.borrower_cu)
+    check("output 3 releases the bond to the lender (2k+1)",
+          bytes(tx.vout[3].scriptPubKey).hex() == "5120" + t.lender_prog)
+    check("and the settlement fits the OpenDAMP shape it is built for",
+          len(tx.vout) <= 6, str(len(tx.vout)))
+
+    # A locktime, for an OpenDAMP rule that binds a transfer to a window.
+    timed = m.tx_from_hex(sp.compose_settlement(
+        vault, verifier, vspk, cu, debt_in, bytes.fromhex("0014" + "cd" * 20),
+        locktime=250_000))
+    check("a settlement can carry a locktime", timed.nLockTime == 250_000,
+          str(timed.nLockTime))
+    check("...with sequences left final, so it is not opted into replacement",
+          all(v.nSequence == 0xfffffffe for v in timed.vin))
+
+    refuses("a verifier coin carrying the repurchase's own asset is refused",
+            lambda: sp.compose_settlement(
+                vault, Outpoint("11" * 32, 0, 1000, t.debt_asset), vspk, cu,
+                debt_in, bytes.fromhex("0014" + "cd" * 20)),
+            "not a verifier output")
+    refuses("a C_U holding more than the repurchase is refused",
+            lambda: sp.compose_settlement(
+                vault, verifier, vspk,
+                Outpoint("33" * 32, 1, t.collateral_amount + 1,
+                         t.collateral_asset),
+                debt_in, bytes.fromhex("0014" + "cd" * 20)),
+            "surplus")
+    refuses("a debt input too small for the debt plus the fee is refused",
+            lambda: sp.compose_settlement(
+                vault, verifier, vspk, cu,
+                Outpoint("44" * 32, 2, 100, t.debt_asset),
+                bytes.fromhex("0014" + "cd" * 20)),
+            "short of the debt")
+    refuses("a fee in anything but the debt asset is refused",
+            lambda: RepurchaseSpender(None, t, "ff" * 32, 5_000)
+            .compose_settlement(vault, verifier, vspk, cu, debt_in,
+                                bytes.fromhex("0014" + "cd" * 20)),
+            "debt asset")
     refuses("an unconsolidated debt input is refused with the fix in the message",
             lambda: settlement_shape(False), "Consolidate first")
     check("the settlement shape names the fee asset",
@@ -437,22 +506,73 @@ def tier_d_vectors():
         check(f"{c['name']}: the bond is the equity", t.bond() == c["bond"])
 
 
+def tier_d_describe_parity():
+    """The two `describe()` implementations say the SAME sentence.
+
+    It is the one screen that stops a borrower reading "loan" and signing a
+    sale, and it exists twice -- once in Python for the command line, once in
+    JavaScript for the page. Both files say in a comment that they must stay
+    word for word identical, and nothing checked it, so the two could drift
+    into telling two different people two different things about the same
+    transaction.
+    """
+    print("\nTier D: both descriptions, word for word")
+    import json as _json
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if node is None:
+        print("  (skipped: no node to run the browser implementation with)")
+        return
+    here = os.path.dirname(os.path.realpath(__file__))
+    vectors = _json.load(open(os.path.join(here, "..", "pignus",
+                                           "vectors.json")))
+    for c in (vectors.get("repurchase") or []):
+        t = RepurchaseTerms(**c["terms"])
+        script = (
+            "import * as repo from '../web/repurchase.js';"
+            "const t = JSON.parse(process.argv[1]);"
+            "process.stdout.write(repo.describe(t));"
+        )
+        try:
+            got = subprocess.run(
+                [node, "--input-type=module", "-e", script, "--",
+                 _json.dumps(c["terms"])],
+                cwd=here, capture_output=True, text=True, timeout=60)
+        except Exception as e:                          # noqa: BLE001
+            check(f"{c['name']}: the browser sentence can be produced", False,
+                  str(e))
+            continue
+        if got.returncode != 0:
+            check(f"{c['name']}: the browser sentence can be produced", False,
+                  got.stderr.strip()[:160])
+            continue
+        check(f"{c['name']}: both implementations say the same sentence",
+              got.stdout == t.describe(),
+              f"\n    python: {t.describe()}\n    browser: {got.stdout}")
+
+
 def main():
+    # `--offline` is a DELIBERATE half-run: the parts that need no chain, which
+    # is what continuous integration can run on every push. It exits 0 because
+    # it did everything it set out to do -- unlike PIGNUS_SKIP_CHAIN, which
+    # means a chain was wanted and was not there, and exits 2 so a runner
+    # cannot print "ok" for a group that tested half of itself.
+    offline = "--offline" in sys.argv
     tier_c()
     tier_d_pure()
     tier_d_vectors()
-    skipped = bool(os.environ.get("PIGNUS_SKIP_CHAIN"))
-    if skipped:
+    tier_d_describe_parity()
+    if offline:
+        print("\n(chain tests not part of this run: --offline)")
+    elif os.environ.get("PIGNUS_SKIP_CHAIN"):
         print("\n(chain tests skipped: PIGNUS_SKIP_CHAIN set)")
     else:
         tier_d_chain()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     if FAIL:
         return 1
-    # A skip is not a pass: RETURN and FORFEIT on a chain, verify_funding
-    # against a real coin and every node-side refusal did not run, and a runner
-    # that saw 0 would print "ok" for a group that tested half of itself.
-    return 2 if skipped else 0
+    return 2 if (os.environ.get("PIGNUS_SKIP_CHAIN") and not offline) else 0
 
 
 if __name__ == "__main__":

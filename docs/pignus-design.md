@@ -30,7 +30,8 @@ the node repository (why section 6.4 exists at all).
 ## 1. What is being claimed
 
 A borrower locks collateral in a single taproot UTXO and receives principal in
-USDX. The vault's spending rules are the loan agreement, compiled. Precisely:
+the loan's debt asset -- any accepted Sequentia asset, since none is privileged
+here. The vault's spending rules are the loan agreement, compiled. Precisely:
 
 - **No custodian.** The collateral is never held by a platform, a lender, a
   multisig federation or an issuer. It sits in a UTXO with a NUMS internal key,
@@ -178,7 +179,9 @@ until somebody tries to leave it.
 
 ### 2.7 Sizes and limits
 
-Measured leaf sizes: REPAY 192 bytes, LIQUIDATE 352, DEFAULT 345, RECOVER 97.
+Measured leaf sizes for a real loan: REPAY 192 bytes, LIQUIDATE 352,
+DEFAULT 346, RECOVER 98. DEFAULT and RECOVER vary by a byte with the size of
+the locktime they carry, so those are the figures for an ordinary height.
 A REPAY spend is in the same class as a covenant CLOB fill (a few hundred
 vbytes; the measured user capacity of a block is about 89,999 vB), which
 matters: doing
@@ -784,6 +787,37 @@ regulated-market instrument. Section 8.1 specifies it.
 
 A repurchase has two legs, created together and settled together.
 
+**What it assumes of OpenDAMP, before any of it works.** These are the
+issuer's decisions, not this platform's, and a repurchase against an asset
+where any of them is false cannot be settled by the transaction below:
+
+- **The asset is enforced at the network, not by a policy service.** OpenDAMP
+  covenants confine a regulated asset in consensus, so every transfer spends
+  the issuer's verifier output at input 0. That is what fixes the bond vault at
+  input 1, and with it the output map the covenant reads. An OpenAMP
+  (co-signature) asset is a different tier and belongs in Tier C.
+- **Both parties are approved holders.** Leg one is an ordinary transfer,
+  subject to the whitelist the issuer already publishes, so a lender who is not
+  approved cannot receive the asset at all and the repurchase never starts.
+  Settlement is the same transfer in reverse and needs the borrower still
+  approved at that moment -- an issuer who removes them in between has stopped
+  the settlement, and nothing in the covenant can override that.
+- **A verifier leaf exists for the shape this settlement uses.** OpenDAMP
+  compiles its verifier once per shape, and this settlement saturates `p4x6`
+  exactly. An issuer whose taptree carries only the narrower `p3x5` and `p3x4`
+  leaves cannot confirm it.
+- **Any-asset fees, with the regulated asset barred from the fee output.**
+  The settlement pays its fee in the debt asset, from the borrower's own input,
+  because all four input slots are spoken for. OpenDAMP enforces absolutely
+  that a fee output never carries the regulated asset, which is what makes that
+  safe.
+- **The wider Simplicity budget is active on the chain.** OpenDAMP covenants
+  are unspendable under the one-to-one rule; on the live testnet the wider
+  budget starts at a stated height, and every fresh chain has it from genesis.
+
+`doc/sequentia/opendamp-design.md` in the node repository is authoritative for
+all of these.
+
 **Leg one, off the covenant.** The borrower transfers `q` units of the OpenDAMP
 asset to `C_U(lender)` by an ordinary transfer. Nothing here is special: it is
 the transfer the asset already supports, subject to the whitelist the issuer
@@ -819,6 +853,30 @@ without an oracle: *the bond is released to the lender only in a transaction
 that delivers `q` units of the OpenDAMP asset to the borrower's own C_U
 address.* FORFEIT says: *after `forfeit_after`, anyone may sweep the bond, and
 only to the borrower.*
+
+**ORIGINATION is not atomic, and that is the tier's one real exposure.**
+Say it plainly, because nothing in the covenant fixes it. Leg one is an
+ordinary OpenDAMP transfer and leg two is a separate funding of the bond vault,
+so between them there is a window in which:
+
+- The borrower has transferred the asset and the lender has funded nothing. The
+  borrower holds no bond and no principal, and the only remedy is the lender's
+  good behaviour. **This is the order to avoid**: fund the bond first.
+- The lender has funded the bond and the borrower has transferred nothing. The
+  bond sits in a vault whose FORFEIT leaf pays the BORROWER after
+  `forfeit_after` -- so a borrower who never delivers the asset can simply wait
+  and sweep it. The lender's remedy is to settle or to stop waiting long before
+  that height, and there is no leaf that returns the bond to them.
+
+Tier A does not have this problem: `build_origination` composes the whole loan
+as one transaction, so the collateral and the principal move together or not at
+all. A repurchase cannot be composed that way today, because leg one is a
+Simplicity spend of the issuer's verifier that this repository does not build.
+Until it can be, the mitigations are procedural and belong in front of both
+parties: fund the bond first, keep `forfeit_after` no further out than the
+lender is willing to wait, and check both halves with `repo-verify` -- which is
+why it reports `leg-one-only` and `bond-only` as distinct states and exits
+non-zero on each.
 
 **Settlement is one atomic transaction.** The borrower's payment of `debt` is
 NOT covenant-checked -- the two output slots RETURN inspects are already spent
@@ -911,7 +969,9 @@ anything but the debt asset -- and `repo-settle --attach` puts the RETURN
 witness on the version everybody has signed. The vault always lands at input 1,
 for the reason above; the composer places it there and that is not something a
 caller can choose. A borrower whose debt coin needs no change leaves five
-outputs rather than six, which the narrower OpenDAMP shape also accepts.
+outputs rather than six. That is fewer, not narrower: a verifier leaf is chosen
+for a SHAPE, and this settlement still spends four inputs, which the `p3x5` and
+`p3x4` leaves do not allow. `p4x6` is the leaf either way.
 
 ## 9. Where the code lives
 

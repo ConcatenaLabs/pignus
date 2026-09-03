@@ -26,17 +26,31 @@ object, or is not valid JSON, is a 400.
 **Numbers.** Amounts in asset atoms are **decimal strings**, because an atom
 count can exceed what a JSON number holds exactly in a browser. Heights,
 locktimes, timestamps, confirmations, counts, prices, `price_scale` and
-`expiry_locktime` are JSON numbers. Two exceptions worth knowing:
-`seizure_if_liquidated` and `surplus_if_liquidated` on a loan are numbers, and
-`live_debt_by_asset` in `/v1/stats` is keyed by asset id with number values.
+`expiry_locktime` are JSON numbers. The exceptions, all of them derived rather
+than agreed: `seizure_if_liquidated` and `surplus_if_liquidated` on a loan,
+every amount inside `/v1/loans/{id}/exit` (`seize_paid`, `seize_expected`,
+`surplus_paid`, `surplus_expected`, `lender_paid`, `debt`), and
+`live_debt_by_asset` in `/v1/stats`, which is keyed by asset id with number
+values. Read them as indicative; the string amounts are the ones to compute
+against.
+
+The `terms` field of an offer or a loan is the JSON **string** that was
+submitted, stored and served back byte for byte -- not a nested object. That is
+deliberate: the terms are what every party's covenant address is derived from,
+so re-serialising them here would be a chance to change them. Parse it
+yourself. Its own amount fields may be decimal strings, and a book must accept
+them either way, because a browser cannot serialise an integer above 2^53
+exactly.
 
 **Prices.** A price is debt-asset atoms per collateral-asset atom, multiplied by
 `price_scale`. `unit_price` in `/v1/markets` is that number divided out, as a
 float, for display only — never compute against it.
 
-**Errors.** Every failure is `{"error": "a sentence"}` with the status code
-below. The sentence is written to be shown to a person, so it says what was
-wrong rather than naming a Python class.
+**Errors.** Every failure that carries a body carries `{"error": "a sentence"}`
+with the status code below. The sentence is written to be shown to a person, so
+it says what was wrong rather than naming a Python class. A `DELETE` on a
+listing that is not there answers 404 with no body at all, because there is
+nothing to say about it; treat an empty body as the code's own meaning.
 
 | code | means |
 |---|---|
@@ -148,10 +162,19 @@ holds:
 {
   "rates": {"<asset id>": 100000000},
   "relay_floor_rfa_per_kvb": 100,
+  "rate_scale": 100000000,
   "feerate_rfa_per_kvb": 2000,
+  "dust_relay_rfa_per_kvb": 300,
+  "dust_output_vsize": 67,
   "vsize": {"repay": 2000, "repay4": 600, "take": 3000, "…": 0}
 }
 ```
+
+`rate_scale`, `dust_relay_rfa_per_kvb` and `dust_output_vsize` are the node's
+own policy numbers, published here because the browser prices a fee and folds
+change to dust from exactly them. Writing them down a second time in JavaScript
+would give two copies of the node's arithmetic to drift apart the day its
+policy changes, with neither side noticing.
 
 `rates` is keyed by asset id and is empty when no node is configured.
 `relay_floor_rfa_per_kvb` is `null` when the node did not report one, rather
@@ -221,14 +244,22 @@ signed by the key a particular loan bakes in.
 
 ```json
 {"loans_by_state": {"LIVE": 12, "REPAID": 40},
- "offers": 7,
+ "offers": 7, "offers_all": 31, "unreadable": 0,
  "live_debt_by_asset": {"<asset id>": 150000000000},
  "at_risk": [{"loan_id": "…", "market": "GOLD/USDX", "health": 1.02}]}
 ```
 
-`at_risk` lists LIVE loans whose health is under 1.15, weakest first. A loan in
-a market with no fresh price is left out rather than shown at a health of zero,
-which would read as "about to be liquidated".
+`at_risk` lists LIVE loans whose health is under 1.15, weakest first, each
+priced by the keys baked into its OWN vault -- not by whichever oracle this
+book currently calls primary, which is a number a loan built on a rotated key
+or on a threshold set cannot be judged by. A loan whose own oracle has no fresh
+price is left out rather than shown at a health of zero, which would read as
+"about to be liquidated".
+
+`offers` counts the OPEN ones, the same figure `/healthz` reports; `offers_all`
+counts every offer still recorded, spent and withdrawn included. `unreadable`
+counts LIVE records this book could not parse, which are skipped here as they
+are in `/v1/loans` rather than failing the whole read.
 
 ### `GET /v1/outpoint/{txid}/{vout}`
 
@@ -279,8 +310,9 @@ tip as far as `back_scan_cap`.
  "height": 118432, "last_poll": 1799999950,
  "markets": 6, "priced": 5, "stale_markets": ["SILVR/USDX"],
  "max_price_age": 600, "min_depth": 2,
- "rescan_depth": 1500, "back_scan_cap": 200,
+ "rescan_depth": 1500, "back_scan_cap": 200, "prune_after": 2592000,
  "offers": 7, "loans": 52, "unrenderable": 0,
+ "explorer_url": "", "oracle_public_url": "",
  "assets": 41, "fee_rates": 6,
  "block_seconds": 60, "reference_ticker": "USDX",
  "oracles": 3, "oracle_errors": [],
@@ -343,7 +375,7 @@ One offer. `/v1/offer/{id}` is accepted as an alias. 404 if there is none.
 ```json
 {
   "offer_id": "…32 hex…",
-  "terms": { … the loan terms document … },
+  "terms": "{…}",                 # the terms document, as a JSON STRING
   "kind": "funded",
   "outpoint": "<txid>:<vout>",
   "vault_address": "…scriptPubKey hex…",
@@ -453,7 +485,7 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
 ```json
 {
   "loan_id": "…", "terms_id": "…",
-  "terms": { … },
+  "terms": "{…}",                 # the terms document, as a JSON STRING
   "state": "LIVE", "confirmations": 143,
   "txid": "…", "vout": 0,
   "single_leaf": true,
@@ -492,8 +524,10 @@ fetch `/v1/markets` to learn what it is.
 `single_leaf` says which vault layout this loan lives in: a loan originated
 through a funded offer is in the single-leaf vault, a directly originated one is
 in the four-leaf tree, and the two have different addresses and different
-witnesses. `vault_address` is the scriptPubKey the terms compile to, which is
-the thing to compare against the coin before signing anything.
+witnesses. `vault_address` is the scriptPubKey for THAT layout -- the one this
+loan's coin actually pays -- and it is the thing to compare against the coin
+before signing anything. On an offer it is likewise the single-leaf address,
+because that is where a loan drawn from the offer will live.
 
 The price-derived fields — `price`, `health`, `ltv`, `liquidatable`,
 `seizure_if_liquidated`, `surplus_if_liquidated` — are **absent** when there is
@@ -635,7 +669,9 @@ good, because money is in flight by then.
 
 ### `GET /v1/btc/offers`
 
-`?status=` (`open` by default, or `withdrawn`, or `all`). Each row is the stored
+`?status=` (`open` by default, or `taken`, `withdrawn`, `gone`, `ghost`,
+`expired`, or `all`). A value outside that set is a 400 listing them, not an
+empty result -- an empty list reads as "there are no offers". Each row is the stored
 offer plus `lots_left`, computed live:
 
 ```json

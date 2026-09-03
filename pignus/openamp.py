@@ -130,8 +130,25 @@ class PledgeClient:
     this token still cannot quietly hand one user's collateral to another.
     """
 
-    def __init__(self, base_url: str, issuer_token: str, timeout: int = 20):
+    def __init__(self, base_url: str, issuer_token: str, timeout: int = 20,
+                 allow_insecure: bool = False):
+        """`base_url` must be https, because a bearer token goes on every call.
+
+        A token sent over plain http is a token every hop can read and reuse:
+        it entitles the holder to ask this issuer about, and act on, every
+        pledge the caller can reach. Local addresses are exempt, because a
+        development issuer on the loopback has no hop to be read by.
+        """
         self.base = base_url.rstrip("/")
+        scheme, _, rest = self.base.partition("://")
+        host = rest.partition("/")[0].partition(":")[0].lower()
+        local = host in ("127.0.0.1", "::1", "localhost") or host.startswith("127.")
+        if scheme.lower() != "https" and not (local or allow_insecure):
+            raise ValueError(
+                f"{base_url} is not https, and every call to it carries a "
+                "bearer token. Anything between here and the issuer could read "
+                "and reuse it. Use https, or --allow-insecure-issuer for a "
+                "deliberate test.")
         self.token = issuer_token
         self.timeout = timeout
 

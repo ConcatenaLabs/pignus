@@ -34,6 +34,12 @@
     "password": "",
     "wallet": ""
   },
+  "_display_note": "Where the page sends a reader looking at a transaction, an explorer or the oracle's own log. Every one is optional; the page falls back to paths that suit the testnet's reverse proxy. Set them on a self-hosted book, whose neighbours live somewhere else.",
+  "explorer_url": "",
+  "explorer_tx_url": "",
+  "btc_explorer_tx_url": "",
+  "oracle_public_url": "",
+
   "_btc_rpc_note": "Optional, and only for cross-chain loans. The book reads the parent chain's tip through it so a Bitcoin-side deadline is checked against a height this daemon read itself rather than one a client sent. It never spends: no wallet is needed.",
   "btc_rpc": {
     "url": "http://127.0.0.1:48332",

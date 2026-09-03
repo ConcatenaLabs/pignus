@@ -327,10 +327,15 @@ places it is checked anywhere.
 | `max_price_age` | 600 | a price older than this is not a price. Health, LTV and liquidatable are withheld rather than computed from it, and `/healthz` turns unhealthy |
 | `min_depth` | 2 | how deep a funding must be before a loan reads as LIVE. Depth is the lender's risk appetite, so it is configuration; the page shows the number in use |
 | `rescan_depth` | 1500 | how far back a poll may walk to find a spend it missed |
-| `back_scan_cap` | 200 | how many blocks one poll may fetch for those backward walks. The walk is the expensive half of a poll, so it is rationed and a search that runs out of budget resumes on the next one |
+| `back_scan_cap` | 200 | how many blocks one poll may fetch for those backward walks. The walk is the expensive half of a poll, so it is rationed and a search that runs out of budget resumes on the next one. The forward scan is budgeted separately and generously: falling behind the tip is the one failure that compounds |
 | `prune_after` | 2592000 | how long a *finished* record is kept: a spent offer, a closed vault, an ended cross-chain take. Nothing pruned is lost — the chain is the record and this book is an index of it — but every list is rendered end to end on every read. Anything still open is kept whatever its age; 0 keeps everything |
 | `trusted_proxies` | `["127.0.0.1", "::1"]` | the peers whose `X-Forwarded-For` this daemon believes |
 | `rpc` | — | the node. Optional: without one the book still serves offers and whatever it last knew, and says so in `/healthz` |
+| `btc_rpc` | — | the parent chain's node, same four fields as `rpc`. Only for cross-chain loans, and it never spends, so no wallet is needed. Without it the Bitcoin half of every cross-chain deadline goes unchecked here, `/healthz` says `btc_node: false`, no `btc_height` is published, and the page refuses to originate rather than check half the timelocks |
+| `explorer_url` | — | where the page's breadcrumb points. A self-hosted book is not behind the testnet's reverse proxy, so it can say where its explorer really is |
+| `explorer_tx_url` | `/explorer/tx/{txid}` | the link a Sequentia transaction id becomes on the page |
+| `btc_explorer_tx_url` | `/testnet4/tx/{txid}` | the same for a parent-chain transaction |
+| `oracle_public_url` | — | where the page's link to the oracle log points |
 
 A watcher that was down for longer than `rescan_depth` blocks cannot reach the
 gap at all. Start it once with `--rescan-from <height>` and the forward scan

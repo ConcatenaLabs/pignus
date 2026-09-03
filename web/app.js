@@ -572,8 +572,17 @@ function renderWallet() {
       <span class="ref">${ref(v, a)}</span></span>`);
   const bal = state.balances?.btc;
   if (bal != null && big(bal) > 0n) {
-    const m = state.markets.find(x => x.cross_chain && x.unit_price != null);
-    const v = m ? `≈ ${money(Number(big(bal)) / 1e8 * Number(m.unit_price))} ${esc(refUnit())}` : "";
+    // Valued through a market whose DEBT side is the reference unit, and
+    // labelled with the unit that market actually quotes in. Any cross-chain
+    // market would do for the multiplication and would then be printed under
+    // the reference ticker whatever it was priced in -- a BTC/EURX quote read
+    // as dollars, with nothing on the page saying so.
+    const m = (state.markets || []).find(
+      x => x.cross_chain && x.unit_price != null && !x.stale &&
+           x.debt_ticker === refUnit());
+    const v = m
+      ? `≈ ${money(Number(big(bal)) / 1e8 * Number(m.unit_price))} ${esc(m.debt_ticker)}`
+      : "";
     rows.unshift(`<span class="bal"><b>${(Number(big(bal)) / 1e8).toLocaleString(undefined,
       { maximumFractionDigits: 8 })}</b> BTC <span class="ref">Bitcoin ${esc(btcNetworkName())} · ${v}</span></span>`);
   }
@@ -646,7 +655,21 @@ function renderMarkets() {
       'attestation this book could verify for this market is ' + esc(priceAge(m)) +
       ', which is past the age it will lend on. Nothing can be borrowed or ' +
       'lent here until the oracle catches up.">stale price</span>');
-    else tags.push('<span class="tag dim" title="this ticker has no asset id in the registry or the node\'s labels, so it cannot be lent against here">not in the registry</span>');
+    else if (m.precision_mismatch)
+      tags.push('<span class="tag warn" title="the oracle quotes this market at ' +
+        'different asset precisions than the registry gives, so its price does ' +
+        'not mean what it appears to">not lendable</span>');
+    else if (!m.collateral_asset || !m.debt_asset)
+      tags.push('<span class="tag dim" title="one of this market\'s tickers has ' +
+        'no asset id in the registry or the node\'s labels, so nothing here can ' +
+        'name the asset a loan would be written in">not in the registry</span>');
+    else if (m.price == null)
+      tags.push('<span class="tag warn" title="this book holds no verified ' +
+        'attestation for this market at all, so there is no price to write a ' +
+        'loan against">no price yet</span>');
+    else
+      tags.push('<span class="tag dim" title="this book does not currently ' +
+        'lend in this market">not lendable</span>');
     // The oracle quotes a price at assumed decimals. If they are not the
     // registry's, the number is right and means something else.
     if (m.precision_mismatch)
@@ -809,6 +832,26 @@ function wireDetails(box) {
  * defect: a reader deciding whether to believe a closed loan needs to know
  * which party did the checking.
  */
+/**
+ * The current time, from the book rather than from this machine.
+ *
+ * `not_before` goes into the vault's leaves, and a clock that is minutes fast
+ * bakes a loan that will not accept an attestation signed a moment ago. The
+ * book's newest verified attestation is a timestamp an oracle signed, which is
+ * a far better clock than a laptop's, and it is one every party to the loan
+ * can already see.
+ */
+function bookNow() {
+  const mine = Math.floor(Date.now() / 1000);
+  let newest = 0;
+  for (const m of state.markets || [])
+    if (m.timestamp) newest = Math.max(newest, Number(m.timestamp));
+  // Never move it FORWARD past this machine's clock: that would retire prices
+  // nobody has signed yet. Only pull it back to the newest price the book has,
+  // which is the earliest moment a loan written now could be judged at.
+  return newest && newest < mine ? newest : mine;
+}
+
 function localVerdict(t, a) {
   try {
     const named = t.oracles && t.oracles.length
@@ -1181,14 +1224,17 @@ function lenderSummary(rows) {
   for (const l of lent) {
     const t = JSON.parse(l.terms);
     const a = (byAsset[t.debt_asset] = byAsset[t.debt_asset]
-      || { principal: 0n, interest: 0n, live: 0n });
+      || { principal: 0n, interest: 0n, live: 0n, n: 0 });
+    // Counted PER ASSET. One count of every loan printed on every asset's line
+    // said a lender had made all of them in each currency at once.
+    a.n += 1;
     a.principal += big(t.principal);
     if (l.state === "REPAID") a.interest += big(t.debt) - big(t.principal);
     if (l.state === "LIVE" || l.state === "UNCONFIRMED") a.live += big(t.principal);
   }
   const seized = lent.filter(l => ["LIQUIDATED", "DEFAULTED", "RECOVERED"].includes(l.state)).length;
   const parts = Object.entries(byAsset).map(([a, v]) =>
-    `${units(v.principal, a)} ${esc(meta(a).ticker)} lent across ${lent.length} loan${lent.length === 1 ? "" : "s"}` +
+    `${units(v.principal, a)} ${esc(meta(a).ticker)} lent across ${v.n} loan${v.n === 1 ? "" : "s"}` +
     ` · ${units(v.live, a)} still out · ${units(v.interest, a)} interest earned`);
   return `<div class="hint" style="margin:0 0 10px">${parts.join("<br>")}` +
          (seized ? `<br>${seized} closed by seizure` : "") + "</div>";
@@ -1322,7 +1368,11 @@ function lendTerms() {
     lender_ver: ver,
     borrower_x: placeholder, borrower_prog: placeholder, borrower_ver: ver,
     market: m.market, oracle_x,
-    strike: String(strike), not_before: String(Math.floor(Date.now() / 1000)),
+    // From the BOOK's clock where it has one. `not_before` retires every
+    // attestation signed before it, so a browser whose clock runs fast bakes a
+    // vault that refuses prices it should accept -- and it is baked into the
+    // address, so nothing can be done about it afterwards.
+    strike: String(strike), not_before: String(bookNow()),
     maturity, recover_after: maturity + Math.round(RECOVER_GAP_DAYS * bpd),
     bonus_num: 100 + BONUS, bonus_den: 100, price_scale: Number(scale),
     max_price: 0, memo: "", oracles, oracle_threshold,
@@ -1447,10 +1497,40 @@ async function confirmAndSend(label, make, opts = {}) {
         resolve(true);
       };
       $("#nogo").onclick = () => resolve(false);
+      // Escape cancels, as it does in every dialog anyone has used.
+      const esckey = (ev) => {
+        if (ev.key !== "Escape") return;
+        document.removeEventListener("keydown", esckey);
+        resolve(false);
+      };
+      document.addEventListener("keydown", esckey);
     };
     draw();
     wire();
+    // This asks a question and waits for an answer, so it is a DIALOG. It
+    // lived in a polite status region, which a screen reader announces
+    // whenever it feels like it and never moves focus to -- so somebody using
+    // one was left on whatever they had been doing while a decision about
+    // their money waited unread somewhere else on the page. Marking it and
+    // moving focus is the whole fix.
+    const box = $("#note");
+    if (box) {
+      box.setAttribute("role", "dialog");
+      box.setAttribute("aria-modal", "false");
+      box.setAttribute("aria-live", "assertive");
+      box.setAttribute("tabindex", "-1");
+      const first = $("#go") || $("#nogo") || box;
+      try { first.focus({ preventScroll: false }); } catch { box.focus(); }
+    }
   });
+  // Back to a status region once the question is answered, so ordinary
+  // progress messages are not announced as though they were a decision.
+  const box = $("#note");
+  if (box) {
+    box.setAttribute("role", "status");
+    box.setAttribute("aria-live", "polite");
+    box.removeAttribute("aria-modal");
+  }
   if (!answer) {
     note(`<b>${esc(label)} — cancelled.</b> Nothing was signed or sent.`, "info");
     return null;
@@ -1557,6 +1637,13 @@ async function borrow(o) {
     const collateral = big(o.collateral || t.collateral_amount);
     const { c, d } = tickers(t);
     const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
+    // The market's own price now, so the summary can say whether this loan
+    // would be liquidatable the instant it exists rather than one day.
+    const mk = (state.markets || []).find(x => x.market === t.market);
+    const price = (mk && mk.price != null && !mk.stale)
+      ? unitPrice(mk.price, mk.price_scale || t.price_scale || 100000,
+                  t.collateral_asset, t.debt_asset)
+      : null;
     const gapDays = ((Number(t.recover_after) - Number(t.maturity)) / blocksPerDay()).toFixed(0);
     const soon = state.height != null &&
       (Number(t.maturity) - state.height) < blocksPerDay();
@@ -1578,7 +1665,15 @@ async function borrow(o) {
         `Borrow ${units(t.principal, t.debt_asset)} ${d}`,
         `Lock ${units(collateral, t.collateral_asset)} ${c} as collateral ${ref(collateral, t.collateral_asset)}`,
         `Repay ${units(t.debt, t.debt_asset)} ${d} by ${whenText(t.maturity)} to get it back`,
-        `Liquidatable if ${c} falls below ${money(liq, 4)} ${d}`,
+        // ...or ALREADY. An offer whose strike sits above the current price
+        // makes a loan anyone may liquidate the moment it exists, and telling
+        // a borrower it becomes liquidatable "if" the price falls describes
+        // a future that has already happened.
+        (price != null && price < liq
+          ? `LIQUIDATABLE IMMEDIATELY: ${c} is ${money(price, 4)} ${d} and this ` +
+            `loan may be liquidated below ${money(liq, 4)} ${d}. Anyone can ` +
+            "close it the moment you open it."
+          : `Liquidatable if ${c} falls below ${money(liq, 4)} ${d}`),
         "After maturity anyone may call the loan at any price",
         `The lender may sweep the vault without an oracle after ${whenText(t.recover_after)}, ${gapDays} days past maturity`,
         ...(o.warnings || []).map(w => `Warning: ${w}`),
