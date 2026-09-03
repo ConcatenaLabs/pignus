@@ -75,5 +75,38 @@ ok("and a carry that fills the fraction moves the whole part",
 ok("a value smaller than the last shown digit reads as zero, not as nothing",
    pig.fixed(5n, 8, 2) === "0", pig.fixed(5n, 8, 2));
 
+// --- and the other direction: a typed amount into exact atoms ---------------
+//
+// The lend form multiplied a Number by a power of ten, directly beneath a
+// comment saying the amounts are computed in BigInt so no double rounding can
+// lose atoms. Above 2^53 -- about ninety million units at eight places -- it
+// lost them, so a lender's offer was funded for one atom more or less than
+// they typed, and the covenant address is derived from that number.
+{
+  const was = (t, dp) => BigInt(Math.round(Number(t) * 10 ** dp));
+  const shows = [
+    ["1", 8, 100000000n],
+    ["0.00000001", 8, 1n],
+    ["90071992.54740993", 8, 9007199254740993n],
+    ["1234567890.12345678", 8, 123456789012345678n],
+    ["1.5", 2, 150n],
+    ["7", 0, 7n],
+  ];
+  for (const [t, dp, want] of shows)
+    ok(`"${t}" at ${dp} places is ${want} atoms`,
+       pig.atomsFromDecimal(t, dp) === want,
+       String(pig.atomsFromDecimal(t, dp)));
+  ok("above 2^53 the double form was out by an atom, which is the point",
+     was("90071992.54740993", 8) !== pig.atomsFromDecimal("90071992.54740993", 8),
+     `both said ${was("90071992.54740993", 8)}`);
+  const refuses = (t, dp) => {
+    try { pig.atomsFromDecimal(t, dp); return false; } catch { return true; }
+  };
+  ok("more decimals than the asset has is refused, not truncated in silence",
+     refuses("1.555", 2));
+  ok("and so is anything that is not an amount",
+     refuses("", 8) && refuses("x", 8) && refuses("1.2.3", 8));
+}
+
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

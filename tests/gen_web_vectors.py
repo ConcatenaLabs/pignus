@@ -133,12 +133,44 @@ def btc_vectors():
     }
 
 
+def _parity_cases(lender_sec, msg):
+    """One adaptor case of each y-parity, and the parity said out loud.
+
+    The generator walks small secrets rather than drawing random ones, so the
+    file it writes is the same on every run: a vector that changes by itself
+    cannot tell a real drift from noise.
+    """
+    out, want = [], {True: 2, False: 2}
+    for i in range(2, 200):
+        t = i.to_bytes(32, "big")
+        even = A._has_even_y(A._point_mul(i))
+        if not want.get(even):
+            continue
+        want[even] -= 1
+        asig = A.encrypt_sign(lender_sec, msg, A.point(t),
+                              aux=_fixed(f"pignus/web-vectors/aux/{i}"))
+        out.append({
+            "secret_t": t.hex(),
+            "adaptor_point_x": A.point(t).hex(),
+            "adaptor_sig": asig.hex(),
+            "completed_sig": A.decrypt(asig, t).hex(),
+            "even_y": even,
+        })
+        if not any(want.values()):
+            break
+    return out
+
+
 def adaptor_vectors():
     """The field names are web/adaptor.js's own: it checks itself against these
     before a borrower acts on a release, so the names are part of the pin."""
     ln, t, _w, _b, lender_sec = loan()
     msg = _fixed("pignus/web-vectors/message")
-    asig = A.encrypt_sign(lender_sec, msg, A.point(t))
+    # A DERIVED aux, so the file is the same on every run. A vector that
+    # changes by itself cannot tell a real drift from noise, and the whole
+    # point of a golden file is that a diff means something.
+    asig = A.encrypt_sign(lender_sec, msg, A.point(t),
+                          aux=_fixed("pignus/web-vectors/aux"))
     return {
         "lender_x": A.xonly_pubkey(lender_sec).hex(),
         "adaptor_point_x": A.point(t).hex(),
@@ -147,6 +179,13 @@ def adaptor_vectors():
         "adaptor_sig": asig.hex(),
         "completed_sig": A.decrypt(asig, t).hex(),
         "bad_msg": _fixed("pignus/web-vectors/other-message").hex(),
+        # BOTH PARITIES. An adaptor point is x-only, so the point a completion
+        # is built over is its EVEN-y lift -- and about half of all secrets
+        # have an odd-y `t*G`. One vector pinned one secret, whose point
+        # happened to be even, so a browser summing the raw point instead of
+        # the lift produced a different signature for half the secrets in the
+        # world and every check here passed. Neither parity may be absent.
+        "cases": _parity_cases(lender_sec, msg),
         # A plain BIP340 signature, because that is what a borrower checks a
         # release with now. Without a case here, the one function standing
         # between them and their collateral is pinned to nothing.

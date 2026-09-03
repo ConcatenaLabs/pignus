@@ -22,7 +22,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HERE/../bin"
 PKG="$HERE/.."
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+PIDS=()
+# Kill what this drill started, not just what it wrote. It brings up a pignusd
+# for the offer-resign checks, and a trap that only removes the directory
+# leaves that daemon running on a port for the rest of the session -- so the
+# next run of the drill, or of the service drill, meets a stranger.
+cleanup() {
+    for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 key() { python3 -c "
 import sys; sys.path.insert(0, '$PKG')
@@ -574,6 +583,120 @@ echo "$AGAIN" | grep -q "already verifies" || {
     echo "re-signing an offer that is already sound did not say so" >&2
     echo "$AGAIN" | sed 's/^/  /' >&2; exit 1; }
 echo "  running it again on a sound offer says so and changes nothing"
+
+# --- the golden vectors must be reproducible --------------------------------
+#
+# A generator that draws fresh randomness writes a different file every run, so
+# `git diff` after regenerating says nothing: a real drift in the browser code
+# looks exactly like noise, and the golden file stops being golden.
+python3 - "$PKG" "$WORK" <<'GEN'
+import hashlib, os, shutil, subprocess, sys
+
+root, work = sys.argv[1], sys.argv[2]
+env = dict(os.environ)
+def digest():
+    return {f: hashlib.sha256(open(os.path.join(root, "web", f), "rb").read())
+            .hexdigest()
+            for f in ("btc_vectors.json", "adaptor_vectors.json")}
+
+before = digest()
+for f in before:
+    shutil.copy(os.path.join(root, "web", f), os.path.join(work, f))
+r = subprocess.run([sys.executable, "tests/gen_web_vectors.py"], cwd=root,
+                   capture_output=True, text=True, env=env)
+if r.returncode != 0:
+    # No covenant source is not a failing test; it is a machine that cannot
+    # run this one.
+    print("  (skipped: the vector generator needs a Sequentia source checkout)")
+    sys.exit(0)
+after = digest()
+for f in before:
+    shutil.copy(os.path.join(work, f), os.path.join(root, "web", f))
+drifted = sorted(f for f in before if before[f] != after[f])
+if drifted:
+    sys.exit(f"FAIL: regenerating changed {drifted} without any code changing, "
+             f"so a real drift could not be told from noise")
+print("  regenerating the golden vectors changes nothing, so a diff means "
+      "something")
+GEN
+
+# --- the README's test list must be the tests -------------------------------
+#
+# It says "runs everything below", and it has drifted twice: a reader deciding
+# whether a change is covered reads that list, and a test missing from it is a
+# test they conclude does not exist.
+python3 - "$PKG" <<'TESTLIST'
+import os, re, sys
+
+root = sys.argv[1]
+runner = open(os.path.join(root, "tests", "run-tests.sh")).read()
+readme = open(os.path.join(root, "README.md")).read()
+pat = r"(tests/[\w.]+\.(?:py|mjs|sh))"
+# `_psetprobe.py` is a helper another test invokes, not a test of its own.
+run = {f for f in re.findall(pat, runner) if "_psetprobe" not in f}
+listed = set(re.findall(pat, readme))
+missing = sorted(run - listed)
+if missing:
+    sys.exit(f"FAIL: run-tests.sh runs these and the README does not list "
+             f"them: {missing}")
+if len(run) < 20:
+    sys.exit(f"FAIL: only found {len(run)} tests in the runner")
+print(f"  the README lists all {len(run)} tests the runner runs")
+TESTLIST
+
+# --- a config file's values must actually be used ----------------------------
+#
+# `_btc_cfg` merged the file only where the flag was falsy, and every one of
+# these flags had a truthy default -- so `book`, `interval`, `disburse_conf`,
+# `claim_depth` and `scan_interval` in a responder config went nowhere at all.
+# An operator who set `claim_depth: 12` got 6, silently, and the deeper wait
+# they asked for never happened.
+python3 - "$BIN/pignus-cli" "$WORK" <<'CFG'
+import argparse, importlib.machinery, importlib.util, json, os, sys
+
+cli, work = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_loader(
+    "pcli_cfg", importlib.machinery.SourceFileLoader("pcli_cfg", cli))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+path = os.path.join(work, "responder-cfg.json")
+json.dump({"book": "https://elsewhere.example/lending", "interval": 60,
+           "disburse_conf": 3, "claim_depth": 12, "scan_interval": 900,
+           "lender_key": "/k", "state": "/s"}, open(path, "w"))
+
+ap = argparse.ArgumentParser()
+sub = ap.add_subparsers(dest="cmd")
+m.add_btc_commands(sub)
+
+def parsed(*argv):
+    a = ap.parse_args(["btc-respond", *argv])
+    m._btc_cfg(a)
+    return a
+
+a = parsed("--config", path)
+want = {"book": "https://elsewhere.example/lending", "interval": 60,
+        "disburse_conf": 3, "claim_depth": 12, "scan_interval": 900}
+wrong = {k: getattr(a, k) for k, v in want.items() if getattr(a, k) != v}
+if wrong:
+    sys.exit(f"FAIL: the config file was ignored for {wrong}")
+print("  a responder config file's values reach the responder")
+
+a = parsed("--config", path, "--claim-depth", "99")
+if a.claim_depth != 99:
+    sys.exit(f"FAIL: a flag did not beat the file: claim_depth={a.claim_depth}")
+if a.interval != 60:
+    sys.exit(f"FAIL: one flag wiped the rest of the file: interval={a.interval}")
+print("  a flag still beats it, and only for the one it names")
+
+a = parsed()
+base = {"book": "http://127.0.0.1:8741", "interval": 5.0, "disburse_conf": 1,
+        "claim_depth": 6, "scan_interval": 300.0}
+wrong = {k: getattr(a, k) for k, v in base.items() if getattr(a, k) != v}
+if wrong:
+    sys.exit(f"FAIL: with neither, the defaults did not apply: {wrong}")
+print("  and with neither, the built-in defaults do")
+CFG
 
 # --- a composer gets the NODE's dust threshold, never a fallback -------------
 #

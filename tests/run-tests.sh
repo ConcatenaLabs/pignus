@@ -71,6 +71,7 @@ run "browser: what the BTC borrow flow refuses" node tests/test_btcborrow_web.mj
 run "browser: what a take puts at index 1" node tests/test_takeoffer_web.mjs
 run "browser: amounts the page shows exactly" node tests/test_format_web.mjs
 run "a cached spend's depth, and a reorg under it" python3 tests/test_spend_depth.py
+run "a cross-chain offer's own end"   python3 tests/test_offer_expiry.py
 run "BTC relay: what it may be believed about" python3 tests/test_btc_relay_auth.py
 run "BTC relay + lender responder"     python3 tests/test_btc_relay.py
 run "BTC principal disbursement"       python3 tests/test_btc_disburse.py

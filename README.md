@@ -33,6 +33,36 @@ that is what makes the one check below sufficient.
 `REPAY` goes further: no oracle either, and no witness data at all. A solvent
 borrower can always leave, whatever anyone else does.
 
+## Getting it
+
+```
+git clone https://github.com/ConcatenaLabs/pignus
+cd pignus
+bin/pignus-cli --version
+```
+
+Nothing to build and nothing to install: the commands are the scripts in
+`bin/`, and Python 3.9 or later is all they need. Put `bin/` on your `PATH` if
+you would rather write `pignus-cli` than `bin/pignus-cli` -- this document
+writes the short form throughout.
+
+Anything that derives an address also needs a Sequentia **source** checkout,
+because that is where the proven covenant lives; `pignus-cli selftest` says so
+plainly if it cannot find one. It looks beside this checkout at `../Sequentia`,
+then at `~/Sequentia`, then at `vendor/sequentia`, and `SEQUENTIA_SRC` names
+one anywhere -- taken as a decision rather than a hint, so a wrong one is
+reported instead of silently falling back.
+
+```
+git clone https://github.com/ConcatenaLabs/Sequentia ../Sequentia
+bin/pignus-cli selftest
+```
+
+Commands that touch a chain need a node's RPC as well: `--rpc`, `--rpc-user`
+and `--rpc-password`, or the `PIGNUS_RPC_*` environment variables. The ones
+that only check something -- `verify`, `show`, `quote`, `address` -- need
+neither a node nor a wallet.
+
 ## The one check
 
 ```
@@ -393,8 +423,14 @@ signature and the attestation behind it are published at the oracle's
 afterwards, which is the whole of the accountability this tier has.
 `deploy/DEPLOY.md` has the procedure.
 
-Because the decision is a signature rather than a script, the borrower's only
-warning is the distance to it. The page shows every live cross-chain loan's
+Because the decision is a signature rather than a script, it can happen at any
+moment and nothing on Sequentia records it. The page therefore reads the
+BITCOIN vault itself: a loan whose collateral has left it stops offering Repay
+and says which of the three leaves took it — the borrower's own reclaim, a
+seizure, or the lender's timeout sweep — because repaying after a seizure pays
+the debt for collateral that is already gone.
+
+The borrower's only forward warning is the distance to the strike. The page shows every live cross-chain loan's
 strike and its health -- the current price over that strike, from the loan's
 own market -- and marks one whose health has gone under 1.00 as seizable now.
 A loan whose market has no current price shows no health at all rather than a
@@ -482,10 +518,20 @@ names the `openampd` (default `http://127.0.0.1:8722`, or `PIGNUS_ISSUER`) and
 is where it belongs).
 
 **OpenDAMP (Tier D)** assets cannot be collateral at all, so what Pignus offers
-is a **repurchase**: the borrower sells the asset and holds a claim, secured by
-a bond in a two-leaf covenant vault. `repo-propose` writes the terms,
-`repo-fund` pays the bond in, and `repo-forfeit` sweeps it back to the borrower
-once the deadline passes.
+is a **repurchase**: the borrower sells the asset outright and holds a claim to
+buy it back, secured by a bond in a two-leaf covenant vault.
+
+The **LENDER** funds that bond, with `repo-fund`, and it is the only thing
+standing behind their promise to sell the asset back. `repo-propose` writes the
+terms; `repo-settle` composes the buyback, which pays the bond to the lender in
+the same transaction that returns the asset; and `repo-forfeit` pays the bond to
+the BORROWER if the deadline passes with no settlement.
+
+So a forfeit is not a remedy that makes the borrower whole: they keep the bond
+and the lender keeps the asset, which is the arrangement they agreed and not a
+restoration of it. The bond is `collateral_value - debt`, so it is worth what
+the borrower would have gained by buying back, and nothing more. A borrower who
+wants the ASSET back has one route, which is the lender settling.
 
 ```
 pignus-cli repo-verify terms.json --txid <bond funding> \
@@ -524,22 +570,10 @@ pignus-cli repo-settle terms.json --txid <bond> --attach settle.json --broadcast
 that works. The borrower's debt-asset side must be a single coin and the fee
 comes out of it, because there is no room for another input.
 
-## Running it
+## Running the services
 
-The package needs a Sequentia **source** checkout, because that is where the
-proven covenant lives. It looks for one at `../Sequentia` (beside this
-checkout), at `~/Sequentia`, or vendored at `vendor/sequentia`; `SEQUENTIA_SRC`
-names one anywhere, and is taken as a decision rather than a hint, so a wrong
-one is reported instead of silently falling back.
-
-```
-tests/cli_drill.sh        # offline, no node, a few seconds
-pignus-cli selftest                      # vectors + an oracle round trip
-```
-
-`tests/test_btc_collateral.py` also needs a Bitcoin Core `bitcoind`
-(`PIGNUS_BITCOIND`, default `~/bitcoin-28.0/bin/bitcoind`), and the
-`tests/*.mjs` browser checks need Node.
+The whole test suite, and what each part of it proves, is under
+[Tests](#tests) at the end.
 
 ### The book and the page
 
@@ -728,7 +762,13 @@ Three collateral types are weaker on purpose and are labelled as such:
 
 `tests/run-tests.sh` runs everything below, fastest first, so a mistake surfaces
 in seconds rather than after a two-chain rig has finished starting. Each file's
-docstring says what it proves.
+docstring says what it proves. A quick smoke test is `tests/cli_drill.sh`
+followed by `pignus-cli selftest`: no node, a few seconds.
+
+`tests/test_btc_collateral.py` and the other two-chain tests need a Bitcoin Core
+`bitcoind` (`PIGNUS_BITCOIND`, default `~/bitcoin-28.0/bin/bitcoind`); the
+`tests/*.mjs` browser checks need Node; and `tests/page_check.sh` needs a
+headless Chromium, which it SKIPS rather than fails without.
 
 Offline, no node. This half also runs in CI on every push:
 
@@ -749,6 +789,9 @@ tests/test_btc_web.mjs             web/btc.js against web/btc_vectors.json
 tests/test_adaptor_web.mjs         web/adaptor.js against adaptor_vectors.json
 tests/test_btcborrow_web.mjs       what the browser's BTC borrow flow refuses
 tests/test_takeoffer_web.mjs       what a take puts at output index 1
+tests/test_format_web.mjs          the amounts the page shows, exactly
+tests/test_spend_depth.py          a cached spend's depth, and a reorg under it
+tests/test_offer_expiry.py         a cross-chain offer's own end
 tests/test_arith_parity.py         the same arithmetic, addresses and refusals
                                    in both languages, over a sweep
 tests/page_check.sh                the page, in a real browser; it skips

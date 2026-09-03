@@ -108,13 +108,19 @@ export function decryptAdaptor(adaptorSigHex, secretTHex) {
   const t = toBig(hexToBytes(secretTHex));
   if (!(t > 0n && t < N)) throw new Error("adaptor secret out of range");
   const R = parseCompressed(sig.slice(0, 33));
-  const T = pointMul([Gx, Gy], t);
-  // an x-only adaptor point lifts to even y; if t*G is odd, the completion
-  // scalar is n - t (see pignus.adaptor._adaptor_scalar).
-  const scalar = hasEvenY(T) ? t : (N - t);
+  const raw = pointMul([Gx, Gy], t);
+  // An adaptor point is X-ONLY, so the point this completion is built over is
+  // its EVEN-y lift -- which is what the signer used and what
+  // `pignus.adaptor.decrypt` sums with R (`_lift_x(point(secret))`). Summing
+  // the raw t*G instead gives a different x for every odd-y secret, which is
+  // about half of them, and the signature that comes out verifies under
+  // nothing. The raw point is still what decides the SCALAR: for an odd-y one
+  // the completion is n - t (see `_adaptor_scalar`).
+  const even = hasEvenY(raw) ? raw : [raw[0], FIELD - raw[1]];
+  const scalar = hasEvenY(raw) ? t : (N - t);
   const sEnc = toBig(sig.slice(33));
   const s = mod(sEnc + scalar, N);
-  const RT = pointAdd(R, T);
+  const RT = pointAdd(R, even);
   return bytesToHex(concat(xOf(RT), be32(s)));
 }
 
@@ -148,5 +154,24 @@ export function selfTest(v) {
     throw new Error(`adaptor.js decrypt differs from the vectors\n  got  ${completed}\n  want ${v.completed_sig}`);
   if (adaptorPoint(v.secret_t) !== v.adaptor_point_x)
     throw new Error("adaptor.js adaptorPoint differs from the vectors");
+  // ...and one case of EACH y-parity. An adaptor point is x-only, so a
+  // completion is built over its even-y lift; summing the raw t*G instead
+  // gives a different signature for every odd-y secret, which is about half of
+  // them. A single vector cannot see that, and did not.
+  let evens = 0, odds = 0;
+  for (const c of v.cases || []) {
+    if (!verifyAdaptor(v.lender_x, v.msg, c.adaptor_point_x, c.adaptor_sig))
+      throw new Error(`adaptor.js failed to verify the ${c.even_y ? "even" : "odd"}-y adaptor signature`);
+    const done = decryptAdaptor(c.adaptor_sig, c.secret_t);
+    if (done !== c.completed_sig)
+      throw new Error(`adaptor.js decrypt differs on an ${c.even_y ? "even" : "odd"}-y secret\n  got  ${done}\n  want ${c.completed_sig}`);
+    if (adaptorPoint(c.secret_t) !== c.adaptor_point_x)
+      throw new Error("adaptor.js adaptorPoint differs on a parity case");
+    if (c.even_y) evens++; else odds++;
+  }
+  if (!evens || !odds)
+    throw new Error(`the vectors carry ${evens} even-y and ${odds} odd-y ` +
+      `adaptor cases; both parities are needed, because summing the raw point ` +
+      `instead of its even-y lift is wrong for exactly one of them`);
   return 1;
 }

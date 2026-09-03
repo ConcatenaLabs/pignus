@@ -460,6 +460,19 @@ export async function borrow(wallet, offer, ui) {
     throw new Error("after that reclaim fee your collateral would come back " +
       "as an output too small for the network to relay, so it would never " +
       "come back at all. Nothing has been broadcast.");
+  // ...and a FLOOR, which is the half that was missing. The cap above bounds
+  // what a relay may take; nothing bounded what it may leave. A fee too small
+  // to relay makes the lender's release worthless -- it is signed over exactly
+  // one transaction, which cannot be replaced or bumped -- so the collateral
+  // would sit in the vault until the lender's own timeout sweep took it.
+  const floor = reclaimFeeFloor(heights.feerate);
+  if (reclaimFee < floor)
+    throw new Error(`this book named a reclaim fee of ${reclaimFee} satoshis ` +
+      `on a transaction of about ${RECLAIM_VSIZE} vbytes, and about ${floor} ` +
+      `is what it takes to relay one right now. The lender signs a release ` +
+      `over exactly that transaction and it can never be bumped, so at that ` +
+      `fee your collateral would never come back at all -- it would sit until ` +
+      `the lender swept it. Nothing has been broadcast.`);
 
   ui.busy(true, "asking the lender to open a loan…");
   const take = await ui.post("v1/btc/take", {
@@ -1038,9 +1051,63 @@ export async function recoverLoans(wallet, ui) {
  * "the lender took the repayment" there. Facts do not have that problem. Each
  * one below only ever becomes true, and the latest true one is the stage.
  */
+/**
+ * Which leaf of this loan's Bitcoin vault emptied it, from the witness that
+ * spent it: "reclaim", "seize", "timeout", or null.
+ *
+ * The answer is on the parent chain and needs no book to interpret it: a
+ * taproot script spend puts the leaf script itself second-from-last in the
+ * witness, and this page holds the tree. Null for a witness that names no leaf
+ * of THIS vault, which is the honest answer for a spend of something else.
+ */
+export function vaultExit(loan, witness) {
+  try {
+    const used = String((witness || [])[witness.length - 2] || "");
+    const tree = btc.fundingTree(loan);
+    for (const name of Object.keys(tree.scripts))
+      if (hex(tree.scripts[name]) === used) return name;
+  } catch { /* an unreadable witness names nothing */ }
+  return null;
+}
+
+/**
+ * Ask the book whether a live loan's Bitcoin vault is still there, and if not,
+ * which leaf emptied it.
+ *
+ * Only for a loan that is LIVE and not already finished: before the upgrade
+ * there is no vault, and afterwards the borrower's own record says how it
+ * ended. Silent on every failure -- a book that cannot answer must not turn a
+ * running loan into a seized one, and the borrower's other panels are none of
+ * this function's business.
+ *
+ * Returns true when it learned something new.
+ */
+export async function checkVault(rec, ui) {
+  if (rec.terminal || rec.vault_exit || !rec.upgrade_txid) return false;
+  let got;
+  try {
+    got = await ui.api(`v1/btc/outpoint/${rec.upgrade_txid}/0`);
+  } catch { return false; }             // no Bitcoin node, or rationed
+  if (!got || got.unspent !== false || !got.spend_txid) return false;
+  const which = vaultExit(rec.loan || {}, got.witness || []);
+  if (!which) return false;             // spent by something not of this vault
+  rec.vault_exit = which;
+  rec.vault_spent_by = got.spend_txid;
+  rememberLoan(rec);
+  return true;
+}
+
 export function stageOf(rec) {
   const done = (rec.terminal || "");
   if (done) return done;                       // reclaimed, aborted, repaid-back
+  // The vault is EMPTY and it was not this borrower who emptied it. Two of its
+  // three leaves belong to the lender -- SEIZE, which they and the oracle sign
+  // together with no price test in any script, and TIMEOUT -- so either can
+  // happen at a moment nobody tells the borrower about. Without this the loan
+  // reads `live` for ever, with a Repay button, and a borrower pays a debt for
+  // collateral that was taken before they paid it.
+  if (rec.vault_exit === "seize") return "seized";
+  if (rec.vault_exit === "timeout") return "swept";
   if (rec.principal_refund_txid) return "principal-refunded";
   if (rec.secret_t || rec.lender_claim_txid) return "repayment-claimed";
   if (rec.repay_txid) return "repaid";
@@ -1088,11 +1155,19 @@ export const MIN_ANCHOR_DEPTH = 2;
  * is to hand: a health of zero would read as "about to be seized", which is the
  * one thing it must not say when the truth is "nobody knows".
  */
-export function seizeHealth(loan, unitPriceBtc) {
+export function seizeHealth(loan, unitPriceBtc, debtPrecision = 8) {
   const strike = BigInt(loan.strike || 0);
   if (strike <= 0n || unitPriceBtc == null) return null;
   const scale = Number(loan.price_scale || 100000);
-  const strikePerBtc = (Number(strike) / scale) * 1e8 / 1e8;
+  // `strike` is debt ATOMS per collateral ATOM, times the scale. A price a
+  // person reads is whole debt units per whole Bitcoin, so getting from one to
+  // the other crosses BOTH precisions: 1e8 satoshis in a Bitcoin, and
+  // 10**debtPrecision atoms in a debt unit. Assuming eight for the second is
+  // right only for an eight-decimal debt asset -- against a six-decimal one it
+  // is out by a hundred, and this number is the whole of a borrower's
+  // liquidation warning on a tier where no script tests the price.
+  const perUnit = 10 ** Number(debtPrecision ?? 8);
+  const strikePerBtc = (Number(strike) / scale) * 1e8 / perUnit;
   if (!(strikePerBtc > 0)) return null;
   return Number(unitPriceBtc) / strikePerBtc;
 }
@@ -1101,6 +1176,32 @@ export function seizeHealth(loan, unitPriceBtc) {
 export function reclaimFeeCap(collateral) {
   return Math.min(RECLAIM_FEE_CEILING,
                   Math.max(BTC_DUST * 10, Math.floor(Number(collateral) / 5)));
+}
+
+// A reclaim is about this many vbytes: one taproot script-path input, one
+// output, and a witness carrying two signatures and a 32-byte preimage.
+export const RECLAIM_VSIZE = 150;
+// ...and the least it may pay, whatever the chain says. Below about 1 sat/vB
+// nothing relays it at all.
+export const MIN_RECLAIM_FEE = RECLAIM_VSIZE;
+
+/**
+ * The LEAST a reclaim fee may be, on a chain charging `feerateSatVb`.
+ *
+ * The lender signs a release over exactly one transaction, paying
+ * `btc_amount - fee`. It cannot be replaced and it cannot be fee-bumped, so a
+ * fee too small to relay is not a slow reclaim: it is a reclaim that never
+ * happens, and the collateral sits in the vault until the lender's own timeout
+ * sweep takes it. The fee arrives on the relay's word and is covered by no
+ * signature, so this is the borrower's only chance to refuse one.
+ *
+ * Priced from the parent chain where a feerate is to hand, and from the
+ * relay floor where it is not -- never from nothing.
+ */
+export function reclaimFeeFloor(feerateSatVb) {
+  const r = Number(feerateSatVb);
+  const priced = Number.isFinite(r) && r > 0 ? Math.ceil(r * RECLAIM_VSIZE) : 0;
+  return Math.max(MIN_RECLAIM_FEE, priced);
 }
 
 export function effectiveRepayDeadline(loan) {
@@ -1143,6 +1244,22 @@ export function nextStep(rec, heights) {
       return { action: "abort", label: "Take the collateral back",
                note: "The principal went back to the lender unclaimed, so " +
                      "there is no loan. " + abortable };
+    case "seized":
+      return { action: null, label: "", terminal: true,
+               note: "Your collateral was SEIZED: the lender and the oracle " +
+                     "signed together, which on this tier is the whole of a " +
+                     "liquidation -- no script tests the price. Do not repay: " +
+                     "the debt would pay for collateral that is already gone. " +
+                     "The price it was meant to be justified below is this " +
+                     "loan's strike, and the attestation behind it is " +
+                     "published at the oracle's /v1/seizures, so a seizure " +
+                     "that was not justified is visible to anyone." };
+    case "swept":
+      return { action: null, label: "", terminal: true,
+               note: "The lender swept your collateral at the timeout, which " +
+                     "opens when a loan was not repaid and reclaimed in time. " +
+                     "Do not repay: the debt would pay for collateral that is " +
+                     "already gone." };
     case "live":
       return { action: "repay", label: "Repay",
                note: "Repay before Sequentia block " +
