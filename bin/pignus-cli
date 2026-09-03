@@ -2417,6 +2417,24 @@ def cmd_btc_disburse(args):
     return 0
 
 
+def _secret_opens(tk, secret_hex):
+    """True when `secret_hex` is the preimage this loan's hash was built on.
+
+    The one fact in a lender's report that needs no lender: hash it and look.
+    """
+    h = str(tk.get("payment_hash", "")).lower()
+    if not h:
+        return False
+    try:
+        raw = bytes.fromhex(str(secret_hex or ""))
+    except ValueError:
+        return False
+    # Only a ValueError from the hex, and nothing else: a broad catch here
+    # would turn a mistake in this function into a silent "no secret", which
+    # is the failure this whole check exists to avoid.
+    return bool(raw) and _sha256(raw) == h
+
+
 def _refresh_from_book(args, tk):
     """Pull the LENDER's reported steps into a ticket, from a relay.
 
@@ -2460,6 +2478,15 @@ def _refresh_from_book(args, tk):
                             "upgrade_txid": "upgraded_auth",
                             "claim_txid": "claimed_auth"}[field], ""))
         if not R.verify_report(lender_x, tag, take_id, auth, **fields(got)):
+            # A SECRET is the exception, because it proves itself: it either
+            # hashes to this loan's payment hash or it does not, and no
+            # signature could make a wrong one right or a right one wrong.
+            # Withholding a hash-checked secret over a missing signature would
+            # cost a borrower their collateral for a formality.
+            if field == "claim_txid" and _secret_opens(tk, got.get("secret_t")):
+                tk["secret_t"] = str(got["secret_t"]).lower()
+                pulled.append("secret_t")
+                continue
             print(f"the relay's {field} for this take is not signed by this "
                   f"loan's lender, so it will not be believed. Ask the lender "
                   f"for the outpoint directly.", file=sys.stderr)
@@ -3993,7 +4020,18 @@ def cmd_btc_respond(args):
                   "/v1/btc/refunded"))
         for _offer, tk, have in our_takes(offers):
             for field, flag, tag, path in facts:
-                if not have.get(field) or have.get(flag):
+                if not have.get(field):
+                    continue
+                # Re-send when this responder never got a 200 -- and ALSO when
+                # the relay is holding the fact without the signature that
+                # proves it. A borrower rebuilding their loan from a book
+                # checks each of a lender's steps against the lender's own key
+                # and refuses one it cannot check, so a report the relay
+                # recorded before it kept signatures leaves that borrower with
+                # no way forward. Re-sending it costs one request and repairs
+                # them.
+                auth_field = path.rsplit("/", 1)[1].replace("-", "_") + "_auth"
+                if have.get(flag) and tk.get(auth_field):
                     continue
                 fields = {"txid": have[field]}
                 if path.endswith("disbursed"):
