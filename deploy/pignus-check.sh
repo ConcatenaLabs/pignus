@@ -140,6 +140,44 @@ raise SystemExit(1 if problems else 0)
     fi
 fi
 
+# The set above is CONFIGURATION, and configuration drifts: a threshold oracle
+# enabled without being added here is one nothing watches, and the first thing
+# to notice would be an m-of-n loan that cannot be liquidated. The book knows
+# which keys it quotes, and each oracle says which key it holds, so the two are
+# compared rather than trusted to have been kept in step by hand. This also
+# catches an oracle serving a DIFFERENT key from the one its loans were written
+# against, which looks like nothing at all until a liquidation is refused.
+checked_keys=""
+for o in $ORACLES; do
+    k=$(curl -sS --max-time 10 "$o/v1/pubkey" 2>/dev/null \
+        | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("oracle_x", ""))
+except Exception: pass' 2>/dev/null)
+    [ -n "$k" ] && checked_keys="$checked_keys $k"
+done
+quoted=$(curl -sS --max-time 10 "$BOOK/v1/oracles" 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(" ".join(json.load(sys.stdin).get("oracles") or []))
+except Exception: pass' 2>/dev/null)
+if [ -z "$quoted" ]; then
+    bad "the book ($BOOK) would not say which oracles it quotes, so whether \
+this check covers them is unknown"
+else
+    missing=""
+    for q in $quoted; do
+        case " $checked_keys " in
+            *" $q "*) ;;
+            *) missing="$missing $q" ;;
+        esac
+    done
+    if [ -n "$missing" ]; then
+        bad "the book quotes oracle key(s)$missing and nothing here checks \
+them; add each one's URL to PIGNUS_ORACLES in pignus-check.service"
+    else
+        ok "every oracle key the book quotes belongs to an oracle checked above"
+    fi
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "pignus check passed"

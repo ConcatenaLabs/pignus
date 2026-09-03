@@ -335,10 +335,13 @@ market that is not cross-chain must have a price signed within
 `PIGNUS_MAX_PRICE_AGE` seconds, with no market disagreeing with the registry
 about how many decimals its assets have. `pignus-check.timer` runs it every
 five minutes and `pignus-check.service` carries the endpoints and that age as
-environment: add each threshold oracle's port to `PIGNUS_ORACLES` there, and
-keep `PIGNUS_MAX_PRICE_AGE` equal to `max_price_age` in `pignusd.json`, since a
-check looser than the book's own limit reports healthy while the book is already
-withholding prices. A failed run shows in `systemctl list-units --failed` and in
+environment: `PIGNUS_ORACLES` names every oracle's port, and
+`PIGNUS_MAX_PRICE_AGE` stays equal to `max_price_age` in `pignusd.json`, since
+a check looser than the book's own limit reports healthy while the book is
+already withholding prices. It also asks the book which oracle keys it quotes
+and fails if `PIGNUS_ORACLES` does not cover them all, so an oracle enabled and
+never added here is reported rather than left unwatched until a liquidation
+needs it. A failed run shows in `systemctl list-units --failed` and in
 the journal, and nowhere else until an alerting unit is named in the commented
 `OnFailure=` at the top of `pignus-check.service`.
 
