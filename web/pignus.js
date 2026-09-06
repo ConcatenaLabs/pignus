@@ -366,7 +366,7 @@ const OP = {
   NIP: 0x77, SWAP: 0x7c, ROT: 0x7b, EQUAL: 0x87, EQUALVERIFY: 0x88,
   ONEADD: 0x8b, ADD: 0x93, LESSTHAN: 0x9f, GREATERTHANOREQUAL: 0xa2,
   VERIFY: 0x69, IF: 0x63, ELSE: 0x67, ENDIF: 0x68, CHECKSIG: 0xac,
-  SHA256: 0xa8,
+  SHA256: 0xa8, SIZE: 0x82,
   CLTV: 0xb1, CSFS: 0xc1, CSFSV: 0xc2, INSPECTINPUTVALUE: 0xc9,
   INSPECTINPUTSCRIPTPUBKEY: 0xca, PUSHCURRENTINPUTINDEX: 0xcd,
   INSPECTOUTPUTASSET: 0xce, INSPECTOUTPUTVALUE: 0xcf,
@@ -539,6 +539,15 @@ function hashlockLeaf(preimageHash, asset, payeeProg, payeeVer) {
   if (preimageHash.length !== 32)
     throw new Error("a SHA-256 commitment is 32 bytes");
   const s = new ScriptBuilder();
+  // The preimage must be exactly 32 bytes, said before anything is hashed.
+  // OP_SHA256 hashes a stack item of any length, so without this a claimant
+  // who chose a 33-byte secret spends the output just as validly -- and the
+  // secret then has to cross to the OTHER chain, where the party waiting for
+  // it looks for 32 bytes and where a long preimage makes the Bitcoin spend it
+  // unlocks non-standard. The claimant is paid here and the counterparty is
+  // left with nothing that starts or finishes their side. Byte for byte the
+  // node repository's builder: 32 is a one-byte script number, pushed as data.
+  s.op(OP.SIZE).push(Uint8Array.from([32])).op(OP.EQUALVERIFY);
   s.op(OP.SHA256).push(preimageHash).op(OP.EQUALVERIFY);
   return sweepBody(s, asset, payeeProg, payeeVer).bytes();
 }

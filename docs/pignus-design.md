@@ -535,7 +535,12 @@ The principal is paid into a hashlocked Sequentia output of the same shape as
 the repayment: CLAIM pays the borrower against `w`, REFUND returns it to the
 lender after `d_refund`. Both Sequentia outputs use the covenant's
 `build_hashlock_leaf`, so **neither leg needs a signature** and neither can pay
-anyone but the party its address already names. That is what lets a browser
+anyone but the party its address already names. The leaf also pins the
+preimage's size -- `OP_SIZE 32 OP_EQUALVERIFY` before the hash -- because
+OP_SHA256 will hash a stack item of any length, and a secret of any other
+length would be paid here and then be useless on the chain it has to cross to:
+the party waiting there looks for 32 bytes, and a long preimage makes the
+Bitcoin spend it unlocks non-standard. That is what lets a browser
 drive the whole thing: the wallet extension signs its own inputs and a Bitcoin
 sighash, but no Sequentia covenant leaf, and here it does not have to.
 
