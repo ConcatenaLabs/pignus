@@ -315,6 +315,12 @@ def main():
             # same conclusion the book did and broadcast nothing: this is the
             # only thing between "the liquidator works" and "the liquidator
             # spends somebody's collateral on a price it never checked".
+            #
+            # The node must publish a fee rate for the DEBT asset, or the
+            # bot cannot restate a fee paid in another asset into the units
+            # its profit is measured in and refuses to decide -- correctly,
+            # and a dry run that "ran clean" on that refusal proved nothing.
+            n.setfeeexchangerates({d: 100_000_000}, False)
             bot = subprocess.run(
                 [sys.executable, os.path.join(BIN, "pignus-liquidator"),
                  "--once", "--dry-run", "--book", book,
@@ -335,10 +341,26 @@ def main():
                   "broadcast" not in bot.stderr
                   and get(f"{book}/v1/loan/{l2['loan_id']}")["state"] == "LIVE",
                   bot.stderr[-200:])
+            check("and priced the fee, so the decision was a real one",
+                  "fee=?" not in bot.stderr and "profit=" in bot.stderr
+                  and "skip:" not in bot.stderr, bot.stderr[-300:])
 
             before = bw.getbalances()["mine"]["trusted"].get(c, 0)
-            cli("liquidate", "--loan", l2["loan_id"], wallet="pignus", rig=rig,
-                book=book)
+            # The bot's LIVE path, which nothing else runs: coin selection,
+            # the preparing sends, the covenant spend and the broadcast, from
+            # the bot's own wallet against the live book. A dry run proves
+            # the decision; only this proves the seizure.
+            live = subprocess.run(
+                [sys.executable, os.path.join(BIN, "pignus-liquidator"),
+                 "--once", "--book", book,
+                 "--oracle", f"http://127.0.0.1:{oracle_port}",
+                 "--taker-address", n.getnewaddress(),
+                 "--rpc", f"http://127.0.0.1:{rig.seq_rpcport}",
+                 "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS,
+                 "--rpc-wallet", "pignus"], capture_output=True, text=True)
+            check("the liquidation bot seizes loan 2 for real",
+                  live.returncode == 0 and "broadcast" in live.stderr,
+                  live.stderr[-400:])
             rig.seq_mine(1)
             st = wait_for(lambda: get(f"{book}/v1/loan/{l2['loan_id']}")
                           ["state"] == "LIQUIDATED")
