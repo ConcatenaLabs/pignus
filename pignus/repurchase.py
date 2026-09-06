@@ -393,6 +393,121 @@ class RepurchaseTerms:
         return o
 
 
+def _explicit(vch, what, kind):
+    """An explicit asset id (display order) or value from a commitment field."""
+    if not vch or vch[0] != 1:
+        raise ValueError(f"{what} is {kind}-blinded; a settlement is explicit "
+                         f"everywhere, because two covenants read it")
+    if kind == "asset":
+        return vch[1:33][::-1].hex()
+    return int.from_bytes(vch[1:9], "big")
+
+
+def inspect_settlement(tx_hex, prevouts, terms, lender_cu=None):
+    """What a settlement pays whom, judged against the terms.
+
+    The lender signs the settlement's OpenDAMP inputs with a tool that signs
+    whatever it is handed, and the one output no covenant checks is the
+    borrower's payment of `debt` (RETURN inspects the asset and the bond, and
+    those two slots are all it has). The design rests on the lender not
+    signing a transaction missing what they are owed; this is how they look.
+
+    `prevouts` are the four spent outputs as the skeleton document carries
+    them. Returns (problems, summary): an empty list means every output is
+    where the terms say, in the amount they say, and the summary says what
+    each party receives.
+    """
+    from .vault import _tf, payout_spk
+    m, _ = _tf()
+    t = terms
+    problems = []
+    tx = m.tx_from_hex(tx_hex)
+    try:
+        check_settlement(len(tx.vin), len(tx.vout))
+    except ValueError as e:
+        return [str(e)], {}
+    if len(prevouts) != len(tx.vin):
+        return [f"the document carries {len(prevouts)} prevouts for "
+                f"{len(tx.vin)} inputs"], {}
+    for i, p in enumerate(prevouts):
+        for k in ("asset", "value", "script_pubkey"):
+            if k not in p:
+                return [f"prevout {i} has no `{k}`"], {}
+    outs = []
+    for i, o in enumerate(tx.vout):
+        try:
+            outs.append((_explicit(o.nAsset.vchCommitment, f"output {i}", "asset"),
+                         _explicit(o.nValue.vchCommitment, f"output {i}", "value"),
+                         o.scriptPubKey.hex()))
+        except ValueError as e:
+            return [str(e)], {}
+    cu_spk, lender_spk, _forfeit = (payout_spk(1, t.borrower_cu).hex(),
+                                    payout_spk(t.lender_ver, t.lender_prog).hex(),
+                                    None)
+    v0 = prevouts[0]
+    if outs[0] != (str(v0["asset"]), int(v0["value"]), str(v0["script_pubkey"])):
+        problems.append("output 0 does not return the verifier's coin as it "
+                        "came: same asset, amount and script as input 0")
+    if str(v0["asset"]) in (t.collateral_asset, t.debt_asset):
+        problems.append("input 0 carries the repurchase's own asset, so it is "
+                        "not the OpenDAMP verifier")
+    v1 = prevouts[1]
+    if str(v1["script_pubkey"]) != t.script_pubkey().hex():
+        problems.append("input 1 does not spend the bond vault these terms "
+                        "compile to")
+    if str(v1["asset"]) != t.debt_asset:
+        problems.append("input 1 (the bond) is not in the debt asset")
+    held = int(v1["value"])
+    v2 = prevouts[2]
+    if str(v2["asset"]) != t.collateral_asset or int(v2["value"]) != t.collateral_amount:
+        problems.append(f"input 2 must be the lender's C_U holding exactly "
+                        f"{t.collateral_amount} atoms of the asset under "
+                        f"repurchase; it holds {v2['value']} of "
+                        f"{str(v2['asset'])[:12]}...")
+    if lender_cu and str(v2["script_pubkey"]) != payout_spk(1, lender_cu).hex():
+        problems.append("input 2 is not the C_U named with --lender-cu")
+    if str(prevouts[3]["asset"]) != t.debt_asset:
+        problems.append("input 3 (the borrower's payment) is not in the debt asset")
+    a1, val1, spk1 = outs[1]
+    if a1 != t.debt_asset or spk1 != lender_spk:
+        problems.append("output 1 does not pay the debt asset to the lender's "
+                        "payout address")
+    elif val1 < int(t.debt):
+        problems.append(f"output 1 pays {val1} atoms; the debt is {t.debt}")
+    a2, val2, spk2 = outs[2]
+    if a2 != t.collateral_asset or spk2 != cu_spk or val2 != t.collateral_amount:
+        problems.append(f"output 2 must pay {t.collateral_amount} atoms of the "
+                        f"asset to C_U(borrower)")
+    a3, val3, spk3 = outs[3]
+    if a3 != t.debt_asset or spk3 != lender_spk:
+        problems.append("output 3 does not pay the bond to the lender's "
+                        "payout address")
+    elif val3 != held:
+        problems.append(f"output 3 pays {val3} atoms; the vault holds {held}")
+    stray = [i for i, (a, _v, _s) in enumerate(outs)
+             if a == t.collateral_asset and i != 2]
+    if stray:
+        problems.append(f"the asset under repurchase also leaves through "
+                        f"output(s) {stray}; all of it goes to C_U(borrower)")
+    fee = outs[-1]
+    if fee[2] != "":
+        problems.append("the last output is not the fee output")
+    elif fee[0] != t.debt_asset:
+        problems.append("the fee is not paid in the debt asset")
+    change = outs[4] if len(outs) == 6 else None
+    if change is not None and change[0] != t.debt_asset:
+        problems.append("output 4 (the borrower's change) is not in the debt asset")
+    summary = {
+        "debt_to_lender": val1, "bond_to_lender": val3, "bond_held": held,
+        "asset_to_borrower": val2, "fee": fee[1],
+        "change": change[1] if change else 0,
+        "change_spk": change[2] if change else None,
+        "locktime": int(tx.nLockTime),
+        "lender_spk": lender_spk, "borrower_cu_spk": cu_spk,
+    }
+    return problems, summary
+
+
 def settlement_shape(consolidated_debt_input: bool) -> dict:
     """What the settlement transaction must look like, and why it has no slack.
 

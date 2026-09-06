@@ -1276,8 +1276,39 @@ def cmd_repo_settle(args):
     """
     from pignus import repurchase as R
     from pignus.vault import wallet_payout
-    node = node_from(args)
     t = _repo_terms(args)
+
+    if args.inspect:
+        # The LENDER's look before signing. No node: the document carries the
+        # four spent outputs, and the terms say where everything must go.
+        with open(args.inspect) as f:
+            text = f.read().strip()
+        try:
+            doc = json.loads(text)
+            raw, prevouts = str(doc["tx"]), list(doc["prevouts"])
+        except (ValueError, KeyError, TypeError):
+            refuse("--inspect takes the document repo-settle --skeleton wrote: "
+                   "`tx` and `prevouts`")
+        _check_settlement_vault(raw, t, args)
+        problems, summary = R.inspect_settlement(raw, prevouts, t,
+                                                 lender_cu=args.lender_cu)
+        if problems:
+            for pr in problems:
+                print(f"  NOT what the terms say: {pr}", file=sys.stderr)
+            print("do not sign this", file=sys.stderr)
+        else:
+            print(f"this settlement pays the lender {summary['debt_to_lender']} "
+                  f"atoms of {t.debt_asset[:12]}... (the debt) and releases the "
+                  f"{summary['bond_to_lender']}-atom bond to them; "
+                  f"{summary['asset_to_borrower']} atoms of "
+                  f"{t.collateral_asset[:12]}... go home to C_U(borrower); fee "
+                  f"{summary['fee']}, change {summary['change']}, locktime "
+                  f"{summary['locktime']}. Every output is where the terms say.",
+                  file=sys.stderr)
+        print(json.dumps({"ok": not problems, "problems": problems, **summary}))
+        return 0 if not problems else 4
+
+    node = node_from(args)
 
     if args.attach:
         raw = args.attach
@@ -6719,6 +6750,14 @@ def main():
                         "stdout: the transaction, with this wallet's debt "
                         "coin signed, and the four outputs it spends, which "
                         "is what `opendamp transfer-cosign` takes")
+    p.add_argument("--inspect", metavar="FILE",
+                   help="the lender's look before signing: what the skeleton "
+                        "document pays whom, judged against the terms; exits "
+                        "4 if anything is not where the terms say. Needs no "
+                        "node")
+    p.add_argument("--lender-cu", metavar="HEX", default=None,
+                   help="with --inspect: the lender's own C_U program, to "
+                        "check input 2 is theirs")
     p.add_argument("--attach", metavar="FILE|HEX",
                    help="the settlement once every other party has signed "
                         "it (the document transfer-cosign wrote, or hex): "

@@ -1083,7 +1083,10 @@ on the collateral and the bond -- so it must never be made outside the RETURN
 transaction. It does not need to be checked, because the transaction cannot
 confirm without both parties: the lender's `C_U(lender)` input is a Simplicity
 spend under the lender's key, the borrower signs the input funding the debt,
-and neither lets a transaction missing what they are owed go out. What signs
+and neither lets a transaction missing what they are owed go out. On the
+lender's side that is `repo-settle --inspect`, which judges the skeleton
+document against the terms, output by output, with no node, and exits 4 rather
+than let a settlement paying the debt elsewhere go on to be signed. What signs
 the two Simplicity inputs -- the verifier at input 0 and `C_U(lender)` at
 input 2 -- is `opendamp transfer-cosign`, the OpenDAMP transfer tool's command
 for a transaction it did not build; this repository signs neither. The full
