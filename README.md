@@ -717,7 +717,12 @@ pignus-cli repo-settle terms.json --txid <bond> --attach settle.json --broadcast
 
 `--skeleton` writes the unsigned settlement for the other party to sign;
 `--attach` puts the covenant's `RETURN` witness on last, which is the only order
-that works. The borrower's debt-asset side must be a single coin and the fee
+that works. `repo-settle`, `repo-forfeit` and `repo-verify` all FIND the bond:
+left without `--vout`, they take the unspent output of the funding
+transaction that pays the address the terms compile to, so the lender's own
+change at index 0 is never mistaken for a spent bond. Name `--vout` only to
+tell a settled or forfeited bond from one that was never funded, which a scan
+cannot. The borrower's debt-asset side must be a single coin and the fee
 comes out of it, because there is no room for another input.
 
 ## Running the services
