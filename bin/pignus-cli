@@ -4755,9 +4755,9 @@ def cmd_btc_respond(args):
         all there is and moving it can only cost the borrower their own loan.
         """
         out = []
-        served = set()
+        served = {}
         for tk in book_get(args.book, "/v1/btc/takes")["takes"]:
-            served.add(tk.get("take_id"))
+            served[tk.get("take_id")] = tk
             if status is not None and tk.get("status") != status:
                 continue
             offer = offers.get(tk.get("btc_offer_id"))
@@ -4777,20 +4777,27 @@ def cmd_btc_respond(args):
         # `requested` until pruned, a month on. So a take still at the very
         # start whose OFFER is no longer open is over too, and so is one
         # that has sat there past the relay's own lot-holding window.
+        # Judged over EVERY take the relay serves, not only those whose offer
+        # verifies under this key today: whether a take is over is a fact
+        # about the chain and this key's own record, and an offer that has
+        # stopped verifying -- served under an old id, say -- must not keep
+        # a wait alive on a take that nothing will ever act on.
         now_ts = int(time.time())
         seq_now = seq_height() if seq_node is not None else 0
         ended = set()
         over = set()
-        for o, tk, _h in out:
+        for take_id, tk in served.items():
+            _h = state.get(take_id) or {}
+            o = offers.get(tk.get("btc_offer_id")) or {}
             st = str(tk.get("status", ""))
             d_refund = int((tk.get("loan") or {}).get("d_refund") or 0)
             if st not in ("requested", "reserved", "pending", "signed",
                           "disbursed", "live"):
-                ended.add(tk["take_id"])
+                ended.add(take_id)
             elif st in ("requested", "reserved") and (
                     str(o.get("status", "open")) != "open"
                     or now_ts - int(tk.get("created") or now_ts) > 3600):
-                ended.add(tk["take_id"])
+                ended.add(take_id)
             elif st in ("pending", "signed") and not _h.get("disbursement_txid") \
                     and not _h.get("disbursing") and seq_now and d_refund \
                     and seq_now > d_refund:
@@ -4802,8 +4809,8 @@ def cmd_btc_respond(args):
                 # it, the disburse pass would re-check the deadlines every
                 # minute and record the same refusal again, which is a wait
                 # the timer reads as a person needed, for ever.
-                ended.add(tk["take_id"])
-                over.add(tk["take_id"])
+                ended.add(take_id)
+                over.add(take_id)
         # A take written off is not this key's to act on, in any pass; nor is
         # one that is over.
         out = [(o, tk, h) for o, tk, h in out
