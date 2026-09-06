@@ -2830,6 +2830,24 @@ class Handler(BaseHTTPRequestHandler):
                                  "spoken for; try again later or find another"})
                 loan, dest, problems = s.btc_check_take(offer, body)
                 from pignus import btc_collateral as BC
+                from pignus import btc_relay as R
+                # The borrower's signature over what they are taking. It is
+                # what a seizure is later judged against, so it is required
+                # here rather than left for a lender to ask for afterwards.
+                take_auth = str(body.get("take_auth") or "")
+                if not take_auth:
+                    raise ValueError("a take needs `take_auth`: the borrower's "
+                                     "signature over the offer id and the "
+                                     "terms they chose")
+                if not R.verify_take(loan.borrower_x, take_auth,
+                                     btc_offer_id=offer["btc_offer_id"],
+                                     borrower_x=loan.borrower_x, h_w=loan.h_w,
+                                     borrower_prog=loan.borrower_prog,
+                                     borrower_ver=loan.borrower_ver,
+                                     prevault_txid=body["prevault_txid"],
+                                     prevault_vout=body["prevault_vout"]):
+                    raise ValueError("that take_auth does not verify against "
+                                     "the borrower's key over this take")
                 # The check above is a courtesy that answers early. This is the
                 # one that decides: the last lot, the funding outpoint and the
                 # commitment are all claimed under one lock, with the insert,
@@ -2847,6 +2865,7 @@ class Handler(BaseHTTPRequestHandler):
                          "prevault_spk": loan.prevault_spk().hex(),
                          "reclaim_dest": dest,
                          "reclaim_fee": int(body.get("reclaim_fee", 3000)),
+                         "take_auth": take_auth,
                          "disbursement_spk": loan.disbursement_spk().hex(),
                          "status": "requested",
                          "warnings": problems},

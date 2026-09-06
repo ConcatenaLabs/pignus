@@ -504,10 +504,19 @@ class BulkHttpPriceSource(PriceSource):
             raise KeyError(
                 f"{symbol} is not in {self.url} "
                 f"(have: {', '.join(sorted(self._snapshot)[:12])})")
+        # `bool` is an int to Python, and a feed answering `true` where a
+        # number belongs -- an error flag from a JavaScript feed, say -- would
+        # be signed as a price of exactly 1. Every loan on that market would
+        # then be liquidatable against a number nobody observed.
+        if isinstance(row, bool):
+            raise ValueError(f"{symbol} is a boolean in {self.url}, not a price")
         if isinstance(row, (int, float)):
             return float(row)
         if self.field not in row:
             raise KeyError(f"{symbol} has no '{self.field}' field: {row}")
+        if isinstance(row[self.field], bool):
+            raise ValueError(f"{symbol}'s '{self.field}' is a boolean in "
+                             f"{self.url}, not a price")
         return float(row[self.field])
 
 
@@ -540,6 +549,8 @@ class HttpPriceSource(PriceSource):
             return hit[1]
         with urllib.request.urlopen(url, timeout=self.timeout) as r:
             data = json.loads(r.read().decode())
+        if isinstance(data, bool):
+            raise ValueError(f"{url} returned a boolean, not a price")
         if isinstance(data, (int, float)):
             return float(data)
         if self.field not in data:

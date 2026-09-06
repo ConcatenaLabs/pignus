@@ -123,7 +123,7 @@ def main():
               os.path.exists(f"{lk}.t.{tk['h_w'][:16]}"))
 
         run("btc-originate", ticket, "--borrower-key", bk, *btc)
-        rig.btc_mine(1)
+        rig.btc_mine(2)          # two deep: what a principal is paid against
         tk = json.load(open(ticket))
         check("the borrower verified the release and committed the collateral",
               rig.btc.gettxout(tk["prevault_txid"], tk["prevault_vout"]) is not None)
@@ -214,8 +214,12 @@ def main():
         # working would break them with a "no such command".
         run("btc-adaptor", t3, "--lender-key", lk)
         run("btc-originate", t3, "--borrower-key", bk, *btc)
-        rig.btc_mine(1)
-        run("btc-disburse", t3, *seq, *btc)
+        rig.btc_mine(2)          # two deep: what a principal is paid against
+        # --force: this loan's deadlines are deliberately unsafe (the sweep
+        # opens before the collateral stops being abortable, which is what the
+        # scenario below needs), and btc-disburse refuses such a loan unless
+        # told the lender understands that.
+        run("btc-disburse", t3, "--force", *seq, *btc)
         rig.seq_mine(1)
         run("btc-claim-principal", t3, "--borrower-key", bk, *seq)
         rig.seq_mine(2)

@@ -677,11 +677,17 @@ echo "-- an offer that stops verifying under its own key"
 DPORT2=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
 LKEY2="$WORK/disowned.key"
 "$BIN/pignus-cli" btc-keygen --out "$LKEY2" >/dev/null
-python3 - "$LKEY2" "$WORK/disowned-book.json" <<'DISOWN'
+# Under its REAL id -- the hash of the terms, which is the only id a relay ever
+# serves an offer under. A responder refuses an offer served under any other
+# id, since a lot cap counted per id would count one offer served under two
+# ids twice; a fixture seeded under a made-up id would be refused for that and
+# never reach the check this section is about.
+DIS_ID=$(python3 - "$LKEY2" "$WORK/disowned-book.json" <<'DISOWN'
 import json, sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, ".")
 from pignus import adaptor as A
+from pignus import btc_relay as R
 sec = bytes.fromhex(open(sys.argv[1]).read().strip())
 lender_x = A.xonly_pubkey(sec).hex()
 loan = {"btc_amount": "100000", "lender_x": lender_x, "oracle_x": "cc" * 32,
@@ -693,13 +699,16 @@ loan = {"btc_amount": "100000", "lender_x": lender_x, "oracle_x": "cc" * 32,
         "payment_hash": "", "adaptor_point": "", "h_w": ""}
 # Signed over SOMETHING ELSE, which is what an offer published under an older
 # canonical form looks like to a responder reading it today.
+oid = R.offer_id(loan, "BTC/USDX", 1)
 pathlib.Path(sys.argv[2]).write_text(json.dumps({
     "loans": {}, "offers": {}, "btc_takes": {}, "btc_commitments": {},
-    "btc_offers": {"1" * 24: {
-        "btc_offer_id": "1" * 24, "loan": loan, "market": "BTC/USDX",
+    "btc_offers": {oid: {
+        "btc_offer_id": oid, "loan": loan, "market": "BTC/USDX",
         "lots": 1, "offer_sig": "00" * 64, "responder": "", "note": "",
         "status": "open", "created": 1799990000}}}))
+print(oid)
 DISOWN
+)
 cat > "$WORK/disowned-cfg.json" <<J
 {"listen":"127.0.0.1:$DPORT2","book":"$WORK/disowned-book.json",
  "oracle":"","registry":"","poll":3600,"markets":[]}
@@ -715,7 +724,7 @@ set +e
 OUT=$("$BIN/pignus-cli" btc-responder-status --lender-key "$LKEY2"         --state "$WORK/disowned.state.json"         --book "http://127.0.0.1:$DPORT2" 2>&1)
 rc=$?
 set -e
-echo "$OUT" | grep -q "111111111111111111111111" || {
+echo "$OUT" | grep -q "$DIS_ID" || {
     echo "the status did not name the offer that stopped verifying" >&2
     echo "$OUT" | sed 's/^/  /' >&2; exit 1; }
 test "$rc" = "4" || {
@@ -728,7 +737,7 @@ echo "  the status names it and exits 4, rather than reporting a quiet night"
 # only ever replace a signature with one that checks out: it cannot change a
 # term, and nobody without the key can use it.
 set +e
-BAD=$("$BIN/pignus-cli" btc-offer-resign --offer 111111111111111111111111 \
+BAD=$("$BIN/pignus-cli" btc-offer-resign --offer "$DIS_ID" \
         --lender-key "$WORK/lender.key" --book "http://127.0.0.1:$DPORT2" 2>&1)
 rc=$?
 set -e
@@ -740,7 +749,7 @@ echo "$BAD" | grep -q "only the lender an offer names" || {
     echo "$BAD" | sed 's/^/  /' >&2; exit 1; }
 echo "  a key the offer does not name cannot re-sign it"
 
-"$BIN/pignus-cli" btc-offer-resign --offer 111111111111111111111111 \
+"$BIN/pignus-cli" btc-offer-resign --offer "$DIS_ID" \
     --lender-key "$LKEY2" --book "http://127.0.0.1:$DPORT2" >/dev/null
 OUT=$("$BIN/pignus-cli" btc-responder-status --lender-key "$LKEY2" \
         --state "$WORK/disowned.state.json" \
@@ -752,7 +761,7 @@ echo "  and its own lender repairs it with one signature, changing no term"
 
 # Twice is a no-op rather than an error: an operator running the repair over
 # every offer they hold should not have to know which ones needed it.
-AGAIN=$("$BIN/pignus-cli" btc-offer-resign --offer 111111111111111111111111 \
+AGAIN=$("$BIN/pignus-cli" btc-offer-resign --offer "$DIS_ID" \
           --lender-key "$LKEY2" --book "http://127.0.0.1:$DPORT2" 2>&1)
 echo "$AGAIN" | grep -q "already verifies" || {
     echo "re-signing an offer that is already sound did not say so" >&2
@@ -929,7 +938,7 @@ if a.interval != 60:
 print("  a flag still beats it, and only for the one it names")
 
 a = parsed()
-base = {"book": "http://127.0.0.1:8741", "interval": 5.0, "disburse_conf": 1,
+base = {"book": "http://127.0.0.1:8741", "interval": 5.0, "disburse_conf": 2,
         "claim_depth": 6, "scan_interval": 300.0}
 wrong = {k: getattr(a, k) for k, v in base.items() if getattr(a, k) != v}
 if wrong:

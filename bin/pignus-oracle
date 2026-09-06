@@ -708,7 +708,25 @@ class Handler(BaseHTTPRequestHandler):
             att = o.latest.get(market)
             error = o.errors.get(market)
         if att is None:
-            att = o.log.latest(market)
+            # The fallback reads the log files END TO END, every one of them,
+            # and this endpoint is public. A market whose feed is down has no
+            # attestation in memory, so a client asking for it in a loop had
+            # this process reading its whole archive off disk for each request
+            # while the signing thread waited for the disk. So the fallback is
+            # rationed like the other archive reads, and a miss is remembered
+            # for a minute rather than searched for again on the next request.
+            if not self._archive_ok():
+                return
+            miss = getattr(o, "_disk_miss", None)
+            if miss is None:
+                miss = o._disk_miss = {}
+            now = time.time()
+            if now - miss.get(market, 0) < 60:
+                att = None
+            else:
+                att = o.log.latest(market)
+                if att is None:
+                    miss[market] = now
         if att is None:
             return self._send(404, {"error": f"no attestation for {market}",
                                     "detail": error, "markets": o.markets})

@@ -14,6 +14,7 @@
 // ever exercised, by the two-chain test; the third and the refusal behind it
 // are here, because they need no node at all.
 import * as flows from "../web/flows.js";
+import * as pig from "../web/pignus.js";
 
 let pass = 0, fail = 0;
 const ok = (n, c, d = "") => { if (c) { pass++; console.log("  ok    " + n); }
@@ -140,6 +141,57 @@ rejects("with the fee in the debt asset and no other change, it refuses",
         () => flows.buildTakeOffer(args(
           [utxo(C, "1000000000", 6), utxo(D, "100000", 7)], D)),
         "not the debt asset");
+
+{
+  // A liquidation just past the threshold, with the fee paid in the
+  // collateral asset: the borrower's return is then an output in the fee
+  // asset and subject to the node's dust rule. The Python composer lifts it to
+  // the threshold out of the taker's share; the page used to build the dust
+  // output and have the node refuse the whole spend.
+  const seizePrice = 17_000_000;                 // under the strike
+  const seize = (150000000000n * 105n / 100n * 100000n + BigInt(seizePrice) - 1n)
+                / BigInt(seizePrice);
+  const locked = seize + 10n;                    // ten atoms of surplus
+  const lt = { ...terms, strike: "180000000", price_scale: 100000,
+               collateral_amount: locked.toString(), debt: "150000000000",
+               oracle_x: "22".repeat(32), not_before: 1, maturity: 100000,
+               recover_after: 143200, max_price: "100000000000",
+               bonus_num: 105, bonus_den: 100,
+               // A fixture oracle: sha256("pignus js liquidate fixture
+               // oracle") as the secret, its x-only key here, and below the
+               // signature it made over this market at price 17,000,000 and
+               // timestamp 2 -- minted by pignus.oracle.sign, since a browser
+               // holds no oracle key and signs no attestation.
+               oracle_x: "20a443b494caeb2c14edb72f82c7c3e33fed755a50d7bf70f0b442aacf07b6cf" };
+  const att = { price: seizePrice, timestamp: 2, price_scale: 100000,
+                feed_id: "6651d2e09710ec83bb76023536db18237c62334cd386830b56ee6afef5cabe67",
+                signature: "a323aa063bc92448ae951e0d0206d74c095be954016cac1dc91eb873d40f94533d6f25cbfae72cd089f8a00a705052442734ccc9fe5713c4d7568615abe60e34" };
+  const mk = (feeAsset) => flows.buildLiquidate({
+    terms: lt, vaultOutpoint: { txid: "11".repeat(32), vout: 0,
+                                scriptPubkey: pig._internals.bytesToHex(
+                                  pig.vaultScriptPubKey(lt)) },
+    collateralAmount: locked.toString(), attestation: att, singleLeaf: false,
+    takerSpk: spk("77"), utxos: [utxo(D, "300000000000", 22),
+                                 utxo(C, "5000000000", 33)],
+    changeSpk: spk("88"), feeAsset, feeAmount: "6000", dustAtoms: "15",
+  });
+  let built = null;
+  try { built = mk(C); } catch (e) { built = { error: e.message }; }
+  ok("a liquidation paid for in the collateral asset composes at all",
+     built && !built.error, built && built.error);
+  if (built && !built.error) {
+    const outs = built.outputs || (built.pset && built.pset.outputs) || [];
+    ok("...and the borrower's return is lifted to the dust threshold",
+       outs[1] && String(outs[1].value) === "15",
+       outs[1] && String(outs[1].value));
+    ok("...out of the taker's share, not out of thin air",
+       outs[2] && String(outs[2].value) === String(locked - 15n),
+       outs[2] && String(outs[2].value));
+    ok("...and the summary says what is really returned",
+       built.summary.some(l => l.includes("Return") && l.includes("15")),
+       built.summary.join(" | "));
+  }
+}
 
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

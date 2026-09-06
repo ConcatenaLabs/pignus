@@ -1515,7 +1515,9 @@ def cmd_offer_fund(args):
         bonus_num=100 + int(args.bonus), bonus_den=100, price_scale=scale,
         memo=args.memo or "")
     fee_asset, fee, rate = choose_fee(node, args, "fund",
-                                      prefer=[terms.debt_asset])
+                                      prefer=[terms.debt_asset],
+                                      committed={terms.debt_asset:
+                                                 int(principal) * int(args.lots)})
     spk = offer_address(terms, principal, collateral, expiry)
     # The strike is debt atoms per collateral atom; a person reads prices in
     # whole units, and the two differ by both assets' precisions.
@@ -1870,7 +1872,8 @@ def cmd_offer_take(args):
     for w in terms.sanity_check():
         print(f"  ! {w}", file=sys.stderr)
     fee_asset, fee, rate = choose_fee(
-        node, args, "take", prefer=[terms.collateral_asset, terms.debt_asset])
+        node, args, "take", prefer=[terms.collateral_asset, terms.debt_asset],
+        committed={terms.collateral_asset: int(terms.collateral_amount)})
     if args.dry_run:
         print("dry run: nothing broadcast. The terms follow; the take is not "
               "composed here, because it needs explicit coins only a real "
@@ -2017,10 +2020,15 @@ def _exit(args, exit_name):
     flow = exit_name if single else exit_name + "4"
     # A REPAY moves the debt; the other exits move the collateral coin, which
     # is the vault's own input rather than something from this wallet.
+    # Every exit but RECOVER pays the lender `debt` out of THIS wallet: REPAY
+    # because it is the debt, LIQUIDATE and DEFAULT because the seizure tail
+    # credits the lender first and the taker keeps collateral instead. A fee
+    # asset picked without subtracting that is one the wallet cannot then
+    # fund, and the failure names no asset.
     fee_asset, fee, rate = choose_fee(
         node, args, flow, prefer=[terms.debt_asset],
         committed=({terms.debt_asset: int(terms.debt)}
-                   if exit_name == "repay" else None))
+                   if exit_name != "recover" else None))
     spender = VaultSpender(node, terms, fee_asset, fee, single_leaf=single,
                            dust_fold=dust_fold_for(rate))
     need = {terms.debt_asset: terms.debt} if exit_name != "recover" else {}
@@ -2285,7 +2293,12 @@ def cmd_btc_keygen(args):
 RESPONDER_DEFAULTS = {
     "book": os.environ.get("PIGNUS_BOOK", "http://127.0.0.1:8741"),
     "interval": 5.0,
-    "disburse_conf": 1,
+    # Two, not one: two Bitcoin blocks is the shortest depth that survives an
+    # ordinary one-block reorg, which is the same reasoning MIN_ANCHOR_DEPTH
+    # applies to every other cross-chain step. A principal paid against one
+    # confirmation is paid against a funding the borrower can replace the
+    # moment that block is orphaned.
+    "disburse_conf": 2,
     "claim_depth": 6,
     "scan_interval": 300.0,
 }
@@ -2845,6 +2858,16 @@ def cmd_btc_disburse(args):
                                    min_conf=args.disburse_conf)
     if not ok:
         refuse(f"not disbursing: {why}")
+    # The deadlines, against BOTH chains' tips now, as the responder checks
+    # them. A borrower chooses when to fund and nothing makes them prompt; a
+    # loan whose abort_after has passed is one the borrower can empty the
+    # moment the principal lands.
+    from pignus.btc_collateral import timelocks_sane    # noqa: PLC0415
+    late = timelocks_sane(loan, btc.getblockcount(), seq.getblockcount())
+    if late and not args.force:
+        refuse("not disbursing -- " + "; ".join(late)
+               + "\nRe-run with --force only if you understand what that "
+                 "means for a principal paid into this loan.")
     if not check_upgrade_presig(loan, tk["prevault_txid"],
                                 int(tk["prevault_vout"]),
                                 bytes.fromhex(tk.get("upgrade_presig", ""))):
@@ -3094,8 +3117,15 @@ def _disowned_offers(args, lender_x):
         loan = o.get("loan") or {}
         if loan.get("lender_x") != lender_x:
             continue
-        if not R.verify_offer(loan, o.get("market", ""),
-                              int(o.get("lots", 1)), o.get("offer_sig", "")):
+        lots = int(o.get("lots", 1) or 1)
+        if not R.verify_offer(loan, o.get("market", ""), lots,
+                              o.get("offer_sig", "")):
+            out.append(o.get("btc_offer_id", "?"))
+        elif (str(o.get("btc_offer_id", "")).lower()
+              != R.offer_id(loan, o.get("market", ""), lots)):
+            # Signed, but served under an id that is not the hash of what was
+            # signed: the responder refuses it for the same reason it refuses
+            # a bad signature, and this is where that is reported.
             out.append(o.get("btc_offer_id", "?"))
     return out
 
@@ -3722,6 +3752,26 @@ def cmd_btc_seize_sighash(args):
     # that signature -- so pass it on, and say plainly when there is none.
     req["offer_sig"] = str(tk.get("offer_sig") or "")
     req["offer_lots"] = int(tk.get("offer_lots", 1) or 1)
+    # ...and the BORROWER's acceptance, which is what pins the strike: the
+    # lender's signature above can be made again over any number. From the
+    # ticket when it carries it, else from the book's own take record.
+    for k in ("take_auth", "prevault_txid", "prevault_vout"):
+        if tk.get(k) not in (None, ""):
+            req[k] = tk[k]
+    if "take_auth" not in req and getattr(args, "book", None) and tk.get("take_id"):
+        try:
+            got = book_get(args.book, f"/v1/btc/take/{tk['take_id']}")
+            for k in ("take_auth", "prevault_txid", "prevault_vout"):
+                if got.get(k) not in (None, ""):
+                    req[k] = got[k]
+        except Exception as e:                          # noqa: BLE001
+            print(f"could not fetch the take from the book: {e}", file=sys.stderr)
+    if "take_auth" not in req:
+        print("this request carries no borrower acceptance (`take_auth`), so "
+              "nothing shows the strike is the one the borrower agreed to. An "
+              "oracle should refuse it, and will unless its operator passes "
+              "--allow-unpinned-strike. Give --book so it can be fetched from "
+              "the take.", file=sys.stderr)
     if not req["offer_sig"]:
         print("this ticket carries no lender-signed offer, so nothing pins the "
               "strike this asks an oracle to judge against. An oracle should "
@@ -3926,8 +3976,19 @@ def cmd_btc_offer_take(args):
                                       broadcast=False)
     dest = bytes.fromhex(btc.getaddressinfo(
         args.reclaim_address or btc.getnewaddress())["scriptPubKey"])
+    # The borrower's acceptance: a signature over the offer's id and the four
+    # things this taker chose. It is what an oracle later judges a seizure
+    # request against, because the lender's own offer signature can be made
+    # again over any strike.
+    from pignus import btc_relay as R                  # noqa: PLC0415
+    take_auth = R.sign_take(borrower, btc_offer_id=args.offer,
+                            borrower_x=loan.borrower_x, h_w=loan.h_w,
+                            borrower_prog=loan.borrower_prog,
+                            borrower_ver=args.borrower_ver,
+                            prevault_txid=ptxid, prevault_vout=pvout)
     code, take = book_post(args.book, "/v1/btc/take", {
         "btc_offer_id": args.offer, "borrower_x": loan.borrower_x,
+        "take_auth": take_auth,
         "borrower_seq_spk": ("0014" if args.borrower_ver == 0 else "5120")
                             + loan.borrower_prog,
         "borrower_prog": loan.borrower_prog, "borrower_ver": args.borrower_ver,
@@ -4138,6 +4199,8 @@ def cmd_btc_respond(args):
     """
     from pignus import adaptor as A
     from pignus import btc_relay as R
+    from pignus.btc_collateral import (                 # noqa: PLC0415
+        _preimage_from_witness, loan_to_dict)
     from pignus.btc_collateral import (loan_from_dict, reclaim_tx,
                                        lender_release, timelocks_sane,
                                        check_upgrade_presig,
@@ -4198,10 +4261,26 @@ def cmd_btc_respond(args):
         loan = offer.get("loan") or {}
         if loan.get("lender_x") != lender_x:
             return False
-        if R.verify_offer(loan, offer.get("market", ""),
-                          int(offer.get("lots", 1)),
+        lots = int(offer.get("lots", 1) or 1)
+        if R.verify_offer(loan, offer.get("market", ""), lots,
                           offer.get("offer_sig", "")):
-            return True
+            # ...and served under ITS OWN id, which is the hash of what was
+            # signed. The lot cap is counted per offer id, so one signed offer
+            # served twice under two ids was two offers of `lots` each, and a
+            # relay could have this key pay two principals for an offer of
+            # one. An id that is not the content's hash is not this offer.
+            want = R.offer_id(loan, offer.get("market", ""), lots)
+            if str(offer.get("btc_offer_id", "")).lower() == want:
+                return True
+            oid = offer.get("btc_offer_id", "?")
+            if oid not in disowned:
+                disowned.add(oid)
+                print(f"offer {oid} carries this key's signature but is served "
+                      f"under an id that is not the hash of its terms "
+                      f"({want}). A relay serving one offer under two ids is "
+                      f"a relay counting its lots twice; every take of it is "
+                      f"being skipped.", file=sys.stderr)
+            return False
         oid = offer.get("btc_offer_id", "?")
         if oid not in disowned:
             disowned.add(oid)
@@ -4264,11 +4343,37 @@ def cmd_btc_respond(args):
     def seq_height():
         return int(seq_node.getblockcount()) if seq_node else 0
 
+    heights_missing_said = set()
+
+    def heights_known(take_id, doing):
+        """False, said once per take, when a deadline check would be made
+        against height 0.
+
+        `timelocks_sane` measures every margin from the chains' tips, and a
+        tip of 0 -- which is what a responder with no node reports -- puts
+        every deadline thousands of blocks in the future. A sign-only
+        responder without nodes therefore passed a loan whose abort_after
+        was already behind it, and a principal paid into that loan is one
+        the borrower keeps after aborting the collateral. No nodes, no
+        deadline check; no deadline check, no signature."""
+        if btc_node is not None and seq_node is not None:
+            return True
+        if take_id not in heights_missing_said:
+            heights_missing_said.add(take_id)
+            print(f"take {take_id}: not {doing} -- this responder has no "
+                  f"{'Bitcoin' if btc_node is None else 'Sequentia'} node to "
+                  f"read a height from, so the loan's deadlines cannot be "
+                  f"checked. Give it read-only RPC to both chains; a wallet is "
+                  f"not needed for that.", file=sys.stderr)
+        return False
+
     def offers_by_id():
         out = {}
         for o in book_get(args.book, "/v1/btc/offers?status=all")["offers"]:
             out[o["btc_offer_id"]] = o
         return out
+
+    missing_said = set()
 
     def our_takes(offers, status=None):
         """Every take of an offer THIS key signed, with this responder's own
@@ -4286,13 +4391,30 @@ def cmd_btc_respond(args):
         all there is and moving it can only cost the borrower their own loan.
         """
         out = []
+        served = set()
         for tk in book_get(args.book, "/v1/btc/takes")["takes"]:
+            served.add(tk.get("take_id"))
             if status is not None and tk.get("status") != status:
                 continue
             offer = offers.get(tk.get("btc_offer_id"))
             if not offer or not ours(offer):
                 continue
             out.append((offer, tk, state.get(tk["take_id"])))
+        # Every pass enumerates through the relay, so a take the relay
+        # stopped serving -- dropped, pruned, re-keyed -- stopped being acted
+        # on, and "not served" looked exactly like "no work": no refund of an
+        # unclaimed principal, no re-claim after a reorg, no secret published.
+        # Said, once per take, because the money behind it is this key's.
+        for take_id, have in state.items():
+            if take_id in served or take_id in missing_said:
+                continue
+            if have.get("disbursement_txid") or have.get("disbursing"):
+                missing_said.add(take_id)
+                print(f"take {take_id}: this key paid a principal for it and "
+                      f"the relay no longer serves it. Nothing here will act "
+                      f"on it until it is served again; its terms are in the "
+                      f"state file under `loan` for the btc-* commands.",
+                      file=sys.stderr)
         return out
 
     def lots_committed(offers, except_take=None):
@@ -4370,6 +4492,8 @@ def cmd_btc_respond(args):
                 loan = loan_for(offer, tk, {"t": t.hex()})
             except ValueError as e:
                 print(f"take {tk['take_id']}: {e}", file=sys.stderr)
+                continue
+            if not heights_known(tk["take_id"], "answering"):
                 continue
             problems = timelocks_sane(loan, btc_height(), seq_height())
             if problems:
@@ -4462,12 +4586,39 @@ def cmd_btc_respond(args):
             except ValueError as e:
                 print(f"take {tk['take_id']}: {e}", file=sys.stderr)
                 continue
-            if not check_upgrade_presig(loan, tk["prevault_txid"],
-                                        int(tk["prevault_vout"]),
-                                        bytes.fromhex(tk["upgrade_presig"])):
+            # The pre-vault THIS key already verified, when it has one. A
+            # take served `pending` again after this key signed and paid --
+            # with a fresh pre-vault and a presig for it, which the borrower
+            # can always produce -- used to be re-signed here, and the record
+            # every later pass rests on overwritten with the new outpoint: the
+            # paid principal then watched a pre-vault nobody had funded, and
+            # the funded one was never vaulted. Once recorded, the pre-vault
+            # is this key's own fact and the relay's copy must agree with it.
+            mine = (have.get("prevault_txid"), have.get("prevault_vout"),
+                    have.get("upgrade_presig"))
+            if all(x not in (None, "") for x in mine):
+                theirs = (str(tk.get("prevault_txid", "")),
+                          int(tk.get("prevault_vout", 0) or 0),
+                          str(tk.get("upgrade_presig", "")))
+                if theirs != (str(mine[0]), int(mine[1]), str(mine[2])):
+                    print(f"take {tk['take_id']}: the relay now serves this "
+                          f"take with a different pre-vault or advance "
+                          f"signature from the one this key signed against; "
+                          f"not signing again. The recorded release stands.",
+                          file=sys.stderr)
+                    continue
+                pv_txid, pv_vout, presig = str(mine[0]), int(mine[1]), str(mine[2])
+            else:
+                pv_txid, pv_vout, presig = (str(tk["prevault_txid"]),
+                                            int(tk["prevault_vout"]),
+                                            str(tk["upgrade_presig"]))
+            if not check_upgrade_presig(loan, pv_txid, pv_vout,
+                                        bytes.fromhex(presig)):
                 print(f"take {tk['take_id']}: the advance signature does not "
                       "move that collateral into this loan; not signing",
                       file=sys.stderr)
+                continue
+            if not heights_known(tk["take_id"], "signing"):
                 continue
             problems = timelocks_sane(loan, btc_height(), seq_height())
             if problems:
@@ -4477,8 +4628,7 @@ def cmd_btc_respond(args):
             # The vault's address depends on the payment hash, so it is only
             # knowable now. Deriving it here rather than reading the relay's
             # copy is what stops a relay making every release useless.
-            vault_txid = upgrade_tx(loan, tk["prevault_txid"],
-                                    int(tk["prevault_vout"])).txid()
+            vault_txid = upgrade_tx(loan, pv_txid, pv_vout).txid()
             rtx = reclaim_tx(loan, vault_txid, 0,
                              bytes.fromhex(tk["reclaim_dest"]),
                              int(tk.get("reclaim_fee", 3000)))
@@ -4497,11 +4647,20 @@ def cmd_btc_respond(args):
             # only moves forward. And reading the outpoint back out of the
             # relay afterwards would be reading it from the one party this code
             # is written never to believe.
+            # ...and the loan itself, as this key rebuilt it from the signed
+            # offer, with the borrower's acceptance. The state file is the
+            # one record a relay cannot edit, and until now it held the
+            # secret and the outpoints but not the terms -- so a relay that
+            # dropped one take after the principal was paid took with it the
+            # only copy of what this key had agreed to.
             state.set(tk["take_id"], vault_txid=vault_txid,
                       payment_hash=_sha256(t),
-                      prevault_txid=str(tk["prevault_txid"]),
-                      prevault_vout=int(tk["prevault_vout"]),
-                      upgrade_presig=str(tk["upgrade_presig"]))
+                      prevault_txid=pv_txid, prevault_vout=pv_vout,
+                      upgrade_presig=presig,
+                      loan=loan_to_dict(loan),
+                      take_auth=str(tk.get("take_auth") or ""),
+                      reclaim_dest=str(tk.get("reclaim_dest") or ""),
+                      reclaim_fee=int(tk.get("reclaim_fee", 3000) or 3000))
             code, r = report(R.ADAPTOR_TAG, tk["take_id"], "/v1/btc/adaptor",
                              adaptor_point=A.point(t).hex(),
                              payment_hash=_sha256(t), adaptor_sig=sig.hex())
@@ -4592,12 +4751,20 @@ def cmd_btc_respond(args):
                     # The borrower's signed report names the transaction that
                     # CLAIMED it. Its input is the disbursement, so reading it
                     # back names the outpoint that was paid.
+                    # The hint is the BORROWER's word, and a borrower who
+                    # claimed a principal that this key never recorded -- a
+                    # crash between the send and the write -- could name any
+                    # transaction of theirs and have the first spent input
+                    # recorded as the disbursement. Only an input whose
+                    # witness carries THIS loan's secret spent this loan's
+                    # disbursement; nothing else is believed.
                     try:
                         raw = seq_node.getrawtransaction(said, True)
                         for vin in raw.get("vin", []):
-                            out = seq_node.gettxout(vin.get("txid", ""),
-                                                    int(vin.get("vout", 0)), True)
-                            if out is None:
+                            w = _preimage_from_witness(
+                                vin.get("txinwitness") or [],
+                                expect_hash=loan.h_w)
+                            if w is not None:
                                 found = (vin["txid"], int(vin["vout"]))
                                 break
                     except Exception:                   # noqa: BLE001
@@ -5465,8 +5632,10 @@ def add_btc_commands(sub):
                        help="LENDER: pay the principal into the output the "
                             "borrower opens to start the loan")
     p.add_argument("ticket")
-    p.add_argument("--disburse-conf", type=int, default=1,
-                   help="Bitcoin confirmations required on the collateral first")
+    p.add_argument("--disburse-conf", type=int, default=2,
+                   help="Bitcoin confirmations required on the collateral "
+                        "first (default 2: the shortest depth that survives "
+                        "an ordinary one-block reorg)")
     p.add_argument("--force", action="store_true",
                    help="pay even though this ticket, or the chain, already "
                         "shows a principal for this loan. A second one sits at "
@@ -5603,6 +5772,7 @@ def add_btc_commands(sub):
     p.add_argument("--btc-fee", type=int, default=3000)
     p.add_argument("--out", help="write the request here, for the oracle")
     add_btc_node_args(p)
+    add_book_arg(p)
     p.set_defaults(fn=cmd_btc_seize_sighash)
 
     p = sub.add_parser("btc-seize", help="LENDER+oracle: seize the collateral")

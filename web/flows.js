@@ -574,11 +574,30 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
                                                  dustAtoms);
   const fee = b(feeAmount) + folded;
   let feePlaced = false;
+  // A seizure just past the threshold leaves the borrower a few atoms, and
+  // the node's dust rule applies to outputs in the transaction's FEE asset --
+  // so when the fee is paid in the collateral asset that return is dust and
+  // the node refuses the whole spend. The covenant requires the return to be
+  // AT LEAST the surplus, never exactly it, so the return is lifted to the
+  // threshold out of the taker's share, as the Python composer does; the two
+  // used to differ here, and the page's spend was the one refused. `ret` is
+  // what is actually returned, and it is what the summary below says.
+  let ret = surplus;
+  if (surplus > 0n && feeAsset === terms.collateral_asset) {
+    const dust = b(dustAtoms);
+    if (ret < dust) ret = dust;
+    if (locked - ret < dust)
+      throw new WalletError(
+        "at this price the seizure and the borrower's return cannot both " +
+        "clear the node's dust threshold with the fee paid in the " +
+        "collateral asset. Pay the fee in another asset, or wait for a " +
+        "price at which the seizure is worth taking.");
+  }
   if (surplus > 0n) {
-    outs.push({ asset: terms.collateral_asset, value: surplus,
+    outs.push({ asset: terms.collateral_asset, value: ret,
                 script: borrowerSpk });
     outs.push({ asset: terms.collateral_asset,
-                value: locked - surplus, script: takerSpk });
+                value: locked - ret, script: takerSpk });
   } else {
     // Under water: the covenant requires no return, but its probe treats ANY
     // collateral-asset output at 2k+1 as a return and then demands the
@@ -625,12 +644,15 @@ export function buildLiquidate({ terms, vaultOutpoint, collateralAmount,
       outputs: outs,
       locktime: atMaturity ? Number(terms.maturity) : 0,
     }),
-    seize, surplus, fee, folded,
+    // The outputs as composed, beside the PSET: what a test, or a screen that
+    // draws its own confirmation, can read without parsing the PSET back.
+    outputs: outs,
+    seize, surplus: ret, fee, folded,
     summary: [
       `Pay ${fmt(terms.debt)} of ${short(terms.debt_asset)} to the lender`,
-      `Keep ${fmt(locked - surplus)} of ${short(terms.collateral_asset)}`,
-      surplus > 0n
-        ? `Return ${fmt(surplus)} to the borrower -- the covenant enforces this`
+      `Keep ${fmt(locked - ret)} of ${short(terms.collateral_asset)}`,
+      ret > 0n
+        ? `Return ${fmt(ret)} to the borrower -- the covenant enforces this`
         : "This position is under water: there is no surplus to return",
     ],
   };

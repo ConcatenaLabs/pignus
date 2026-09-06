@@ -39,6 +39,17 @@ REFUNDED_TAG = "pignus/btc-refunded/1"
 # the key the take names, or they are not believed.
 CLAIMED_PRINCIPAL_TAG = "pignus/btc-claimed-principal/1"
 REPAID_TAG = "pignus/btc-repaid/1"
+# The BORROWER's acceptance of a take: their signature over the id of the offer
+# they took -- which is the hash of everything the lender signed, the strike
+# among it -- and the four things a taker chooses. It exists because the strike
+# is in no Bitcoin script: the only thing pinning it was the lender's own offer
+# signature, and the lender is the party who asks for a seizure. A lender could
+# re-sign the same loan with any strike they liked and hand an honest oracle a
+# request that judged a healthy loan against it. The borrower's signature over
+# the ORIGINAL offer id is something the lender cannot mint alone.
+TAKE_TAG = "pignus/btc-take/1"
+TAKE_FIELDS = ("btc_offer_id", "borrower_x", "h_w", "borrower_prog",
+               "borrower_ver", "prevault_txid", "prevault_vout")
 
 # Every field a lender's signature over an offer must cover. Anything a taker
 # could vary and profit from has to be in here.
@@ -132,6 +143,36 @@ def verify_report(lender_x: str, tag: str, take_id: str, sig_hex: str,
     try:
         return A.verify(bytes.fromhex(lender_x),
                         _report_msg(tag, take_id, fields),
+                        bytes.fromhex(sig_hex))
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def take_payload(fields: dict) -> dict:
+    """Exactly TAKE_FIELDS, canonically typed, so both routes sign one thing."""
+    out = {}
+    for k in TAKE_FIELDS:
+        if k not in fields or fields[k] in (None, ""):
+            raise ValueError(f"a take acceptance needs {k}")
+        v = fields[k]
+        out[k] = int(v) if k in ("borrower_ver", "prevault_vout") else str(v).lower()
+    return out
+
+
+def take_msg(fields: dict) -> bytes:
+    return tagged(TAKE_TAG, canonical(take_payload(fields)))
+
+
+def sign_take(sec: bytes, **fields) -> str:
+    """The borrower signs what they are taking, and from whom."""
+    return A.sign(sec, take_msg(fields)).hex()
+
+
+def verify_take(key_x: str, sig_hex: str, **fields) -> bool:
+    """`key_x` rather than `borrower_x`: the borrower's key is also one of the
+    signed fields, and the two are checked against each other by the caller."""
+    try:
+        return A.verify(bytes.fromhex(key_x), take_msg(fields),
                         bytes.fromhex(sig_hex))
     except Exception:                                   # noqa: BLE001
         return False

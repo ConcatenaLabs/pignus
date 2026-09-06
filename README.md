@@ -259,11 +259,13 @@ the terms up; with the terms file in hand, `pignus-cli repay --terms loan.json
 --txid <vault txid> --rpc-wallet me` closes it against nothing but a node.
 `pignus-cli loan-export` writes that file out of the book for keeping.
 
-After a loan closes, `pignus-cli explain --loan <id>` reads the ending back off
-the chain: which exit was taken, the attested price behind a seizure, checked
-against the key the vault itself bakes in, and what the transaction actually
-paid each party against what the terms say that price buys. It works from
-`--terms` and `--txid` too, with no book involved.
+After a loan closes, `pignus-cli explain` reads the ending back off the chain:
+which exit was taken, the attested price behind a seizure, checked against the
+key the vault itself bakes in, and what the transaction actually paid each
+party against what the terms say that price buys. With `--terms` and `--txid`
+it does that against your own node and nothing else; with `--loan <id>` it
+returns the book's verdict, and says so, since a book is the party that
+computed it.
 
 ### Threshold oracles
 
@@ -459,11 +461,16 @@ co-sign on the Bitcoin side are in the design doc, section 7.
 
 A seizure is the one move that needs a third party while a loan is live: there
 is no covenant on the Bitcoin side, so the oracle's signature *is* the decision.
-`btc-seize-sighash --out` writes a request carrying the loan, the oracle
-operator co-signs it with `pignus-oracle --sign-seize --request`, and both the
-signature and the attestation behind it are published at the oracle's
-`/v1/seizures` -- so a seizure that was not justified is visible to anyone
-afterwards, which is the whole of the accountability this tier has.
+`btc-seize-sighash --out --book` writes a request carrying the loan, the
+lender's signed offer, and the borrower's own acceptance of it (`take_auth`,
+fetched from the take); the oracle operator co-signs it with `pignus-oracle
+--sign-seize --request`, and both the signature and the attestation behind it
+are published at the oracle's `/v1/seizures` -- so a seizure that was not
+justified is visible to anyone afterwards, which is the whole of the
+accountability this tier has. The borrower's acceptance is what pins the
+strike: it is in no Bitcoin script, and the lender's own offer signature can be
+made again over any strike, so an oracle refuses a request whose terms do not
+hash to the offer id the borrower signed.
 `deploy/DEPLOY.md` has the procedure.
 
 Because the decision is a signature rather than a script, it can happen at any
@@ -508,11 +515,15 @@ key.
 |---|---|
 | `--config` | the JSON holding the key, both nodes' credentials and the state file |
 | `--watch` / `--interval` | keep running, and how many seconds between passes (default 5) |
-| `--disburse-conf` | Bitcoin confirmations required on the collateral before a principal is paid (default 1) |
+| `--disburse-conf` | Bitcoin confirmations required on the collateral before a principal is paid (default 2: the shortest depth that survives an ordinary one-block reorg, which is what every other cross-chain step here waits for) |
 | `--claim-depth` | confirmations required on a borrower's claim before their collateral is moved into the vault (default 6) -- the claim is a Sequentia transaction, and Sequentia reorgs when Bitcoin does |
 | `--scan-interval` | seconds between chain scans for a repayment whose borrower never said where it landed (default 300) |
 | `--fee-asset` | what the Sequentia legs pay their fee in (default: the debt asset) |
 | `--state` | where it records what it has already done (default: beside the key) |
+
+A responder signs nothing it cannot check the deadlines of, and the deadlines
+are measured from both chains' tips, so it needs read-only RPC to both nodes
+even when it only signs; a wallet is not needed for that.
 
 Every offer is signed by the key it names as the lender, and the relay verifies
 that before storing it -- otherwise anyone could publish in a lender's name and

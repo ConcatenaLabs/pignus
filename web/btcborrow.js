@@ -474,6 +474,25 @@ export async function borrow(wallet, offer, ui) {
       `fee your collateral would never come back at all -- it would sit until ` +
       `the lender swept it. Nothing has been broadcast.`);
 
+  // The borrower's signature over WHAT they are taking: the offer's id --
+  // the hash of every term the lender signed, the strike among them -- and
+  // the four things a taker chooses. The strike is in no Bitcoin script, so
+  // without this the only thing pinning it at a seizure is the lender's own
+  // offer signature, which the lender can make again over any strike. This
+  // is the one signature a lender cannot mint, and an oracle asks for it
+  // before it co-signs. Byte for byte what pignus/btc_relay.py signs.
+  const takeAuth = (await wallet.request("signBtcTaproot", {
+    sighash: hex(takeDigest({
+      btc_offer_id: offer.btc_offer_id, borrower_x, h_w: loan.h_w,
+      borrower_prog: seqSpk.prog, borrower_ver: seqSpk.ver,
+      prevault_txid: prep.txid, prevault_vout: vout,
+    })),
+    display: { detail: "Accept this offer's terms. This signature moves " +
+                       "nothing; it is what a seizure is later judged " +
+                       "against, so that the strike cannot be changed on " +
+                       "you afterwards." },
+  })).signature;
+
   ui.busy(true, "asking the lender to open a loan…");
   const take = await ui.post("v1/btc/take", {
     btc_offer_id: offer.btc_offer_id,
@@ -483,6 +502,7 @@ export async function borrow(wallet, offer, ui) {
     borrower_ver: seqSpk.ver,
     h_w: loan.h_w,
     w_seq,
+    take_auth: takeAuth,
     prevault_txid: prep.txid,
     prevault_vout: vout,
     prevault_value: preValue.toString(),
@@ -664,6 +684,22 @@ export async function claimPrincipal(wallet, rec, ui) {
  * drift apart -- and so a relay's word about what a lender said can be tested
  * rather than believed.
  */
+/** The 32 bytes a borrower signs to accept a take. Same fields, same types
+ *  and same canonical form as `take_msg` in pignus/btc_relay.py. */
+export function takeDigest(f) {
+  const obj = {
+    btc_offer_id: String(f.btc_offer_id).toLowerCase(),
+    borrower_x: String(f.borrower_x).toLowerCase(),
+    h_w: String(f.h_w).toLowerCase(),
+    borrower_prog: String(f.borrower_prog).toLowerCase(),
+    borrower_ver: Number(f.borrower_ver),
+    prevault_txid: String(f.prevault_txid).toLowerCase(),
+    prevault_vout: Number(f.prevault_vout),
+  };
+  return P.taggedHash("pignus/btc-take/1", new TextEncoder().encode(
+    JSON.stringify(obj, Object.keys(obj).sort())));
+}
+
 function reportDigest(tag, takeId, fields) {
   const obj = { take_id: String(takeId), ...fields };
   return P.taggedHash(tag, new TextEncoder().encode(

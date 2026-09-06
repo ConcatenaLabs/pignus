@@ -677,7 +677,14 @@ asks for more, and the list is short enough to state:
   refuse an offer whose oracle is the lender's own key -- which the tools also
   refuse to build. Every co-signature the oracle makes is published beside the
   attestation that justified it, so the decision is checkable afterwards even
-  though it cannot be constrained beforehand.
+  though it cannot be constrained beforehand. What the oracle judges by is the
+  strike, and the strike is in no Bitcoin script: the lender's signature over
+  the offer would pin it only against a stranger, since the lender is the party
+  asking for the seizure and can sign the same loan again over any strike. So a
+  take carries the borrower's own signature over the id of the offer as it was
+  when they took it, and an oracle refuses a seizure request whose terms no
+  longer hash to that id. The strike a seizure is judged against is therefore
+  one the borrower agreed to, not one the lender presents.
 - **The deadline ordering.** `timelocks_sane()` refuses a loan whose deadlines
   do not leave the margins section 7.1 describes, but a borrower building terms
   by hand should read them: the gap between `d_refund` and `abort_after`, and

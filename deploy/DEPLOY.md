@@ -553,7 +553,7 @@ key, and never delete it while a loan is open.
 | `state` | beside the key | what this responder has already done, written *before* each send |
 | `book` | — | the relay it reads takes from and reports to |
 | `interval` | 5 | seconds between passes over the queue |
-| `disburse_conf` | 1 | Bitcoin confirmations on the borrower's collateral before the principal is paid |
+| `disburse_conf` | 2 | Bitcoin confirmations on the borrower's collateral before the principal is paid. Two is the shortest depth that survives an ordinary one-block reorg, the same reasoning every other cross-chain step here applies |
 | `claim_depth` | 6 | confirmations on the borrower's claim of that principal before their collateral is moved into the loan |
 | `scan_interval` | 300 | seconds between chain scans for a repayment whose borrower never said where it landed |
 | `fee_asset` | the debt asset | which asset pays the Sequentia-side fees. Any asset the node publishes a rate for; there is no privileged fee coin |
@@ -618,12 +618,15 @@ can pass `--allow-unpinned-strike` — after which nothing holds the lender to
 any strike at all.
 
 ```bash
-# lender: build the request, which carries the loan and the offer signature
-# that fixed its strike, not just a number
-pignus-cli btc-seize-sighash loan.json --dest <btc address> --out seizure.json
+# lender: build the request, which carries the loan, the offer signature that
+# fixed its strike, and the borrower's own acceptance of that offer (fetched
+# from the take on the book, which is why --book is given)
+pignus-cli btc-seize-sighash loan.json --dest <btc address> --out seizure.json \
+    --book http://127.0.0.1:8741
 
 # oracle operator: rebuild the sighash from the terms, check the strike against
-# the lender's own signed offer, and co-sign
+# the offer the BORROWER signed for -- the lender's own signature alone pins
+# nothing, since the lender could sign again over any strike -- and co-sign
 pignus-oracle --config /root/sequentia/pignus-oracle.json \
     --sign-seize --request seizure.json
 

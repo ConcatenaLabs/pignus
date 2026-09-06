@@ -866,6 +866,10 @@ verifying from strings agree. An absent number counts as a zero there, not as
 an empty string.
 
 `offer_sig` is the lender's BIP340 signature over the offer's own terms. It is
+what a responder checks before acting on any take of the offer, together with
+the id: an offer this relay serves under an id that is not `offer_id` of its
+terms is refused by the responder, since a lot cap counted per id would count a
+single offer served under two ids twice. `offer_sig` is
 what makes this endpoint safe to leave open: an offer carrying somebody else's
 key would make **their** responder pay it out.
 
@@ -929,7 +933,8 @@ drawn yet, so neither the vault nor the release over it exists at this point.
  "borrower_seq_spk": "0014…",
  "prevault_txid": "…", "prevault_vout": 1, "prevault_value": "103000",
  "btc_height": 150773,
- "reclaim_dest": "0014…", "reclaim_fee": 3000}
+ "reclaim_dest": "0014…", "reclaim_fee": 3000,
+ "take_auth": "…128 hex…"}
 ```
 
 The relay rebuilds the loan from the offer's own terms plus the four things a
@@ -937,6 +942,17 @@ taker chooses (`borrower_x`, `h_w`, `borrower_prog`, `borrower_ver`) and
 refuses the request unless the pre-vault address and value it derives match the
 outpoint named. It also refuses an outpoint another take already names: one coin
 funds one loan.
+
+`take_auth` is the borrower's BIP340 signature, with the key `borrower_x`, over
+the tagged hash `pignus/btc-take/1` of the canonical JSON (sorted keys, no
+spaces) of `btc_offer_id`, `borrower_x`, `h_w`, `borrower_prog`,
+`borrower_ver`, `prevault_txid` and `prevault_vout` -- the strings lower-cased,
+the two numbers as JSON numbers. It is required, and it exists for the seizure
+a lender may one day ask for: the strike is in no Bitcoin script, and the
+lender's own signature over the offer can be made again over any strike, so
+the borrower's signature over the id of the offer as it was when they took it
+is the one thing that pins the strike a seizure is judged against. The relay
+stores it on the take and serves it back.
 
 `200` returns the take with `status: "requested"`, its derived `prevault_spk`
 and `disbursement_spk`, and any `warnings` its deadlines raise. `404` no such
