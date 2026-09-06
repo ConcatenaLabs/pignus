@@ -735,6 +735,10 @@ def test_node_gone():
     check("the next poll starts over and asks about every vault again",
           not w.cut_short and n.calls["gettxout"] - before == 12,
           f"{n.calls['gettxout'] - before} asked, cut_short={w.cut_short}")
+    w._unanswered = 99                  # left over from a poll that asked nothing
+    w.poll()
+    check("a poll starts with a clean count, whatever the last one left",
+          not w.cut_short)
     # One transient failure among answered questions is not a dead node.
     flaky = {"n": 0}
     def once(txid, vout, include_mempool=False):

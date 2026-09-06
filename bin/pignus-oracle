@@ -322,6 +322,11 @@ class Oracle:
         self.latest = {}
         self.errors = {}
         self.signed_at = {}
+        # When each market was last OBSERVED by a round, whether or not that
+        # round signed anything new: an attestation carries the observation
+        # time, so a feed that is answering and unchanged must not read as a
+        # feed that stopped.
+        self.seen_at = {}
         self.last_round = 0.0
         # Two different failures, kept apart. `source_error` is the price feed
         # not answering, which is degraded but not yet wrong: the source serves
@@ -409,13 +414,6 @@ class Oracle:
                         f"moving, and a price nobody observed is not signed")
                 price = self.source.price_for(market, self.precisions,
                                               self.price_scale, self.aliases)
-                skew = getattr(self.source, "clock_skew", None)
-                if skew is not None and abs(skew) > O.CLOCK_TOLERANCE:
-                    raise RuntimeError(
-                        f"this machine's clock is {skew:+.0f}s from the "
-                        f"feed's; an attestation stamped from it is refused "
-                        f"downstream as from the future or already stale. "
-                        f"Fix the clock (NTP) rather than the feed")
                 self._jump_guard(market, price)
                 # Stamped with the OBSERVATION, not the signing. A snapshot
                 # re-signed after the feed stopped answering carried a fresh
@@ -430,6 +428,7 @@ class Oracle:
                         and prev.price == price:
                     with self._lock:
                         self.errors.pop(market, None)
+                        self.seen_at[market] = time.time()
                     continue
                 att = O.sign(self.sec, market, price, self.price_scale,
                              timestamp=ts)
@@ -444,6 +443,7 @@ class Oracle:
             with self._lock:
                 self.latest[market] = att
                 self.signed_at[market] = att.timestamp
+                self.seen_at[market] = time.time()
                 self.errors.pop(market, None)
         with self._lock:
             self.last_round = time.time()
@@ -459,8 +459,13 @@ class Oracle:
         if ref <= 0 or abs(price - ref) <= self.max_jump * ref:
             self._jump.pop(market, None)
             return
+        # Still on the far side of the jump? A real feed ticks by a few atoms
+        # every round; a count that demanded byte-identical prices never
+        # reached jump_rounds for a genuine move, and the market stayed
+        # unsigned until the price held still.
         held, n = self._jump.get(market, (None, 0))
-        n = n + 1 if held == price else 1
+        n = n + 1 if (held is not None
+                      and abs(price - held) <= self.max_jump * max(held, 1)) else 1
         self._jump[market] = (price, n)
         if n < self.jump_rounds:
             raise RuntimeError(
@@ -489,6 +494,15 @@ class Oracle:
         if source_error != said["source"]:
             print(f"pignus-oracle: feed: "
                   f"{source_error or 'answering again'}", file=sys.stderr)
+        skew = getattr(self.source, "clock_skew", None)
+        far = skew is not None and abs(skew) > O.CLOCK_TOLERANCE
+        if far != said.get("skew", False):
+            print(f"pignus-oracle: this machine's clock is {skew:+.0f}s from "
+                  f"the feed's Date header" + (
+                      "; if the feed's clock is right, attestations stamped "
+                      "here will be refused downstream as from the future or "
+                      "already stale -- run NTP" if far else "; back in range")
+                  if skew is not None else "", file=sys.stderr)
         if frozen != said["frozen"]:
             print("pignus-oracle: the feed is frozen; signing has stopped"
                   if frozen else "pignus-oracle: the feed is moving again",
@@ -498,7 +512,7 @@ class Oracle:
             print(f"pignus-oracle: signed {signed} of {len(self.markets)} "
                   f"markets", file=sys.stderr)
         self._said = {"errors": errs, "source": source_error,
-                      "frozen": frozen, "signed": signed}
+                      "frozen": frozen, "signed": signed, "skew": far}
 
     def run_forever(self, interval):
         """The signing loop.
@@ -639,6 +653,10 @@ class Oracle:
         # market minutes ago -- a frozen feed, an erroring one -- while the
         # last attestation is still under --max-age. What it stopped signing
         # it does not co-sign against.
+        if self.xonly.hex().lower() in self.compromised_keys:
+            raise SystemExit("REFUSED: this oracle's own key is listed in its "
+                             "compromised_keys. A key declared compromised "
+                             "co-signs nothing; retire it.")
         if not allow_stale:
             self._daemon_agrees(market)
         if loan and self.book and not allow_unlisted:
@@ -836,7 +854,7 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         with o._lock:
             errs = dict(o.errors)
-            signed_at = dict(o.signed_at)
+            signed_at = dict(o.seen_at)
             last_round = o.last_round
             round_error, source_error = o.round_error, o.source_error
         # Two intervals, and never less than half a minute: a one-second

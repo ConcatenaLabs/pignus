@@ -4728,6 +4728,19 @@ def cmd_btc_respond(args):
         # on, and "not served" looked exactly like "no work": no refund of an
         # unclaimed principal, no re-claim after a reorg, no secret published.
         # Said, once per take, because the money behind it is this key's.
+        # A wait recorded on a take the relay no longer serves as open --
+        # expired, aborted, gone -- with nothing of this key's money behind
+        # it is a row, not a person needed: cleared, so a routine refusal
+        # near an offer's deadline does not alarm the timer for a month.
+        ended = {tk["take_id"] for _o, tk, _h in out
+                 if str(tk.get("status", "")) not in
+                 ("requested", "reserved", "pending", "signed", "disbursed",
+                  "live")}
+        for take_id, have in state.items():
+            if have.get("waiting") and not have.get("disbursing") \
+                    and not have.get("disbursement_txid") \
+                    and (take_id not in served or take_id in ended):
+                state.set(take_id, waiting=None)
         for take_id, have in state.items():
             if take_id in served or take_id in missing_said:
                 continue

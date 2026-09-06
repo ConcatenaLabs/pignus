@@ -513,9 +513,13 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
   ok("a vault the chain holds makes the loan live, whatever the relay reported",
      a.upgrade_txid === EE && bb.stageOf(a) === "live", bb.stageOf(a));
   const b = { ...signed };
-  await bb.learnFromChain(b, byPath({ ["v1/btc/outpoint/" + EE]: { unspent: false, spend_txid: "" },
-                                      ["v1/btc/outpoint/" + CC]: { unspent: false, spend_txid: "" } }));
-  ok("a funding the chain does not know is said to be unbroadcast",
+  const unknown = byPath({ ["v1/btc/outpoint/" + EE]: { unspent: false, spend_txid: "" },
+                           ["v1/btc/outpoint/" + CC]: { unspent: false, spend_txid: "" } });
+  await bb.learnFromChain(b, unknown);
+  ok("one miss at the funding outpoint is not yet 'never broadcast' -- it may be propagating",
+     !b.unfunded && b.unfunded_misses === 1);
+  await bb.learnFromChain(b, unknown);
+  ok("a funding the chain does not know twice running is said to be unbroadcast",
      b.unfunded === true && /never broadcast/.test(bb.nextStep(b, heights).note),
      bb.nextStep(b, heights).note);
   const c = { ...signed };
