@@ -33,6 +33,14 @@ that is what makes the one check below sufficient.
 `REPAY` goes further: no oracle either, and no witness data at all. A solvent
 borrower can always leave, whatever anyone else does.
 
+Pignus calls its collateral types tiers. **Tier A** is any unrestricted issued
+asset in the covenant vault above, and is the design. **Tier B** is native
+Bitcoin on the parent chain: cross-chain, and needing an online lender. **Tier
+C** is an OpenAMP restricted asset, pledged at the issuer's policy server rather
+than vaulted. **Tier D** is an OpenDAMP restricted asset, which cannot be
+collateral and gets a repurchase instead. Section 8 of
+[`docs/pignus-design.md`](docs/pignus-design.md) says why each is what it is.
+
 ## Getting it
 
 ```
@@ -41,12 +49,15 @@ cd pignus
 bin/pignus-cli --version
 ```
 
-The page runs at `https://sequentiatestnet.com/lending/` and drives Ambra
-(`github.com/ConcatenaLabs/sequentia-extension`), the browser extension that
-holds the keys; the page itself signs nothing. Testnet assets come from the
-faucet at `https://sequentiatestnet.com/faucet`, a source tarball of this
-repository is published at `https://sequentiatestnet.com/download/`, and
-problems go to `https://github.com/ConcatenaLabs/pignus/issues`.
+On the testnet:
+
+- the page is `https://sequentiatestnet.com/lending/`. It drives Ambra for
+  Chromium (`github.com/ConcatenaLabs/sequentia-extension`), the browser
+  extension that holds the keys, and signs nothing itself;
+- testnet assets come from `https://sequentiatestnet.com/faucet`;
+- a source tarball of this repository is at
+  `https://sequentiatestnet.com/download/`;
+- problems go to `https://github.com/ConcatenaLabs/pignus/issues`.
 
 Nothing to build and nothing to install: the commands are the scripts in
 `bin/`, and Python 3.9 or later is all they need. Put `bin/` on your `PATH` if
@@ -57,8 +68,8 @@ Anything that derives an address also needs a Sequentia **source** checkout,
 because that is where the proven covenant lives; `pignus-cli selftest` says so
 plainly if it cannot find one. It looks beside this checkout at `../Sequentia`,
 then at `~/Sequentia`, then at `vendor/sequentia`, and `SEQUENTIA_SRC` names
-one anywhere -- taken as a decision rather than a hint, so a wrong one is
-reported instead of silently falling back.
+one anywhere. When `SEQUENTIA_SRC` is set it is the only place looked at: a
+wrong path is reported, never silently replaced by one of the defaults.
 
 ```
 git clone https://github.com/ConcatenaLabs/Sequentia ../Sequentia
@@ -95,6 +106,23 @@ Run this before signing anything, and again on the vault a take produced:
 whether the loan came from a resting offer or was originated directly.
 Everything Pignus claims reduces to it; a wallet or a book that skips it has
 quietly reintroduced a trusted party.
+
+## Using the page
+
+As a **lender**: connect the wallet, open *Lend*, pick a market, set the amount
+per loan, the number of loans, the interest, both loan-to-value figures and the
+term, and publish. Your principal goes into an offer covenant; borrowers take it
+while you are offline, and anything untaken comes back with *Withdraw* once the
+offer expires.
+
+As a **borrower**: open *Borrow*, pick an offer and press *Borrow*; the page
+shows the vault address and the exact terms before your wallet asks you to
+sign. Repay from *Loans* any time before maturity and the collateral returns in
+the same transaction. For native Bitcoin, use *BTC collateral*: the collateral
+waits in a pre-vault you can take back until you claim the principal.
+
+The alerts at the top of the page say what needs a person in whichever seat
+your wallet is in, and their count goes in the tab title.
 
 ## Layout
 
@@ -177,10 +205,10 @@ holds; and coins are prepared explicit when the wallet only has blinded change,
 which a covenant cannot spend.
 
 `pignus-cli loans --book <url> --mine` and `pignus-cli offers --book <url>
---mine` list what the book knows that this wallet is party to, matching each
-record's payout programs against the wallet's coins and payout address the way
-the page decides "mine"; both exit 4 when something of yours needs a person, so
-a cron job with your own mail is a monitor. `pignus-cli status --terms loan.json
+--mine` list the loans and offers this wallet is party to, deciding "mine" the
+way the page does: by matching each record's payout programs against the
+wallet's coins and payout address. Both exit 4 when something of yours needs a
+person, so either one in a cron job that mails you is a monitor. `pignus-cli status --terms loan.json
 --book <url>` adds the book's price, health and `liquidatable_since` to the
 reconciliation without anybody typing `--price`, and `--watch` keeps going,
 printing a line whenever the state, liquidatable, matured or recover_open
@@ -205,7 +233,7 @@ book's advertisement down so nobody new takes the terms, and touches no coin;
 withdrawing brings the principal itself back, and only once the offer's expiry
 has opened. A delisted offer's record stays in the book, hidden from the board,
 because it is the only copy of the terms the refund is built from; `offer-
-withdraw` finds it by id as before, and the page keeps it under "mine" with its
+withdraw` finds it by id, and the page keeps it under "mine" with its
 Withdraw button. Nothing returns on its own. The manage token `offer-publish`
 prints is served once and stored only as a hash, so a lender who loses it waits
 for the expiry.
@@ -220,8 +248,8 @@ What shapes an offer is worth having here:
 | `--open-ltv` / `--liq-ltv` | the loan-to-value a loan opens at and the one it liquidates at (default 50 and 75) |
 | `--term-days` / `--offer-days` | the term, and how long the offer stays open (default: the term) |
 | `--bonus` | the liquidation bonus, percent (default 5) |
-| `--borrower-ver` | the witness version borrowers are paid out at: 0 for a bech32 extension wallet, 1 for taproot. It is part of the offer's address, so it cannot be changed afterwards |
-| `--oracles` / `--oracle-threshold` | an m-of-n oracle set, below |
+| `--borrower-ver` | the witness version borrowers are paid out at: 0 for a bech32 extension wallet (the default), 1 for taproot. It is part of the offer's address, so it cannot be changed afterwards |
+| `--oracles` / `--oracle-threshold` | an m-of-n oracle set, below; the threshold defaults to all of them |
 | `--memo` | a note kept in the terms |
 | `--no-publish` | fund the offer without listing it on the book |
 
@@ -364,8 +392,8 @@ their own within a block or two, so a take on the same one for hours is on one
 that will not, with a borrower's collateral committed behind it; those are
 reported as needing attention, and `--waiting-hours` sets how patient to be.
 Every wait and every recorded failure carries the time it began, and a step
-that succeeds clears the failure before it: an error nothing clears reads as
-current for ever, beside a take that recovered on its own an hour later. `btc-responder-clear` is the one
+that succeeds clears the failure recorded before it, so an old error is never
+shown as current beside a take that has since recovered. `btc-responder-clear` is the one
 recovery a responder cannot make for itself -- telling it a send it recorded as
 in-flight never went out -- and it takes the responder's own lock, so it cannot
 run against a live one, and checks the chain before it does anything.
@@ -638,15 +666,15 @@ comes out of it, because there is no room for another input.
 
 ## Running the services
 
-The whole test suite, and what each part of it proves, is under
-[Tests](#tests) at the end.
 
 ### The book and the page
 
 `pignusd` serves the loan book, the chain watcher, the cross-chain relay and the
 browser client, and on the testnet it is what `/lending/` is.
-`deploy/DEPLOY.md` covers running it and the oracle as systemd units behind
-Caddy, with `deploy/pignusd.example.json` as the starting configuration, and
+`pignusd --config pignusd.json` is the whole of running it.
+`deploy/pignusd.example.json` is a starting configuration, and every key is
+explained under *`pignusd` configuration* in `deploy/DEPLOY.md`, which also
+covers running it and the oracle as systemd units behind Caddy.
 [`docs/api.md`](docs/api.md) documents every endpoint it serves.
 
 A borrower's own risk is a price moving while their attention is elsewhere, so
@@ -728,7 +756,7 @@ the slash) and `/v1/attestation/{market}/at/{ts}`, `/v1/log`, `/v1/log/raw`,
 are in [`docs/api.md`](docs/api.md).
 
 `/healthz` answers 503, not 200, when the oracle has not completed a signing
-round within two intervals: the process staying up while the signing thread is
+round within two intervals, or thirty seconds where that is longer: the process staying up while the signing thread is
 dead is exactly the outage that otherwise goes unnoticed until it reaches the
 `RECOVER` backstop.
 
