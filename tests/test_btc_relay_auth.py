@@ -256,6 +256,16 @@ def main():
                            "prevault_txid": "bb" * 32, "prevault_vout": 0,
                            "status": "requested"}, lots_of="o1")
     tid = rec["take_id"]
+    # The listing counts every offer's free lots in one pass over the takes;
+    # it must agree with the per-offer count the take path decides by.
+    bk.btc_offers["o2"] = {"btc_offer_id": "o2", "lots": 3, "status": "open",
+                           "lots_taken": 1}
+    check("the one-pass lot count agrees with the per-offer one",
+          bk.btc_lots_left_all() == {o: bk.btc_offer_lots_left(o)
+                                     for o in bk.btc_offers}
+          and bk.btc_lots_left_all()["o2"] == 2,
+          str(bk.btc_lots_left_all()))
+    del bk.btc_offers["o2"]
     for step in ("reserved", "pending", "signed", "disbursed", "live"):
         bk.update_btc_take(tid, status=step)
     check("a take walks forward through the handshake",

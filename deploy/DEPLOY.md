@@ -309,7 +309,7 @@ security policy that forbids scripts and connections from anywhere but itself
 and forbids framing, `nosniff`, and no referrer -- so nothing here has to add
 them. What Caddy should add is what a reverse proxy alone can: read and header
 timeouts, so a client dribbling one byte a minute cannot hold a `pignusd`
-thread open for ever (`servers { timeouts { read_body 30s read_header 10s } }`
+thread open for ever (`servers { timeouts { read_header 10s read_body 60s } }`
 in the global options block).
 
 `caddy validate --config /etc/caddy/Caddyfile`, then `caddy reload --config

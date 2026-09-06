@@ -165,7 +165,13 @@ class VaultWatcher:
     does not know that output, so there is no spender to find.
     """
 
+    # Unanswered node questions in a row before a poll gives up; see
+    # `_node_gone`. Three is past any single transient failure.
+    GIVE_UP_AFTER = 3
+
     def __init__(self, node, min_depth=2, rescan_depth=1500, back_scan_cap=200):
+        self._unanswered = 0
+        self.cut_short = False
         self.node = node
         self.min_depth = min_depth
         self.rescan_depth = rescan_depth
@@ -290,10 +296,17 @@ class VaultWatcher:
         # counted afresh so a long catch-up does not starve them.
         self._blocks_fetched = 0
         self._block_budget = self.back_scan_cap
+        self.cut_short = False
         for v in self.vaults.values():
+            if self._node_gone():
+                self.cut_short = True
+                break
             if self._refresh(v, tip):
                 changed.append(v)
         for o in list(self.offers.values()):
+            if self._node_gone():
+                self.cut_short = True
+                break
             self._refresh_offer(o, tip)
         self._forget_below(tip - self.rescan_depth)
         self._block_cache = {}
@@ -330,18 +343,38 @@ class VaultWatcher:
 
     def _hash_at(self, h):
         try:
-            return self.node.getblockhash(h)
+            got = self.node.getblockhash(h)
         except RpcFailure:
+            self._unanswered += 1
             return None
+        self._unanswered = 0
+        return got
 
     def _txout(self, txid, vout):
         """(output or None, answered). "The node could not be asked" is not the
         same answer as "the output is not there", and reading it as one is how a
         watcher invents a reorg out of an RPC timeout."""
         try:
-            return self.node.gettxout(txid, int(vout), True), True   # w/ mempool
+            got = self.node.gettxout(txid, int(vout), True)         # w/ mempool
         except RpcFailure:
+            self._unanswered += 1
             return None, False
+        self._unanswered = 0
+        return got, True
+
+    def _node_gone(self):
+        """Has the node stopped answering for this poll?
+
+        Every question here is asked once per vault and once per offer, and an
+        unanswered one is left for the next poll rather than guessed at. That
+        is right for one vault and ruinous for all of them: a node that
+        accepts the connection and never answers costs a whole RPC timeout
+        per question, and a poll over thousands of records would hold the
+        chain lock for days while every list showed states frozen at the
+        last good poll. After `GIVE_UP_AFTER` unanswered questions in a row
+        the rest of the poll is abandoned; the next one starts over.
+        """
+        return self._unanswered >= self.GIVE_UP_AFTER
 
     def _mempool(self):
         """The mempool, decoded once per poll.

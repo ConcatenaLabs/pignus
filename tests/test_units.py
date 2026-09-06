@@ -796,12 +796,22 @@ def test_at_risk_stamp_and_meta():
                   max_price=10 ** 6 * 100000)
     rec = b.put_loan(t.to_json(), "11" * 32, 0)
     b.update_loan(rec["loan_id"], state="LIVE")
+    other = b.put_loan(t.to_json(), "12" * 32, 0)
+    b.update_loan(other["loan_id"], state="LIVE")
     b.stamp_at_risk(lambda _t: 300 * 100000, now=1000)
     check("a loan above its strike carries no date",
           not b.loans[rec["loan_id"]].get("liquidatable_since"))
+    # A crossing moves every loan on the market at once, and each is a
+    # write of the whole book unless the sweep is batched: count them.
+    writes, real_write = [], b._write
+    b._write = lambda: (writes.append(1), real_write())[1]
     b.stamp_at_risk(lambda _t: 170 * 100000, now=2000)
+    b._write = real_write
     check("crossing the strike stamps the moment",
-          b.loans[rec["loan_id"]].get("liquidatable_since") == 2000)
+          b.loans[rec["loan_id"]].get("liquidatable_since") == 2000
+          and b.loans[other["loan_id"]].get("liquidatable_since") == 2000)
+    check("...with ONE write for the whole sweep, not one per loan",
+          len(writes) == 1, f"{len(writes)} writes")
     b.stamp_at_risk(lambda _t: 170 * 100000, now=3000)
     check("...and staying under it keeps the first moment, not the last poll",
           b.loans[rec["loan_id"]].get("liquidatable_since") == 2000)
