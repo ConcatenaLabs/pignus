@@ -85,7 +85,7 @@ two = b.put_offer({"terms": terms.to_json(), "kind": "funded",
 assert rec["manage_token"] != sys.argv[2] and two["manage_token"] != sys.argv[3], \
     "a new listing kept the publisher's own token"
 # A stored loan is the CANONICAL spelling of its terms, whatever was posted:
-# `from_json` reads "1_500" and the page's BigInt does not. A scratch book,
+# from_json reads "1_500" and the page's BigInt does not. A scratch book,
 # so the daemon's own count of loans is untouched.
 d = json.loads(terms.to_json()); d["debt"] = d["debt"][:1] + "_" + d["debt"][1:]
 ln = Book(sys.argv[1] + ".scratch").put_loan(json.dumps(d), "13" * 32, 0)

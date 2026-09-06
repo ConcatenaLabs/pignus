@@ -1984,6 +1984,13 @@ class Service:
             reasons.append("no node configured; chain states are frozen")
         if self.node_error:
             reasons.append(self.node_error)
+        if getattr(self, "btc_node", None) is not None and btc_h is None:
+            # Configured and not answering. Without it every Bitcoin-side
+            # deadline goes unchecked, the expiry sweep judges nothing, and
+            # the page refuses to originate -- and none of that showed here.
+            reasons.append("the Bitcoin node is not answering: cross-chain "
+                           "deadlines are unchecked and the page will not "
+                           "originate until it does")
         if self.oracle_error:
             reasons.append(self.oracle_error)
         if not self.last_poll:

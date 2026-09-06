@@ -713,6 +713,15 @@ def test_fee_is_priced_in_the_asset_that_pays_it():
         _F.fee_table = real
 
 
+def test_manage_token_shape():
+    print("a manage token never begins with a dash")
+    from pignus.book import new_manage_token                # noqa: PLC0415
+    toks = [new_manage_token() for _ in range(5000)]
+    check("five thousand tokens, none an option to a command line",
+          all(not t.startswith("-") and len(t) >= 30 for t in toks))
+    check("and they are distinct", len(set(toks)) == len(toks))
+
+
 def test_node_batch():
     print("a batch is one round trip, answered in order, errors kept apart")
     import json as _json                                   # noqa: PLC0415
@@ -885,7 +894,7 @@ def main():
                test_amounts,
                test_attestation_log, test_adaptor, test_dlc,
                test_rate_limiter, test_at_risk_stamp_and_meta,
-               test_node_batch):
+               test_node_batch, test_manage_token_shape):
         fn()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0

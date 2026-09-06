@@ -110,6 +110,17 @@ def _last_touched(rec):
     return int(rec.get("updated") or rec.get("created") or 0)
 
 
+def new_manage_token():
+    """A manage token a command line can carry. `token_urlsafe` draws from an
+    alphabet that includes "-", and one in sixty-four tokens began with it --
+    which `pignus-cli offer-delist --token <tok>` then read as an option and
+    refused with "expected one argument", for a token the book had issued."""
+    while True:
+        token = secrets.token_urlsafe(24)
+        if not token.startswith("-"):
+            return token
+
+
 class Book:
     def __init__(self, path):
         self.path = str(path)
@@ -300,7 +311,7 @@ class Book:
         # A NEW listing always gets a token this book drew: a publisher-chosen
         # one is a publisher-chosen strength. A supplied token only ever
         # proves a republish of a record that already exists, below.
-        token = secrets.token_urlsafe(24)
+        token = new_manage_token()
         warnings = list(offer.get("warnings") or [])
         warnings += list(terms.sanity_check())
         rec = {
