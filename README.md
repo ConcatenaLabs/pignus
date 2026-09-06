@@ -121,9 +121,11 @@ offer expires.
 
 As a **borrower**: open *Borrow*, pick an offer and press *Borrow*; the page
 shows the vault address and the exact terms before your wallet asks you to
-sign. Repay from *Loans* any time before maturity and the collateral returns in
-the same transaction. For native Bitcoin, use *BTC collateral*: the collateral
-waits in a pre-vault you can take back until you claim the principal.
+sign. Repay from *Loans* at any time until the vault is spent -- before maturity, or
+after it while nobody has called the loan -- and the collateral returns in the
+same transaction. For native Bitcoin, use *BTC collateral*: the collateral
+waits in a pre-vault only you can take back, from its abort height on, until
+you claim the principal.
 
 A cross-chain loan is remembered in the browser and rebuilt from the book on
 any device with the same wallet, and what the chain says is read directly:
