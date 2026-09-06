@@ -106,11 +106,13 @@ jobs:
         working-directory: pignus
         run: |
           set -e
-          for f in test_web test_offer_web test_repurchase_web test_btc_web \
-                   test_adaptor_web test_btcborrow_web test_takeoffer_web \
-                   test_format_web; do
+          # Every browser test there is, minus the two a node drives: a list
+          # written by hand omitted test_alerts_web, and a failing alerts
+          # test went through this gate unread.
+          for f in tests/test_*.mjs; do
+            case "$f" in */test_pset.mjs|*/test_flows.mjs) continue ;; esac
             echo "== $f"
-            node "tests/$f.mjs"
+            node "$f"
           done
 
       # The page, in a real browser. It needs a headless Chromium, and skips
