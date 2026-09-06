@@ -32,10 +32,10 @@ const live = (o = {}) => ({ state: "LIVE", loan_id: "L1", txid: "11".repeat(32),
 {
   const c = A.alertsFor(view({ loans: [live({ oracle_compromised: true })] }));
   ok("a loan whose oracle key is declared compromised is a bad alert with Repay for the borrower",
-     c.borrower.some(x => x.level === "bad" && x.action === "repay" && /COMPROMISED/.test(x.text)), JSON.stringify(c.borrower));
+     c.borrower.some(x => x.level === "bad" && x.action === "repay" && /compromised/i.test(x.text)), JSON.stringify(c.borrower));
   const asLender = A.alertsFor(view({ loans: [live({ oracle_compromised: true, terms: terms({ borrower_prog: "77".repeat(20) }) })] }));
   ok("...and a bad alert with no button for the lender",
-     asLender.lender.some(x => x.level === "bad" && x.action === null && /COMPROMISED/.test(x.text)), JSON.stringify(asLender.lender));
+     asLender.lender.some(x => x.level === "bad" && x.action === null && /compromised/i.test(x.text)), JSON.stringify(asLender.lender));
 }
 {
   const a = A.alertsFor(view({ loans: [live({ health: 0.95, liquidatable_since: 1_800_000_000 - 3 * 3600, liquidatable: true })] }));
@@ -63,7 +63,7 @@ const live = (o = {}) => ({ state: "LIVE", loan_id: "L1", txid: "11".repeat(32),
   ok("with the oracle-free sweep open, the lender is pointed at Recover, which needs nothing",
      a.lender[0]?.action === "recover");
   ok("...and the borrower is told the whole collateral can go",
-     /WHOLE collateral/.test(a.borrower[0]?.text || ""));
+     /whole collateral/i.test(a.borrower[0]?.text || ""));
 }
 {
   const a = A.alertsFor(view({ loans: [live({ terms: terms({ maturity: 50000 + 2 * 1440 }) })] }));
@@ -95,14 +95,14 @@ const live = (o = {}) => ({ state: "LIVE", loan_id: "L1", txid: "11".repeat(32),
                     loan: { d_refund: 50000 + 60, abort_after: 1, recover_after: 1, repay_deadline: 99999, btc_amount: "100000" } };
   const w = A.alertsFor(view({ btcLoans: [waiting] }));
   ok("a principal waiting to be claimed near d_refund is an alert with a button",
-     w.btc.some(x => x.action === "btcstep" && /claim it/.test(x.text)), JSON.stringify(w.btc));
+     w.btc.some(x => x.action === "btcclaim" && /claim it/.test(x.text)), JSON.stringify(w.btc));
   const gone = A.alertsFor(view({ btcLoans: [{ ...waiting, loan: { ...waiting.loan, d_refund: 49999 } }] }));
   const under = A.alertsFor(view({ btcLoans: [{ ...rec, loan: { ...rec.loan, strike: "5218666667", price_scale: 100000, market: "BTC/USDX", debt_asset: "11".repeat(32) } }],
                                    btcPrice: () => 40000, debtPrecision: () => 8 }));
   ok("a live loan under its seizure price is a bad alert with Repay",
      under.btc.some(x => x.level === "bad" && x.action === "btcstep" && /seizure price/.test(x.text)), JSON.stringify(under.btc));
-  ok("...and past d_refund it says the lender may take it back, with no button",
-     gone.btc.some(x => x.level === "bad" && x.action === null), JSON.stringify(gone.btc));
+  ok("...and past d_refund it says the lender may take it back, still with the claim button, since claiming still starts the loan",
+     gone.btc.some(x => x.level === "bad" && x.action === "btcclaim" && /take your unclaimed principal back/.test(x.text)), JSON.stringify(gone.btc));
 }
 {
   const a = A.alertsFor(view({ offers: [{ offer_id: "O1", lender_prog: "1e".repeat(20), expired: true, lots_left: 1 }] }));

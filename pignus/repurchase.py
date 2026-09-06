@@ -342,8 +342,20 @@ class RepurchaseTerms:
         first written and what a test caught.
         """
         want_spk = self.script_pubkey().hex()
-        o = _find_output(node, txid, vout,
-                         lambda got: got["scriptPubKey"]["hex"] == want_spk)
+        bond = self.bond()
+
+        def is_bond(got):
+            return (got["scriptPubKey"]["hex"] == want_spk
+                    and got.get("asset") == self.debt_asset
+                    and "value" in got and _atoms(got["value"]) == bond)
+        # The bond itself first: a wrong-asset or wrong-amount output at the
+        # same address must not shadow the real bond at a later index. Only
+        # when no output IS the bond does the address alone decide, so the
+        # refusal below can say what sits there instead.
+        o = _find_output(node, txid, vout, is_bond)
+        if o is None and vout is None:
+            o = _find_output(node, txid, vout,
+                             lambda got: got["scriptPubKey"]["hex"] == want_spk)
         if o is None:
             # NOT the same as a coin that pays the wrong thing. "Nothing pays
             # this address" is a repurchase whose bond has not been funded --

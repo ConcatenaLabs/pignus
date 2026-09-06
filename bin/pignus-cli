@@ -962,8 +962,14 @@ def cmd_repo_verify(args):
         # the bond sits unspent at the next index.
         try:
             live = t.verify_funding(node, args.txid)
-        except (R.NotFunded, ValueError):
+        except R.NotFunded:
             live = None
+        except ValueError as e:
+            # An unspent output DOES pay the bond address, wrongly: that is
+            # not a finished repurchase, whatever the named output says.
+            refuse(f"the output at {args.txid}:{args.vout} is spent, but "
+                   f"another output of that transaction pays the bond "
+                   f"address and is not the bond: {e}")
         if live is not None:
             refuse(f"the output at {args.txid}:{args.vout} is spent, but the "
                    f"bond these terms compile to is still unspent at "
@@ -1207,6 +1213,15 @@ def _check_settlement_vault(raw, terms, args):
                f"bond vault sits at input {SETTLEMENT_VAULT_INDEX}")
     vin = tx.vin[SETTLEMENT_VAULT_INDEX]
     got = (f"{vin.prevout.hash:064x}", int(vin.prevout.n))
+    if args.vout is None:
+        # Left to be found, as every other repurchase command finds it: the
+        # bond is whichever output of --txid the skeleton spends at input 1,
+        # and the checks below then judge that outpoint.
+        if got[0] != str(args.txid).lower():
+            refuse(f"input {SETTLEMENT_VAULT_INDEX} of that transaction spends "
+                   f"{got[0]}:{got[1]}, and --txid names {str(args.txid).lower()}. "
+                   "This witness belongs to a different settlement.")
+        args.vout = got[1]
     want = (str(args.txid).lower(), int(args.vout))
     if got != want:
         refuse(f"input {SETTLEMENT_VAULT_INDEX} of that transaction spends "
@@ -4732,10 +4747,21 @@ def cmd_btc_respond(args):
         # expired, aborted, gone -- with nothing of this key's money behind
         # it is a row, not a person needed: cleared, so a routine refusal
         # near an offer's deadline does not alarm the timer for a month.
-        ended = {tk["take_id"] for _o, tk, _h in out
-                 if str(tk.get("status", "")) not in
-                 ("requested", "reserved", "pending", "signed", "disbursed",
-                  "live")}
+        # The relay never moves a take it merely stopped answering; it stays
+        # `requested` until pruned, a month on. So a take still at the very
+        # start whose OFFER is no longer open is over too, and so is one
+        # that has sat there past the relay's own lot-holding window.
+        now_ts = int(time.time())
+        ended = set()
+        for o, tk, _h in out:
+            st = str(tk.get("status", ""))
+            if st not in ("requested", "reserved", "pending", "signed",
+                          "disbursed", "live"):
+                ended.add(tk["take_id"])
+            elif st in ("requested", "reserved") and (
+                    str(o.get("status", "open")) != "open"
+                    or now_ts - int(tk.get("created") or now_ts) > 3600):
+                ended.add(tk["take_id"])
         for take_id, have in state.items():
             if have.get("waiting") and not have.get("disbursing") \
                     and not have.get("disbursement_txid") \
