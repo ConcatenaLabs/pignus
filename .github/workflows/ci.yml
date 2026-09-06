@@ -13,9 +13,10 @@
 # The chain tests (tests/test_platform.py and everything below it in
 # run-tests.sh) are deliberately NOT here. Each one starts a sequentiad, and
 # tests/test_btc_collateral.py starts a Bitcoin Core regtest beside it; that
-# means a built node and a Bitcoin Core release on the runner, and ten to twenty
-# minutes per run. They are run before a merge on a machine that has both
-# binaries. What this workflow buys is the fast half: a drift between the
+# means a built node, a Bitcoin Core release and, for the Tier D settlement,
+# the opendamp binary on the runner, and ten to twenty minutes per run. They
+# are run before a merge on a machine that has all three. What this workflow
+# buys is the fast half: a drift between the
 # browser composer and the Python one, a broken CLI argument, a JSON typo in
 # deploy/, or a regenerated vector file, caught in about a minute.
 

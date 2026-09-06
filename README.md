@@ -715,7 +715,8 @@ the BORROWER if the deadline passes with no settlement.
 OpenDAMP Simplicity inputs -- the verifier and the lender's restricted output
 -- and the lender signs both with `opendamp transfer-cosign`, the OpenDAMP
 transfer tool's command for a transaction it did not build, against the
-issuer's current policy snapshot. A lender who cannot produce that signature
+issuer's current policy snapshot (their `openampd` serves it at
+`GET /v1/snapshots?asset=<id>`). A lender who cannot produce that signature
 cannot return the asset, and the bond is all a settlement that never comes
 leaves the holder with; sell only under a lender who can. `repo-propose` says
 so on every document it writes.
@@ -766,10 +767,10 @@ spends, which is what a signer that did not build it needs. The lender signs
 the two OpenDAMP inputs with `opendamp transfer-cosign` from the
 [openamp](https://github.com/ConcatenaLabs/openamp) repository (`cargo build
 --release` in its `opendamp/` directory), which leaves every other witness as
-it found it. `--attach` puts the covenant's `RETURN`
-witness on last, which is the only order that works, and refuses a transaction
-on which any of the three signatures is missing, naming the input and who
-signs it. `repo-settle`, `repo-forfeit` and `repo-verify` all FIND the bond:
+it found it. `--attach` puts the covenant's `RETURN` witness on last, which is
+the only order that works, and refuses a transaction on which any of the three
+signatures is missing, naming the input and who signs it. `repo-settle`,
+`repo-forfeit` and `repo-verify` all FIND the bond:
 left without `--vout`, they take the unspent output of the funding
 transaction that pays the address the terms compile to, so the lender's own
 change at index 0 is never mistaken for a spent bond. Name `--vout` only to

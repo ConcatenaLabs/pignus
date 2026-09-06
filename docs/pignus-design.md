@@ -1190,7 +1190,8 @@ for a SHAPE, and this settlement still spends four inputs, which the `p3x5` and
 **Settlement takes the lender's OpenDAMP key.** Inputs 0 and 2 are spends of
 OpenDAMP covenants -- the verifier and the lender's `C_U` -- and the lender
 signs both with `opendamp transfer-cosign`, against the issuer's current
-policy snapshot: the verifier witness proves the lender as sender and the
+policy snapshot, which their `openampd` serves at `GET /v1/snapshots?asset=<id>`:
+the verifier witness proves the lender as sender and the
 borrower as recipient under that policy, and the `C_U` witness is the lender's
 signature. A lender who cannot produce that signature -- no OpenDAMP key, or
 a policy that no longer names the borrower -- cannot return the asset, and the
