@@ -932,6 +932,7 @@ def cmd_repo_verify(args):
         except Exception:                               # noqa: BLE001
             spent = False
     bond = None
+    unfunded_why = None
     if not spent:
         try:
             bond = t.verify_funding(node, args.txid,
@@ -942,9 +943,31 @@ def cmd_repo_verify(args):
             # needs to hear. Refusing here reported it as a bad terms document
             # and made `not-funded` and `leg-one-only` -- both documented --
             # reachable from no command at all.
+            #
+            # A scan that finds nothing cannot tell "never funded" from
+            # "settled or forfeited": a spent bond also pays nothing now. Only
+            # a named output can, so a scan says so rather than reporting a
+            # finished repurchase as one the lender never secured.
             bond = None
+            if args.vout is None:
+                unfunded_why = ("no unspent output pays the bond address: "
+                                "never funded, or already settled or "
+                                "forfeited. Pass --vout to name the bond's "
+                                "output and tell the two apart")
         except ValueError as e:
             refuse(str(e))
+    elif args.vout is not None:
+        # A named output that is spent: still make sure it WAS the bond, or a
+        # lender's spent change output reads as a settled repurchase while
+        # the bond sits unspent at the next index.
+        try:
+            live = t.verify_funding(node, args.txid)
+        except (R.NotFunded, ValueError):
+            live = None
+        if live is not None:
+            refuse(f"the output at {args.txid}:{args.vout} is spent, but the "
+                   f"bond these terms compile to is still unspent at "
+                   f"{args.txid}:{live['n']}; that was not the bond's output")
     leg = None
     if args.leg_txid:
         # C_U(Y) is a taproot output: the OpenDAMP verifier only ever pays the
@@ -981,6 +1004,8 @@ def cmd_repo_verify(args):
         },
         "min_confirmations": args.min_confirmations,
     }, indent=2))
+    if state == "not-funded" and unfunded_why:
+        print(unfunded_why, file=sys.stderr)
     if state == "settled":
         print("settled: the bond vault has been spent, which is what a "
               "settlement or a forfeit does. Read the spending transaction to "
@@ -1055,11 +1080,30 @@ def cmd_repo_fund(args):
 
 
 def _repo_spender(args, node, t):
-    from pignus.repurchase import RepurchaseSpender
+    from pignus.repurchase import RepurchaseSpender, NotFunded
     from pignus.vault import Outpoint
+    # The bond is FOUND, not assumed at vout 0. `repo-fund` and `repo-verify`
+    # scan for the output that pays the bond address; a spender that defaulted
+    # to 0 read the lender's own spent change as "that bond vault is already
+    # spent", and told a borrower whose bond sits at vout 1 that their
+    # counterparty had cheated.
+    if args.vout is None:
+        try:
+            o = t.verify_funding(node, args.txid)
+        except NotFunded:
+            refuse("no unspent output of that transaction pays the bond "
+                   "address these terms compile to: the bond was never "
+                   "funded there, or it has already been settled or "
+                   "forfeited. Pass --vout to name the output and tell the "
+                   "two apart.")
+        except ValueError as e:
+            refuse(str(e))
+        args.vout = int(o["n"])
     got = node.gettxout(args.txid, args.vout, True)
     if got is None:
-        refuse("that bond vault is already spent")
+        refuse(f"there is no unspent output at {args.txid}:{args.vout}: the "
+               f"bond there has already been settled or forfeited, or that "
+               f"was never the bond's output (leave --vout off to find it)")
     if got["scriptPubKey"]["hex"] != t.script_pubkey().hex():
         refuse("the coin is not the vault these terms compile to")
     if "value" not in got or "asset" not in got:
@@ -6455,7 +6499,7 @@ def main():
                             "borrower")
     p.add_argument("terms")
     p.add_argument("--txid", required=True, help="the bond vault's coin")
-    p.add_argument("--vout", type=int, default=0,
+    p.add_argument("--vout", type=int, default=None,
                    help="the bond vault's output index, as repo-fund reported it")
     add_node_args(p)
     add_fee_args(p, "the bond asset")
@@ -6469,7 +6513,7 @@ def main():
                             "borrower, the bond to the lender")
     p.add_argument("terms")
     p.add_argument("--txid", required=True, help="the bond vault's coin")
-    p.add_argument("--vout", type=int, default=0,
+    p.add_argument("--vout", type=int, default=None,
                    help="the bond vault's output index, as repo-fund reported it")
     p.add_argument("--verifier", metavar="TXID:VOUT",
                    help="the OpenDAMP verifier output every transfer of the "
