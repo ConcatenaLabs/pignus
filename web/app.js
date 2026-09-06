@@ -3007,7 +3007,20 @@ function wireTabs() {
       x.tabIndex = on ? 0 : -1;
     });
     $$("[data-panel]").forEach(p => { p.hidden = p.dataset.panel !== b.dataset.tab; });
+    // The tab is the URL's fragment, so a tab can be linked to -- from a
+    // runbook, a chat, a bug report -- and the back button and a reload
+    // land where the reader was. Replaced, not pushed: five tabs are not
+    // five pages of history.
+    if (location.hash !== "#" + b.dataset.tab)
+      history.replaceState(null, "", "#" + b.dataset.tab);
   };
+  const byHash = () => {
+    const want = location.hash.slice(1);
+    const t = tabs.find(x => x.dataset.tab === want);
+    if (t && !t.classList.contains("on")) show(t);
+  };
+  window.addEventListener("hashchange", byHash);
+  byHash();
   tabs.forEach((b, i) => {
     b.setAttribute("role", "tab");
     b.setAttribute("aria-selected", b.classList.contains("on") ? "true" : "false");
