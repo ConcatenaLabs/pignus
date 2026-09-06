@@ -456,8 +456,23 @@ the borrower's own page from showing a loan as running after they have paid it.
 program -- where the principal is paid and where a repayment refunds to -- and
 `--lender-prog` and `--lender-ver` the lender's; both are 20 bytes at witness
 version 0 and 32 at version 1, and both are baked into addresses, so neither can
-be changed afterwards. `--reclaim-address` is the Bitcoin address the collateral
-comes back to, a fresh one from the wallet by default.
+be changed afterwards. `pignus-cli payout-program --rpc-wallet <name>` prints a
+fresh one from a node wallet in exactly this form. `--reclaim-address` is the
+Bitcoin address the collateral comes back to, a fresh one from the wallet by
+default.
+
+The rest of an offer's terms come from the book it is published to.
+`--oracle-x` is the first entry of `GET /v1/oracles` there, `--debt-asset` is
+the asset id `GET /v1/markets` shows for the market, and `--strike` is what
+`pignus-cli quote` computes for the liquidation price. The four deadlines are
+block heights, judged against both chains' tips (`height` and `btc_height` in
+`GET /v1/markets`) by the publish command, by the relay, and by every
+responder, all with the same rules: `d_refund` at least two hours ahead;
+`abort_after` at least a day after `d_refund`; `repay_deadline` at least a day
+after `d_refund` plus the two-hour claim margin; `recover_after` at least a
+day after `repay_deadline`, and past `abort_after`. Because the heights are
+absolute, the offer leaves the board two hours before `d_refund`, and a take
+made later has a shorter term than an earlier one.
 
 **The Bitcoin fees are asked of the node, not assumed.** `--feerate` prices the
 funding in sat/vB and, left unset, comes from `estimatesmartfee`; so does
@@ -556,10 +571,10 @@ key.
 
 | flag | what it does |
 |---|---|
-| `--config` | the JSON holding the key, both nodes' credentials and the state file |
+| `--config` | the JSON holding the key, both nodes' credentials and the state file. The Sequentia wallet it names must be loaded on the node -- put it in the node's `wallet=` configuration so a restart reloads it -- and hold the debt asset for every lot on offer plus an asset with a published fee rate; the responder refuses to start when it cannot reach the wallet, and will not sign a release the wallet could not pay |
 | `--watch` / `--interval` | keep running, and how many seconds between passes (default 5) |
-| `--disburse-conf` | Bitcoin confirmations required on the collateral before a principal is paid (default 2: the shortest depth that survives an ordinary one-block reorg, which is what every other cross-chain step here waits for) |
-| `--claim-depth` | confirmations required on a borrower's claim before their collateral is moved into the vault (default 6) -- the claim is a Sequentia transaction, and Sequentia reorgs when Bitcoin does |
+| `--disburse-conf` | Bitcoin confirmations required on the collateral before a principal is paid (default 2, which is also the floor: the shortest depth that survives an ordinary one-block reorg, which is what every other cross-chain step here waits for) |
+| `--claim-depth` | Sequentia confirmations required on a borrower's claim before their collateral is moved into the vault (default 6) -- and, whatever this says, the Bitcoin block that claim is anchored to must be two deep, so the effective wait is the longer of the two |
 | `--scan-interval` | seconds between chain scans for a repayment whose borrower never said where it landed (default 300) |
 | `--fee-asset` | what the Sequentia legs pay their fee in (default: the debt asset) |
 | `--state` | where it records what it has already done (default: beside the key) |

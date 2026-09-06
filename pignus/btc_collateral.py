@@ -982,6 +982,14 @@ def _dust_fold(node, fee_asset):
         return 0
 
 
+class NotBroadcast(Exception):
+    """A payment that failed BEFORE anything reached the network: the wallet
+    is not loaded, cannot fund it, or cannot sign it. The caller may try
+    again freely; nothing went out. Everything after `sendrawtransaction` is
+    a plain exception, because by then the answer may simply have been lost
+    and the payment must be looked for rather than repeated."""
+
+
 def _pay_into(node, spk, asset, amount, *, change_spk=None, fee_asset=None,
               fee=None, flow="btcrepay"):
     """Pay `amount` atoms of `asset` into `spk`, explicitly, from a node wallet.
@@ -989,51 +997,54 @@ def _pay_into(node, spk, asset, amount, *, change_spk=None, fee_asset=None,
     A covenant reads the values it checks, so every input must be explicit and
     the payment must be explicit too. Returns (txid, vout).
     """
-    m, _ = _seq_tf()
-    if fee is None:
-        if fee_asset:
-            # Priced at the asset that will actually PAY it. Choosing again
-            # here would price at whatever the wallet happened to prefer and
-            # then emit that number of atoms of the caller's asset instead.
-            fee = seq_fee_for(node, fee_asset, flow=flow)
-        else:
-            fee_asset, fee = seq_fee_choice(node, prefer=(asset,), flow=flow)
-    fee = int(fee)
-    need = {asset: int(amount)}
-    need[fee_asset] = need.get(fee_asset, 0) + int(fee)
-    coins = _seq_explicit_many(node, need)
-    if change_spk is None:
-        from .vault import wallet_payout
-        change_spk = wallet_payout(node)[2]
-    have = {}
-    for o in coins:
-        have[o.asset] = have.get(o.asset, 0) + o.amount
-    tx = m.CTransaction(); tx.nVersion = 2
-    for o in coins:
-        tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout)))
-    tx.vout.append(m.CTxOut(m.CTxOutValue(int(amount)), spk,
-                            m.CTxOutAsset(_aout(asset))))
-    # Change below the node's own dust threshold goes to the FEE rather than to
-    # an output. An output the network calls dust is one nobody will relay a
-    # spend of, so keeping it is not keeping the money -- it is a coin that
-    # exists and cannot move. Every other composer in this repository folds it,
-    # and the browser does too; this tier's Sequentia legs did not.
-    fold = _dust_fold(node, fee_asset)
-    fee = int(fee)
-    for a, total in have.items():
-        rest = total - need.get(a, 0)
-        if rest <= 0:
-            continue
-        if a == fee_asset and rest < fold:
-            fee += rest
-            continue
-        tx.vout.append(m.CTxOut(m.CTxOutValue(rest), change_spk,
-                                m.CTxOutAsset(_aout(a))))
-    tx.vout.append(m.CTxOut(m.CTxOutValue(int(fee)),
-                            nAsset=m.CTxOutAsset(_aout(fee_asset))))
-    signed = node.signrawtransactionwithwallet(tx.serialize().hex())
-    if not signed["complete"]:
-        raise ValueError("the wallet could not sign this payment's inputs")
+    try:
+        m, _ = _seq_tf()
+        if fee is None:
+            if fee_asset:
+                # Priced at the asset that will actually PAY it. Choosing again
+                # here would price at whatever the wallet happened to prefer and
+                # then emit that number of atoms of the caller's asset instead.
+                fee = seq_fee_for(node, fee_asset, flow=flow)
+            else:
+                fee_asset, fee = seq_fee_choice(node, prefer=(asset,), flow=flow)
+        fee = int(fee)
+        need = {asset: int(amount)}
+        need[fee_asset] = need.get(fee_asset, 0) + int(fee)
+        coins = _seq_explicit_many(node, need)
+        if change_spk is None:
+            from .vault import wallet_payout
+            change_spk = wallet_payout(node)[2]
+        have = {}
+        for o in coins:
+            have[o.asset] = have.get(o.asset, 0) + o.amount
+        tx = m.CTransaction(); tx.nVersion = 2
+        for o in coins:
+            tx.vin.append(m.CTxIn(m.COutPoint(int(o.txid, 16), o.vout)))
+        tx.vout.append(m.CTxOut(m.CTxOutValue(int(amount)), spk,
+                                m.CTxOutAsset(_aout(asset))))
+        # Change below the node's own dust threshold goes to the FEE rather than to
+        # an output. An output the network calls dust is one nobody will relay a
+        # spend of, so keeping it is not keeping the money -- it is a coin that
+        # exists and cannot move. Every other composer in this repository folds it,
+        # and the browser does too; this tier's Sequentia legs did not.
+        fold = _dust_fold(node, fee_asset)
+        fee = int(fee)
+        for a, total in have.items():
+            rest = total - need.get(a, 0)
+            if rest <= 0:
+                continue
+            if a == fee_asset and rest < fold:
+                fee += rest
+                continue
+            tx.vout.append(m.CTxOut(m.CTxOutValue(rest), change_spk,
+                                    m.CTxOutAsset(_aout(a))))
+        tx.vout.append(m.CTxOut(m.CTxOutValue(int(fee)),
+                                nAsset=m.CTxOutAsset(_aout(fee_asset))))
+        signed = node.signrawtransactionwithwallet(tx.serialize().hex())
+        if not signed["complete"]:
+            raise ValueError("the wallet could not sign this payment's inputs")
+    except Exception as e:                              # noqa: BLE001
+        raise NotBroadcast(f"{type(e).__name__}: {e}") from e
     txid = node.sendrawtransaction(signed["hex"])
     return txid, _find_vout(node, signed["hex"], spk)
 

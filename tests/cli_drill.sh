@@ -963,6 +963,41 @@ wrong = {k: getattr(a, k) for k, v in base.items() if getattr(a, k) != v}
 if wrong:
     sys.exit(f"FAIL: with neither, the defaults did not apply: {wrong}")
 print("  and with neither, the built-in defaults do")
+
+# The file's `book` reaches every command that takes --config, not only the
+# responder: the offer commands and the status command talked to localhost
+# whatever the file said, and the status command then reported zero
+# problems from a book it never read.
+for cmd in ("btc-offer-withdraw", "btc-offer-resign", "btc-responder-status"):
+    try:
+        a = ap.parse_args([cmd, "--config", path] + (
+            ["--offer", "x"] if cmd.startswith("btc-offer") else []))
+    except SystemExit:
+        a = None
+    if a is None:
+        sys.exit(f"FAIL: {cmd} would not parse with --config and --offer")
+    m._btc_cfg(a)
+    if a.book != "https://elsewhere.example/lending":
+        sys.exit(f"FAIL: {cmd} ignored the file's book: {a.book}")
+print("  the file's book reaches the offer and status commands too")
+os.environ["PIGNUS_BOOK"] = "http://env.example:1"
+a = parsed("--config", path)
+del os.environ["PIGNUS_BOOK"]
+if a.book != "http://env.example:1":
+    sys.exit(f"FAIL: PIGNUS_BOOK did not beat the file: {a.book}")
+print("  and PIGNUS_BOOK beats the file, as a flag beats both")
+
+# A principal paid against one confirmation is paid against a funding the
+# borrower can replace the moment one block is orphaned: the floor is two.
+low = os.path.join(work, "responder-low.json")
+json.dump({"disburse_conf": 1, "lender_key": "/k", "state": "/s"}, open(low, "w"))
+try:
+    parsed("--config", low)
+    sys.exit("FAIL: disburse_conf 1 was accepted")
+except SystemExit as e:
+    if e.code != 2:
+        raise
+print("  disburse_conf below two is refused")
 CFG
 
 # --- a composer gets the NODE's dust threshold, never a fallback -------------

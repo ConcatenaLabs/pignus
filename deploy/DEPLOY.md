@@ -596,8 +596,8 @@ key, and never delete it while a loan is open.
 | `claim_depth` | 6 | confirmations on the borrower's claim of that principal before their collateral is moved into the loan |
 | `scan_interval` | 300 | seconds between chain scans for a repayment whose borrower never said where it landed |
 | `fee_asset` | the debt asset | which asset pays the Sequentia-side fees. Any asset the node publishes a rate for; there is no privileged fee coin |
-| `rpc` | — | the Sequentia node: `url`, one of `cookie` or `user`/`password`, and `wallet` |
-| `btc_rpc` | — | the Bitcoin node, the same four fields |
+| `rpc` | — | the Sequentia node: `url`, one of `cookie` or `user`/`password`, and `wallet`. The wallet must be loaded on the node -- name it in the node's `wallet=` configuration so a restart reloads it -- and hold the debt asset for every lot on offer plus an asset with a published fee rate. The responder refuses to start when it cannot reach it |
+| `btc_rpc` | — | the Bitcoin node, the same four fields. Without it the commands fall back to `http://127.0.0.1:8332`, which is mainnet's port; the example's `48332` is testnet4 |
 
 `disburse_conf` and `claim_depth` are the lender's exposure to a reorg on the
 other chain, which is why they are configuration rather than constants.
@@ -622,12 +622,21 @@ Publishing an offer, from the lender's machine:
 
 ```bash
 pignus-cli btc-offer-publish --config /root/sequentia/pignus-responder.json \
-    --market BTC/USDX --oracle-x <x> --strike <price> \
+    --market BTC/USDX --oracle-x <x> --strike <strike from quote> \
     --btc-amount 100000 --debt-asset <id> --debt 5250000000 \
     --principal 5000000000 --lender-prog <hex> --lots 3 \
     --recover-after <btc-height> --abort-after <btc-height> \
     --repay-deadline <seq-height> --d-refund <seq-height>
 ```
+
+`<x>` is the first entry of `curl $BOOK/v1/oracles`, `<id>` the debt asset id
+from `curl $BOOK/v1/markets`, `<hex>` from `pignus-cli payout-program
+--rpc-wallet <name>`, and the strike from `pignus-cli quote`. The four heights
+are judged against the tips in `/v1/markets` (`height`, `btc_height`) by the
+command, by the relay and by every responder: `d_refund` at least two hours
+ahead, `abort_after` a day after it, `repay_deadline` a day after `d_refund`
+plus the two-hour claim margin, `recover_after` a day after `repay_deadline`
+and past `abort_after`. An offer leaves the board two hours before `d_refund`.
 
 Every offer is signed by the lender key it names, and the relay refuses one that
 is not: an unsigned offer would let anyone publish in a lender's name and have
