@@ -3654,7 +3654,8 @@ def cmd_btc_responder_status(args):
     # only when asked (--expect-offer): a key that has deliberately withdrawn
     # is not a person needed.
     no_offer = bool(getattr(args, "expect_offer", False)) and not unchecked \
-        and lender_x_of(args) and not dis.get("open")
+        and getattr(args, "book", None) and lender_x_of(args) \
+        and not dis.get("open")
     print(json.dumps({"state": path, "takes": len(rows),
                       "needing_attention": (len(stuck) + len(disowned)
                                             + len(unfixable) + len(slow)
@@ -3772,6 +3773,11 @@ def cmd_btc_responder_clear(args):
     state = _ResponderState(path, exclusive=True)   # refuses if one is running
     have = state.get(args.take)
     if getattr(args, "write_off", None):
+        # A take this key never touched is not written off: a mistyped id
+        # would otherwise become a fresh record, listed as written off.
+        if not have:
+            refuse(f"{path} has no record of take {args.take}; nothing to "
+                   f"write off")
         # A take this key can do nothing more about -- a record from before
         # the format that lets it be rebuilt, a principal paid to a plain
         # address that no covenant ever bound -- written off, on the record,

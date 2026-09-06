@@ -708,6 +708,16 @@ if r.returncode == 0 or "no claim of its repayment" not in r.stderr:
     sys.exit(f"FAIL: a take with a paid, unclaimed principal was written off "
              f"without --force: {r.returncode} {r.stderr[-300:]}")
 print("  a take with a paid, unclaimed principal is not written off by accident")
+# ...and a take this key never touched is not written off either: a mistyped
+# id must not become a fresh record listed as written off.
+r = subprocess.run([sys.executable, cli, "btc-responder-clear",
+                    "--state", state, "--take", "take-typo", "--force",
+                    "--write-off", "a slip of the finger"],
+                   capture_output=True, text=True)
+if r.returncode == 0 or "no record of take" not in r.stderr \
+        or "take-typo" in json.load(open(state)):
+    sys.exit(f"FAIL: an unknown take was written off: {r.returncode} {r.stderr[-200:]}")
+print("  an id this key has no record of is refused, not written off")
 r = subprocess.run([sys.executable, cli, "btc-responder-clear",
                     "--state", state, "--take", "take-live", "--force",
                     "--write-off", "pre-format record; principal went to a plain address"],
@@ -926,6 +936,12 @@ OUT=$("$BIN/pignus-cli" btc-responder-status --lender-key "$LKEY3" \
 rc=$?
 set -e
 test "$rc" = "0" || { echo "without --expect-offer an idle key is not a person needed (exit $rc)" >&2; exit 1; }
+set +e
+OUT=$("$BIN/pignus-cli" btc-responder-status --lender-key "$LKEY3" \
+        --state "$WORK/idle.state.json" --book "" --expect-offer 2>&1)
+rc=$?
+set -e
+test "$rc" = "0" || { echo "--expect-offer with no book judged a board it never read (exit $rc)" >&2; exit 1; }
 echo "  --expect-offer counts a sound open offer, and reports a key with nothing takeable on the board"
 
 # Twice is a no-op rather than an error: an operator running the repair over
