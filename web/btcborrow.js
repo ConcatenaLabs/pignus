@@ -312,8 +312,11 @@ export function renderOffers(box, offers, ui, onBorrow, write, feerateSatVb) {
       'deadline is Sequentia block ' +
       Number(l.repay_deadline).toLocaleString() +
       '</span></td>' +
-      '<td data-label="lender sweep">Bitcoin block ' +
-        Number(l.recover_after).toLocaleString() + '</td>' +
+      // A date like the deadline beside it, with the block in small print;
+      // a bare block height next to a date reads as a different kind of
+      // thing, and it is not.
+      '<td data-label="lender sweep">' +
+        ui.blockTime(l.recover_after, "Bitcoin") + '</td>' +
       // How many of this offer's lots are still free. The book computes it
       // live, counting the takes already holding one -- and a borrower who
       // cannot see it learns an offer is spoken for by being refused after
