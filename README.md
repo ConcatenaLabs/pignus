@@ -909,7 +909,9 @@ tests/test_offer_expiry.py         a cross-chain offer's own end
 tests/test_arith_parity.py         the same arithmetic, addresses and refusals
                                    in both languages, over a sweep
 tests/page_check.sh                the page, in a real browser; it skips
-                                   itself where there is no headless Chromium
+                                   itself where there is no headless Chromium.
+                                   PIGNUS_SHOTS=<dir> keeps a desktop and a
+                                   phone screenshot there for a person to look at
 ```
 
 Against a running chain (a `sequentiad`, and for the BTC ones a `bitcoind` too):
