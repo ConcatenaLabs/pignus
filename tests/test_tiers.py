@@ -224,6 +224,14 @@ def tier_d_pure():
     problems, _ = inspect_settlement(raw, wrong_vault, t)
     check("and a bond vault that is not these terms', naming input 1",
           any("input 1" in p for p in problems), str(problems))
+    short = m.tx_from_hex(raw)
+    del short.vout[2:]
+    problems, _ = inspect_settlement(short.serialize().hex(), prevouts, t)
+    check("and a transaction with too few outputs is refused, not crashed on",
+          any("at least five" in p for p in problems), str(problems))
+    problems, _ = inspect_settlement("zz", prevouts, t)
+    check("and one that is not a transaction at all",
+          any("not a transaction" in p for p in problems), str(problems))
 
     # A locktime, for an OpenDAMP rule that binds a transfer to a window.
     timed = m.tx_from_hex(sp.compose_settlement(
