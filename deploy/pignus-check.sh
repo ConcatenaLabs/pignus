@@ -37,9 +37,18 @@ set -uo pipefail
 # person only when it CHANGES. A crash before the verdict is another matter:
 # pignus-check.service carries no OnFailure= (it would repeat the verdict every
 # run), so this is the only thing that would say the check itself has broken.
+#
+# Only the TIMER's runs record a verdict and page anyone. A run by hand -- an
+# operator looking, a drill on the box -- must not overwrite the timer's last
+# verdict or announce a failure of a book it made up: systemd marks its own
+# runs with INVOCATION_ID, and naming PIGNUS_CHECK_STATE opts a run in.
 ALERT="$(dirname "$0")/pignus-alert.sh"
+RECORDS=""
+if [ -n "${INVOCATION_ID:-}" ] || [ -n "${PIGNUS_CHECK_STATE:-}" ]; then
+    RECORDS=1
+fi
 VERDICT_SAID=""
-trap 'rc=$?; if [ -z "$VERDICT_SAID" ] && [ -x "$ALERT" ]; then "$ALERT" "pignus check CRASHED (exit $rc) before reaching a verdict; journalctl -u pignus-check.service says where"; fi' EXIT
+trap 'rc=$?; if [ -n "$RECORDS" ] && [ -z "$VERDICT_SAID" ] && [ -x "$ALERT" ]; then "$ALERT" "pignus check CRASHED (exit $rc) before reaching a verdict; journalctl -u pignus-check.service says where"; fi' EXIT
 
 # Every oracle whose loans this box is responsible for, space separated: the
 # primary, plus any pignus-oracle@N instances. An m-of-n loan needs m of them
@@ -278,10 +287,15 @@ echo
 # failing run, and the run that passes again. `pignus-alert.sh` says how the
 # push channel is set up; without one this is a journal line.
 STATE_FILE="${PIGNUS_CHECK_STATE:-/var/lib/pignus-check/last}"
-was=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 now_verdict=$([ "$fails" -eq 0 ] && echo ok || echo fail)
-mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null && echo "$now_verdict" > "$STATE_FILE" 2>/dev/null
 VERDICT_SAID=1
+if [ -z "$RECORDS" ]; then
+    echo "(run by hand: this verdict is not recorded and pages nobody; the timer's runs do both)"
+    was="$now_verdict"
+else
+    was=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
+    mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null && echo "$now_verdict" > "$STATE_FILE" 2>/dev/null
+fi
 if [ "$now_verdict" != "$was" ] && [ -x "$ALERT" ]; then
     if [ "$now_verdict" = fail ]; then
         "$ALERT" "pignus check FAILED ($fails): $(printf '%s' "$OUTPUT_SO_FAR" | grep '  FAIL' | head -3 | cut -c1-200 | tr '\n' ' ')"
