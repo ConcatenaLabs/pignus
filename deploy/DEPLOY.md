@@ -23,6 +23,7 @@ on the box.
 | `bitcoind` (testnet4) | 48332 | the Bitcoin network | cross-chain deadlines go unchecked, `/healthz` says `btc_node: false`, the page refuses to originate, and the responder cannot pay or start a loan |
 | the price server | 8088 | upstream quotes | every oracle stops signing once its feed has come back byte-identical for `flat_rounds` rounds, or sooner if `feed_max_age` is set |
 | `sequentia-registry` | 3005 | — | tickers fall back to the node's own asset labels |
+| `pignus-alert@<unit>` | none (a oneshot) | the ntfy topic in `pignus-alert.env` | a unit's failure, or a change in the check's verdict, reaches nobody's phone; the journal still has it |
 
 The price server is the node repository's `contrib/price-server`, the same one
 that feeds the any-asset fee market; Pignus deliberately does not run a second
@@ -84,9 +85,16 @@ chmod 600 /root/sequentia/pignusd.json /root/sequentia/pignus-responder.json
 # pignus-responder.json's rpc.wallet must be loaded on the node (name it in
 # the node's wallet=) and hold the debt asset of every lot on offer; the
 # responder exits at start otherwise.
+
+# the push channel a unit's failure and the check's verdict go to
+# (*Alerting* below): a topic name nobody guesses, in a root-only file
+printf 'NTFY_TOPIC=%s\n' "pignus-$(openssl rand -hex 8)" > /root/sequentia/pignus-alert.env
+chmod 600 /root/sequentia/pignus-alert.env
+
 systemctl daemon-reload
 systemctl enable --now pignus-oracle pignus-oracle@2 pignus-oracle@3 pignusd pignus-btc-responder
 systemctl enable --now pignus-backup.timer pignus-check.timer
+systemctl start pignus-alert@test.service    # one test line reaches the topic
 ```
 
 The three oracles are enabled together because the check timer names all
