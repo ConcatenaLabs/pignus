@@ -451,11 +451,18 @@ class BulkHttpPriceSource(PriceSource):
         self._snapshot = {}
         self._fetched = 0.0
         self._updated = 0.0
+        self.clock_skew = None
+
+    def observed_at(self) -> float:
+        """When the prices held were observed: what the feed says of its own
+        numbers when it says anything, else when this oracle read them."""
+        return self._updated or self._fetched
 
     def refresh(self) -> None:
-        import urllib.request
-        with urllib.request.urlopen(self.url, timeout=self.timeout) as r:
-            data = json.loads(r.read().decode())
+        body, skew = fetch_feed(self.url, self.timeout)
+        data = json.loads(body.decode())
+        if skew is not None:
+            self.clock_skew = skew
         if not isinstance(data, dict):
             raise ValueError(f"{self.url} did not return an object")
         meta = data.get("_meta") or {}
@@ -520,6 +527,61 @@ class BulkHttpPriceSource(PriceSource):
         return float(row[self.field])
 
 
+# How far this machine's clock may sit from a feed's before an attestation
+# stamped here is refused downstream as from the future or already stale.
+CLOCK_TOLERANCE = 60.0
+# The most a feed may say in one answer. A price is a few bytes.
+FEED_MAX_BYTES = 1_000_000
+
+
+def check_feed_url(url: str, insecure: bool = False) -> None:
+    """A plain-http feed on another machine is one a path in between can
+    rewrite, and an oracle signs the rewrite. Refused at start unless the
+    operator says `insecure` on purpose."""
+    from urllib.parse import urlparse
+    u = urlparse(str(url))
+    host = (u.hostname or "").lower()
+    if u.scheme == "http" and host not in ("127.0.0.1", "localhost", "::1") \
+            and not host.startswith("127.") and not insecure:
+        raise SystemExit(
+            f"the price feed {url} is plain http on another machine, which a "
+            f"path in between can rewrite -- and this oracle would sign the "
+            f"rewrite. Use https, a loopback feed, or set "
+            f"\"insecure\": true in the source to say this is deliberate.")
+    if u.scheme not in ("http", "https"):
+        raise SystemExit(f"the price feed {url} is not an http(s) URL")
+
+
+_OPENER = None
+
+
+def fetch_feed(url: str, timeout: float):
+    """(bytes, clock skew in seconds or None): the body, capped, and how far
+    this machine's clock is from the feed's Date header. A redirect is
+    refused: a feed that moved is not the one the operator checked."""
+    global _OPENER
+    import urllib.request
+    from email.utils import parsedate_to_datetime
+    if _OPENER is None:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                raise ValueError("the feed redirected; refusing to follow")
+        _OPENER = urllib.request.build_opener(_NoRedirect())
+    with _OPENER.open(url, timeout=timeout) as r:
+        body = r.read(FEED_MAX_BYTES + 1)
+        if len(body) > FEED_MAX_BYTES:
+            raise ValueError(f"{url} answered more than {FEED_MAX_BYTES} "
+                             f"bytes; a price feed does not")
+        skew = None
+        date = r.headers.get("Date")
+        if date:
+            try:
+                skew = time.time() - parsedate_to_datetime(date).timestamp()
+            except Exception:                           # noqa: BLE001
+                skew = None
+    return body, skew
+
+
 class HttpPriceSource(PriceSource):
     """Reads the Sequentia price feed already deployed for the any-asset fee
     market (contrib/price-server). Deliberately not a second price pipeline:
@@ -538,17 +600,24 @@ class HttpPriceSource(PriceSource):
         # so has a different shape of the same question.
         self.max_age = max_age
         self._cache = {}
+        self._fetched = 0.0
+        self.clock_skew = None
+
+    def observed_at(self) -> float:
+        return self._fetched
 
     def reference_price(self, symbol: str) -> float:
-        import urllib.request
         # NOT upper-cased: feed tickers are case-sensitive (the Sequentia demo
         # feed serves `tBTC`, and `TBTC` is a 404).
         url = f"{self.url}/{symbol}"
         hit = self._cache.get(symbol)
         if hit and self.max_age and (time.time() - hit[0]) <= self.max_age:
             return hit[1]
-        with urllib.request.urlopen(url, timeout=self.timeout) as r:
-            data = json.loads(r.read().decode())
+        body, skew = fetch_feed(url, self.timeout)
+        data = json.loads(body.decode())
+        self._fetched = time.time()
+        if skew is not None:
+            self.clock_skew = skew
         if isinstance(data, bool):
             raise ValueError(f"{url} returned a boolean, not a price")
         if isinstance(data, (int, float)):

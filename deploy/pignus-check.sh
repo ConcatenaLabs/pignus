@@ -66,6 +66,10 @@ try:
 except ValueError:
     print("its /healthz was not JSON")
     raise SystemExit(1)
+errs = d.get("oracle_errors") or []
+if errs:
+    print("oracle errors: " + "; ".join(str(e) for e in errs)[:400])
+    raise SystemExit(1)
 if d.get("ok") is True:
     raise SystemExit(0)
 # The book says "error"; the oracle says "round_error" or "source_error" and

@@ -479,7 +479,11 @@ async function refresh() {
   if (o) state.offers = o.offers;
   if (l) state.loans = l.loans;
   if (or) state.oracleX = or.oracle_x;
-  if (ors) state.oracles = ors.oracles || [];
+  if (ors) {
+    state.oracles = ors.oracles || [];
+    state.oraclePrevious = ors.previous || [];
+    state.oracleCompromised = ors.compromised || [];
+  }
   try { state.btcOffers = (await api("v1/btc/offers")).offers || []; } catch { /* keep */ }
   // The Bitcoin height, for the half of a cross-chain loan's deadlines that
   // this chain cannot see. A book without a Bitcoin node publishes none, and
@@ -847,14 +851,26 @@ function oracleKeys(t) {
 }
 
 function unknownOracles(t) {
-  const known = new Set([state.oracleX, ...state.oracles].filter(Boolean));
+  // A key an oracle USED to sign with is a rotation, not a stranger.
+  const known = new Set([state.oracleX, ...state.oracles,
+                         ...(state.oraclePrevious || [])].filter(Boolean));
   if (!known.size) return [];
   return oracleKeys(t).filter(k => !known.has(k));
+}
+
+/** The keys of this loan's oracle set that some quoted oracle has declared
+ *  compromised: whoever holds one can sign any price for the loan. */
+function compromisedOracles(t) {
+  const bad = new Set(state.oracleCompromised || []);
+  if (!bad.size) return [];
+  return oracleKeys(t).filter(k => bad.has(k));
 }
 
 function oracleTags(t) {
   const keys = oracleKeys(t);
   let out = "";
+  if (compromisedOracles(t).length)
+    out += ' <span class="tag bad" title="an oracle has declared this key compromised: whoever holds it can sign any price for this loan. A borrower repays now; a lender expects nothing from the oracle">oracle key compromised</span>';
   if (t.oracles && t.oracles.length)
     out = ` <span class="tag dim" title="${esc(t.oracles.join("\n"))}">${esc(t.oracle_threshold)}-of-${t.oracles.length} oracles</span>`;
   else if (keys.length)
@@ -1659,7 +1675,11 @@ function lendTerms() {
     const n = Number(oMode);
     if (!(state.oracles.length >= n && n >= 2))
       throw new Error("that oracle set is no longer available");
-    oracle_x = ""; oracles = state.oracles.slice(); oracle_threshold = n;
+    // A MAJORITY by default, never n-of-n: n-of-n makes every liquidation
+    // depend on every oracle's uptime, and one frozen feed takes the
+    // lender's only remedy away for as long as it lasts.
+    oracle_x = ""; oracles = state.oracles.slice();
+    oracle_threshold = Math.max(2, Math.ceil((n + 1) / 2));
   } else if (!state.oracleX) {
     throw new Error("the book has no oracle key right now (its oracle is " +
                     "unreachable); an offer cannot be built without one");

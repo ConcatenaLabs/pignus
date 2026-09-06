@@ -355,11 +355,62 @@ def test_documented_configs_start():
             return False
 
     check("an http source may cache, and says so by accepting max_age",
-          accepted({"type": "http", "url": "http://x", "max_age": 60}))
+          accepted({"type": "http", "url": "https://x", "max_age": 60}))
     check("a setting no source understands is refused, not ignored",
-          not accepted({"type": "http", "url": "http://x", "nonsense": 1}))
+          not accepted({"type": "http", "url": "https://x", "nonsense": 1}))
     check("and an underscore key is a comment, which is welcome",
-          accepted({"type": "http", "url": "http://x", "_why": "because"}))
+          accepted({"type": "http", "url": "https://x", "_why": "because"}))
+    # A plain-http feed on another machine is a feed a path in between can
+    # rewrite, and the oracle would sign the rewrite.
+    check("a plain-http feed on another machine is refused at start",
+          not accepted({"type": "http_bulk", "url": "http://feeds.example/prices"}))
+    check("...unless the operator says insecure on purpose",
+          accepted({"type": "http_bulk", "url": "http://feeds.example/prices", "insecure": True}))
+    check("and loopback is fine over plain http",
+          accepted({"type": "http_bulk", "url": "http://127.0.0.1:8088/prices"}))
+    # The jump guard: a price that moves further than max_jump in one step is
+    # held until it has stayed there for jump_rounds rounds.
+    import tempfile                                       # noqa: PLC0415
+    d = tempfile.mkdtemp()
+    jcfg = {"keyfile": os.path.join(d, "k"), "logfile": os.path.join(d, "l"),
+            "markets": ["GOLD/USDX"], "precisions": {"GOLD": 8, "USDX": 8},
+            "source": {"type": "static", "prices": {"GOLD": 3000, "USDX": 1}},
+            "jump_rounds": 2}
+    jo = om.Oracle(jcfg, create_key=True)
+    jo.tick()
+    first = jo.latest["GOLD/USDX"].price
+    jo.source.prices["GOLD"] = 30000.0
+    jo.tick()
+    check("a tenfold price is not signed on the round it appears",
+          "GOLD/USDX" in jo.errors and jo.latest["GOLD/USDX"].price == first,
+          str(jo.errors))
+    jo.tick()
+    check("...but is once it has held for jump_rounds rounds",
+          "GOLD/USDX" not in jo.errors and jo.latest["GOLD/USDX"].price == first * 10,
+          str(jo.errors))
+    jo.source.prices["GOLD"] = 30000.0 * 1.2
+    jo.tick()
+    check("a move within max_jump is signed at once",
+          "GOLD/USDX" not in jo.errors and jo.latest["GOLD/USDX"].price == first * 12)
+    # Observation time: a feed that stops answering leaves the last
+    # attestation standing rather than re-signing it with a fresh stamp.
+    class Held(om.O.StaticPriceSource):
+        seen = 1000.0
+        def observed_at(self):
+            return self.seen
+    hcfg = dict(jcfg, keyfile=os.path.join(d, "k2"), logfile=os.path.join(d, "l2"))
+    ho = om.Oracle(hcfg, create_key=True)
+    ho.source = Held({"GOLD": 3000, "USDX": 1})
+    ho.tick(); n1 = len(ho.log.all("GOLD/USDX")) if hasattr(ho.log, "all") else None
+    ts1 = ho.latest["GOLD/USDX"].timestamp
+    ho.tick()
+    check("an attestation is stamped with the observation, not the signing",
+          ts1 == 1000 and ho.latest["GOLD/USDX"].timestamp == 1000)
+    check("and nothing new observed signs nothing new",
+          "GOLD/USDX" not in ho.errors and ho.latest["GOLD/USDX"].timestamp == 1000)
+    ho.source.seen = 2000.0
+    ho.tick()
+    check("a new observation is a new attestation", ho.latest["GOLD/USDX"].timestamp == 2000)
     check("every documented source key is one its source understands",
           all(accepted(json.loads(open(p2).read()).get("source", {}))
               for p2 in glob.glob(os.path.join(ROOT, "deploy", "oracle*.json"))))
@@ -396,6 +447,9 @@ def main():
         "listen": f"127.0.0.1:{oport}",
         "interval": 1,
         "price_scale": 100_000,
+        # These drills move the feed's prices by whatever the check needs;
+        # the jump guard has its own check above and is off here.
+        "max_jump": 0,
         # SILVR is priced by nothing the feed serves. It must fail on its own
         # without taking the round down: an oracle that stops signing every
         # market because one feed hiccuped is an oracle whose outage reaches

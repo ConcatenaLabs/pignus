@@ -30,6 +30,14 @@ const live = (o = {}) => ({ state: "LIVE", loan_id: "L1", txid: "11".repeat(32),
      a.borrower.length === 0 && a.lender.length === 0);
 }
 {
+  const c = A.alertsFor(view({ loans: [live({ oracle_compromised: true })] }));
+  ok("a loan whose oracle key is declared compromised is a bad alert with Repay for the borrower",
+     c.borrower.some(x => x.level === "bad" && x.action === "repay" && /COMPROMISED/.test(x.text)), JSON.stringify(c.borrower));
+  const asLender = A.alertsFor(view({ loans: [live({ oracle_compromised: true, terms: terms({ borrower_prog: "77".repeat(20) }) })] }));
+  ok("...and a bad alert with no button for the lender",
+     asLender.lender.some(x => x.level === "bad" && x.action === null && /COMPROMISED/.test(x.text)), JSON.stringify(asLender.lender));
+}
+{
   const a = A.alertsFor(view({ loans: [live({ health: 0.95, liquidatable_since: 1_800_000_000 - 3 * 3600, liquidatable: true })] }));
   ok("a liquidatable loan tells the borrower, with how long it has sat there",
      a.borrower[0]?.level === "bad" && /3 hours/.test(a.borrower[0].text) && a.borrower[0].action === "repay",

@@ -192,7 +192,7 @@ cat > "$WORK/oracle.json" <<EOF
   "source": {"type": "static", "prices": {"GOLD": 3000, "SILVR": 30, "USDX": 1}}
 }
 EOF
-"$BIN/pignus-oracle" --config "$WORK/oracle.json" --once
+"$BIN/pignus-oracle" --config "$WORK/oracle.json" --once --create-key
 OX=$("$BIN/pignus-oracle" --config "$WORK/oracle.json" --print-pubkey)
 echo "oracle key $OX"
 test "$(stat -c '%a' "$WORK/oracle.key")" = "600" || { echo "FAIL: key not 0600" >&2; exit 1; }

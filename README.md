@@ -635,8 +635,26 @@ the borrower's countersignature on an early seizure, `--holder-sig`. Every one
 of these prints the sentence that says the collateral is issuer-permissioned,
 because presenting it quietly beside a Tier A loan would be a lie. `--issuer`
 names the `openampd` (default `http://127.0.0.1:8722`, or `PIGNUS_ISSUER`) and
-`--token` authenticates the caller to it and nothing more (`PIGNUS_ISSUER_TOKEN`
-is where it belongs).
+`--token` is the **issuer operator's** bearer token (`PIGNUS_ISSUER_TOKEN` is
+where it belongs): `pledge-create`, `pledge-list`, `pledge-release` and
+`pledge-seize` are run by whoever operates the policy server, never by the
+borrower or the lender. Those two run `pledge-sign` and hand the issuer the
+signature; the policy server's public `/v1/log` is their read path, and it
+records every pledge, release and seizure. `pledge-sign --key` is the key
+whose x-only public key the party registered with the issuer for their AID,
+and nothing else verifies; both parties need an AID that holds an enclave for
+the asset, and the asset must carry a clawback leaf, or the issuer refuses.
+
+The order of operations, since Pignus moves no money on this tier: the issuer
+runs `pledge-create`; the lender sees it in `/v1/log` and pays the principal
+by an ordinary transfer; the borrower repays by an ordinary transfer; the
+lender runs `pledge-sign --action release --extra <repaid txid>` and the
+issuer runs `pledge-release --lender-sig … --repaid-txid <the same>`. The
+release is the lender's word alone; nothing checks the repayment. A seizure of
+an asset whose issuer key is external is two phases, like a clawback: the
+request, then the issuer signing the sighashes it is handed and completing
+it; `pledge-seize` says which of the two it got, and exits 4 while the
+collateral is still the issuer's to move.
 
 **OpenDAMP (Tier D)** assets cannot be collateral at all, so what Pignus offers
 is a **repurchase**: the borrower sells the asset outright and holds a claim to
@@ -648,9 +666,20 @@ terms; `repo-settle` composes the buyback, which pays the bond to the lender in
 the same transaction that returns the asset; and `repo-forfeit` pays the bond to
 the BORROWER if the deadline passes with no settlement.
 
+**Settlement has no signer yet.** The buyback spends two OpenDAMP Simplicity
+inputs -- the verifier and the lender's restricted output -- and nothing in
+this repository or in the OpenDAMP transfer tool signs those for a
+transaction it did not build. `repo-settle` composes the skeleton and attaches
+the covenant's own witness; the two Simplicity witnesses are the issuer's
+tooling to provide, and until it does, an asset sold under a repurchase does
+not come back. A holder who sells under one today should expect the bond, not
+the asset. `repo-propose` says so.
+
 So a forfeit is not a remedy that makes the borrower whole: they keep the bond
 and the lender keeps the asset, which is the arrangement they agreed and not a
-restoration of it. The bond is `collateral_value - debt`, so it is worth what
+restoration of it. It is also the lender's whole exposure: there is no leaf
+that returns a bond to a lender whose borrower never delivered the asset, so
+a lender who funds the bond first is trusting the borrower for leg one. The bond is `collateral_value - debt`, so it is worth what
 the borrower would have gained by buying back, and nothing more. A borrower who
 wants the ASSET back has one route, which is the lender settling.
 
@@ -757,25 +786,52 @@ pignus-oracle --config oracle.json
 | `listen` | `host:port` |
 | `log_max_bytes` | rotate the attestation log past this size (0, the default, never rotates) |
 | `previous_keys` | x-only keys this oracle used to sign with, published at `/v1/pubkey` so a borrower can tell a rotation from a stranger |
+| `compromised_keys` | keys this operator declares compromised, published at `/v1/pubkey`; a book refuses attestations under them and flags the loans that bake them |
+| `max_jump`, `jump_rounds` | a price that moves further than `max_jump` (a fraction of the last signed price, default 0.5) in one step is held, unsigned, until it has stayed there for `jump_rounds` consecutive rounds (default 3). A feed that switched units is a perfectly good signature over a number a thousandfold off; 0 turns the guard off |
+| `book` | the book a cross-chain seizure is checked against before it is co-signed: the take must still be open there. Optional; `--allow-unlisted` co-signs without asking |
 | `seizures` | where Tier B co-signatures are logged (default: `<logfile>.seizures`) |
 | `source.type` | `static` (fixed prices, for drills), `http` (one request per market) or `http_bulk` (one snapshot per round, which is what keeps a round's prices consistent) |
-| `source.prices` | with `static`, the fixed price per market |
+| `source.prices` | with `static`, the fixed reference price per asset named in `markets` (`{"GOLD": 3000, "USDX": 1}`) |
 | `source.url`, `.field` | where the prices are, and which field of each row holds one |
-| `source.timeout`, `.max_age` | seconds to wait, and how long a fetched snapshot may be reused |
+| `source.timeout`, `.max_age` | seconds to wait, and how long a fetched snapshot may be reused. Every attestation is stamped with the time the price was OBSERVED -- the feed's own `_meta.updated` when it publishes one, else the fetch -- so a snapshot re-used after the feed stopped answering ages honestly, and nothing new observed signs nothing new |
+| `source.insecure` | allow a plain-`http` feed on another machine. Refused otherwise: a path in between can rewrite it, and this oracle would sign the rewrite |
 | `source.feed_max_age` | how old the feed's own `_meta.updated` may be before this oracle refuses to re-sign its numbers. **Off unless you set it**, and set it only against a feed that publishes that field: an oracle asked for a check it cannot perform refuses to sign at all rather than read "cannot tell" as "fresh", and a key that signs nothing is one no loan under it can ever be liquidated |
 
 8730 is the built-in listen default; the testnet box runs the oracle on 8740
 and `pignusd` on 8741, see `deploy/DEPLOY.md`.
 
 `--once` signs one round, prints it and exits, without serving; `--print-pubkey`
-prints the x-only key and exits. Neither it nor `--sign-seize` will create a key
-file: asking what a key is, or asking it to co-sign, must never answer with a
-new one. Every other path does create one on first run.
+prints the x-only key and exits. None of `--once`, `--print-pubkey` and
+`--sign-seize` will create a key file: asking what a key is, checking a config,
+or asking the key to co-sign must never answer with a new one. The serving
+path creates one on its own only on a fresh install, where no attestation log
+exists yet; a machine that holds this oracle's log but not its key is a lost
+key, and it refuses to start until the key is restored or `--create-key` says
+a new one is meant. Creation is announced loudly: back the file up then.
 
-The key is created 0600 on first run and its mode is re-checked on every start.
+The key is created 0600 and its mode is re-checked on every start.
 It is never logged and never served. Prices come from the price feed that
 already drives the any-asset fee market (the node repository's
 `contrib/price-server`) -- deliberately not a second price pipeline.
+
+An `http_bulk` feed is a JSON object keyed by ticker, matched without regard
+to case, each value a number or an object whose `field` (default `price`)
+holds one; an optional `_meta.updated` in Unix seconds says when the feed
+last refreshed its own numbers. Booleans are refused, a redirect is refused,
+an answer over a megabyte is refused, and the feed's `Date` header is read to
+measure this machine's clock against it: a clock more than sixty seconds out
+stops signing, because a book refuses an attestation from the future or
+already stale. Run NTP. `symbols` maps a market's asset to the ticker the
+feed knows it by; `--once` prints `X is not in URL (have: …)`, which is how to
+discover the feed's names. `flat_rounds × interval` and `source.max_age`
+should both sit under the book's `max_price_age`, or the book will call a
+price stale that this oracle still serves.
+
+The signing loop prints every transition to its journal -- a market that
+stops being signed and why, the feed going quiet or answering again, the
+feed frozen, and how many markets were signed when that changes -- so
+`journalctl` says what `/healthz` says. `/healthz` also carries `signed` and
+`clock_skew`.
 
 Endpoints: `/v1/pubkey`, `/v1/markets`, `/v1/attestation/{market}` (use `_` for
 the slash) and `/v1/attestation/{market}/at/{ts}`, `/v1/log`, `/v1/log/raw`,

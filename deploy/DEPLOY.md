@@ -463,6 +463,7 @@ does.
 | `book` | — | the book file. Rewritten atomically (temporary file, fsync, rename). A book that is not valid JSON stops `pignusd` rather than being replaced with an empty one: restore it from a backup, or move it aside to start empty on purpose |
 | `oracle` | — | the PRIMARY oracle: its key is the one this book hands lenders, and its prices are the ones shown |
 | `oracles` | `[]` | further independent oracles, quoted for m-of-n loans. They never stand in for the primary, because a vault verifies against the key baked into it |
+| `oracle_keys` | `[]` | the key each oracle is expected to serve, in the same order as `oracle` then `oracles` (an empty entry pins nothing). Unpinned, the book adopts whatever an oracle's `/v1/pubkey` serves on every poll, so a lost-and-recreated key or one substituted in transit is accepted while every loan baked to the old key goes unpriced. Pinned, a different key is an `oracle_errors` entry and its attestations are ignored |
 | `registry` | — | the asset registry, for tickers and precisions |
 | `markets` | `[]` | which markets to show |
 | `poll` | 30 | seconds between chain and oracle refreshes; keep it under `block_seconds` |
@@ -516,7 +517,7 @@ systemctl enable --now pignus-oracle@2 pignus-oracle@3
 ```
 
 Those two files are `oracle.example.json` with a different `keyfile`, `logfile`
-and `listen` and nothing else changed; `diff` them to see it. The primary keeps
+and `listen`; `diff` them to see what else differs. The primary keeps
 its own unit, `pignus-oracle.service`, because its key is the one the book hands
 lenders — it is named rather than numbered.
 
@@ -526,6 +527,50 @@ sharing one key are a 1-of-1 wearing a 2-of-3 label. Print each key with
 `pignus-check.service`, and confirm `/v1/oracles` on the book lists them all.
 The backup already covers the extra keys and configs, which are under
 `pignus-data` and match the `pignus-oracle*.json` glob.
+
+**Every new offer made with `--oracles book` names every oracle the book
+quotes, n-of-n unless `--oracle-threshold` says otherwise.** So the moment a
+URL lands in `oracles`, that oracle's uptime is part of every such loan's
+liquidation: a frozen feed, an unanswerable `feed_max_age`, a clock out by a
+minute, and no lender can liquidate until it is back. Tell a joining
+operator that, and set a threshold below n when the set is bigger than two.
+
+## Joining a book as a signer
+
+An operator running an oracle on their own machine, to be quoted by a book
+they do not run:
+
+1. Copy `oracle.example.json`, point `source.url` at a feed of your own
+   (https, or loopback), set `precisions` and `price_scale` to exactly what
+   the book's `/v1/markets` shows for the markets you will sign
+   (`collateral_precision`, `debt_precision`, `price_scale`): an attestation
+   at another scale or precision is a good signature over a number off by a
+   power of ten, and the book drops it or, worse, believes it. Run NTP.
+2. Start the service; on a fresh install it creates the key and says so. Back
+   the key up, and the attestation log with it, from that moment.
+3. Send the book's operator your public https URL and the key from
+   `--print-pubkey`. They add the URL to `oracles` and `oracle_public_urls`
+   in `pignusd.json` and to `PIGNUS_ORACLES` in `pignus-check.service`, and
+   restart `pignusd`.
+4. Confirm `/v1/oracles` on the book lists your key and URL, and that
+   `/healthz` there shows no `oracle_errors` naming you. The book reads your
+   `/v1/pubkey`, `/v1/markets` and `/v1/attestation/*` every `poll` seconds;
+   a rate limit or a firewall between you and it is an outage.
+
+## A compromised oracle key
+
+A rotation keeps the old key signing until the last loan that bakes it
+matures. A compromised key must not: whoever holds it can sign any price and
+liquidate every covenant loan baked to it, and co-sign any cross-chain
+seizure with a cooperating lender.
+
+1. Stop the instance.
+2. Start the successor with the old key in `compromised_keys`; `/v1/pubkey`
+   publishes it, and every book that quotes the successor refuses
+   attestations under it from the next poll.
+3. Tell the book's operator, so they drop the old URL from `oracles`.
+4. Borrowers of loans that bake the key REPAY: the page flags those loans,
+   and nothing else protects them.
 
 Independence here is of **keys**, not of prices. Every oracle in the example
 configuration reads the same price server, so a stale or manipulated feed
