@@ -151,7 +151,7 @@ def main():
                       "--repay-deadline", str(seqh + 43_200),
                       "--abort-after", str(btch + 400),
                       "--d-refund", str(seqh + 1_440),
-                      "--lender-prog", lender_prog, "--lots", "2",
+                      "--lender-prog", lender_prog, "--lots", "3",
                       # The upgrade fee is PRICED from a Bitcoin node: it is
                       # fixed at origination and can never be raised, so a
                       # constant is an offer whose loans cannot be started when
@@ -442,6 +442,80 @@ def main():
                                             or "00")).hex()
                   == signed_live.payment_hash,
                   str(served.get("secret_t"))[:32])
+
+            # A take whose principal-refund height passed with nothing paid
+            # into it is OVER: this key will never pay it now, and the
+            # borrower takes their collateral back at their own height. A
+            # responder that kept it in every pass re-ran the deadline check
+            # each minute and recorded the same refusal again, which the
+            # timer read as a person needed -- for ever, and there was
+            # nothing for the person to do.
+            borrower2 = A.new_secret()
+            w2 = A.new_secret()
+            loan2_d = dict(offer["loan"])
+            loan2_d.update(borrower_x=A.xonly_pubkey(borrower2).hex(),
+                           h_w=B.sha256(w2).hex(),
+                           borrower_prog=b_spk[4:], borrower_ver=0)
+            loan2 = B.loan_from_dict(loan2_d)
+            ptxid2, pvout2, _ = B.fund_bitcoin(rig.btc, loan2)
+            rig.btc_mine(2)
+            take2 = post(base + "/v1/btc/take", {
+                "btc_offer_id": offer["btc_offer_id"],
+                "borrower_x": loan2.borrower_x,
+                "borrower_seq_spk": b_spk,
+                "borrower_prog": loan2.borrower_prog, "borrower_ver": 0,
+                "h_w": loan2.h_w, "w_seq": 0,
+                "take_auth": R.sign_take(
+                    borrower2, btc_offer_id=offer["btc_offer_id"],
+                    borrower_x=loan2.borrower_x, h_w=loan2.h_w,
+                    borrower_prog=loan2.borrower_prog, borrower_ver=0,
+                    prevault_txid=ptxid2, prevault_vout=pvout2),
+                "prevault_txid": ptxid2, "prevault_vout": pvout2,
+                "prevault_value": str(loan2.prevault_value()),
+                "btc_height": rig.btc.getblockcount(),
+                "reclaim_dest": dest.hex(), "reclaim_fee": 3000})
+            respond()                       # draws a secret; the take is reserved
+            reserved2 = get(base + f"/v1/btc/take/{take2['take_id']}")
+            check("a second take of the same offer is reserved",
+                  reserved2.get("status") == "reserved",
+                  json.dumps(reserved2)[:200])
+            live2 = B.loan_from_dict({**B.loan_to_dict(loan2),
+                                      "payment_hash": reserved2["payment_hash"]})
+            post(base + "/v1/btc/presig", {
+                "take_id": take2["take_id"],
+                "upgrade_presig": B.presign_upgrade(live2, ptxid2, pvout2,
+                                                    borrower2).hex()})
+            # ...and then the chain moves past d_refund before the lender
+            # ever pays into it.
+            d_refund = int(offer["loan"]["d_refund"])
+            rig.seq_mine(d_refund + 2 - n.getblockcount())
+            check("the pre-vault is funded but the principal's refund height "
+                  "has passed", n.getblockcount() > d_refund)
+            # The record an older responder left behind: the deadline
+            # refusal, hours old.
+            st_all = json.load(open(state_path))
+            st_all.setdefault(take2["take_id"], {}).update(
+                waiting="the principal can be taken back at Sequentia block "
+                        f"{d_refund}, only -60 minutes away: a borrower would "
+                        "have no time to claim it",
+                waiting_since=int(time.time()) - 8 * 3600)
+            json.dump(st_all, open(state_path, "w"))
+            r = respond()
+            st2 = json.load(open(state_path)).get(take2["take_id"], {})
+            check("a pass clears the wait on a take that is over, rather "
+                  "than recording the refusal again",
+                  st2.get("waiting") is None
+                  and "no time to claim it" not in r.stderr,
+                  json.dumps(st2)[:220] + " -- " + r.stderr.strip()[-200:])
+            check("and nothing was paid into it",
+                  not st2.get("disbursement_txid") and not st2.get("disbursing"))
+            r = subprocess.run(
+                [sys.executable, os.path.join(BIN, "pignus-cli"),
+                 "btc-responder-status", "--lender-key", lkey,
+                 "--state", state_path, "--book", base],
+                capture_output=True, text=True)
+            check("so the status reports no person needed for it",
+                  r.returncode == 0, f"exit {r.returncode}: {r.stdout[-400:]}")
         finally:
             for p in procs:
                 p.terminate()

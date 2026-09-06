@@ -4780,6 +4780,7 @@ def cmd_btc_respond(args):
         now_ts = int(time.time())
         seq_now = seq_height() if seq_node is not None else 0
         ended = set()
+        over = set()
         for o, tk, _h in out:
             st = str(tk.get("status", ""))
             d_refund = int((tk.get("loan") or {}).get("d_refund") or 0)
@@ -4796,10 +4797,17 @@ def cmd_btc_respond(args):
                 # The principal's own refund window has opened and none was
                 # paid: this key will pay nothing into it now, and the
                 # borrower takes their collateral back at their own height.
-                # Nothing here is a person's to do.
+                # Nothing here is a person's to do -- and nothing here is a
+                # PASS's to do either, so the take leaves the list: left in
+                # it, the disburse pass would re-check the deadlines every
+                # minute and record the same refusal again, which is a wait
+                # the timer reads as a person needed, for ever.
                 ended.add(tk["take_id"])
-        # A take written off is not this key's to act on, in any pass.
-        out = [(o, tk, h) for o, tk, h in out if not h.get("written_off")]
+                over.add(tk["take_id"])
+        # A take written off is not this key's to act on, in any pass; nor is
+        # one that is over.
+        out = [(o, tk, h) for o, tk, h in out
+               if not h.get("written_off") and tk["take_id"] not in over]
         for take_id, have in state.items():
             if have.get("waiting") and not have.get("disbursing") \
                     and not have.get("disbursement_txid") \
