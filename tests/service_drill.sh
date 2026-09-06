@@ -681,5 +681,26 @@ test "$(basename "$SCRIPT")" = pignus-alert.sh || {
     echo "pignus-alert@.service runs $SCRIPT, not pignus-alert.sh" >&2; exit 1; }
 echo "  every OnFailure= target exists, every long-running unit has one, the check has none, and the env path agrees in the unit, the script, the backup and the runbook"
 
+# The same message twice within the mute window goes out once; a different
+# one goes out; after the window it goes out again. No topic here, so "went
+# out" is the journal line, which is the same decision.
+mkdir -p "$WORK/alert-state"
+say() {
+    local out
+    out=$(PIGNUS_ALERT_ENV=/dev/null PIGNUS_ALERT_STATE="$WORK/alert-state" \
+          PIGNUS_ALERT_MUTE="${2:-600}" bash "$DEPLOY/pignus-alert.sh" "$1" 2>&1)
+    printf '%s\n' "${out%%$'\n'*}"
+}
+first=$(say "pignusd.service failed; journalctl -u pignusd.service says why")
+second=$(say "pignusd.service failed; journalctl -u pignusd.service says why")
+other=$(say "pignus check passes again")
+case "$first" in "alert: pignusd.service failed"*) ;; *) echo "the first message was not sent: $first" >&2; exit 1;; esac
+case "$second" in "alert (muted"*) ;; *) echo "the same message within the window was sent again: $second" >&2; exit 1;; esac
+case "$other" in "alert: pignus check passes again"*) ;; *) echo "a different message was muted: $other" >&2; exit 1;; esac
+touch -d "-20 minutes" "$WORK/alert-state"/*
+third=$(say "pignusd.service failed; journalctl -u pignusd.service says why")
+case "$third" in "alert: pignusd.service failed"*) ;; *) echo "after the window the message was still muted: $third" >&2; exit 1;; esac
+echo "  a repeated message pages once per window, a different one at once, and again after the window"
+
 echo
 echo "all service drills passed"

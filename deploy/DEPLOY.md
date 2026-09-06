@@ -616,8 +616,12 @@ systemctl start pignus-alert@test.service     # one test line arrives
 
 Subscribe at `https://ntfy.sh/<topic>` (the ntfy app, or the page itself in a
 browser tab). `NTFY_URL` in the same file points at a self-hosted ntfy;
-`ALERT_PREFIX` sets the message's title. The topic is the whole of the
-channel's secrecy, so it is in the backup and nowhere in git. Without the
+`ALERT_PREFIX` sets the message's title. The same message is not sent twice
+within ten minutes (`PIGNUS_ALERT_MUTE` seconds), so a unit that crash-loops
+every thirty seconds pages once per ten minutes and a flapping check does the
+same; a different message -- a recovery, another unit -- always goes out. The
+topic is the whole of the channel's secrecy, so it is in the backup and
+nowhere in git. Without the
 file the script prints to the journal and exits 0: a box that has not set a
 topic up loses the push and nothing else.
 
