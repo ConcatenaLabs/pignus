@@ -293,7 +293,9 @@ for u in $PUBLIC_URLS; do
         ok "$host's certificate is not checked (no openssl here)"
         continue
     fi
-    notafter=$(echo | openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null \
+    # s_client has no timeout of its own; a black-holed port would hold the
+    # timer's run open for good.
+    notafter=$(echo | timeout 20 openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null \
                | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
     if [ -z "$notafter" ]; then
         bad "$host's certificate could not be read"
