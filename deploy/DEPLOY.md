@@ -365,7 +365,11 @@ market that is not cross-chain must have a price signed within
 about how many decimals its assets have. `pignus-check.timer` runs it every
 five minutes and `pignus-check.service` carries the endpoints and that age as
 environment: `PIGNUS_ORACLES` names every oracle's port, and
-`PIGNUS_MAX_PRICE_AGE` stays equal to `max_price_age` in `pignusd.json`, since
+`PIGNUS_RESPONDER_CONFIG` names the responder's config on a box that runs one,
+and the check then reads its state through `btc-responder-status` and fails
+when a take has waited on a person; it also reads `/v1/stats` and fails for a
+loan that is under its strike and still open, since no liquidator is
+guaranteed to be running. `PIGNUS_MAX_PRICE_AGE` stays equal to `max_price_age` in `pignusd.json`, since
 a check looser than the book's own limit reports healthy while the book is
 already withholding prices. It also asks the book which oracle keys it quotes
 and fails if `PIGNUS_ORACLES` does not cover them all, so an oracle enabled and
@@ -404,6 +408,13 @@ refuses to re-sign its numbers. `max_price_age` at the book, and
 attestation may be before it is treated as no price at all. Nothing in tapscript
 can check recency (section 5 of the design doc), so those two are the only
 places it is checked anywhere.
+
+`flat_rounds` is the third guard and needs nothing from the feed: when every
+market has come back byte-identical for that many rounds (30 by default, 0 to
+turn it off, a static source exempt), the oracle calls the feed frozen and
+stops signing until it moves, and `/healthz` turns 503. A feed whose upstream
+died keeps answering 200 with last week's numbers, and nothing else here can
+tell.
 
 `feed_max_age` is **off unless you set it**, and it needs the feed to publish
 `_meta.updated`. A feed that does not cannot be checked at all — it could be

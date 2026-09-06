@@ -178,6 +178,46 @@ them; add each one's URL to PIGNUS_ORACLES in pignus-check.service"
     fi
 fi
 
+# The responder, when this box runs one. It is the one process whose silence
+# costs the OTHER party -- a take blocked on an unclearing reason, or an offer
+# whose signature stopped verifying, stops every cross-chain loan under it --
+# and until now nothing on a timer looked at it. `btc-responder-status` is
+# read-only, safe against the running unit, and exits 4 when a person is
+# needed, which is exactly the answer a timer wants.
+if [ -n "${PIGNUS_RESPONDER_CONFIG:-}" ]; then
+    CLI="$(dirname "$0")/../bin/pignus-cli"
+    out=$("$CLI" btc-responder-status --config "$PIGNUS_RESPONDER_CONFIG" \
+            --book "$BOOK" 2>&1 >/dev/null)
+    rc=$?
+    case "$rc" in
+        0) ok "the responder ($PIGNUS_RESPONDER_CONFIG) has nothing waiting on a person" ;;
+        4) bad "the responder needs a person: $(printf '%s' "$out" | head -3 | tr '\n' ' ')" ;;
+        *) bad "the responder could not be read (exit $rc): $(printf '%s' "$out" | tail -1)" ;;
+    esac
+fi
+
+# Loans that are liquidatable and have stayed that way. No liquidator is
+# guaranteed to be running, so "liquidatable" is a state the book can watch and
+# nobody sees; this is where somebody sees it.
+at_risk=$(curl -sS --max-time 10 "$BOOK/v1/stats" 2>/dev/null | python3 -c '
+import json, sys, time
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+now = int(time.time())
+for r in d.get("at_risk") or []:
+    if r.get("liquidatable"):
+        since = r.get("liquidatable_since")
+        age = f" for {(now - int(since)) // 60} min" if since else ""
+        print(f"{r.get(\"loan_id\", \"?\")[:12]} ({r.get(\"market\")}) is liquidatable{age} and still open")
+' 2>/dev/null)
+if [ -n "$at_risk" ]; then
+    while IFS= read -r line; do bad "$line"; done <<< "$at_risk"
+else
+    ok "no loan has crossed its strike and been left there"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "pignus check passed"

@@ -34,6 +34,10 @@ Environment="PIGNUS_ORACLES=http://127.0.0.1:8740 http://127.0.0.1:8742 http://1
 Environment=PIGNUS_BOOK=http://127.0.0.1:8741
 # Keep this equal to max_price_age in pignusd.json.
 Environment=PIGNUS_MAX_PRICE_AGE=600
+# The responder's config, when this box runs one: the check then reads its
+# state through `pignus-cli btc-responder-status` and fails when a take has
+# waited on a person. Leave it unset on a box with no responder.
+Environment=PIGNUS_RESPONDER_CONFIG=/root/sequentia/pignus-responder.json
 ExecStart=/root/sequentia/pignus/deploy/pignus-check.sh
 NoNewPrivileges=true
 PrivateTmp=true

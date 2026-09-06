@@ -263,6 +263,18 @@ class Oracle:
         self.aliases = dict(cfg.get("symbols", {}))
         self.price_scale = int(cfg.get("price_scale", 100_000))
         self.interval = float(cfg.get("interval", 60))
+        # How many rounds every market may come back byte-identical before the
+        # feed is called frozen. A feed whose upstream died keeps answering 200
+        # with last week's numbers, and an oracle that re-signs them with fresh
+        # timestamps makes every health figure, every liquidation decision and
+        # every check downstream read green on prices nobody observed. Real
+        # prices move; a whole board that has not moved in half an hour is a
+        # feed that has stopped. A static source is flat by construction and
+        # is exempt; anything else defaults to thirty rounds, and 0 turns the
+        # guard off for a feed that is genuinely flat.
+        static = (cfg.get("source") or {}).get("type") == "static"
+        self.flat_rounds = int(cfg.get("flat_rounds", 0 if static else 30))
+        self._flat = {}                 # market -> (price, consecutive rounds)
         # An x-only key this oracle used to sign with. Live vaults bake the key
         # they were originated against, so a rotation cannot be a swap: naming
         # the old keys lets a borrower's page tell a rotation from a stranger.
@@ -329,8 +341,32 @@ class Oracle:
             source_error = None
         except Exception as e:                    # noqa: BLE001 - reported, not raised
             source_error = f"{type(e).__name__}: {e}"
+        frozen = False
+        if self.flat_rounds:
+            # Judged across the WHOLE board, not per market: one market can
+            # legitimately sit still, a stablecoin pair most of all, but every
+            # market holding the exact same number for thirty rounds is a feed
+            # that has stopped, whatever its status code says.
+            prices = {}
+            for market in self.markets:
+                try:
+                    prices[market] = self.source.price_for(
+                        market, self.precisions, self.price_scale, self.aliases)
+                except Exception:                       # noqa: BLE001
+                    pass                # the loop below reports it properly
+            for market, price in prices.items():
+                last, n = self._flat.get(market, (None, 0))
+                self._flat[market] = (price, n + 1 if price == last else 1)
+            frozen = bool(prices) and all(
+                self._flat.get(m, (None, 0))[1] >= self.flat_rounds
+                for m in prices)
         for market in self.markets:
             try:
+                if frozen:
+                    raise RuntimeError(
+                        f"the feed has returned the same price for every "
+                        f"market for {self.flat_rounds} rounds; it has stopped "
+                        f"moving, and a price nobody observed is not signed")
                 price = self.source.price_for(market, self.precisions,
                                               self.price_scale, self.aliases)
                 att = O.sign(self.sec, market, price, self.price_scale)

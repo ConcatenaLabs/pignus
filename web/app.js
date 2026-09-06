@@ -20,6 +20,7 @@ import * as repo from "./repurchase.js";
 import * as btc from "./btc.js";
 import * as badaptor from "./adaptor.js";
 import * as btcborrow from "./btcborrow.js";
+import * as alerts from "./alerts.js";
 import { Wallet, payoutProgram, programFromScriptPubKey, programFromAddress,
          scriptPubKeyFor, WalletError } from "./wallet.js";
 
@@ -444,6 +445,10 @@ async function refresh() {
     // A self-hosted book is not behind the testnet's reverse proxy, so it can
     // say where its explorer and its oracle actually live.
     if (hz.explorer_url) $("#crumb").href = hz.explorer_url;
+    if (hz.rescan_needed_from != null) {
+      const d = $("#daemon");
+      if (d) { d.textContent = `book degraded: away longer than it can look back; needs a rescan from ${Number(hz.rescan_needed_from).toLocaleString()}`; d.className = "tag warn"; }
+    }
     // A BASE address, the same thing `oracle_public_urls` holds for every
     // oracle, so one name means one thing. It used to be the full link, which
     // left two settings for "where is the oracle" meaning two different
@@ -624,7 +629,30 @@ function rebuildMine() {
     try { s.add(programFromAddress(state.account.address).prog); }
     catch { /* an address this page cannot decode tells us nothing */ }
   }
+  // ...and every program this browser has ever seen this account own. The
+  // extension hands out fresh addresses and the coin that funded an offer is
+  // spent the moment it is taken, so a lender back a month later held none
+  // of the programs their offers and loans name -- and "yours" vanished,
+  // Withdraw and Call default with it. Remembered per account, unioned here,
+  // and anything pasted into the wallet card joins it.
+  for (const p of rememberedMine()) s.add(p);
+  rememberMine(...s);
   state.mine = s;
+}
+
+function mineKey() {
+  return "pignus.mine." + String(state.account?.address || "").slice(-16);
+}
+function rememberedMine() {
+  try { return JSON.parse(localStorage.getItem(mineKey()) || "[]"); }
+  catch { return []; }
+}
+function rememberMine(...progs) {
+  try {
+    const s = new Set(rememberedMine());
+    for (const p of progs) if (p) s.add(p);
+    localStorage.setItem(mineKey(), JSON.stringify([...s]));
+  } catch { /* private mode: this session only */ }
 }
 
 function forgetWallet() {
@@ -683,10 +711,27 @@ function renderWallet() {
       ${payout}
       <span class="spacer" style="flex:1"></span>
       <button class="sm" id="reload">Reload balances</button>
-    </div><div class="bals">${rows.join("") || '<span class="hint">no balance yet: receive something first</span>'}</div>`;
+    </div><div class="bals">${rows.join("") || '<span class="hint">no balance yet: receive something first</span>'}</div>
+    <div class="row" style="margin-top:8px">
+      <input id="mineaddr" class="small" style="flex:1;min-width:16em" placeholder="an address of yours this page does not know, e.g. one an old offer or loan pays out to"
+             title="the page decides what is yours from the coins the wallet holds today and the addresses it has seen you use; paste one it has not, and its offers and loans become yours here">
+      <button class="sm" id="mineadd">This address is mine</button>
+    </div>`;
   $("#reload").onclick = async () => {
     try { await loadWallet(); } catch (e) { note(explain(e), "bad"); }
     renderWallet(); renderOffers(); renderLoans(); renderAlerts();
+  };
+  $("#mineadd").onclick = () => {
+    const raw = ($("#mineaddr").value || "").trim();
+    if (!raw) return;
+    try {
+      const { prog } = programFromAddress(raw);
+      rememberMine(prog); rebuildMine();
+      $("#mineaddr").value = "";
+      note("Remembered. Anything paying out to that address now reads as yours " +
+           "here; this browser keeps it, and nothing is sent anywhere.", "ok");
+      renderOffers(); renderLoans(); renderAlerts();
+    } catch (e) { note(explain(e), "bad"); }
   };
 }
 
@@ -1348,10 +1393,21 @@ function renderLoans() {
       return `<tr>
         <td data-label="loan" class="mono"><a href="${txLink(l.txid)}" style="color:inherit;text-decoration:none">${shortHex(l.txid, 10)}</a>${role ? "<br>" + role : ""}</td>
         <td data-label="market">${esc(l.collateral_ticker)} / ${esc(l.debt_ticker)}${oracle}</td>
-        <td data-label="owed">${amount(t.debt, t.debt_asset)}<span class="sub2">borrowed ${units(t.principal, t.debt_asset)}</span></td>
+        <td data-label="owed">${amount(t.debt, t.debt_asset)}<span class="sub2">borrowed ${units(t.principal, t.debt_asset)}</span>${
+          l.state === "LIVE" && l.seizure_if_liquidated != null
+            ? `<span class="sub2">if liquidated now: ${units(l.seizure_if_liquidated, t.collateral_asset)} ${esc(l.collateral_ticker)} taken, ${units(l.surplus_if_liquidated, t.collateral_asset)} back to the borrower</span>`
+            : ""}${
+          l.state === "LIVE" && mine(t.borrower_prog) && state.utxos.length
+            ? (() => { const hv = holdings(true)[t.debt_asset] || 0n;
+                       return hv >= big(t.debt) ? "" :
+                         `<span class="sub2" style="color:var(--warn)">this wallet holds ${units(hv, t.debt_asset)} of the ${units(t.debt, t.debt_asset)} a repayment needs, in explicit coins</span>`; })()
+            : ""}</td>
         <td data-label="collateral">${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}</span></td>
         <td data-label="price / liq.">${now != null ? money(now, now < 10 ? 4 : 2) : "—"} / ${money(liq, liq < 10 ? 4 : 2)}<span class="sub2">${esc(l.debt_ticker)} per ${esc(l.collateral_ticker)}${l.ltv != null ? ` · LTV ${(l.ltv * 100).toFixed(0)}%` : ""}${ownPrice ? ` · <span title="this loan is judged by the oracle keys its own vault bakes in, which are not the ones this book quotes the market at">its own oracle</span>` : ""}</span></td>
-        <td data-label="health"><span class="tag health ${cls}">${h == null ? "no price" : h.toFixed(3)}</span></td>
+        <td data-label="health"><span class="tag health ${cls}">${h == null ? "no price" : h.toFixed(3)}</span>${
+          l.liquidatable && l.liquidatable_since
+            ? `<span class="sub2">under the strike for ${Math.max(1, Math.round((Date.now() / 1000 - Number(l.liquidatable_since)) / 60))} min and still open</span>`
+            : ""}</td>
         <td data-label="matures">${whenBlock(t.maturity)}</td>
         <td data-label="state"><span class="tag ${STATE_CLS[l.state] || "dim"}" title="${esc(STATE_WHY[l.state] || "")}">${esc(l.state)}</span>${l.state === "UNCONFIRMED" && l.confirmations != null ? ` <span class="small">${l.confirmations}/${depth}</span>` : ""}${shallow}${l.note ? `<span class="sub2">${esc(l.note)}</span>` : ""}<br>${closed}</td>
         <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>` +
@@ -1401,33 +1457,45 @@ function lenderSummary(rows) {
          (seized ? `<br>${seized} closed by seizure` : "") + "</div>";
 }
 
-/** A borrower's own loans, when they are close to the strike. */
+/**
+ * What needs a person: every seat, every moment. Decided in alerts.js, which
+ * is pure and tested; drawn here, with the button that does the thing.
+ */
 function renderAlerts() {
-  const risky = state.loans.filter(l => l.state === "LIVE" && mine(l.borrower_prog)
-    && l.health != null && Number(l.health) < 1.15);
-  const html = risky.map((l, i) => {
-    const t = JSON.parse(l.terms);
-    const h = Number(l.health);
-    const m = marketFor(t);
-    const now = m?.unit_price != null ? Number(m.unit_price) : null;
-    const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
-    const { c, d } = tickers(t);
-    const what = h < 1
-      ? "liquidatable now"
-      : `liquidatable if ${esc(c)} falls below ${money(liq, liq < 10 ? 4 : 2)} ${esc(d)}` +
-        (now != null ? ` (now ${money(now, now < 10 ? 4 : 2)})` : "");
-    return `<div class="note ${h < 1 ? "bad" : "warn"}">
-      Your ${esc(c)}/${esc(d)} loan <span class="mono">${shortHex(l.txid, 10)}</span>
-      is at health ${h.toFixed(3)}: ${what}. Repay it to close it.
-      <button class="sm" data-alert-repay="${i}" style="margin-left:8px">Repay</button>
-    </div>`;
-  }).join("");
+  const a = alerts.alertsFor({
+    loans: state.loans,
+    offers: state.offers.map(o => ({ ...o, manage_mine: !!manageToken(o.offer_id) })),
+    btcLoans: state.btcLoans || [],
+    mine: (p) => mine(p), holdings: holdings(true),
+    height: state.height, btcHeight: state.btcHeight,
+    blockSeconds: blockSeconds(), btcFeerate: state.btcFeerate,
+  });
+  const byLoan = new Map(state.loans.map(l => [l.loan_id || l.txid, l]));
+  const byOffer = new Map(state.offers.map(o => [o.offer_id, o]));
+  const byTake = new Map((state.btcLoans || []).map(r => [r.take_id, r]));
+  const LABEL = { repay: "Repay", withdraw: "Withdraw", default: "Call default",
+                  liquidate: "Liquidate", recover: "Recover", btcstep: "Open" };
+  const all = [...a.borrower.map(x => ({ ...x, seat: "borrower" })),
+               ...a.lender.map(x => ({ ...x, seat: "lender" })),
+               ...a.btc.map(x => ({ ...x, seat: "btc" }))];
+  const html = all.map((x, i) => `<div class="note ${x.level}">
+      ${x.seat === "lender" ? "<b>As lender:</b> " : ""}${esc(x.text)}
+      ${x.action ? `<button class="sm" data-alert="${i}" style="margin-left:8px">${LABEL[x.action]}</button>` : ""}
+    </div>`).join("");
   paint("#alerts", html, (box) => {
-    box.querySelectorAll("[data-alert-repay]").forEach(b => {
-      b.onclick = () => repay(risky[Number(b.dataset.alertRepay)]);
+    box.querySelectorAll("[data-alert]").forEach(b => {
+      const x = all[Number(b.dataset.alert)];
+      b.onclick = () => {
+        if (x.action === "repay") return repay(byLoan.get(x.key));
+        if (x.action === "withdraw") return withdraw(byOffer.get(x.key));
+        if (x.action === "default") return seize(byLoan.get(x.key), true);
+        if (x.action === "liquidate") return seize(byLoan.get(x.key), false);
+        if (x.action === "recover") return recover(byLoan.get(x.key));
+        if (x.action === "btcstep") return btcStep(byTake.get(x.key), false);
+      };
     });
   });
-  markTitle(risky.length);
+  markTitle(alerts.atRiskCount(a));
 }
 
 // The one thing this page can say to somebody who is not looking at it.
@@ -1442,12 +1510,9 @@ function renderAlerts() {
 // The wording lives in pignus.js, where a test can reach it: nothing in this
 // file can be exercised without a browser.
 const BASE_TITLE = document.title;
-const titleCounts = { seq: 0, btc: 0 };
 
-function markTitle(seq, btc) {
-  if (seq != null) titleCounts.seq = seq;
-  if (btc != null) titleCounts.btc = btc;
-  document.title = pig.riskTitle(BASE_TITLE, titleCounts.seq + titleCounts.btc);
+function markTitle(n) {
+  document.title = pig.riskTitle(BASE_TITLE, n);
 }
 
 // -------------------------------------------------------------- lend form
@@ -2280,6 +2345,33 @@ async function confirmBtcSpend(label, lines, { flow, prefer = [],
                         { flow, prefer, committed, noSend: true });
 }
 
+/**
+ * Show what a Bitcoin transaction will do and ask before the wallet is asked.
+ *
+ * Every Sequentia spend on this page goes through confirmAndSend, with the
+ * fee asset to choose and the summary to read; the two Bitcoin spends -- the
+ * reclaim and the abort -- went straight to the wallet with a fee the relay
+ * fixed. The page said "shown to you before you sign"; here it is.
+ */
+async function confirmLines(label, lines) {
+  note(`<b>${esc(label)}</b><ul>${lines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
+    <div class="hint" style="margin:8px 0 0">Your wallet will show its own view of this
+    before you approve it. If the two disagree, reject it.</div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="go">Continue to wallet</button>
+      <button id="nogo">Cancel</button>
+    </div>`, "info");
+  return new Promise((settle) => {
+    let done = false;
+    const resolve = (v) => { if (done) return; done = true;
+                             document.removeEventListener("keydown", esckey); settle(v); };
+    const esckey = (e) => { if (e.key === "Escape") resolve(false); };
+    document.addEventListener("keydown", esckey);
+    $("#go").onclick = () => resolve(true);
+    $("#nogo").onclick = () => resolve(false);
+  });
+}
+
 function btcUi({ flow = "btcrepay", prefer = [], committed = {},
                 fee = null } = {}) {
   return {
@@ -2433,7 +2525,6 @@ async function renderBtcLoans() {
   // borrower's warning matters most: no script tests the price, so a seizure
   // is the lender and the oracle signing together and can happen at any
   // moment nobody tells them about.
-  let atRisk = 0;
   const html = `<table><thead><tr><th>collateral</th><th>you owe</th>
       <th>seized below</th><th>health</th>
       <th>repay by</th><th>lender sweep</th><th>where it stands</th><th></th>
@@ -2449,9 +2540,14 @@ async function renderBtcLoans() {
       const health = btcborrow.seizeHealth(l, btcPriceFor(l.market),
                                            meta(l.debt_asset).precision ?? 8);
       const acts = [];
-      if (health != null && health < 1.15 && !rec.terminal
-          && !btcborrow.stageOf(rec).match(/^(reclaimed|aborted|seized|swept)$/))
-        atRisk += 1;
+      // The reclaim fee, judged AGAIN now rather than only at the take: it was
+      // fixed then, cannot be bumped or replaced, and a month later Bitcoin
+      // may charge more than it carries -- in which case the reclaim will not
+      // confirm and the lender's sweep will. The alert above says so too.
+      const floor = state.btcFeerate ? btcborrow.reclaimFeeFloor(state.btcFeerate) : 0;
+      if (floor && Number(rec.reclaim_fee || 0) < floor
+          && ["live", "repaid", "repayment-claimed"].includes(btcborrow.stageOf(rec)))
+        acts.push(`<span class="tag warn" title="your reclaim carries ${esc(rec.reclaim_fee)} satoshis and Bitcoin now charges about ${floor} for it; it cannot be bumped, so repay early enough for it to confirm">reclaim fee low</span>`);
       if (health != null && health < 1 && !rec.terminal)
         acts.push('<span class="tag bad" title="the lender and the oracle can co-sign a seizure of your collateral at this price. Repaying is what stops it">seizable now</span>');
       if (step.action)
@@ -2493,7 +2589,6 @@ async function renderBtcLoans() {
      block its Sequentia block anchored to. Sequentia follows Bitcoin reorgs in
      real time, so Sequentia confirmations measure the wrong thing: six of them
      are six minutes, and one ordinary Bitcoin reorg undoes ten at once.</p>`;
-  markTitle(null, atRisk);
   paint("#btcloans", html, (b) => {
     b.querySelectorAll("[data-btcstep]").forEach(btn => {
       btn.onclick = () => btcStep(rows[Number(btn.dataset.btcstep)], false);
@@ -2563,6 +2658,13 @@ async function btcStep(rec, force) {
         "The lender can only take it by publishing the secret that releases " +
         "your Bitcoin; once that claim is buried, reclaim from here.", "ok");
     } else if (step.action === "reclaim") {
+      const go = await confirmLines("Reclaim the collateral", [
+        `Spend the vault's ${pig.fixed(BigInt(l.btc_amount), 8, 8)} BTC to the address you named when you took the loan`,
+        `Bitcoin fee: ${Number(rec.reclaim_fee || 3000)} satoshis, fixed when the loan was taken and signed over by the lender's release; it cannot be changed`,
+        force ? "Without waiting for the Bitcoin block your secret's Sequentia block anchored to"
+              : "Only once the Bitcoin block your secret's Sequentia block anchored to is buried",
+      ]);
+      if (!go) { note("Nothing was signed.", "info"); return; }
       const txid = await btcborrow.reclaim(state.wallet, rec, btcUi(),
                                            { force });
       note(`<b>Collateral reclaimed.</b> <a href="${txLink(txid, true)}" class="mono">${esc(txid)}</a>`, "ok");
@@ -2628,6 +2730,11 @@ async function btcRefundRepayment(rec) {
 async function btcAbort(rec) {
   if (needWallet() || needBtcHeight()) return;
   try {
+    const go = await confirmLines("Take the collateral back", [
+      `Spend the pre-vault's ${pig.fixed(BigInt(rec.loan.btc_amount), 8, 8)} BTC (plus the unspent upgrade fee) to an address of your own`,
+      "The principal never came, so no loan ever started; this needs nobody's signature but yours",
+    ]);
+    if (!go) { note("Nothing was signed.", "info"); return; }
     const txid = await btcborrow.abort(state.wallet, rec, btcUi());
     note(`<b>Collateral taken back.</b> <a href="${txLink(txid, true)}" class="mono">${esc(txid)}</a>. ` +
       "The principal never came, so the loan never started.", "ok");

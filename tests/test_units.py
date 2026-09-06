@@ -772,6 +772,54 @@ def test_rate_limiter():
           got == 8, f"let {got} through")
 
 
+def test_at_risk_stamp_and_meta():
+    """A loan that crossed its strike gets a date, and the book remembers
+    where it was.
+
+    `liquidatable` was computed on every read and never remembered, so the
+    platform could say a loan is liquidatable and never for how long -- and
+    with no liquidator guaranteed to be running, "for three hours and nobody
+    has" is a different fact from "just crossed". The book's own last height is
+    what lets a restart tell it was away longer than a poll can look back.
+    """
+    print("\nThe at-risk stamp, and the book's memory of itself")
+    import tempfile
+    from pignus.book import Book
+    from pignus.terms import LoanTerms
+    path = os.path.join(tempfile.mkdtemp(), "book.json")
+    b = Book(path)
+    t = LoanTerms(collateral_asset="aa" * 32, debt_asset="bb" * 32,
+                  collateral_amount=10 * 10 ** 8, principal=1450 * 10 ** 8,
+                  debt=1500 * 10 ** 8, borrower_x="dd" * 32, lender_x="ee" * 32,
+                  market="GOLD/USDX", oracle_x="22" * 32, strike=180 * 100000,
+                  not_before=1700000000, maturity=100000, recover_after=143200,
+                  max_price=10 ** 6 * 100000)
+    rec = b.put_loan(t.to_json(), "11" * 32, 0)
+    b.update_loan(rec["loan_id"], state="LIVE")
+    b.stamp_at_risk(lambda _t: 300 * 100000, now=1000)
+    check("a loan above its strike carries no date",
+          not b.loans[rec["loan_id"]].get("liquidatable_since"))
+    b.stamp_at_risk(lambda _t: 170 * 100000, now=2000)
+    check("crossing the strike stamps the moment",
+          b.loans[rec["loan_id"]].get("liquidatable_since") == 2000)
+    b.stamp_at_risk(lambda _t: 170 * 100000, now=3000)
+    check("...and staying under it keeps the first moment, not the last poll",
+          b.loans[rec["loan_id"]].get("liquidatable_since") == 2000)
+    b.stamp_at_risk(lambda _t: None, now=3500)
+    check("no price is no verdict either way",
+          b.loans[rec["loan_id"]].get("liquidatable_since") == 2000)
+    b.stamp_at_risk(lambda _t: 300 * 100000, now=4000)
+    check("climbing back above it clears the date",
+          not b.loans[rec["loan_id"]].get("liquidatable_since"))
+    st = b.stats(price_for=lambda _t: 170 * 100000)
+    check("/v1/stats says which at-risk loans are liquidatable",
+          st["at_risk"] and st["at_risk"][0]["liquidatable"] is True)
+    b.meta["last_height"] = 4242
+    b._save()
+    check("the book's own last height survives a reload",
+          Book(path).meta.get("last_height") == 4242)
+
+
 def main():
     for fn in (test_vectors, test_terms, test_amount_strings,
                test_price_freshness_is_two_sided,
@@ -781,7 +829,7 @@ def main():
                test_page_shaped_terms, test_oracle,
                test_amounts,
                test_attestation_log, test_adaptor, test_dlc,
-               test_rate_limiter):
+               test_rate_limiter, test_at_risk_stamp_and_meta):
         fn()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0

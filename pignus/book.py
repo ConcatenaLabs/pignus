@@ -113,6 +113,7 @@ def _last_touched(rec):
 class Book:
     def __init__(self, path):
         self.path = str(path)
+        self.meta = {}
         self._lock = threading.Lock()
         # Deferred writing is per THREAD: the poll thread batches a whole
         # reconciliation into one write, while an HTTP handler's write still
@@ -143,6 +144,10 @@ class Book:
                 f"book {self.path} is not valid JSON ({e}); refusing to start "
                 "rather than overwrite it with an empty book. Restore it from "
                 "a backup, or move it aside to start empty on purpose.")
+        # What the book knows about ITSELF: the last height it reconciled to,
+        # so a restart can tell how long it was away. Absent in a book written
+        # before it was kept, and that is an ordinary book.
+        self.meta = dict(d.get("meta") or {}) if isinstance(d, dict) else {}
         if not isinstance(d, dict) or not all(
                 isinstance(d.get(k, {}), dict)
                 for k in ("offers", "loans", "btc_offers", "btc_takes",
@@ -216,7 +221,7 @@ class Book:
         without the flushes the rename can reach the disk before the bytes it
         renames, and the book comes back empty.
         """
-        d = {"offers": self.offers, "loans": self.loans,
+        d = {"meta": self.meta, "offers": self.offers, "loans": self.loans,
              "btc_offers": self.btc_offers, "btc_takes": self.btc_takes,
              "btc_commitments": self.btc_commitments,
              "updated": int(time.time())}
@@ -842,6 +847,40 @@ class Book:
                 self._save()
         return out
 
+    def stamp_at_risk(self, price_for, now=None):
+        """Record WHEN each live loan became liquidatable, and clear it when it
+        stops being.
+
+        `liquidatable` is computed on every read and was never remembered, so
+        the platform could say a loan is liquidatable and never for how long.
+        With no liquidator guaranteed to be running, "liquidatable for three
+        hours and nobody has" is a different fact from "just crossed", for the
+        lender who has to decide whether to act themselves and for anybody
+        watching the book. Stamped only on the transition, so the clock is
+        the crossing's and not the poll's.
+        """
+        now = int(now or time.time())
+        with self._lock:
+            records = [(k, dict(v)) for k, v in self.loans.items()]
+        for loan_id, rec in records:
+            if rec.get("state") != "LIVE":
+                if rec.get("liquidatable_since"):
+                    self.update_loan(loan_id, liquidatable_since=None)
+                continue
+            try:
+                t = LoanTerms.from_json(rec["terms"])
+            except (ValueError, TypeError):
+                continue
+            price = price_for(t)
+            if price is None:
+                continue                # no price is no verdict, either way
+            liq = t.is_liquidatable(price)
+            was = rec.get("liquidatable_since")
+            if liq and not was:
+                self.update_loan(loan_id, liquidatable_since=now)
+            elif not liq and was:
+                self.update_loan(loan_id, liquidatable_since=None)
+
     def stats(self, prices=None, price_for=None):
         """A summary a page can render. Health figures need prices, and are
         simply omitted for markets with none rather than shown as zero -- a
@@ -875,7 +914,10 @@ class Book:
             price = price_for(t) if price_for else prices.get(t.market)
             if price is not None and t.health(price) < 1.15:
                 at_risk.append({"loan_id": rec["loan_id"], "market": t.market,
-                                "health": round(t.health(price), 4)})
+                                "health": round(t.health(price), 4),
+                                "liquidatable": t.is_liquidatable(price),
+                                "liquidatable_since":
+                                    rec.get("liquidatable_since")})
         # OPEN offers, the same count `/healthz` reports. Counting every offer
         # ever recorded made the two disagree for no reason a reader could see.
         # UNDER THE LOCK. Iterating `self.offers` while the poll thread

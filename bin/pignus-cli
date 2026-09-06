@@ -394,13 +394,8 @@ def cmd_verify(args):
     return 0
 
 
-def cmd_status(args):
-    t, doc = terms_doc(args.terms)
-    if args.txid is None:
-        args.txid = doc.get("txid")
-        args.vout = int(doc.get("vout") or 0)
-    if args.txid is None:
-        refuse("status needs --txid, or a terms file that carries one")
+def _status_once(args, t, doc):
+    """One reconciliation of a loan, as `status` prints it."""
     node = node_from(args)
     single = bool(args.single_leaf or doc.get("single_leaf"))
     got = node.gettxout(args.txid, args.vout, True)
@@ -432,8 +427,147 @@ def cmd_status(args):
     # DEFAULT exit has opened.
     out["past_maturity"] = _pkg_locktime_open(
         t.maturity, out["height"], median_time(node, out["height"]))
-    print(json.dumps(out, indent=2))
-    return 0
+    # The BOOK's view, when there is one to ask: it holds the price by the
+    # loan's own oracle keys, so health and liquidatable come without
+    # anybody typing --price, and it remembers when the loan crossed. This
+    # is what makes the command something a cron job can run.
+    if getattr(args, "book", None):
+        key = _book_loan_key(t, args.txid, args.vout)
+        try:
+            view = book_get(args.book, f"/v1/loan/{key}")
+        except Exception as e:                          # noqa: BLE001
+            out["book_error"] = f"{type(e).__name__}: {e}"
+        else:
+            for k in ("state", "health", "ltv", "price", "liquidatable",
+                      "liquidatable_since", "recover_open",
+                      "closed_confirmations", "seizure_if_liquidated",
+                      "surplus_if_liquidated"):
+                if k in view:
+                    out[k] = view[k]
+            if "past_maturity" in view:
+                out["past_maturity"] = view["past_maturity"]
+    # What needs a person, said as a status. 4 is "ran, and reported a state
+    # that is not settled and not safe to act on": a live loan that can be
+    # liquidated, called, or swept is exactly that, for both its parties.
+    live = str(out.get("state", "")).upper() == "LIVE"
+    needs = live and bool(out.get("liquidatable") or out.get("past_maturity")
+                          or out.get("recover_open"))
+    out["needs_attention"] = needs
+    return out, (4 if needs else 0)
+
+
+def cmd_status(args):
+    t, doc = terms_doc(args.terms)
+    if args.txid is None:
+        args.txid = doc.get("txid")
+        args.vout = int(doc.get("vout") or 0)
+    if args.txid is None:
+        refuse("status needs --txid, or a terms file that carries one")
+    if not args.watch:
+        out, rc = _status_once(args, t, doc)
+        print(json.dumps(out, indent=2))
+        return rc
+    # --watch: one line per pass, and a change of anything that matters is a
+    # line of its own, so a log of this is a history of the loan. Stopped by
+    # the operator; the exit status is the last pass's.
+    last, rc = None, 0
+    try:
+        while True:
+            out, rc = _status_once(args, t, doc)
+            key = (out.get("state"), out.get("liquidatable"),
+                   out.get("past_maturity"), out.get("recover_open"))
+            line = (f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+                    f"{out.get('state')} health={out.get('health', '?')} "
+                    f"liquidatable={out.get('liquidatable', '?')} "
+                    f"matured={out.get('past_maturity')} "
+                    f"recover_open={out.get('recover_open')} "
+                    f"height={out.get('height')}"
+                    + (" NEEDS ATTENTION" if rc == 4 else ""))
+            if key != last or args.verbose:
+                print(line, flush=True)
+                last = key
+            time.sleep(max(5.0, float(args.interval)))
+    except KeyboardInterrupt:
+        return rc
+
+
+def _wallet_programs(node):
+    """Every payout program this wallet can be paid at, from its own coins and
+    its payout address -- the same set the page calls "mine"."""
+    progs = set()
+    try:
+        _ver, prog, _spk = wallet_payout(node)
+        progs.add(prog)
+    except Exception:                                   # noqa: BLE001
+        pass
+    for u in node.listunspent():
+        spk = str(u.get("scriptPubKey", ""))
+        if spk.startswith("0014") and len(spk) == 44:
+            progs.add(spk[4:])
+        elif spk.startswith("5120") and len(spk) == 68:
+            progs.add(spk[4:])
+    return progs
+
+
+def cmd_loans(args):
+    """List the loans a book knows, or only this wallet's.
+
+    The page can show "mine" because it has a wallet beside it; the command
+    line had no listing at all, so a lender or a borrower with a node and a
+    cron job had nothing to point it at. `--mine` matches each loan's payout
+    programs against this wallet's coins and payout address, which is what
+    the page does too.
+    """
+    q = f"/v1/loans?state={args.state}" if args.state else "/v1/loans"
+    if args.market:
+        q += ("&" if "?" in q else "?") + f"market={args.market}"
+    rows = book_get(args.book, q)["loans"]
+    mine = _wallet_programs(node_from(args)) if args.mine else None
+    out = []
+    for l in rows:
+        try:
+            t = json.loads(l["terms"])
+        except (TypeError, ValueError):
+            continue
+        role = []
+        if mine is not None:
+            if t.get("borrower_prog") in mine:
+                role.append("borrower")
+            if t.get("lender_prog") in mine:
+                role.append("lender")
+            if not role:
+                continue
+        out.append({"loan_id": l.get("loan_id"), "market": l.get("market"),
+                    "state": l.get("state"), "health": l.get("health"),
+                    "liquidatable": l.get("liquidatable"),
+                    "liquidatable_since": l.get("liquidatable_since"),
+                    "past_maturity": l.get("past_maturity"),
+                    "recover_open": l.get("recover_open"),
+                    "maturity": t.get("maturity"),
+                    "outpoint": f"{l.get('txid')}:{l.get('vout')}",
+                    "role": role or None})
+    print(json.dumps({"loans": out, "count": len(out)}, indent=2))
+    needs = any(r["state"] == "LIVE" and (r["liquidatable"] or r["past_maturity"]
+                                          or r["recover_open"]) for r in out)
+    return 4 if (needs and args.mine) else 0
+
+
+def cmd_offers(args):
+    """List a book's offers, or only this wallet's."""
+    rows = book_get(args.book, f"/v1/offers?status={args.status}")["offers"]
+    mine = _wallet_programs(node_from(args)) if args.mine else None
+    out = []
+    for o in rows:
+        if mine is not None and o.get("lender_prog") not in mine:
+            continue
+        out.append({k: o.get(k) for k in
+                    ("offer_id", "market", "status", "expired", "lots",
+                     "lots_left", "principal", "funded_value",
+                     "expiry_locktime", "outpoint")})
+    print(json.dumps({"offers": out, "count": len(out)}, indent=2))
+    tidy = any(o.get("expired") and (o.get("lots_left") or 0) and
+               o.get("status") == "open" for o in out)
+    return 4 if (tidy and args.mine) else 0
 
 
 def cmd_check_attestation(args):
@@ -4277,9 +4411,12 @@ def cmd_btc_respond(args):
                 disowned.add(oid)
                 print(f"offer {oid} carries this key's signature but is served "
                       f"under an id that is not the hash of its terms "
-                      f"({want}). A relay serving one offer under two ids is "
-                      f"a relay counting its lots twice; every take of it is "
-                      f"being skipped.", file=sys.stderr)
+                      f"({want}), so every take of it is being skipped. A "
+                      f"relay serving one offer under two ids would be a "
+                      f"relay counting its lots twice; a record from before "
+                      f"ids were that hash looks the same, and the safe answer "
+                      f"is the same. If it is one of yours and still wanted, "
+                      f"withdraw it and publish it again.", file=sys.stderr)
             return False
         oid = offer.get("btc_offer_id", "?")
         if oid not in disowned:
@@ -6208,6 +6345,31 @@ def main():
     add_node_args(p)
     p.set_defaults(fn=cmd_verify)
 
+    p = sub.add_parser("loans", help="list a book's loans, or only this "
+                                     "wallet's (--mine); exits 4 when one of "
+                                     "yours needs a person")
+    p.add_argument("--state", help="LIVE, REPAID, LIQUIDATED, ...; default all")
+    p.add_argument("--market")
+    p.add_argument("--mine", action="store_true",
+                   help="only loans whose borrower or lender program is one "
+                        "this wallet's coins or payout address use")
+    add_book_arg(p)
+    add_node_args(p)
+    p.set_defaults(fn=cmd_loans)
+
+    p = sub.add_parser("offers", help="list a book's offers, or only this "
+                                      "wallet's (--mine); exits 4 when one of "
+                                      "yours has expired with lots untaken")
+    p.add_argument("--status", default="open",
+                   help="open, delisted, taken, withdrawn, gone, ghost, "
+                        "expired or all (default open)")
+    p.add_argument("--mine", action="store_true",
+                   help="only offers whose lender program is one this "
+                        "wallet's coins or payout address use")
+    add_book_arg(p)
+    add_node_args(p)
+    p.set_defaults(fn=cmd_offers)
+
     p = sub.add_parser("status", help="reconcile a loan against the chain")
     p.add_argument("--terms", required=True,
                    help="the terms document, or the record offer-take printed")
@@ -6219,6 +6381,15 @@ def main():
                         "it is spent, since until then the chain says which it is")
     p.add_argument("--price", type=int)
     p.add_argument("--min-depth", type=int, default=2)
+    p.add_argument("--watch", action="store_true",
+                   help="keep reconciling, printing a line whenever the state, "
+                        "liquidatable, matured or recover_open changes; exit "
+                        "status is the last pass's")
+    p.add_argument("--interval", type=float, default=60,
+                   help="seconds between passes with --watch (default 60)")
+    p.add_argument("--verbose", action="store_true",
+                   help="with --watch, print every pass rather than changes")
+    add_book_arg(p)
     add_node_args(p)
     p.set_defaults(fn=cmd_status)
 
