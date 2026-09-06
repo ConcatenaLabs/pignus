@@ -235,7 +235,11 @@ class Book:
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".book-")
         try:
             with os.fdopen(fd, "w") as f:
-                json.dump(d, f, indent=2, sort_keys=True)
+                # Compact. Indenting and sorting a full book costs five times
+                # the dump -- a quarter of a second under the lock every read
+                # takes, once a poll and once per write -- and nobody reads a
+                # ten-megabyte file by eye; `python3 -m json.tool` does.
+                json.dump(d, f, separators=(",", ":"))
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
