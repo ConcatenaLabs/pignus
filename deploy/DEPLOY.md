@@ -32,7 +32,9 @@ described below.
 
 All of it is pure Python and needs no build step. It does need a Sequentia
 **source** checkout, because the loan covenant lives in the node repository and
-Pignus imports the proven builder rather than carrying a copy — see `CLAUDE.md`.
+Pignus imports the proven builder rather than carrying a copy — the README's
+*Getting it* section says where the checkout is looked for and how
+`SEQUENTIA_SRC` names one.
 
 `pignusd` reads the asset registry (`registry` in its config) to turn each
 market's tickers into asset ids and precisions, and the node's
@@ -130,9 +132,9 @@ lender key that is gone is worse, and it is worth being exact about who it
 costs. A loan that has not STARTED costs nobody: the borrower's collateral is
 still in a pre-vault they alone can take back, and they abort it at their own
 deadline. A loan that IS live costs the borrower their collateral,
-permanently — both ways out of that vault need the missing key. RECLAIM needs
-the secret, which only a claim by that key publishes; TIMEOUT needs that key's
-signature. The borrower's repayment is not lost, because its own refund leaf
+permanently — every leaf of that vault needs the missing key. RECLAIM needs
+the secret, which only a claim by that key publishes; SEIZE needs its signature
+beside the oracle's; TIMEOUT needs its signature alone. The borrower's repayment is not lost, because its own refund leaf
 opens for them at the repay deadline, so they keep the debt and the collateral
 sits in the vault for ever. A responder state file that is gone can cost a
 principal paid twice.
@@ -570,8 +572,9 @@ pignus-cli btc-check loan.json
 
 **Back up the lender key AND the state file.** Losing the key loses more than
 the ability to claim: every LIVE loan's collateral is frozen for good, because
-both ways out of that vault need this key — RECLAIM needs the secret only a
-claim by it publishes, and TIMEOUT needs its signature. A loan that has not
+every leaf of that vault needs this key — RECLAIM needs the secret only a
+claim by it publishes, SEIZE needs its signature beside the oracle's, and
+TIMEOUT needs its signature alone. A loan that has not
 started yet costs nobody, since the borrower aborts their own pre-vault. Losing
 the state file without losing the key risks paying a principal twice. See
 "What each piece costs to lose" above.

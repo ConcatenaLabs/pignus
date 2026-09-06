@@ -327,13 +327,13 @@ or an explicit new origination.
 
 ### 5.2 Epoch commitment
 
-A possible oracle-side extension, not implemented: the oracle would sign
-`feed_id || epoch || price` where `epoch` advances every N minutes, and the
-vault would bake a `min_epoch`. That does not remove the window; it bounds how
-far back a saved attestation can reach, and only while `min_epoch` advances --
-which requires re-covenanting. It would be useful mainly for short-term loans,
-where `not_before` can be set close to origination. What the oracle signs today
-is `feed_id || timestamp || price`, and nothing here reads an epoch.
+The oracle signs `feed_id || timestamp || price`, and nothing here reads an
+epoch. An epoch scheme -- the oracle signing `feed_id || epoch || price` with
+`epoch` advancing every N minutes, and the vault baking a `min_epoch` -- would
+not remove the window; it would only bound how far back a saved attestation can
+reach, and only while `min_epoch` advances, which requires re-covenanting. It
+would help mainly short-term loans, where `not_before` can be set close to
+origination, and that is why this design leaves it out.
 
 This gap is inherent to putting an external fact into a script, and every
 oracle-driven on-chain lending design has some version of it. It is written down
@@ -609,7 +609,7 @@ worth stating plainly rather than being left as "nobody is robbed":
 The second row is the honest one: a lender who stalls gives up the repayment and
 takes collateral worth more, so on an over-collateralised loan stalling **pays**.
 The last row is the one nobody plans for: a lost lender key is not a loss
-confined to the lender, because the vault's two exits both need it, and there
+confined to the lender, because all three of the vault's leaves need it, and there
 is no timeout that opens for anybody else. It is why `deploy/DEPLOY.md` treats
 that key as the money it is.
 The borrower's protection is not the lender's incentive; it is the margin
@@ -827,7 +827,7 @@ That inverts who holds what, and Pignus says so in those words. It is not
 collateralized lending and must never be shown as if it were: the borrower has
 sold their asset and holds a claim. It is also how securities financing actually
 works, which is the point -- the restricted-asset tier ends up with the
-regulated-market instrument. Section 8.1 specifies it.
+instrument securities markets already use. Section 8.1 specifies it.
 
 ### 8.1 The repurchase, specified
 
@@ -916,9 +916,9 @@ so between them there is a window in which:
 
 Tier A does not have this problem: `build_origination` composes the whole loan
 as one transaction, so the collateral and the principal move together or not at
-all. A repurchase cannot be composed that way today, because leg one is a
+all. A repurchase is not composed as one transaction, because leg one is a
 Simplicity spend of the issuer's verifier that this repository does not build.
-Until it can be, the mitigations are procedural and belong in front of both
+The mitigations are therefore procedural and belong in front of both
 parties: fund the bond first, keep `forfeit_after` no further out than the
 lender is willing to wait, and check both halves with `repo-verify` -- which is
 why it reports `leg-one-only` and `bond-only` as distinct states and exits
@@ -1045,8 +1045,9 @@ What runs where:
   inputs and, for a cross-chain loan, the Bitcoin funding and the reclaim. It
   cannot sign a covenant leaf and exposes no x-only key to bake into one, which
   is why every exit in section 2 and both legs in section 7 are signature-free.
-- **the CLI**, on the downloads page -- the same operations against your own
-  node, for anyone who would rather not use a website, plus the lender's side of
+- **the CLI**, from `https://sequentiatestnet.com/download/` as a source
+  tarball or from a clone of this repository -- the same operations against
+  your own node, for anyone who would rather not use a website, plus the lender's side of
   a cross-chain loan, which is a process rather than a page: the lender draws
   the secrets, and drawing a secret in a browser means storing it in one.
 - **the cross-chain relay**, the `/v1/btc/*` endpoints of `pignusd` -- carries

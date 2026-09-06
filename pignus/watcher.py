@@ -438,7 +438,16 @@ class VaultWatcher:
             if seen is None:
                 ancestor -= 1
                 continue                # not scanned this run; no evidence
-            if self._hash_at(ancestor) == seen:
+            got = self._hash_at(ancestor)
+            if got is None:
+                # The node would not say. Reading that as "replaced" walks
+                # the rewind past the real fork point on one timeout, reopens
+                # every loan below it and replays every offer event -- the
+                # rule stated for the first comparison above, and just as
+                # true for every one after it. Nothing is undone this poll;
+                # the mismatch at the top is still there next poll.
+                return
+            if got == seen:
                 break
             ancestor -= 1
         self._undo_above(ancestor, changed)
@@ -562,6 +571,14 @@ class VaultWatcher:
         # block away can put the offer back on the shelf it came off.
         o.history.append({"txid": o.txid, "vout": o.vout, "value": o.value,
                           "status": o.status, "height": height,
+                          # How buried the coin was BEFORE the move. Undoing a
+                          # provisional move restores this, because zeroing it
+                          # made the offer look never-buried, and a never-
+                          # buried offer only ever checks the mempool -- so a
+                          # take that replaced the provisional one and was
+                          # MINED was never looked for, and the offer was
+                          # called a ghost with its real remainder on chain.
+                          "confirmations": o.confirmations,
                           # WHICH transaction moved it. A move read out of the
                           # mempool is provisional, and undoing it later means
                           # being able to ask whether that transaction is still
@@ -622,7 +639,7 @@ class VaultWatcher:
         o.txid, o.vout = last["txid"], int(last["vout"])
         o.value = int(last.get("value") or 0)
         o.status = last.get("status") or "open"
-        o.confirmations = 0
+        o.confirmations = int(last.get("confirmations") or 0)
         o.scanned_back_to = 0
         self._by_offer[(o.txid, o.vout)] = o.offer_id
         self.events.append({
@@ -633,8 +650,18 @@ class VaultWatcher:
         return True
 
     def _refresh_offer(self, o, tip):
-        if o.status not in ("open", "ghost"):
-            return
+        if o.status not in ("open", "ghost", "delisted"):
+            # A take with no remainder, or a refund, seen only in the mempool
+            # sets a terminal status straight from a height-0 history entry --
+            # and terminal was the end of it: nothing looked again, so a take
+            # that was then dropped left the offer "taken" with the coin still
+            # on the shelf and open to anybody, delisted for good. A move that
+            # never reached a block is undone exactly as a partial one is.
+            if o.history and int(o.history[-1].get("height", 0)) == 0 \
+                    and self._unwind_provisional(o):
+                pass                    # back on the shelf; fall through
+            else:
+                return
         got, answered = self._txout(o.txid, o.vout)
         if not answered:
             return
@@ -765,12 +792,25 @@ class VaultWatcher:
                 and v.spent_height > 0)
 
     def _final(self, v, tip):
-        """A closed vault this watcher can stop asking about: its exit is not
-        merely in a block but buried. Until then the exit is provisional -- a
-        spend seen in the mempool can be replaced, and a shallow one can be
-        reorged out -- and the vault is worth another gettxout each poll."""
+        """A closed vault this watcher can stop asking about.
+
+        Not `min_depth`. That is the depth at which the BOOK is willing to call
+        a funding LIVE, a display threshold measured in Sequentia blocks -- and
+        Sequentia blocks are not what protects anything here. Sequentia reorgs
+        when Bitcoin reorgs, so one ordinary single-block Bitcoin reorg undoes
+        about ten of them, and a close that stopped being checked at two was a
+        close this watcher would report as settled for ever while the
+        collateral sat unspent: the rewind cannot reach it either, because
+        after a restart the rewind only knows the blocks this run scanned.
+
+        So a close is asked about, one gettxout a poll, until it is as deep as
+        the whole rescan window. That is about a day of Sequentia blocks and
+        well over a hundred Bitcoin blocks, which is finality in the only sense
+        this chain has; and it is what `_refresh` needs to notice the coin is
+        back, which is the one signal that does not depend on remembering
+        which block anything was in."""
         return (self._settled(v)
-                and (tip - v.spent_height + 1) >= self.min_depth)
+                and (tip - v.spent_height + 1) >= self.rescan_depth)
 
     def _record_funding(self, v, tip):
         """Remember which block buried the funding, once. The height and the
@@ -782,9 +822,37 @@ class VaultWatcher:
         h = tip - v.confirmations + 1
         if h < 1:
             return
-        got = self._hash_at(h)
-        if got:
-            v.funding_height, v.funding_block = h, got
+        # `tip` was read at the start of the poll and `confirmations` after a
+        # forward scan of up to `rescan_depth` blocks, so a block that arrived
+        # in between makes `h` the funding block's PARENT -- whose hash then
+        # survives a reorg that replaces only the funding block, and a reorged
+        # funding reads as an exit nobody can name instead of a ghost. The
+        # When the tip has not moved since the poll began, the arithmetic is
+        # exact and costs nothing more. When it has, the pair is only worth
+        # keeping if the block at that height really holds the funding, so
+        # the neighbours are probed for it; otherwise the next poll records it.
+        try:
+            now = int(self.node.getblockcount())
+        except Exception:                               # noqa: BLE001
+            return
+        if now == tip:
+            got = self._hash_at(h)
+            if got:
+                v.funding_height, v.funding_block = h, got
+            return
+        for cand in (h, h + 1, h - 1):
+            if cand < 1:
+                continue
+            got = self._hash_at(cand)
+            if not got:
+                continue
+            block = self._block(cand)
+            if block is None:
+                continue
+            if any((tx.get("txid") if isinstance(tx, dict) else tx) == v.txid
+                   for tx in block.get("tx", [])):
+                v.funding_height, v.funding_block = cand, got
+                return
 
     def _funding_reorged(self, v, tip):
         """True if the block that buried this vault has left the chain, False if

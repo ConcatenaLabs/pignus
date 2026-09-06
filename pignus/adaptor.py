@@ -65,9 +65,19 @@ def _point_add(p, q):
     return k.SECP256K1.affine(k.SECP256K1.mul([(p, 1), (q, 1)]))
 
 
+# The field prime. BIP340 says an x-only key is invalid at or above it, and
+# the node's `lift_x` does not check -- so `x + p` lifted to the point at `x`
+# here while the JS refused it, and a key CHECKSIG would reject verified.
+_FIELD_P = 2 ** 256 - 2 ** 32 - 977
+
+
 def _lift_x(xonly):
     k = _k()
-    p = k.SECP256K1.lift_x(int.from_bytes(xonly, "big"))
+    x = int.from_bytes(xonly, "big")
+    if x >= _FIELD_P:
+        raise ValueError("not a valid x-only point: x is not below the field "
+                         "prime")
+    p = k.SECP256K1.lift_x(x)
     if p is None:
         raise ValueError("not a valid x-only point")
     return k.SECP256K1.affine(p)
@@ -288,4 +298,10 @@ def sign(sec: bytes, msg: bytes, aux: bytes = None) -> bytes:
     adaptor-encrypted."""
     load_covenant()
     from test_framework.key import sign_schnorr
-    return sign_schnorr(sec, msg, aux=aux or bytes(32))
+    sig = sign_schnorr(sec, msg, aux=aux or bytes(32))
+    if sig is None:
+        # The node's signer answers an out-of-range key with None, and a
+        # release that is None dies later as a TypeError in whatever tries to
+        # verify it, far from the key that caused it.
+        raise ValueError("invalid private key: not in 1..n-1")
+    return sig

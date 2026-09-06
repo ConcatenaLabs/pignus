@@ -41,6 +41,13 @@ cd pignus
 bin/pignus-cli --version
 ```
 
+The page runs at `https://sequentiatestnet.com/lending/` and drives Ambra
+(`github.com/ConcatenaLabs/sequentia-extension`), the browser extension that
+holds the keys; the page itself signs nothing. Testnet assets come from the
+faucet at `https://sequentiatestnet.com/faucet`, a source tarball of this
+repository is published at `https://sequentiatestnet.com/download/`, and
+problems go to `https://github.com/ConcatenaLabs/pignus/issues`.
+
 Nothing to build and nothing to install: the commands are the scripts in
 `bin/`, and Python 3.9 or later is all they need. Put `bin/` on your `PATH` if
 you would rather write `pignus-cli` than `bin/pignus-cli` -- this document
@@ -59,9 +66,10 @@ bin/pignus-cli selftest
 ```
 
 Commands that touch a chain need a node's RPC as well: `--rpc`, `--rpc-user`
-and `--rpc-password`, or the `PIGNUS_RPC_*` environment variables. The ones
-that only check something -- `verify`, `show`, `quote`, `address` -- need
-neither a node nor a wallet.
+and `--rpc-password`, or the `PIGNUS_RPC_*` environment variables. `show`,
+`quote` and `address` need neither a node nor a wallet. `verify` needs a node
+to read the funded output, unless you hand it the scriptPubKey yourself with
+`--spk`; it never needs a wallet.
 
 ## The one check
 
@@ -166,6 +174,11 @@ anything; fees are priced from the node's exchange rates in whatever the wallet
 holds; and coins are prepared explicit when the wallet only has blinded change,
 which a covenant cannot spend.
 
+The page and the CLI are two routes, not one. A loan begun in the browser is
+finished in the browser, because its secret lives in the extension; a loan
+begun with `btc-offer-take` is finished with the `btc-*` commands and the
+ticket file it wrote. Neither can pick up the other's loan.
+
 ```
 pignus-cli offer-fund --market GOLD/USDX --principal 100 --lots 3 \
     --interest 3 --open-ltv 50 --liq-ltv 75 --term-days 30 --rpc-wallet me
@@ -178,8 +191,12 @@ pignus-cli offer-withdraw --offer <id> --rpc-wallet me
 `offer-delist` and `offer-withdraw` are different acts. Delisting takes the
 book's advertisement down so nobody new takes the terms, and touches no coin;
 withdrawing brings the principal itself back, and only once the offer's expiry
-has opened. The manage token `offer-publish` prints is served once and stored
-only as a hash, so a lender who loses it waits for the expiry.
+has opened. A delisted offer's record stays in the book, hidden from the board,
+because it is the only copy of the terms the refund is built from; `offer-
+withdraw` finds it by id as before, and the page keeps it under "mine" with its
+Withdraw button. Nothing returns on its own. The manage token `offer-publish`
+prints is served once and stored only as a hash, so a lender who loses it waits
+for the expiry.
 
 `pignus-cli <command> --help` is the complete list of options for any command.
 What shapes an offer is worth having here:
@@ -645,7 +662,9 @@ pignus-oracle --config oracle.json
 
 | key | what it is |
 |---|---|
+| `keyfile` / `logfile` | where the key is created, mode 0600, and where every attestation is appended |
 | `markets` | the feeds this oracle signs, `COLLATERAL/DEBT` |
+| `trusted_proxies` | the peers whose `X-Forwarded-For` this oracle believes when it keys its log rate limit, loopback by default; set it behind a reverse proxy, or the whole internet shares one bucket |
 | `precisions` | each named asset's decimal count. **Give every one an entry**: a missing one is assumed to be 8, and where that is wrong the signed price is wrong by a power of ten, which no signature check downstream can catch. A config that names some and not others is refused at start |
 | `symbols` | the ticker the feed knows an asset by, where it differs from the market's name |
 | `price_scale` | what a price is multiplied by before signing (default `1e5`) |
@@ -810,6 +829,8 @@ tests/service_drill.sh             the oracle and pignusd together
 tests/test_units.py                the covenant vectors + an oracle round trip
 tests/test_openamp.py              the Tier C pledge message, pinned
 tests/test_watcher.py              reorgs, and reading an exit back
+tests/test_watcher_reorgs.py       a close undone below the restart tip, a dropped
+                                   or replaced mempool take, a mid-poll block
 tests/test_oracle_service.py       what the oracle will not sign
 tests/test_liquidator.py           what the liquidation bot refuses
 tests/test_btc_relay.py            the relay and the lender's responder

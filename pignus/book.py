@@ -313,6 +313,13 @@ class Book:
         }
         with self._lock:
             old = self.offers.get(offer_id)
+            # A DELISTED record is off the board and owned by nobody: its
+            # publisher gave the listing up, and the coin is the truth, so
+            # whoever lists the coin again lists it, with a fresh token. It is
+            # exactly what happened when a delist deleted the record, and the
+            # only difference now is that the terms survived in between.
+            if old is not None and old.get("status") == "delisted":
+                old = None
             if old is not None:
                 if not self.manage_token_ok(offer_id, supplied):
                     raise OfferExists(
@@ -349,12 +356,28 @@ class Book:
             self._save()
             return rec
 
-    def drop_offer(self, offer_id) -> bool:
+    def delist_offer(self, offer_id) -> bool:
+        """Take a listing off the board without forgetting it.
+
+        The record is the only copy of the terms that can ever spend the coin:
+        the offer address is their hash, nothing on chain carries them, and a
+        page that published the listing forgot its own copy the moment the
+        listing landed. Deleting the record was therefore deleting the lender's
+        principal -- withdrawn at expiry through a REFUND leaf that needs the
+        terms to build, from a row that no longer existed to offer the button.
+        A delisted offer is hidden from every listing, still served by its id,
+        and still watched, so the withdraw works exactly as it does for one
+        that expired on the board. Publishing the same coin again reopens it.
+        """
         with self._lock:
-            gone = self.offers.pop(offer_id, None) is not None
-            if gone:
+            rec = self.offers.get(offer_id)
+            if rec is None:
+                return False
+            if rec.get("status", "open") == "open":
+                rec["status"] = "delisted"
+                rec["updated"] = int(time.time())
                 self._save()
-        return gone
+            return True
 
     def list_offers(self, market=None, kind=None, status="open"):
         """Open offers by default, as COPIES. `status="all"` includes taken,

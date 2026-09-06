@@ -40,9 +40,8 @@ Native BTC collateral (Tier B), a two-party handshake carrying a ticket JSON:
     btc-offer-withdraw, btc-respond, btc-responder-status,
     btc-responder-clear.
 
-    `btc-adaptor` is the old name for `btc-release` and still works. The
-    signature it produces is a plain release the lender publishes, not an
-    adaptor signature, and the name said otherwise.
+    `btc-adaptor` is an alias of `btc-release`. What it produces is a plain
+    BIP340 release signature the lender publishes, not an adaptor signature.
 
 Pledged collateral at an OpenAMP issuer (Tier C), where a signature rather than
 a key travels between the parties:
@@ -793,7 +792,7 @@ def cmd_repo_verify(args):
     leg = None
     if args.leg_txid:
         # C_U(Y) is a taproot output: the OpenDAMP verifier only ever pays the
-        # regulated asset to one, so the program given is a v1 program.
+        # restricted asset to one, so the program given is a v1 program.
         cu_spk = payout_spk(1, args.lender_cu).hex()
         try:
             leg = R.verify_leg_one(node, args.leg_txid, cu_spk,
@@ -1928,8 +1927,11 @@ def cmd_offer_delist(args):
     if code != 200:
         refuse(f"the book refused: {r.get('error') or code}")
     print(json.dumps({"offer_id": args.offer, "delisted": True,
-                      "note": "the listing is gone; the coin is untouched and "
-                              "comes back with offer-withdraw at its expiry"},
+                      "note": "the listing is off the board; the book keeps "
+                              "the record, since it is the only copy of the "
+                              "terms the withdraw is built from. The coin is "
+                              "untouched, and offer-withdraw brings it back "
+                              "once the expiry opens"},
                      indent=2))
     return 0
 
@@ -4091,9 +4093,9 @@ def cmd_btc_offer_resign(args):
     checks it before acting on any take of that offer. One that stops verifying
     stops every loan under it -- live ones included -- and the collateral behind
     them is never released, silently. There are two ways that happens: a book
-    serving a record it altered, and an offer signed under an older form of the
-    payload. This repairs the second; nothing repairs the first, and nothing
-    should.
+    serving a record it altered, and an offer whose stored signature was made
+    over a different serialisation of the same terms. This repairs the second;
+    nothing repairs the first, and nothing should.
 
     The book verifies the new signature over the terms it ALREADY holds before
     accepting it, so this can only ever replace a signature with one that
@@ -5942,7 +5944,7 @@ def main():
                    help="the bond vault's output index, as repo-fund reported it")
     p.add_argument("--verifier", metavar="TXID:VOUT",
                    help="the OpenDAMP verifier output every transfer of the "
-                        "regulated asset spends; it goes at input 0")
+                        "restricted asset spends; it goes at input 0")
     p.add_argument("--verifier-spk", metavar="HEX",
                    help="the verifier covenant's own scriptPubKey, which "
                         "output 0 returns its whole value to")

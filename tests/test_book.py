@@ -215,8 +215,13 @@ def main():
             check("the token cancels it", code == 200
                   and body2.get("removed") is True, json.dumps(body2)[:120])
             code, _ = delete(f"{base}/v1/offers/{offer_id}", tok)
-            check("and cancelling it twice is a clean 404", code == 404,
+            check("and cancelling it twice is a clean 200: the record is kept, "
+                  "so there is still a listing to take down", code == 200,
                   str(code))
+            code, rec = get(f"{base}/v1/offer/{offer_id}")
+            check("a delisted offer is still served by id, with its terms",
+                  code == 200 and rec.get("status") == "delisted"
+                  and bool(rec.get("terms")), f"{code} {json.dumps(rec)[:120]}")
             code, body = post(base + "/v1/offers", good)
             check("the coin can be listed again once the listing is gone",
                   code == 200, f"{code} {json.dumps(body)[:120]}")
@@ -254,6 +259,27 @@ def main():
                 **good, "terms": altered.to_json()})
             check("the real offer output described with ALTERED terms is "
                   "refused", code == 400 and "does not hold" in body.get("error", ""),
+                  json.dumps(body)[:120])
+
+            # An OBJECT where a JSON string belongs was stored verbatim and
+            # served back: the page did JSON.parse on "[object Object]" and
+            # the whole offers panel went down for every visitor.
+            code, body = post(base + "/v1/offers", {
+                **good, "terms": json.loads(tj)})
+            check("terms posted as an object rather than a string are refused",
+                  code == 400 and "STRING" in body.get("error", ""),
+                  json.dumps(body)[:120])
+
+            # A maturity written as a Unix time compares as a height thousands
+            # of years away on every screen, while the loan's DEFAULT leaf is
+            # open the block it exists.
+            timed = LoanTerms.from_json(json.dumps(
+                {**json.loads(tj), "maturity": 1600000000,
+                 "recover_after": 1602592000}))
+            code, body = post(base + "/v1/offers", {
+                **good, "terms": timed.to_json()})
+            check("a maturity written as a Unix time is refused at the door",
+                  code == 400 and "Unix time" in body.get("error", ""),
                   json.dumps(body)[:120])
 
             big = LoanTerms.from_json(json.dumps(
