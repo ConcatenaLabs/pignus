@@ -253,10 +253,12 @@ fi
 # A liquidator unit that exists and is not running is a bot everybody thinks
 # is watching the book. The check below on liquidatable loans catches the
 # consequence; this names the cause.
+# `activating` is a unit in the seconds after a restart round, not one that
+# has stopped: counting it as down paged a person after every update.
 if command -v systemctl >/dev/null 2>&1 \
         && systemctl list-unit-files pignus-liquidator.service 2>/dev/null | grep -q pignus-liquidator \
         && ! systemctl is-enabled pignus-liquidator 2>/dev/null | grep -q '^masked' \
-        && ! systemctl is-active --quiet pignus-liquidator; then
+        && ! systemctl is-active pignus-liquidator 2>/dev/null | grep -qE '^(active|activating|reloading)$'; then
     bad "the liquidator unit pignus-liquidator is installed and not running"
 fi
 
