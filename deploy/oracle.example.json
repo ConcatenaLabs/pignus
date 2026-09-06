@@ -32,6 +32,8 @@
   },
   "_log_note": "Rotate the attestation log past this many bytes (0 never rotates). The closed file's digest is published beside it and seeded into the next file's running hash, so /v1/digest still commits to every attestation ever signed. Rotate ONLY this way: an outside rename or truncate desynchronises the running hash from the file.",
   "log_max_bytes": 256000000,
+  "_flat_note": "How many signing rounds every market may come back byte-identical before the feed is called frozen and this oracle stops signing it: a feed whose upstream died keeps answering 200 with last week's numbers, and re-signing them with fresh timestamps turns every health figure and every liquidation decision downstream green on prices nobody observed. Judged across the whole board, so one market sitting still does not trip it. Defaults to 30 for an http feed; a static source is exempt; 0 turns it off.",
+  "flat_rounds": 30,
   "_source_note": "`max_age` is how long a fetched snapshot may be reused. `feed_max_age` is how old the feed's own `_meta.updated` may be before this oracle refuses to re-sign its numbers -- OFF unless you set it, because a feed is not obliged to publish that field and most do not, the node repository's mock price server included. Set it only against a feed that does: an oracle asked for a check it cannot perform refuses to sign rather than treat 'cannot tell' as 'fresh'. `type` may also be `http` (one request per market, which honours `max_age` as a per-symbol cache) or `static` (fixed prices, for drills). A key a source does not understand is refused at start rather than ignored: a setting that goes nowhere is one you believe is protecting you.",
   "source": {
     "type": "http_bulk",

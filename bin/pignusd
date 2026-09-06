@@ -486,6 +486,8 @@ class Service:
         # ones only: a mempool spend can be replaced.
         self.spend_cache = {}
         self.last_poll = 0
+        self.rescan_needed_from = None
+        self._absence_checked = False
         # What the last poll raised, if it raised. The thread
         # survives one, so this is the only place a caller can
         # see that everything the book knows stopped updating.
@@ -667,6 +669,11 @@ class Service:
             self.oracle_error = (f"primary oracle {primary} published no "
                                  "attestation this book could verify")
         self.oracle_errors = errors
+        # With the prices in hand, remember which loans crossed and when.
+        try:
+            self.book.stamp_at_risk(self.price_for)
+        except Exception as e:                          # noqa: BLE001
+            print(f"at-risk stamp: {type(e).__name__}: {e}", file=sys.stderr)
 
     def _refresh_oracle_precisions(self, url, ox, errors):
         """What each oracle believes the two assets of a market are denominated
@@ -811,6 +818,26 @@ class Service:
             return          # a reconcile is already in flight; let it finish
         try:
             self.height = self.node.getblockcount()
+            # The first tip this process sees, against the last one the book
+            # was reconciled to before it stopped. A backward walk is bounded
+            # by `rescan_depth`, so a book away longer than that cannot see
+            # what happened while it was away: offers quietly read as `gone`
+            # and vaults as `SPENT_UNKNOWN`, which looks like chain trouble
+            # rather than "run me once with --rescan-from". So it is said, in
+            # /healthz and on the page, until that is done.
+            if self.rescan_needed_from is None and not self._absence_checked:
+                self._absence_checked = True
+                last = int(self.book.meta.get("last_height") or 0)
+                if last and self.height - last > self.rescan_depth:
+                    self.rescan_needed_from = last
+                    print(f"pignusd: the book was last reconciled at height "
+                          f"{last} and the chain is at {self.height}, which "
+                          f"is further back than the {self.rescan_depth} "
+                          f"blocks a poll can look. Run once with "
+                          f"--rescan-from {last} to read what happened in "
+                          f"between; until then some offers and vaults may "
+                          f"read as gone or unknown.", file=sys.stderr)
+            self.book.meta["last_height"] = int(self.height)
             # One write for the whole reconciliation. Confirmations move on
             # every block for every live loan and every open offer, and each of
             # those used to rewrite the entire book under the lock the request
@@ -1381,6 +1408,8 @@ class Service:
         out["lender_ver"] = t.lender_ver
         out["oracle_x"] = t.oracle_x
         price = self.price_for(t)
+        if rec.get("liquidatable_since"):
+            out["liquidatable_since"] = int(rec["liquidatable_since"])
         if price is not None:
             out["price"] = price
             out["open_ltv"] = round(t.principal / max(1, t.collateral_value(price)), 4)
@@ -1916,6 +1945,11 @@ class Service:
                        "this book knows, or the precisions disagree. Check "
                        "the registry")
             reasons.append(named + why)
+        if self.rescan_needed_from is not None:
+            reasons.append(
+                f"this book was away for longer than it can look back: run "
+                f"once with --rescan-from {self.rescan_needed_from}, or offers "
+                f"and vaults that moved meanwhile read as gone or unknown")
         if UNRENDERABLE:
             # A record this book holds and cannot show. It is missing from
             # every listing, so a lender looking for their own offer simply
@@ -1942,6 +1976,9 @@ class Service:
             "covenant_vectors": compat.verified_cases(),
             "height": self.height,
             "last_poll": self.last_poll, "markets": len(self.markets),
+            # The height a rescan is needed from, when this book was away for
+            # longer than a poll can look back; null otherwise.
+            "rescan_needed_from": self.rescan_needed_from,
             "priced": len(self.fresh_prices()),
             "stale_markets": stale,
             "max_price_age": self.max_price_age,
@@ -3243,6 +3280,8 @@ def main():
                   file=sys.stderr)
             return 1
         svc.watcher.rescan_from(args.rescan_from)
+        svc.rescan_needed_from = None
+        svc._absence_checked = True
         print(f"pignusd: rescanning from height {args.rescan_from}",
               file=sys.stderr)
 

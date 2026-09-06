@@ -732,6 +732,25 @@ test "$rc" = "4" || {
          "attention (exit $rc)" >&2; exit 1; }
 echo "  the status names it and exits 4, rather than reporting a quiet night"
 
+# ...and the TIMER sees it. The responder is the one process whose silence
+# costs the other party, and until the checker read it, a disowned offer or a
+# take blocked for hours was found only when somebody typed the command.
+cat > "$WORK/disowned-responder.json" <<J
+{"lender_key": "$LKEY2", "state": "$WORK/disowned.state.json",
+ "book": "http://127.0.0.1:$DPORT2"}
+J
+set +e
+CHK=$(PIGNUS_ORACLES="" PIGNUS_BOOK="http://127.0.0.1:$DPORT2" \
+      PIGNUS_RESPONDER_CONFIG="$WORK/disowned-responder.json" \
+      bash "$PKG/deploy/pignus-check.sh" 2>&1)
+rc=$?
+set -e
+echo "$CHK" | grep -q "the responder needs a person" || {
+    echo "the checker did not report the responder's disowned offer" >&2
+    echo "$CHK" | sed 's/^/  /' >&2; exit 1; }
+test "$rc" = "1" || { echo "the checker exited $rc with a responder needing a person" >&2; exit 1; }
+echo "  and the timer's check reports it too, rather than a quiet night"
+
 # ...and the lender can repair it, which is the whole point of noticing. The
 # book verifies the new signature over the terms it ALREADY holds, so this can
 # only ever replace a signature with one that checks out: it cannot change a

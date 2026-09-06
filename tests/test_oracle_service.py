@@ -240,6 +240,76 @@ def test_a_seizure_is_findable_however_old():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_frozen_feed():
+    """A feed that stops moving stops being signed.
+
+    A price server whose upstream died keeps answering 200 with last week's
+    numbers, and an oracle that re-signs them with fresh timestamps makes every
+    health figure, every liquidation decision and every check downstream read
+    green on prices nobody observed. The test feed is flat by construction,
+    which is exactly the shape of that failure.
+    """
+    print("\na feed that has stopped moving is not signed")
+    # Its own feed and its own directory: main() has torn its own down by now.
+    work = tempfile.mkdtemp(prefix="pignus-oracle-flat-")
+    fport = free_port()
+    feed = ThreadingHTTPServer(("127.0.0.1", fport), Feed)
+    threading.Thread(target=feed.serve_forever, daemon=True).start()
+    feed_url = f"http://127.0.0.1:{fport}"
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    cfg = {"keyfile": os.path.join(work, "flat.key"),
+           "logfile": os.path.join(work, "flat.log"),
+           "listen": f"127.0.0.1:{port}", "interval": 1, "price_scale": 100_000,
+           "markets": ["GOLD/USDX"], "precisions": {"GOLD": 8, "USDX": 2},
+           "flat_rounds": 3,
+           "source": {"type": "http_bulk", "url": feed_url + "/prices",
+                      "timeout": 5, "max_age": 300}}
+    path = os.path.join(work, "flat.json")
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    log = open(os.path.join(work, "flat.oracle.log"), "w")
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(REPO, "bin", "pignus-oracle"),
+         "--config", path], stdout=log, stderr=subprocess.STDOUT)
+    try:
+        first = None
+        for _ in range(80):
+            try:
+                st, body = get(base + "/healthz", want_status=None)
+                if body.get("ok"):
+                    first = body
+                    break
+            except Exception:
+                pass
+            time.sleep(0.25)
+        check("the first rounds sign: three identical prices are not yet a "
+              "frozen feed", first is not None)
+        frozen = None
+        for _ in range(60):
+            time.sleep(0.5)
+            try:
+                st, body = get(base + "/healthz", want_status=None)
+            except Exception:
+                continue
+            if not body.get("ok") and "stopped moving" in json.dumps(body):
+                frozen = (st, body)
+                break
+        check("after flat_rounds identical rounds the feed is called frozen and "
+              "signing stops", frozen is not None, json.dumps(body)[:200])
+        check("...and /healthz says so with a 503, so a check that reads only "
+              "the status sees it", frozen is not None and frozen[0] == 503,
+              str(frozen and frozen[0]))
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        log.close()
+        feed.shutdown()
+
+
 def test_documented_configs_start():
     """Every example config in this repository must actually start the oracle.
 
@@ -336,6 +406,9 @@ def main():
         "previous_keys": ["11" * 32],
         "source": {"type": "http_bulk", "url": feed_url + "/prices",
                    "timeout": 5, "max_age": 300, "feed_max_age": 300},
+        # This feed never moves by design, and this oracle runs for the whole
+        # test; the frozen-feed guard is what test_frozen_feed is about.
+        "flat_rounds": 0,
     }
     cfg_path = os.path.join(work, "oracle.json")
     with open(cfg_path, "w") as f:
@@ -648,6 +721,7 @@ def main():
     test_log_rotation()
     test_a_seizure_is_findable_however_old()
     test_documented_configs_start()
+    test_frozen_feed()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0
 

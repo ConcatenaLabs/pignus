@@ -127,7 +127,8 @@ bin/pignus-oracle        sign prices on a timer and publish them
 bin/pignusd              the loan book, the watcher, the cross-chain relay, and
                          the page at /lending/
 bin/pignus-cli           selftest, quote, propose, show, address, verify, status,
-                         explain, check-attestation; with a node wallet:
+                         loans, offers, explain, check-attestation; with a node
+                         wallet:
                          offer-fund, offer-publish, offer-take, offer-delist,
                          offer-withdraw,
                          loan-export, repay, liquidate, default, recover; btc-*
@@ -173,6 +174,16 @@ it acts on from the terms and checks it against the coin before building
 anything; fees are priced from the node's exchange rates in whatever the wallet
 holds; and coins are prepared explicit when the wallet only has blinded change,
 which a covenant cannot spend.
+
+`pignus-cli loans --book <url> --mine` and `pignus-cli offers --book <url>
+--mine` list what the book knows that this wallet is party to, matching each
+record's payout programs against the wallet's coins and payout address the way
+the page decides "mine"; both exit 4 when something of yours needs a person, so
+a cron job with your own mail is a monitor. `pignus-cli status --terms loan.json
+--book <url>` adds the book's price, health and `liquidatable_since` to the
+reconciliation without anybody typing `--price`, and `--watch` keeps going,
+printing a line whenever the state, liquidatable, matured or recover_open
+changes.
 
 The page and the CLI are two routes, not one. A loan begun in the browser is
 finished in the browser, because its secret lives in the extension; a loan
@@ -638,8 +649,14 @@ Caddy, with `deploy/pignusd.example.json` as the starting configuration, and
 [`docs/api.md`](docs/api.md) documents every endpoint it serves.
 
 A borrower's own risk is a price moving while their attention is elsewhere, so
-the page shows a loan close to its strike as an alert above everything else and
-also puts the count in the browser tab's title. The tab strip is the one
+the page says what needs a person, above everything else, for whichever seat
+the wallet is in: a loan close to or under its strike (and for how long nobody
+has liquidated it), one that has matured or whose oracle-free sweep has opened,
+a maturity days away, a cross-chain repayment deadline coming up or a reclaim
+fee the parent chain has outgrown; and for a lender, an expired offer with lots
+untaken, a matured loan to call, a loan under its strike that nobody has taken.
+Each carries the button, and says when the wallet could not pay for it. The
+count goes in the browser tab's title. The tab strip is the one
 surface a background tab still owns, and it needs no permission to use, which
 is what a page holding no keys should reach for first.
 
@@ -854,6 +871,7 @@ tests/test_adaptor_web.mjs         web/adaptor.js against adaptor_vectors.json
 tests/test_btcborrow_web.mjs       what the browser's BTC borrow flow refuses
 tests/test_takeoffer_web.mjs       what a take puts at output index 1
 tests/test_format_web.mjs          the amounts the page shows, exactly
+tests/test_alerts_web.mjs          what needs a person, per seat and per moment
 tests/test_spend_depth.py          a cached spend's depth, and a reorg under it
 tests/test_offer_expiry.py         a cross-chain offer's own end
 tests/test_arith_parity.py         the same arithmetic, addresses and refusals

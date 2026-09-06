@@ -433,8 +433,16 @@ at the whole book.
  "block_seconds": 60, "reference_ticker": "USDX",
  "oracles": 3, "oracle_errors": [],
  "event_errors": [], "event_backlog": 0,
+ "rescan_needed_from": null,
  "node": true, "btc_node": true, "btc_height": 155377}
 ```
+
+`rescan_needed_from` is a height when this book was stopped for longer than
+`rescan_depth` blocks: a poll's backward walk is bounded, so what happened in
+between is invisible until an operator runs it once with `--rescan-from` that
+height, and until then offers and vaults that moved meanwhile read as gone or
+unknown. The book keeps its own last reconciled height in `book.json` (under
+`meta`) to know. It is `null` otherwise, and `ok` is false while it is set.
 
 `ok` is false when there is no node, when the node or the **primary** oracle is
 unreachable, while the first sync is still running, when the poll thread has not
@@ -637,6 +645,13 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
  "funding_height": 118289, "funding_block": "…"
 }
 ```
+
+`liquidatable_since` is the Unix time at which a LIVE loan's price last crossed
+under its strike, present only while it is under; the book stamps the crossing
+on every price refresh and clears it when the price climbs back. With no
+liquidator guaranteed to be running it is the difference between "just crossed"
+and "liquidatable for three hours and nobody has". `/v1/stats` carries it on
+each `at_risk` row beside `liquidatable`.
 
 `funding_height` and `funding_block` are how a Bitcoin-driven reorg is told from
 a spend the watcher could not reach, and they are persisted with the record so a
