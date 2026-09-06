@@ -24,7 +24,9 @@ fi
 url="${NTFY_URL:-https://ntfy.sh}/$NTFY_TOPIC"
 # A failure to deliver is said and not fatal: the alert path must never be
 # the thing that takes a unit down a second time.
+# --data-raw, not -d: a message beginning with "@" would otherwise name a
+# file for curl to read and send instead.
 curl -sS --max-time 15 -H "Title: $title" -H "Priority: high" \
-     -d "$msg" "$url" >/dev/null 2>&1 \
+     --data-raw "$msg" "$url" >/dev/null 2>&1 \
   || echo "alert: could not reach $url" >&2
 exit 0
