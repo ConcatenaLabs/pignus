@@ -494,6 +494,8 @@ class Service:
         self.poll_error = None
         self._btc_feerate = None
         self._btc_feerate_at = 0
+        self._btc_height = None
+        self._btc_height_at = 0
         self.height = None
         self.assets = {}            # asset id -> {ticker, name, precision}
         self.by_ticker = {}         # TICKER (upper) -> asset id
@@ -1099,6 +1101,12 @@ class Service:
             return
         for lid in loans:
             w.vaults.pop(lid, None)
+            # The vault script cache is keyed by the loan's terms id, which
+            # is its loan id; evicting here keeps it from ever reaching the
+            # size at which it is cleared wholesale and every list pays the
+            # covenant build again.
+            for single in (True, False):
+                self._spk_cache.pop((lid, single), None)
         for oid in offers:
             w.offers.pop(oid, None)
         for attr, gone in (("_by_outpoint", loans), ("_by_offer", offers)):
@@ -1129,7 +1137,10 @@ class Service:
         if btc_h is None or not self.height:
             return 0                    # no parent chain: judge nothing
         n = 0
-        for o in self.book.list_btc_offers(status="open"):
+        # One write for the sweep, not one per expired offer: see
+        # `Book.stamp_at_risk`.
+        with self.book.batch():
+          for o in self.book.list_btc_offers(status="open"):
             # An offer is the LENDER's half of a loan. The borrower's key and
             # their origination commitment arrive on the take, so an offer
             # carries neither -- and `loan_from_dict` cannot build a BtcLoan
@@ -1775,10 +1786,19 @@ class Service:
         node = getattr(self, "btc_node", None)
         if node is None:
             return None
+        # Remembered for a while, like the feerate. `/healthz` and
+        # `/v1/markets` both carry it and every open tab polls both, so an
+        # uncached call made a hung bitcoind block every health check for its
+        # whole RPC timeout, thread by thread.
+        now = time.time()
+        if self._btc_height_at and now - self._btc_height_at < 20:
+            return self._btc_height
         try:
-            return int(node.getblockcount())
+            self._btc_height = int(node.getblockcount())
         except Exception:                               # noqa: BLE001
-            return None
+            self._btc_height = None
+        self._btc_height_at = now
+        return self._btc_height
 
     def depth_at(self, height, block_hash):
         """How deep a block is, or None if the chain no longer holds it there.
@@ -1909,6 +1929,9 @@ class Service:
         elif now - self.last_poll > max(120, 3 * self.poll_interval):
             reasons.append(f"poll thread stalled: last finished "
                            f"{int(now - self.last_poll)}s ago")
+        if getattr(self.watcher, "cut_short", False):
+            reasons.append("the node stopped answering partway through the "
+                           "last poll; chain states may lag until it answers")
         if self.poll_error:
             reasons.append(f"the last poll failed: {self.poll_error}")
         if stale:
@@ -2672,8 +2695,10 @@ class Handler(BaseHTTPRequestHandler):
             # themselves, so writing a computed field onto one wrote it into
             # the book -- and the next save persisted a number that is only
             # true for an instant.
-            offers = [served_loan(dict(o, lots_left=s.book.btc_offer_lots_left(
-                o["btc_offer_id"], BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)))
+            # One pass over the takes for every offer, not one per offer:
+            # this listing is what every open tab polls.
+            left = s.book.btc_lots_left_all(BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)
+            offers = [served_loan(dict(o, lots_left=left.get(o["btc_offer_id"], 0)))
                 for o in s.book.list_btc_offers(status=status)]
             return self._send(200, {"offers": offers})
         if path.startswith("/v1/btc/offer/"):

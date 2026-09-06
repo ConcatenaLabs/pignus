@@ -514,6 +514,23 @@ class Book:
         with self._lock:
             return self._lots_left(btc_offer_id, take_ttl, signed_ttl)
 
+    def btc_lots_left_all(self, take_ttl=1800, signed_ttl=6 * 3600):
+        """`btc_offer_lots_left` for every offer at once: one pass over the
+        takes, not one per offer. The listing every open tab polls asked per
+        offer, and takes are only ever pruned a month after they finish, so
+        that was offers times takes under the lock on every poll."""
+        now = int(time.time())
+        with self._lock:
+            held = {}
+            for t in self.btc_takes.values():
+                if _holds_lot(t, now, take_ttl, signed_ttl):
+                    oid = t.get("btc_offer_id")
+                    held[oid] = held.get(oid, 0) + 1
+            return {oid: max(0, int(rec.get("lots") or 1)
+                             - int(rec.get("lots_taken") or 0)
+                             - held.get(oid, 0))
+                    for oid, rec in self.btc_offers.items()}
+
     def _lots_left(self, btc_offer_id, take_ttl=1800, signed_ttl=6 * 3600):
         """`btc_offer_lots_left` without the lock, for callers that hold it.
 
@@ -869,24 +886,30 @@ class Book:
         now = int(now or time.time())
         with self._lock:
             records = [(k, dict(v)) for k, v in self.loans.items()]
-        for loan_id, rec in records:
-            if rec.get("state") != "LIVE":
-                if rec.get("liquidatable_since"):
+        # ONE write for the sweep. A price crossing a strike moves every loan
+        # on that market at once, and each `update_loan` outside a batch is a
+        # full rewrite of the book with an fsync, under the lock every read
+        # takes: thousands of loans meant minutes of stalled reads and
+        # gigabytes written for one oracle round.
+        with self.batch():
+            for loan_id, rec in records:
+                if rec.get("state") != "LIVE":
+                    if rec.get("liquidatable_since"):
+                        self.update_loan(loan_id, liquidatable_since=None)
+                    continue
+                try:
+                    t = LoanTerms.from_json(rec["terms"])
+                except (ValueError, TypeError):
+                    continue
+                price = price_for(t)
+                if price is None:
+                    continue            # no price is no verdict, either way
+                liq = t.is_liquidatable(price)
+                was = rec.get("liquidatable_since")
+                if liq and not was:
+                    self.update_loan(loan_id, liquidatable_since=now)
+                elif not liq and was:
                     self.update_loan(loan_id, liquidatable_since=None)
-                continue
-            try:
-                t = LoanTerms.from_json(rec["terms"])
-            except (ValueError, TypeError):
-                continue
-            price = price_for(t)
-            if price is None:
-                continue                # no price is no verdict, either way
-            liq = t.is_liquidatable(price)
-            was = rec.get("liquidatable_since")
-            if liq and not was:
-                self.update_loan(loan_id, liquidatable_since=now)
-            elif not liq and was:
-                self.update_loan(loan_id, liquidatable_since=None)
 
     def stats(self, prices=None, price_for=None):
         """A summary a page can render. Health figures need prices, and are

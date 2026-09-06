@@ -658,8 +658,55 @@ def test_explain():
     check("nothing is wrong with it", e["problems"] == [], str(e["problems"]))
 
 
+def test_node_gone():
+    print("a node that stops answering ends the poll, not the daemon's day")
+    # Every unanswered question is left for the next poll -- right for one
+    # vault, ruinous for thousands: a node that accepts the connection and
+    # never answers costs a whole RPC timeout per record, and the chain lock
+    # is held the whole time. So a run of unanswered questions abandons the
+    # rest of the poll, and the next one starts over.
+    n = StubNode()
+    w = VaultWatcher(n, min_depth=2, rescan_depth=50)
+    for i in range(12):
+        n.utxos[(f"fund{i}", 0)] = {"value": 1.0, "confirmations": 5}
+        w.track(f"loan{i}", StubTerms(), f"fund{i}", 0)
+    w.poll()
+    check("every vault is looked at while the node answers",
+          not w.cut_short and all(v.state is State.LIVE for v in w.vaults.values()))
+    real = n.gettxout
+    def dead(*_a, **_k):
+        n.calls["gettxout"] += 1
+        raise RuntimeError("timed out")
+    n.gettxout = dead
+    before = n.calls["gettxout"]
+    w.poll()
+    asked = n.calls["gettxout"] - before
+    check("after three unanswered questions in a row the poll gives up",
+          asked == VaultWatcher.GIVE_UP_AFTER, f"asked {asked} times")
+    check("and says so", w.cut_short is True)
+    check("nothing was guessed: every vault is as it was",
+          all(v.state is State.LIVE for v in w.vaults.values()))
+    n.gettxout = real
+    before = n.calls["gettxout"]
+    w.poll()
+    check("the next poll starts over and asks about every vault again",
+          not w.cut_short and n.calls["gettxout"] - before == 12,
+          f"{n.calls['gettxout'] - before} asked, cut_short={w.cut_short}")
+    # One transient failure among answered questions is not a dead node.
+    flaky = {"n": 0}
+    def once(txid, vout, include_mempool=False):
+        flaky["n"] += 1
+        if flaky["n"] % 5 == 0:
+            n.calls["gettxout"] += 1
+            raise RuntimeError("blip")
+        return real(txid, vout, include_mempool)
+    n.gettxout = once
+    w.poll()
+    check("a failure now and then does not end the poll", not w.cut_short)
+
+
 def main():
-    for fn in (test_offer_not_ghosted_while_the_scan_is_behind, test_ghost, test_provisional_exit, test_restart,
+    for fn in (test_node_gone, test_offer_not_ghosted_while_the_scan_is_behind, test_ghost, test_provisional_exit, test_restart,
                test_reorg_after_restart,
                test_bounded_walk, test_failed_block, test_offers,
                test_rescan_from, test_explain):

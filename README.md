@@ -106,7 +106,8 @@ pignus/vault.py          every transaction: fund/take/withdraw an offer, the fou
                          exits, explicit-coin preparation for node wallets
 pignus/fees.py           a fee in any asset, from the node's exchange rates
 pignus/watcher.py        reconcile loans AND offers to the chain; name each exit;
-                         discover loans from take witnesses; catch ghosts
+                         discover loans from take witnesses; catch ghosts; give
+                         a poll up on a node that stops answering
 pignus/book.py           the loan book: discovery, nothing else
 pignus/offers.py         funded resting offers (the node repo's pignus_offer.py)
 pignus/btc_collateral.py native BTC collateral (Tier B): the pre-vault, the
