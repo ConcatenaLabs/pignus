@@ -253,6 +253,9 @@ file is missing.
 ```
 
 The note is the API's own health warning and is served with it deliberately.
+`url` is the primary's public address, the first entry of `oracle_public_urls`
+in the book's configuration; only when none is configured is it the address
+the book itself reads from, which behind a proxy is loopback.
 
 ### `GET /v1/oracles`
 

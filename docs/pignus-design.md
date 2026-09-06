@@ -744,7 +744,7 @@ the principal.
 
 | Tier | Assets | Enforcement | Trust |
 |---|---|---|---|
-| A | tSEQ, GOLD, SILVR, OILX, EURX, SBTC, and any unrestricted issued asset | The section-2 covenant | Oracle, for one number |
+| A | any unrestricted issued asset, the Sequence token (tSEQ) included | The section-2 covenant | Oracle, for one number |
 | B | Native BTC | Section 7, cross-chain | Oracle, interactively, for liquidation; the lender, for claiming the repayment and for being reachable at origination |
 | C | OpenAMP (`cosign`) assets | A pledge the policy server enforces | The issuer's policy server, and before maturity the borrower's consent |
 | D | OpenDAMP (`damp`) assets | Not lending: a repurchase (8.1) | The lender, for the bond; no oracle |

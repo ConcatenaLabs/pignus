@@ -380,7 +380,8 @@ export async function borrow(wallet, offer, ui) {
   const missing = missingMethods(caps);
   if (missing.length)
     throw new Error("this wallet cannot sign the Bitcoin side yet (it has no " +
-      missing.join(", ") + "). Update the extension, or use pignus-cli btc-*.");
+      missing.join(", ") + "). Update the extension, or take the offer from the " +
+      "command line with pignus-cli btc-offer-take.");
 
   const bad = offerProblems(offer.loan);
   if (bad.length) throw new Error(bad.join(" "));

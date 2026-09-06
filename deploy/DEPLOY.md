@@ -1,5 +1,11 @@
 # Deploying Pignus
 
+This is the runbook for the testnet deployment at `sequentiatestnet.com`, and
+"the box" below is that server. Anyone running their own `pignusd` and oracle
+needs only the *`pignusd` configuration*, *Threshold oracles* and *Checking it*
+sections and the systemd units in this directory; substitute your own paths
+for `/root/sequentia/`.
+
 The box pulls from GitHub and runs from there. Never edit source on the box and
 never copy binaries onto it: build and check on a laptop, push, then `git pull`
 on the box.
@@ -10,9 +16,9 @@ on the box.
 |---|---|---|---|
 | `pignus-oracle` | 8740 | the price feed on :8088 | attestations stop within one tick; loans cannot be liquidated until it returns |
 | further oracles | 8742, 8743 | the price feed on :8088 | an m-of-n loan loses a signer |
-| `pignusd` | 8741 | node RPC :18200, registry :3005, the oracles | the page and the book go with it; nothing on chain is affected |
+| `pignusd` | 8741 | node RPC :18200 (the box's node runs with `-rpcport=18200`; the binary's own default is 18776), registry :3005, the oracles | the page and the book go with it; nothing on chain is affected |
 | `pignus-btc-responder` | none (a client) | `pignusd` :8741, node RPC :18200, Bitcoin testnet4 RPC :48332 | cross-chain borrows stall: takes go unsigned, funded ones unpaid |
-| the price server | 8088 | upstream quotes | every oracle errors within `feed_max_age` |
+| the price server | 8088 | upstream quotes | every oracle stops signing once its feed has come back byte-identical for `flat_rounds` rounds, or sooner if `feed_max_age` is set |
 | `sequentia-registry` | 3005 | — | tickers fall back to the node's own asset labels |
 
 The price server is the node repository's `contrib/price-server`, the same one
@@ -322,12 +328,15 @@ peer *without* the header is taken for the box's own tooling — the responder
 and the CLI on loopback — and is not rate-limited at all. Exposed directly,
 every public client would arrive looking like that.
 
-There are two limits, and they meter different costs. Writes are metered
+There are three limits, and they meter different costs. Writes are metered
 because they change the book. Reads that touch the NODE — `/v1/spend`, which
-walks blocks backwards, and `/v1/outpoint`, which asks per call — are metered
-because they cost the node work, and both must stay unauthenticated: a borrower
-recovering their own collateral has no account here. Everything else is served
-from memory and is not worth limiting.
+walks blocks backwards, `/v1/outpoint`, `/v1/scan` and `/v1/btc/outpoint`,
+which ask per call — are metered because they cost the node work, and all must
+stay unauthenticated: a borrower recovering their own collateral has no account
+here. The four whole-book listings are metered at two a second per client
+because each is a full render when the cache misses; the page asks for each
+once every thirty seconds. Every other read comes out of memory and is not
+limited. `docs/api.md` carries the figures.
 
 **`pignus-oracle` takes the same `trusted_proxies` setting**, and for a sharper
 reason. Its log endpoints read off disk, so they are rate-limited — and keyed on
@@ -403,15 +412,18 @@ market whose oracle and registry disagree about them is priced out by a power of
 ten and no signature check anywhere can see it.
 
 The oracle's `/healthz` answers **503**, not 200, when it has not completed a
-signing round within two intervals, with `stale`, `errors` and `round_error`
+signing round within two intervals (thirty seconds where that is longer), with `stale`, `errors` and `round_error`
 saying which market and why. A green oracle answers 200. The process staying up
 while its signing thread is dead is exactly the outage that otherwise goes
 unnoticed until it reaches the RECOVER backstop.
 
 `pignusd`'s `/healthz` reports `ok: false` with the reason when there is no
 node, when the node or the **primary** oracle is unreachable, while the first
-sync runs, when the poll thread has not finished for `max(120s, 3 × poll)`, or
-when any market's newest verified attestation is older than `max_price_age`.
+sync runs, when the poll thread has not finished for `max(120s, 3 × poll)`,
+when any market's newest verified attestation is older than `max_price_age`,
+and for the other causes `docs/api.md` lists under `/healthz`: a record that
+cannot be rendered, an unapplied offer backlog, a node that stopped answering
+partway through a poll, a rescan owed.
 `error`, `stale_markets` and `oracle_errors` name what is wrong; the page shows
 "degraded" rather than stale numbers dressed as live ones. `covenant_vectors`
 is how many golden vector cases the tripwire checked in that process — zero

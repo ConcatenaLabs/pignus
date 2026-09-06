@@ -1590,9 +1590,9 @@ function lendTerms() {
                     "keep 'offer open for' at or below the maturity");
   // Every locktime here is a height, so an offer cannot be built without one.
   if (state.height == null || !state.healthy?.node)
-    throw new Error("the book has no node right now, so it cannot place a " +
-                    "maturity or an expiry; try again when the chain tag shows " +
-                    "a block height");
+    throw new Error("the book has no node, so it cannot turn the term into a " +
+                    "block height; try again when the 'chain' badge at the " +
+                    "top of the page shows a height");
   const dp = m.debt_precision ?? 8;
   const scale = BigInt(m.price_scale || 100000);
   const price = BigInt(m.price);

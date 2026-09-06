@@ -2275,9 +2275,10 @@ class Handler(BaseHTTPRequestHandler):
         serialised once, compact, and gzipped once beside it.
         """
         if self._list_limited():
-            return self._send(429, {"error": "too many listing requests; "
-                                             "the page needs one every thirty "
-                                             "seconds"})
+            return self._send(429, {"error": "too many listing requests: two "
+                                             "a second per client with a burst "
+                                             "of thirty; the page itself asks "
+                                             "once every thirty seconds"})
         s = self.svc
         full = (name, s.book.generation, s.view_epoch,
                 int(time.time() // RENDER_TTL)) + tuple(key)
@@ -2458,8 +2459,13 @@ class Handler(BaseHTTPRequestHandler):
                                         "missing; the browser has nothing to "
                                         "pin itself against"})
         if path == "/v1/oracle":
+            # The PUBLIC address when the operator gave one. The address the
+            # book reads from is loopback behind a proxy, and answering
+            # "where is this oracle" with 127.0.0.1 sends a reader to their
+            # own machine.
+            public = s.oracle_public_urls[0] if s.oracle_public_urls else ""
             return self._send(200, {
-                "oracle_x": s.oracle_x, "url": s.oracle_url,
+                "oracle_x": s.oracle_x, "url": public or s.oracle_url,
                 "note": "verify every attestation against the key the VAULT "
                         "bakes in, not against this one"})
         if path == "/v1/oracles":
