@@ -40,7 +40,8 @@ price.
 
 Every one of those amounts is coerced to a decimal string when a record is
 written and again when it is served, so the shape holds for every record
-whatever wrote it. Heights,
+whatever wrote it. The decimal-string rule holds for the amounts a book
+derives as well as the ones it stores. Heights,
 locktimes, timestamps, confirmations, counts, prices, `price_scale` and
 `expiry_locktime` are JSON numbers. That holds for the amounts a book derives
 as well as the ones it stores: `seizure_if_liquidated` and
@@ -53,9 +54,9 @@ The `terms` field of an offer or a loan is the JSON **string** that was
 submitted, stored and served back byte for byte -- not a nested object. That is
 deliberate: the terms are what every party's covenant address is derived from,
 so re-serialising them here would be a chance to change them. Parse it
-yourself. Its own amount fields may be decimal strings, and a book must accept
-them either way, because a browser cannot serialise an integer above 2^53
-exactly.
+yourself. Its amount fields are decimal strings whenever this book, the CLI or
+the page writes them; a book accepts either spelling on the way in, because a
+browser cannot serialise an integer above 2^53 exactly.
 
 **Prices.** A price is debt-asset atoms per collateral-asset atom, multiplied by
 `price_scale`. `unit_price` in `/v1/markets` is that number divided out, as a
@@ -75,21 +76,22 @@ four hundred together. The whole-book listings -- `/v1/loans`, `/v1/offers`,
 `/v1/btc/offers` and `/v1/stats` -- are charged at two a second with a burst
 of thirty per client; the page asks for each once every thirty seconds. Over
 any of those the answer is 429. Every other read is served from memory and is
-not limited.
+not limited, except `/v1/loans/{id}/exit`, which reads the closing block from
+the node once and answers from a cache after that.
 
 **Listings.** The four listings are rendered once and served from a cache
 until the book changes, the poll learns something new, or ten seconds pass,
 whichever is first; every tab asking within that window gets the same
 render. They are sent compact, and gzipped when the request carries
 `Accept-Encoding: gzip` (a full book compresses about tenfold). When more
-than a few renders are already running the answer is a 503 with
+than eight renders are already running the answer is a 503 with
 `Retry-After: 5` rather than a queue without bound. The server holds at most
 256 connections at once; past that an accept is closed unread and a client
 that retries gets a slot when one frees.
 
 Every write -- each `POST`, and `DELETE` -- must come from this site. A `POST`
 must carry `Content-Type: application/json`, and an `Origin` header naming
-another site is refused, both with a 400 before the body is read. Nothing a
+another site is refused, both with a 400 before the body is parsed. Nothing a
 write can do moves money without a coin or a signature; what this refuses is
 a page elsewhere spending a visitor's own rate-limit bucket from their
 browser. Reads stay open to every origin. Every answer carries a content
@@ -97,7 +99,7 @@ security policy that keeps the page's scripts and connections to this site
 and forbids framing it, plus `X-Frame-Options: DENY`,
 `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
 
-**Behind a proxy.** Every request then arrives from loopback, so `pignusd`
+**Behind a proxy.** Behind a reverse proxy every request arrives from loopback, so `pignusd`
 believes `X-Forwarded-For` (or `X-Real-IP`) only from a peer listed in
 `trusted_proxies`, and only its last hop — earlier entries are whatever the
 client claimed. A request from a trusted peer *without* that header is the box's
@@ -213,7 +215,7 @@ holds:
   "feerate_rfa_per_kvb": 2000,
   "dust_relay_rfa_per_kvb": 100,
   "dust_output_vsize": 145,
-  "vsize": {"repay": 2000, "repay4": 600, "take": 3000, "…": 0}
+  "vsize": {"repay": 2000, "repay4": 600, "take": 3000}
 }
 ```
 
@@ -293,8 +295,9 @@ every consumer here compares the scale to the loan's own before using a price.
 signed property and cannot be, but a reader acting on a price needs it: a
 signature stays valid however old the number under it is. It is SIGNED -- a
 negative age is an attestation dated ahead of this book's clock, which is
-exactly the case a reader most needs to see, and `stale` is true for one that
-is far enough ahead to be a broken clock rather than drift.
+exactly the case a reader most needs to see, and `stale` is true whenever the
+attestation is not current: older than `max_price_age`, or dated more than two
+minutes ahead of this book's clock.
 Verify against the key the **vault** bakes in, not against whichever oracle
 served it. 404 when the book holds none.
 
@@ -312,7 +315,8 @@ signed by the key a particular loan bakes in.
 {"loans_by_state": {"LIVE": 12, "REPAID": 40},
  "offers": 7, "offers_all": 31, "unreadable": 0,
  "live_debt_by_asset": {"<asset id>": "150000000000"},
- "at_risk": [{"loan_id": "…", "market": "GOLD/USDX", "health": 1.02}]}
+ "at_risk": [{"loan_id": "…", "market": "GOLD/USDX", "health": 1.02,
+              "liquidatable": false, "liquidatable_since": null}]}
 ```
 
 `at_risk` lists LIVE loans whose health is under 1.15, weakest first, each
@@ -341,6 +345,7 @@ transaction index is needed:
   the lookup, or if the output is confidential (it has no public amount, and a
   covenant cannot spend one).
 - 404 if the output is unspent nowhere — it may already be spent.
+- 429 if this client is reading the chain too fast.
 - 503 if this book has no node.
 
 ### `GET /v1/scan/{scriptPubKey}`
@@ -362,7 +367,9 @@ would then make the same payment twice. Every address here is derived from
 terms the asker already holds, so asking about one reveals nothing.
 
 It walks the whole UTXO set, so it is rationed like `/v1/spend` (429 when a
-client asks too often), and 503 when this book has no node.
+client asks too often), 400 if the scriptPubKey is not hex of 2 to 200
+characters, `asset` is not 64 hex, `amount` is not a whole number, or the node
+refuses the scan, and 503 when this book has no node.
 
 ### `GET /v1/spend/{txid}/{vout}`
 
@@ -394,6 +401,7 @@ tip as far as `back_scan_cap`.
 
 - 400 if the txid is not 64 hex or the vout is not a number.
 - 404 if the output is still unspent, or its spend is outside the scan window.
+- 429 if this client is reading the chain too fast.
 - 503 if this book has no node.
 
 ### `GET /v1/btc/outpoint/{txid}/{vout}`
@@ -405,7 +413,10 @@ Is a **Bitcoin** outpoint still unspent, and if not, what spent it:
  "witness": ["…", "…"], "confirmations": 12}
 ```
 
-`{"unspent": true, "confirmations": n}` while it is still there. This book stays
+`{"txid": "…", "vout": 0, "unspent": true, "confirmations": n}` while it is
+still there. `unspent` false with an empty `spend_txid` means the coin is gone
+but its spend is outside this book's scan window (`back_scan_cap` blocks):
+treat that as "taken by something unseen", never as unspent. This book stays
 ignorant of any loan, exactly as `/v1/spend` does: it returns the outpoint's
 state and the raw witness, and the caller names the leaf from its own copy of
 the tree.
@@ -452,7 +463,8 @@ at the whole book.
  "oracles": 3, "oracle_errors": [],
  "event_errors": [], "event_backlog": 0,
  "rescan_needed_from": null,
- "node": true, "btc_node": true, "btc_height": 155377}
+ "node": true, "btc_node": true, "btc_height": 155377,
+ "compromised_keys": []}
 ```
 
 `rescan_needed_from` is a height when this book was stopped for longer than
@@ -524,7 +536,7 @@ One offer. `/v1/offer/{id}` is accepted as an alias. 404 if there is none.
 ```json
 {
   "offer_id": "…32 hex…",
-  "terms": "{…}",                 # the terms document, as a JSON STRING
+  "terms": "{…}",
   "kind": "funded",
   "outpoint": "<txid>:<vout>",
   "vault_address": "…scriptPubKey hex…",
@@ -538,6 +550,7 @@ One offer. `/v1/offer/{id}` is accepted as an alias. 404 if there is none.
   "collateral_precision": 8, "debt_precision": 8,
   "debt": "10500000000", "strike": "18000000", "maturity": 119000,
   "lender_prog": "…hex…", "lender_ver": 1, "oracle_x": "…",
+  "oracle_compromised": false,
   "price": 300000000, "open_ltv": 0.5,
   "expired": false, "height": 118432,
   "warnings": [],
@@ -644,7 +657,7 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
 ```json
 {
   "loan_id": "…", "terms_id": "…",
-  "terms": "{…}",                 # the terms document, as a JSON STRING
+  "terms": "{…}",
   "state": "LIVE", "confirmations": 143,
   "txid": "…", "vout": 0,
   "single_leaf": true,
@@ -661,6 +674,7 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
   "borrower_prog": "…", "borrower_ver": 0,
   "oracle": "2-of-3", "oracle_x": "…",
   "oracle_keys": ["…", "…", "…"],
+  "oracle_compromised": false,
   "height": 118432, "past_maturity": false, "recover_open": false,
   "price": 300000000, "health": 1.6667, "ltv": 0.525,
   "liquidatable": false,
@@ -760,6 +774,10 @@ say that price buys.
  "problems": []}
 ```
 
+`strike` and `not_before` are JSON numbers here, unlike `strike` on
+`/v1/loans/{id}`; the amounts -- `debt`, `collateral`, `seize_*`, `surplus_*`,
+`lender_paid` -- are decimal strings.
+
 `problems` is empty when everything the covenant enforces is visible and agrees;
 a non-empty entry names what could not be checked or did not add up. A borrower
 who was liquidated has no other way to see the price it happened at.
@@ -835,8 +853,9 @@ true. The page derives everything it shows from them.
 `requested`, `reserved` or `pending` five minutes after it was made releases
 its lot, and a `signed` one whose collateral never
 appeared releases its lot after six hours: a borrower who asks and walks away
-must not hold a lender's offer shut. Every status past that holds its lot for
-good, because money is in flight by then.
+must not hold a lender's offer shut. `disbursed`, `live` and `claimed` hold
+their lot for good, because money is in flight by then; `refunded` releases
+it, since the principal went home.
 
 Those windows are short on purpose. Asking for a loan is free and anonymous, so
 every second an unfinished request holds a lot is a second somebody who is not
@@ -1002,7 +1021,8 @@ stores it on the take and serves it back.
 `200` returns the take with `status: "requested"`, its derived `prevault_spk`
 and `disbursement_spk`, and any `warnings` its deadlines raise. `404` no such
 offer. `409` the offer is closed, or every lot is spoken for. `400` anything the
-relay could not rebuild.
+relay could not rebuild, including an outpoint another take already names.
+`429` this client is writing too fast.
 
 ### `POST /v1/btc/hash`
 
@@ -1025,7 +1045,7 @@ their repayment will commit to came from the lender rather than from the relay.
 hash implies — read them back from `GET /v1/btc/take/{id}`. `403` the signature
 is not the lender's. `409` the take already has a different hash, or this hash
 is already committed to another loan on this book. `400` the hash is not 32
-bytes, or is the one the principal is locked to (`h_w`).
+bytes, or is the one the principal is locked to (`h_w`). `404` no such take.
 
 ### `POST /v1/btc/presig`
 
@@ -1039,7 +1059,7 @@ vault -- which they can only derive now that the hash exists.
 The relay verifies the signature against the loan it rebuilt, so a lender is
 never asked to fund a loan that could not start. `200` moves the take to
 `status: "pending"`. `409` the take has no hash yet. `400` the signature does
-not move that collateral into that vault.
+not move that collateral into that vault. `404` no such take.
 
 ### `GET /v1/btc/takes`
 
@@ -1085,8 +1105,9 @@ payment_hash, adaptor_sig}))`.
 
 The relay derives the vault from the take's own pre-vault outpoint and payment
 hash, rebuilds the reclaim transaction, and refuses a signature that does not
-verify against it. `200` moves the take to `status: "signed"` and serves the
-`vault_txid` it derived. `403` the reply is not the lender's. `409` the take has
+verify against it. `200` is `{"ok": true, "take_id": "…"}` and moves the take
+to `status: "signed"`, recording the `vault_txid` it derived -- read it back
+from `GET /v1/btc/take/{id}`. `403` the reply is not the lender's. `409` the take has
 no advance signature yet, the release is for a different payment hash, or a
 different release is already stored (re-sending the same one is accepted).
 `400` the signature does not verify.
@@ -1125,8 +1146,10 @@ can send it again.
 ### `POST /v1/btc/claimed-principal`, `/v1/btc/repaid`
 
 The borrower's own reports: where they took the principal, and where they paid
-the debt. Both are hints -- everything they say is on chain -- and both record
-`txid`/`vout` and change NO status, because a status a borrower can set is one
+the debt. Both are hints -- everything they say is on chain -- and both are
+stored on the take (`/v1/btc/claimed-principal` as `principal_claim_txid`,
+`/v1/btc/repaid` as `repay_txid` and `repay_vout`) and change NO status,
+because a status a borrower can set is one
 they can use to move a take out from under the step their lender was about to
 take. They are signed by the key the take names all the same: an unsigned hint
 is a way to write into somebody else's loan, and a lender's responder saves a
@@ -1140,7 +1163,8 @@ whole-UTXO-set scan by believing one that checks out.
 `tagged("pignus/btc-claimed-principal/1" | "pignus/btc-repaid/1",
 canonical({take_id, txid, vout}))`.
 
-`200` on either. `403` the signature is not the borrower's. `404` no such take.
+`200` is `{"ok": true}` on either. `403` the signature is not the borrower's.
+`404` no such take.
 
 The page sends both as it broadcasts. From the command line they are sent by
 `pignus-cli btc-claim-principal` and `btc-repay` when given `--book` and
@@ -1155,7 +1179,12 @@ Everything the oracle serves is a read. The ones that go to disk for it —
 `/v1/attestation/{market}/at/{ts}`, and `/v1/log` whenever `since`, `until` or
 `cursor` sends it to the archive — are limited to one request a second per
 address with a burst of ten, and twenty a second with a burst of two hundred
-for everybody together, and answer 429 over that. `/v1/attestation/{market}` is limited the same way while the market has no attestation in memory and the answer has to come from the archive; a book treats that 429 as the oracle erroring, not as no price. An auditor's query is
+for everybody together, and answer 429 over that. `/v1/attestation/{market}`
+is limited the same way while the market has no attestation in memory and the
+answer has to come from the archive; a book treats that 429 as the oracle
+erroring, not as no price. A market found nowhere on disk is remembered as
+missing for a minute rather than searched for again on the next request. An
+auditor's query is
 cheap once and expensive in a loop, and this process has signing to do.
 Everything else comes out of memory and is not limited.
 
@@ -1216,7 +1245,9 @@ Without `since`, `until` or `cursor` the answer comes from the in-memory tail
 log file is bisected by timestamp and the answer carries `cursor`, a byte offset
 to pass back for the next page, or `null` at the end.
 
-`{"attestations": [ … ], "cursor": 65536}`. 400 if any of the four is not a
+`{"attestations": [ … ]}` from memory; `{"attestations": [ … ], "cursor":
+65536}` from the archive, with `cursor` `null` on the last page. 400 if any of
+the four is not a
 number, or `n` is under 1.
 
 ### `GET /v1/log/raw`
@@ -1265,8 +1296,8 @@ oracle co-signed no such seizure.
 ### `GET /healthz`
 
 ```json
-{"ok": true, "markets": 6, "errors": {}, "stale": [],
- "round_error": null, "source_error": null,
+{"ok": true, "markets": 6, "signed": 6, "errors": {}, "stale": [],
+ "round_error": null, "source_error": null, "clock_skew": 0.3,
  "last_round": 1799999940, "age": 12.4}
 ```
 
@@ -1275,7 +1306,9 @@ signing thread, an unwritable log or a feed that stopped answering all leave the
 process happily serving its last attestation. A round that has not completed
 within two intervals, or within thirty seconds where that is longer, is not ok, and the reply
 carries **503** so a check that only reads the status code sees it. A green
-oracle answers 200.
+oracle answers 200. `signed` counts the markets neither erroring nor stale;
+`clock_skew` is the seconds this host's clock differs from the price source's,
+or `null` when the source does not say.
 
 ## Verifying a liquidation
 
