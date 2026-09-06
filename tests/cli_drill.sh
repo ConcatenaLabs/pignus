@@ -667,6 +667,26 @@ r = subprocess.run([sys.executable, cli, "btc-responder-clear",
 if r.returncode == 0:
     sys.exit("FAIL: clearing a take with nothing in flight was allowed")
 print("  a take with nothing in flight is left alone")
+
+# ...but it can be WRITTEN OFF, on the record: kept, reported as written off
+# rather than as needing a person, and not acted on again.
+r = subprocess.run([sys.executable, cli, "btc-responder-clear",
+                    "--state", state, "--take", "take-live",
+                    "--write-off", "pre-format record; principal went to a plain address"],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    sys.exit(f"FAIL: the write-off was refused: {r.stderr[-300:]}")
+rec = json.load(open(state))["take-live"]
+if not rec.get("written_off") or rec.get("waiting"):
+    sys.exit(f"FAIL: the write-off was not recorded, or the wait survived it: {rec}")
+r = subprocess.run([sys.executable, cli, "btc-responder-status", "--state", state],
+                   capture_output=True, text=True)
+out = json.loads(r.stdout[r.stdout.index("{"):])
+if "take-live" not in out.get("written_off", []):
+    sys.exit(f"FAIL: status does not list the write-off: {out.get('written_off')}")
+if any(row["take_id"] == "take-live" and not row.get("written_off") for row in out["rows"]):
+    sys.exit("FAIL: the written-off row reads as live")
+print("  a take this key can do nothing about is written off, on the record, and reported as such")
 PYSTATUS
 
 # --- an offer a responder no longer recognises must be LOUD -----------------

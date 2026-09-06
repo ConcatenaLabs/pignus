@@ -3,6 +3,8 @@ Description=Pignus loan book and watcher (Sequentia testnet)
 Documentation=https://github.com/ConcatenaLabs/pignus
 After=network-online.target pignus-oracle.service
 Wants=network-online.target
+# A failure tells a person: see deploy/pignus-alert.sh.
+OnFailure=pignus-alert@%n.service
 
 [Service]
 Type=simple

@@ -3,6 +3,8 @@ Description=Pignus cross-chain lender responder (Sequentia testnet)
 Documentation=https://github.com/ConcatenaLabs/pignus
 After=network-online.target pignusd.service
 Wants=network-online.target
+# A failure tells a person: see deploy/pignus-alert.sh.
+OnFailure=pignus-alert@%n.service
 
 [Service]
 Type=simple

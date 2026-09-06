@@ -1,0 +1,18 @@
+# One instance per failing unit, named through OnFailure=pignus-alert@%n.service
+# in every Pignus unit: when pignusd, an oracle, the responder, the liquidator,
+# the check or the backup fails, this sends one line to the push topic named in
+# /root/sequentia/pignus-alert.env. deploy/pignus-alert.sh says how to set the
+# topic up; without one the failure is in the journal only, as before.
+[Unit]
+Description=Pignus alert for %i (Sequentia testnet)
+Documentation=https://github.com/ConcatenaLabs/pignus
+
+[Service]
+Type=oneshot
+User=root
+Environment=PIGNUS_ALERT_ENV=/root/sequentia/pignus-alert.env
+ExecStart=/root/sequentia/pignus/deploy/pignus-alert.sh "%i failed; journalctl -u %i says why"
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

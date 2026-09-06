@@ -626,7 +626,9 @@ recorded before it, so an old error is never shown as current beside a take
 that has since recovered. `btc-responder-clear` is the one recovery a
 responder cannot make for itself: telling it that a send it recorded as
 in-flight never went out. It checks the chain first, and it takes the
-responder's own lock, so it cannot run against a live one.
+responder's own lock, so it cannot run against a live one. The same command
+with `--write-off "<why>"` records that this key can do nothing more about a
+take, so it is reported as written off rather than as needing a person.
 
 Give `btc-responder-status` a `--book` and it also checks that the offers that
 book serves under this key still verify under it. One that does not is one

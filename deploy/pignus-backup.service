@@ -8,6 +8,8 @@
 # is gone can cost a principal paid twice.
 Description=Pignus backup
 Documentation=https://github.com/ConcatenaLabs/pignus
+# A failure tells a person: see deploy/pignus-alert.sh.
+OnFailure=pignus-alert@%n.service
 
 [Service]
 Type=oneshot
@@ -48,7 +50,9 @@ ExecStart=/bin/sh -c 'exec tar czf /var/lib/pignus-backup/pignus-$(date +%%F).tg
     $(test -f /root/sequentia/pignus-responder.json \
       && echo /root/sequentia/pignus-responder.json) \
     $(test -f /root/sequentia/pignus-liquidator.env \
-      && echo /root/sequentia/pignus-liquidator.env)'
+      && echo /root/sequentia/pignus-liquidator.env) \
+    $(test -f /root/sequentia/pignus-alert.env \
+      && echo /root/sequentia/pignus-alert.env)'
 NoNewPrivileges=true
 PrivateTmp=true
 # /root is where both the source and the destination live, so ProtectSystem=

@@ -7,12 +7,8 @@ Description=Pignus service check
 Documentation=https://github.com/ConcatenaLabs/pignus
 After=network-online.target pignus-oracle.service pignusd.service
 #
-# A failed check is only in the journal until something is wired here. OnFailure=
-# names a unit systemd starts when this one fails, so make that unit send the
-# mail, the page or the chat message, and give it the failed unit's name with
-# %i by templating it. Uncomment once that unit exists -- an OnFailure= naming a
-# unit that is not installed makes every failure a second, confusing failure.
-# OnFailure=pignus-alert@%n.service
+# A failure tells a person: see deploy/pignus-alert.sh.
+OnFailure=pignus-alert@%n.service
 
 [Service]
 Type=oneshot
@@ -49,6 +45,8 @@ PrivateTmp=true
 # stay writable and there is no ReadWritePaths. /root is read-only rather than
 # hidden only because the script itself lives under it.
 ProtectSystem=full
+# The last verdict, so a change is what alerts, not every run.
+StateDirectory=pignus-check
 ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
