@@ -163,6 +163,14 @@ refuses while the unit is running (stop it first), and it looks at the chain
 before it changes anything. If the payment IS there, it records it rather than
 clearing, with `--found <txid>:<vout>`.
 
+An offer served under an id that is not the hash of its terms is reported
+separately, as `offers_under_an_old_id`: the responder skips it for the same
+reason, and re-signing cannot repair it, since the id is the record's key. A
+principal already paid under one is refunded with `btc-refund-principal` once
+its `d_refund` opens; with nothing in flight, withdraw the offer and publish
+the coin again. Neither list names an offer that is withdrawn with nothing in
+flight under it, which is history rather than something to act on.
+
 The other repair is an offer whose signature no longer verifies. A responder
 checks that signature before acting on any take of the offer, so one that stops
 verifying stops every loan under it — live ones included, whose borrowers then
