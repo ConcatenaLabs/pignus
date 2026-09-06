@@ -1179,7 +1179,11 @@ produce, and the covenant's witness must go on last. `repo-settle
 it is given -- refusing a verifier coin carrying the repurchase's own asset, a
 blinded coin, a `C_U` holding the wrong asset or the wrong amount, and a fee in
 anything but the debt asset -- signs the borrower's debt coin with the wallet
-that composes, and writes the transaction beside the four outputs it spends;
+that composes (or says it cannot, when that wallet does not hold it, and the
+borrower signs the document's transaction with their own), prices the fee in
+the debt asset without asking what the composing wallet holds, since the fee
+comes out of that coin, and writes the transaction beside the four outputs it
+spends;
 `opendamp transfer-cosign` signs the two OpenDAMP inputs and leaves every
 other witness in place; and `repo-settle --attach` puts the RETURN witness on
 the version everybody has signed, refusing one on which a signature is still

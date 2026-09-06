@@ -773,7 +773,12 @@ pignus-cli repo-settle terms.json --txid <bond> --attach settle.signed.json --br
 
 `--skeleton` writes a document: the transaction, with the borrower's own debt
 coin already signed by the wallet that composed it, and the four outputs it
-spends, which is what a signer that did not build it needs. `--inspect` is the
+spends, which is what a signer that did not build it needs. Composed by a
+wallet that does not hold that coin -- the lender's, say -- the document says
+the coin is not signed, and the borrower signs its `tx` with
+`signrawtransactionwithwallet` and puts the result back before anyone else
+signs; the fee comes out of that coin either way, never out of the composing
+wallet. `--inspect` is the
 lender's look before signing, and it needs no node: it says what the document
 pays whom, judged against the terms, and exits 4 if any output is not where
 the terms say. That look is what the design rests on, because the borrower's

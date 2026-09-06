@@ -2325,6 +2325,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         return True
 
+    def log_error(self, fmt, *args):
+        # An idle keep-alive socket closing at `timeout` is what the standard
+        # handler logs as "Request timed out": nothing was asked and nothing
+        # failed, but in the journal it reads as a request that did. Every
+        # other error is logged as before.
+        if str(fmt).startswith("Request timed out"):
+            return
+        self.log_message(fmt, *args)
+
     def log_message(self, fmt, *args):
         # A manage token in a query string is a secret in the journal. The
         # header is the right place for it; redact it either way.
