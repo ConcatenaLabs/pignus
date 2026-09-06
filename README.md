@@ -585,6 +585,12 @@ pignus-cli btc-offer-publish --config responder.json --market BTC/USDX \
 pignus-cli btc-respond --config responder.json --watch
 ```
 
+The command judges the four heights against both chains' tips and prints how
+much headroom each margin has, warning under two days: the parent chain does
+not keep a steady pace, and an offer whose headroom runs out is expired by the
+book, with the reason on its record. `deploy/DEPLOY.md` gives heights that
+keep one on the board for days.
+
 The responder signs releases, pays principals once the collateral is confirmed,
 starts loans as borrowers claim them, and takes back what nobody claimed. Its
 configuration file carries the node credentials and the path to the lender's

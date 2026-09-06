@@ -813,7 +813,15 @@ are judged against the tips in `/v1/markets` (`height`, `btc_height`) by the
 command, by the relay and by every responder: `d_refund` at least two hours
 ahead, `abort_after` a day after it, `repay_deadline` a day after `d_refund`
 plus the two-hour claim margin, `recover_after` a day after `repay_deadline`
-and past `abort_after`. An offer leaves the board two hours before `d_refund`.
+and past `abort_after`. An offer leaves the board two hours before `d_refund`,
+or the moment the parent chain's pace eats one of the margins that pit a
+Bitcoin height against a Sequentia one: testnet4 does not advance at ten
+minutes a block, and every hour it runs ahead is an hour off `abort_after`'s
+lead over `d_refund`. The command prints the headroom each margin has and
+warns under two days. Heights that keep an offer on the board for days:
+`d_refund` seq+4320, `repay_deadline` seq+20160, `abort_after` btc+1000,
+`recover_after` btc+5000. When an offer does expire, the record says why
+(`expired_reason`), and the timer's check says the board is empty.
 
 Every offer is signed by the lender key it names, and the relay refuses one that
 is not: an unsigned offer would let anyone publish in a lender's name and have

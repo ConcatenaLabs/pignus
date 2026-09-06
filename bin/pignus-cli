@@ -4603,6 +4603,20 @@ def cmd_btc_offer_publish(args):
     except Exception as e:                              # noqa: BLE001
         refuse(f"could not read the chain tips from {args.book} "
                f"({type(e).__name__}: {e}); the deadlines cannot be judged")
+    # A book without a Bitcoin node of its own reports no parent height, and
+    # the judgement below was skipped whole. This command already prices the
+    # upgrade fee from a Bitcoin node when it has one; the same node knows
+    # the height.
+    if btc_h is None:
+        try:
+            btc_h = btc_node_from(args).getblockcount()
+        except Exception:                               # noqa: BLE001
+            btc_h = None
+    if btc_h is None or seq_h is None:
+        print("  the deadlines were NOT judged: no Bitcoin height from the "
+              "book or from a --btc-rpc node. The relay's sweep judges them "
+              "on its next poll and expires an offer that fails.",
+              file=sys.stderr)
     if btc_h is not None and seq_h is not None:
         from pignus.btc_collateral import loan_from_dict, timelocks_sane
         judged = dict(loan, borrower_x="00" * 32, h_w="00" * 32)
@@ -4615,6 +4629,37 @@ def cmd_btc_offer_publish(args):
                    "repay_deadline at least a day after d_refund plus the "
                    "two-hour claim margin; recover_after at least a day after "
                    "repay_deadline, and past abort_after.")
+        # Room is not the same as passing. The two margins that pit a Bitcoin
+        # height against a Sequentia one are judged at ten-minute blocks, and
+        # the parent chain does not keep that pace: every hour it runs ahead
+        # eats an hour of headroom, and an offer whose headroom runs out is
+        # expired by the book's sweep, quietly, with nothing to take behind
+        # it. Said here, before the lender walks away from a board that will
+        # be empty by evening.
+        from pignus.btc_collateral import (BTC_BLOCK_SECONDS, SEQ_BLOCK_SECONDS,
+                                           REPAY_MARGIN_SECONDS,
+                                           UPGRADE_MARGIN_SECONDS)
+        btc_s = lambda h: (int(h) - int(btc_h)) * BTC_BLOCK_SECONDS  # noqa: E731
+        seq_s = lambda h: (int(h) - int(seq_h)) * SEQ_BLOCK_SECONDS  # noqa: E731
+        room = []
+        if int(loan.get("abort_after") or 0) and int(loan.get("d_refund") or 0):
+            room.append(("abort_after over d_refund",
+                         btc_s(loan["abort_after"]) - seq_s(loan["d_refund"])
+                         - UPGRADE_MARGIN_SECONDS))
+        room.append(("recover_after over repay_deadline",
+                     btc_s(loan["recover_after"]) - seq_s(loan["repay_deadline"])
+                     - REPAY_MARGIN_SECONDS))
+        print("  headroom over the margins, at ten-minute Bitcoin blocks: "
+              + ", ".join(f"{n} {h / 3600:.0f}h" for n, h in room),
+              file=sys.stderr)
+        thin = [n for n, h in room if h < 48 * 3600]
+        if thin:
+            print("  THIN: the parent chain does not advance at a steady pace, "
+                  "and every hour it runs ahead eats an hour of that; when it "
+                  "runs out the book's sweep expires this offer and the board "
+                  "is empty. Two days or more keeps one on it: move "
+                  + " and ".join(n.split(" over ")[0] for n in thin)
+                  + " later.", file=sys.stderr)
     lots = max(1, int(args.lots))
     body = {"loan": loan, "market": args.market or "", "lots": lots,
             "note": args.note or "",
