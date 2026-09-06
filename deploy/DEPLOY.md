@@ -362,8 +362,11 @@ every oracle's `/healthz` and the book's must say `ok`, every market that is
 not cross-chain must have a price signed within `PIGNUS_MAX_PRICE_AGE`
 seconds, no market may disagree with the registry about its assets' decimals,
 every key the book quotes must belong to a listed oracle, a liquidator unit
-that is installed must be running, and no loan may sit under its strike and
-still open. `pignus-check.timer` runs it every five minutes, and
+that is installed must be running, no loan may sit under its strike and
+still open, the responder (when `PIGNUS_RESPONDER_CONFIG` names one) must
+have no take waiting on a person, the disk every service writes to must have
+room, and the services must answer through the proxy with a certificate that
+has a week left. `pignus-check.timer` runs it every five minutes, and
 `pignus-check.service` carries its settings as environment. `PIGNUS_ORACLES`
 is every oracle's URL, space separated and quoted; the shipped unit names
 8740, 8742 and 8743. `PIGNUS_MAX_PRICE_AGE` stays equal to `max_price_age` in
