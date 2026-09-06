@@ -697,10 +697,16 @@ other=$(say "pignus check passes again")
 case "$first" in "alert: pignusd.service failed"*) ;; *) echo "the first message was not sent: $first" >&2; exit 1;; esac
 case "$second" in "alert (muted"*) ;; *) echo "the same message within the window was sent again: $second" >&2; exit 1;; esac
 case "$other" in "alert: pignus check passes again"*) ;; *) echo "a different message was muted: $other" >&2; exit 1;; esac
+# ...and "the same" is the first three words: a check's line carries counts
+# and hours that differ every run, and must not dodge the mute on them.
+varied=$(say "pignus check FAILED (2): FAIL the book did not answer, 6.3h")
+varied2=$(say "pignus check FAILED (3): FAIL the oracle did not answer, 6.4h")
+case "$varied" in "alert: pignus check FAILED"*) ;; *) echo "the first check failure was not sent: $varied" >&2; exit 1;; esac
+case "$varied2" in "alert (muted"*) ;; *) echo "a check failure differing only in its numbers was sent again: $varied2" >&2; exit 1;; esac
 touch -d "-20 minutes" "$WORK/alert-state"/*
 third=$(say "pignusd.service failed; journalctl -u pignusd.service says why")
 case "$third" in "alert: pignusd.service failed"*) ;; *) echo "after the window the message was still muted: $third" >&2; exit 1;; esac
-echo "  a repeated message pages once per window, a different one at once, and again after the window"
+echo "  a repeated message pages once per window (judged by its first three words), a different one at once, and again after the window"
 
 echo
 echo "all service drills passed"
