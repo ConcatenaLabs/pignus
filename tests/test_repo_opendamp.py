@@ -205,6 +205,31 @@ def main():
         check("and the borrower's debt coin is already signed",
               doc.get("debt_input_signed") is True, str(doc.get("debt_input_signed")))
 
+        # --- 3b. the lender LOOKS before signing --------------------------
+        # The debt output is the one thing no covenant checks; the tool that
+        # signs the OpenDAMP inputs signs what it is handed. This is the look.
+        ins = cli("repo-settle", terms, "--txid", bond["txid"],
+                  "--inspect", skel, "--lender-cu", cu_lender_spk[4:], ok=False)
+        verdict = last_json(ins) if ins.stdout.strip() else {}
+        check("repo-settle --inspect judges the skeleton against the terms, "
+              "with no node",
+              ins.returncode == 0 and verdict.get("ok") is True
+              and verdict.get("debt_to_lender") == 750 * COIN
+              and verdict.get("bond_to_lender") == 250 * COIN
+              and verdict.get("asset_to_borrower") == collateral,
+              f"exit {ins.returncode}: {ins.stdout[-300:]} {ins.stderr[-200:]}")
+        from pignus.vault import _tf                          # noqa: PLC0415
+        msgs, _ = _tf()
+        stolen = msgs.tx_from_hex(doc["tx"])
+        stolen.vout[1].scriptPubKey = bytes.fromhex("0014" + borrower_prog)
+        bad = os.path.join(root, "settle.stolen.json")
+        json.dump({**doc, "tx": stolen.serialize().hex()}, open(bad, "w"))
+        ins = cli("repo-settle", terms, "--txid", bond["txid"],
+                  "--inspect", bad, ok=False)
+        check("and refuses a skeleton whose debt output pays somebody else",
+              ins.returncode == 4 and "output 1" in ins.stderr,
+              f"exit {ins.returncode}: {ins.stderr[-300:]}")
+
         # --- 4. the lender signs the OpenDAMP inputs -------------------------
         signed = os.path.join(root, "settle.signed.json")
         c = subprocess.run([od, "transfer-cosign", "--snapshot", snap,

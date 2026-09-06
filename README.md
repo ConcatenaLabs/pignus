@@ -756,6 +756,8 @@ composed in two steps and signed in between:
 pignus-cli repo-settle terms.json --txid <bond> --verifier <txid:vout> \
     --verifier-spk <hex> --cu-lender <txid:vout> --debt-utxo <txid:vout> \
     --skeleton settle.json
+pignus-cli repo-settle terms.json --txid <bond> --inspect settle.json \
+    --lender-cu <hex>                          # the lender, before signing
 opendamp transfer-cosign --snapshot <policy snapshot> --transaction settle.json \
     --sender-privkey <the lender's OpenDAMP key> --out settle.signed.json
 pignus-cli repo-settle terms.json --txid <bond> --attach settle.signed.json --broadcast
@@ -763,7 +765,12 @@ pignus-cli repo-settle terms.json --txid <bond> --attach settle.signed.json --br
 
 `--skeleton` writes a document: the transaction, with the borrower's own debt
 coin already signed by the wallet that composed it, and the four outputs it
-spends, which is what a signer that did not build it needs. The lender signs
+spends, which is what a signer that did not build it needs. `--inspect` is the
+lender's look before signing, and it needs no node: it says what the document
+pays whom, judged against the terms, and exits 4 if any output is not where
+the terms say. That look is what the design rests on, because the borrower's
+payment of the debt is the one output no covenant checks; the tool that signs
+signs what it is handed. The lender then signs
 the two OpenDAMP inputs with `opendamp transfer-cosign` from the
 [openamp](https://github.com/ConcatenaLabs/openamp) repository (`cargo build
 --release` in its `opendamp/` directory), which leaves every other witness as
