@@ -808,7 +808,8 @@ browser client, and on the testnet it is what `/lending/` is.
 `pignusd --config pignusd.json` is the whole of running it.
 `deploy/pignusd.example.json` is a starting configuration, and every key is
 explained under *`pignusd` configuration* in `deploy/DEPLOY.md`, which also
-covers running it and the oracle as systemd units behind Caddy.
+covers running it and the oracle as systemd units behind Caddy, and how a
+failure of any of them reaches a phone.
 [`docs/api.md`](docs/api.md) documents every endpoint it serves.
 
 

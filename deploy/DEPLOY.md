@@ -722,7 +722,10 @@ than as needing a person, the responder acts on it no more, and an offer
 served under an old id stops counting it as money in flight. A take with a
 paid principal and no claim of its repayment needs `--force` as well: written
 off, no pass will claim that repayment, and walking away from it is a
-decision, not a side effect.
+decision, not a side effect. The relay knows nothing of a write-off: a
+written-off take that had reached `disbursed` goes on holding one lot of its
+offer there, so if the offer is still open and its lots matter, withdraw it
+and publish it again.
 
 A take that is simply over needs no write-off. One signed but never paid into,
 whose `d_refund` has passed, will never be paid into by this key, and the
