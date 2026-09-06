@@ -143,11 +143,13 @@ fi
 if [ -n "${PIGNUS_SHOTS:-}" ]; then
     mkdir -p "$PIGNUS_SHOTS"
     for size in 1280,2400 390,2600; do
-        timeout 90 "$CHROME" --headless=new --no-sandbox --disable-gpu \
-            --no-first-run --disable-extensions --hide-scrollbars \
-            --virtual-time-budget=6000 --window-size="$size" \
-            --screenshot="$PIGNUS_SHOTS/page-${size%,*}.png" \
-            "http://127.0.0.1:$DPORT/" >/dev/null 2>&1 || true
+        for tab in borrow lend loans repo btc; do
+            timeout 90 "$CHROME" --headless=new --no-sandbox --disable-gpu \
+                --no-first-run --disable-extensions --hide-scrollbars \
+                --virtual-time-budget=6000 --window-size="$size" \
+                --screenshot="$PIGNUS_SHOTS/$tab-${size%,*}.png" \
+                "http://127.0.0.1:$DPORT/#$tab" >/dev/null 2>&1 || true
+        done
     done
     echo "  screenshots in $PIGNUS_SHOTS"
 fi

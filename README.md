@@ -122,7 +122,10 @@ the same transaction. For native Bitcoin, use *BTC collateral*: the collateral
 waits in a pre-vault you can take back until you claim the principal.
 
 The alerts at the top of the page say what needs a person in whichever seat
-your wallet is in, and their count goes in the tab title.
+your wallet is in, and their count goes in the tab title. Each tab has its own
+link -- `#borrow`, `#lend`, `#loans`, `#repo`, `#btc` after the page's address
+-- so a runbook or a message can point at one, and a reload lands where you
+were.
 
 ## Layout
 
