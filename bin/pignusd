@@ -645,6 +645,7 @@ class Service:
         primary = self.oracle_urls[0]
         key_by_url, errors = {}, []
         compromised, previous = set(), {}
+        primary_err = None              # why the PRIMARY is out, when it is
         for url in self.oracle_urls:
             try:
                 with urllib.request.urlopen(f"{url}/v1/pubkey", timeout=8) as r:
@@ -652,6 +653,8 @@ class Service:
                 served = str(pub["oracle_x"]).lower()
             except Exception as e:                  # noqa: BLE001
                 errors.append(f"{url}: {type(e).__name__}: {e}")
+                if url == primary:
+                    primary_err = errors[-1]
                 continue
             want = self.oracle_expected.get(url)
             if want and served != want:
@@ -661,6 +664,8 @@ class Service:
                               f"{want[:16]}… this book is configured to expect; "
                               f"its attestations are ignored until the key "
                               f"is restored or the configuration changed")
+                if url == primary:
+                    primary_err = errors[-1]
                 continue
             # Only the declarer's OWN keys: the one it serves and the ones it
             # used to sign with. Otherwise any quoted oracle -- or whatever
@@ -682,6 +687,8 @@ class Service:
             if ox in compromised:
                 errors.append(f"{url}: its key {ox[:16]}… is declared "
                               f"compromised; nothing it signs is accepted")
+                if url == primary:
+                    primary_err = errors[-1]
                 del key_by_url[url]
         with self._lock:
             # Configured order, not the order they happened to answer in.
@@ -699,8 +706,10 @@ class Service:
             # known, stop updating the price, and say so in /healthz.
             if primary in key_by_url:
                 self.oracle_x = key_by_url[primary]
-        primary_err = next((e for e in errors if e.startswith(primary + ":")),
-                           None)
+        # Decided by the flag set where the primary was actually dropped,
+        # not by scanning every note that names its URL: a declaration the
+        # book merely ignored is a note, and read as an outage it took the
+        # book to unhealthy with the primary answering and its prices fresh.
         self.oracle_error = (f"primary oracle unreachable: {primary_err}"
                              if primary_err else None)
         fresh_primary = 0
