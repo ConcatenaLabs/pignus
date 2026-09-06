@@ -142,7 +142,9 @@ tar czf /var/lib/pignus-backup/pignus-$(date +%F).tgz \
     $(test -f /root/sequentia/pignus-responder.json \
       && echo /root/sequentia/pignus-responder.json) \
     $(test -f /root/sequentia/pignus-liquidator.env \
-      && echo /root/sequentia/pignus-liquidator.env)
+      && echo /root/sequentia/pignus-liquidator.env) \
+    $(test -f /root/sequentia/pignus-alert.env \
+      && echo /root/sequentia/pignus-alert.env)
 ```
 
 `pignus-btc-keys` is named as well as `pignus-data` because a lender key kept
@@ -577,6 +579,31 @@ the node's `wallet=`) and the taker address must belong to it: the bot exits
 judged against the key it bakes, so a loan naming an oracle this bot does not
 watch is skipped.
 
+## Alerting
+
+Every Pignus unit carries `OnFailure=pignus-alert@%n.service`, and the timer's
+check calls the same script when its verdict changes -- the first failing
+run, and the run that passes again -- so a person hears once, not every five
+minutes. `deploy/pignus-alert.sh` posts one line to an ntfy topic, a push
+channel a phone or a browser subscribes to with no account: the box needs
+`curl` and the topic's name, nothing else.
+
+```bash
+cat > /root/sequentia/pignus-alert.env <<EOF
+NTFY_TOPIC=<a name nobody guesses>
+EOF
+chmod 600 /root/sequentia/pignus-alert.env
+systemctl daemon-reload
+systemctl start pignus-alert@test.service     # one test line arrives
+```
+
+Subscribe at `https://ntfy.sh/<topic>` (the ntfy app, or the page itself in a
+browser tab). `NTFY_URL` in the same file points at a self-hosted ntfy;
+`ALERT_PREFIX` sets the message's title. The topic is the whole of the
+channel's secrecy, so it is in the backup and nowhere in git. Without the
+file the script prints to the journal and exits 0: a box that has not set a
+topic up loses the push and nothing else.
+
 ## Rotating the oracle key
 
 A vault bakes the key it was originated against, so a rotation is never a swap:
@@ -662,6 +689,14 @@ pignus-cli btc-check loan.json
 
 **Back up the lender key AND the state file** -- see "What each piece costs to
 lose" under *Backups*.
+
+A take this key can do nothing more about -- one from before the format that
+lets its loan be rebuilt, a principal that went to a plain address no covenant
+ever bound -- is written off, on the record: `pignus-cli btc-responder-clear
+--config … --take <id> --write-off "<why>"`, with the responder stopped, since
+the command takes its lock. The take is then reported as written off rather
+than as needing a person, the responder acts on it no more, and an offer
+served under an old id stops counting it as money in flight.
 
 ### Reading and repairing a responder
 

@@ -45,7 +45,9 @@ MAX_AGE="${PIGNUS_MAX_PRICE_AGE:-600}"
 
 fails=0
 ok()  { echo "  ok    $1"; }
-bad() { echo "  FAIL  $1"; fails=$((fails + 1)); }
+OUTPUT_SO_FAR=""
+bad() { echo "  FAIL  $1"; fails=$((fails + 1)); OUTPUT_SO_FAR="$OUTPUT_SO_FAR
+  FAIL  $1"; }
 
 # `ok` in a /healthz answer means the service is doing its job, so the body is
 # what is read; the status code is only how it says the same thing to something
@@ -264,6 +266,21 @@ else
 fi
 
 echo
+# Tell a person when the verdict CHANGES, not every five minutes: the first
+# failing run, and the run that passes again. `pignus-alert.sh` says how the
+# push channel is set up; without one this is a journal line.
+STATE_FILE="${PIGNUS_CHECK_STATE:-/var/lib/pignus-check/last}"
+was=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
+now_verdict=$([ "$fails" -eq 0 ] && echo ok || echo fail)
+mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null && echo "$now_verdict" > "$STATE_FILE" 2>/dev/null
+ALERT="$(dirname "$0")/pignus-alert.sh"
+if [ "$now_verdict" != "$was" ] && [ -x "$ALERT" ]; then
+    if [ "$now_verdict" = fail ]; then
+        "$ALERT" "pignus check FAILED ($fails): $(printf '%s' "$OUTPUT_SO_FAR" | grep '  FAIL' | head -3 | cut -c1-200 | tr '\n' ' ')"
+    elif [ "$was" != unknown ]; then
+        "$ALERT" "pignus check passes again"
+    fi
+fi
 if [ "$fails" -eq 0 ]; then
     echo "pignus check passed"
     exit 0

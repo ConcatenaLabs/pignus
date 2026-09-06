@@ -3340,7 +3340,7 @@ def lender_x_of(args):
         return ""
 
 
-def _disowned_offers(args, lender_x):
+def _disowned_offers(args, lender_x, written_off=()):
     """Offers a book serves under this key whose signature does not verify.
 
     Read-only and best effort: with no book, or no key to check against, this
@@ -3366,9 +3366,14 @@ def _disowned_offers(args, lender_x):
         takes = book_get(book, "/v1/btc/takes")["takes"]
     except Exception:                                    # noqa: BLE001
         takes = []
+    # Money this key can still act on. A take written off, or one from
+    # before the format that lets its loan be rebuilt (no payout programs),
+    # is not something a person can be asked for again.
     in_flight = {t.get("btc_offer_id") for t in takes
                  if t.get("status") in ("disbursed", "live", "claimed")
-                 and not t.get("secret_t")}
+                 and not t.get("secret_t")
+                 and t.get("take_id") not in set(written_off)
+                 and (t.get("loan") or {}).get("borrower_prog")}
     out = {"bad_sig": [], "bad_id": []}
     for o in offers:
         loan = o.get("loan") or {}
@@ -3448,6 +3453,7 @@ def cmd_btc_responder_status(args):
             "take_id": take_id,
             "stage": stage(h),
             "waiting_on": h.get("waiting") or None,
+            "written_off": h.get("written_off") or None,
             "waiting_hours": (None if not h.get("waiting_since")
                               else round((time.time()
                                           - int(h["waiting_since"])) / 3600, 1)),
@@ -3477,7 +3483,9 @@ def cmd_btc_responder_status(args):
     # pass by the outpoint it spent -- so raising the alarm on them sends an
     # operator to `btc-responder-clear`, which refuses them, for something that
     # was already fixing itself.
-    stuck = [r for r in rows if "DISBURSEMENT IN FLIGHT" in r["stage"]]
+    written = [r for r in rows if r.get("written_off")]
+    rows_live = [r for r in rows if not r.get("written_off")]
+    stuck = [r for r in rows_live if "DISBURSEMENT IN FLIGHT" in r["stage"]]
     # And a wait that has stopped being a wait. Most reasons here clear
     # themselves within a block or two -- a pre-vault not yet confirmed, an
     # anchor not yet buried -- so a take still on the same one hours later is
@@ -3488,7 +3496,7 @@ def cmd_btc_responder_status(args):
     # a borrower's collateral committed behind it. What the lender does about
     # it is usually to withdraw the OFFER, since a reason like that repeats for
     # every take of it.
-    slow = [r for r in rows
+    slow = [r for r in rows_live
             if r not in stuck and r["waiting_on"]
             and (r["waiting_hours"] or 0) >= args.waiting_hours]
     # A wait written before waits were dated has no date, and the reason a take
@@ -3497,15 +3505,16 @@ def cmd_btc_responder_status(args):
     # starts, which only it may do: this command holds no lock, and a second
     # writer here could land its snapshot on top of a disbursement the
     # responder had just recorded. So it says so instead of guessing.
-    undated = [r for r in rows if r["waiting_on"] and r["waiting_hours"] is None]
-    healing = [r for r in rows
+    undated = [r for r in rows_live if r["waiting_on"] and r["waiting_hours"] is None]
+    healing = [r for r in rows_live
                if r not in stuck and "not recorded" in r["stage"]]
     # And the offers this key signed that a book is now serving with a
     # signature that does not check out. A responder skips every take of one,
     # silently, so a live loan under it stops being claimed and its borrower's
     # collateral is never released -- and nothing else here would show it,
     # because the state file looks exactly as it did the day before.
-    dis = _disowned_offers(args, lender_x_of(args))
+    dis = _disowned_offers(args, lender_x_of(args),
+                           written_off={r["take_id"] for r in written})
     disowned = dis["bad_sig"]
     unfixable = dis["bad_id"]
     unchecked = dis.get("unchecked")
@@ -3516,6 +3525,7 @@ def cmd_btc_responder_status(args):
                       "disowned_offers": disowned,
                       "offers_under_an_old_id": unfixable,
                       "offers_unchecked_at": unchecked,
+                      "written_off": [r["take_id"] for r in written],
                       "rows": rows}, indent=2))
     if unchecked:
         print(f"the book at {unchecked} could not be read, so the offers "
@@ -3610,6 +3620,21 @@ def cmd_btc_responder_clear(args):
             "writes a responder's state file and nothing here says which.")
     state = _ResponderState(path, exclusive=True)   # refuses if one is running
     have = state.get(args.take)
+    if getattr(args, "write_off", None):
+        # A take this key can do nothing more about -- a record from before
+        # the format that lets it be rebuilt, a principal paid to a plain
+        # address that no covenant ever bound -- written off, on the record,
+        # so the status command and the timer stop asking for a person.
+        # The reason is kept; a write-off with no reason is a blind spot.
+        if have.get("disbursing"):
+            refuse(f"take {args.take} has a disbursement in flight; clear or "
+                   f"record that first, then write the take off.")
+        state.set(args.take, written_off=str(args.write_off),
+                  written_off_at=int(time.time()), waiting=None)
+        print(f"take {args.take} written off: {args.write_off}. It is kept in "
+              f"the state file and reported as written off, and the responder "
+              f"acts on it no more.", file=sys.stderr)
+        return 0
     if not have:
         refuse(f"{path} has no record of take {args.take}")
     if not have.get("disbursing"):
@@ -4753,9 +4778,11 @@ def cmd_btc_respond(args):
         # start whose OFFER is no longer open is over too, and so is one
         # that has sat there past the relay's own lot-holding window.
         now_ts = int(time.time())
+        seq_now = seq_height() if seq_node is not None else 0
         ended = set()
         for o, tk, _h in out:
             st = str(tk.get("status", ""))
+            d_refund = int((tk.get("loan") or {}).get("d_refund") or 0)
             if st not in ("requested", "reserved", "pending", "signed",
                           "disbursed", "live"):
                 ended.add(tk["take_id"])
@@ -4763,6 +4790,16 @@ def cmd_btc_respond(args):
                     str(o.get("status", "open")) != "open"
                     or now_ts - int(tk.get("created") or now_ts) > 3600):
                 ended.add(tk["take_id"])
+            elif st in ("pending", "signed") and not _h.get("disbursement_txid") \
+                    and not _h.get("disbursing") and seq_now and d_refund \
+                    and seq_now > d_refund:
+                # The principal's own refund window has opened and none was
+                # paid: this key will pay nothing into it now, and the
+                # borrower takes their collateral back at their own height.
+                # Nothing here is a person's to do.
+                ended.add(tk["take_id"])
+        # A take written off is not this key's to act on, in any pass.
+        out = [(o, tk, h) for o, tk, h in out if not h.get("written_off")]
         for take_id, have in state.items():
             if have.get("waiting") and not have.get("disbursing") \
                     and not have.get("disbursement_txid") \
@@ -6318,6 +6355,11 @@ def add_btc_commands(sub):
     p.add_argument("--lender-key")
     p.add_argument("--state", help="the state file (default: beside the key)")
     p.add_argument("--take", required=True, help="the take id to clear")
+    p.add_argument("--write-off", metavar="REASON",
+                   help="record that this key can do nothing more about the "
+                        "take, with the reason; it is then reported as written "
+                        "off rather than as needing a person, and the "
+                        "responder acts on it no more")
     p.add_argument("--found", metavar="TXID:VOUT",
                    help="record the payment at this outpoint instead of "
                         "clearing: use this when the chain shows it DID go out")

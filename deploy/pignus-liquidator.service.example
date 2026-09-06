@@ -20,6 +20,8 @@ Wants=network-online.target
 #
 # It prints every loan it would close and the profit each one leaves, and moves
 # nothing. Only once that reads the way you expect is it worth installing.
+# A failure tells a person: see deploy/pignus-alert.sh.
+OnFailure=pignus-alert@%n.service
 
 [Service]
 Type=simple
