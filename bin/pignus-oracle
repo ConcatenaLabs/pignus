@@ -1049,14 +1049,19 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--config", required=True)
+    ap.add_argument("--config", required=True,
+                    help="the JSON config: keyfile, logfile, listen, "
+                         "markets, precisions, source; deploy/oracle.example.json "
+                         "shows the rest")
     ap.add_argument("--once", action="store_true",
                     help="sign one round and exit, without serving")
     ap.add_argument("--print-pubkey", action="store_true",
                     help="print the oracle x-only key and exit")
     ap.add_argument("--sign-seize", action="store_true",
-                    help="co-sign a native-BTC seizure sighash, and publish "
-                         "the attestation that justifies it")
+                    help="co-sign a native-BTC seizure and publish the "
+                         "attestation that justifies it. Takes --request "
+                         "(preferred), or --sighash with --market, --strike "
+                         "and --price-scale plus --allow-unpinned-strike")
     ap.add_argument("--sighash", help="with --sign-seize: the 32-byte sighash "
                                       "from `pignus-cli btc-seize-sighash`")
     ap.add_argument("--request", help="with --sign-seize: the seizure request "

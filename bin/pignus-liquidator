@@ -105,12 +105,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
-    ap.add_argument("--loans", help="a JSON list of loans to watch")
-    ap.add_argument("--book", help="a pignusd to read LIVE loans from instead")
+    ap.add_argument("--loans", help="a JSON list of loans to watch; one of "
+                                    "--loans and --book is required")
+    ap.add_argument("--book", help="a pignusd to read LIVE loans, and prices, "
+                                   "from instead; one of --loans and --book "
+                                   "is required")
     ap.add_argument("--oracle", action="append", metavar="URL",
-                    help="an oracle to read prices from; repeatable. Loans are "
-                         "judged against the key each one bakes, so name every "
-                         "oracle whose loans this bot should close")
+                    help="an oracle to read prices from; repeatable, and "
+                         "required without --book. Loans are judged against "
+                         "the key each one bakes, so name every oracle whose "
+                         "loans this bot should close")
     ap.add_argument("--rpc", default=os.environ.get(
         "PIGNUS_RPC_URL", "http://127.0.0.1:18776"),
         help="the Sequentia node's JSON-RPC url (18776 on the default chain, "
@@ -128,12 +132,17 @@ def main():
     ap.add_argument("--rpc-cookie", default=os.environ.get("PIGNUS_RPC_COOKIE"),
                     help="path to the node's .cookie file, used when "
                          "--rpc-user is not given; or PIGNUS_RPC_COOKIE")
-    ap.add_argument("--taker-spk", help="hex scriptPubKey to receive seized collateral")
-    ap.add_argument("--taker-address", help="address to receive seized collateral")
+    ap.add_argument("--taker-spk", help="hex scriptPubKey to receive seized "
+                                        "collateral; one of --taker-spk and "
+                                        "--taker-address is required")
+    ap.add_argument("--taker-address", help="address to receive seized "
+                                            "collateral; one of --taker-spk "
+                                            "and --taker-address is required")
     ap.add_argument("--fee-asset", help="label or hex; default: the debt asset "
                     "being spent, else anything held with a published rate")
-    ap.add_argument("--fee-amount", type=int, help="atoms; default: priced "
-                    "from the node's exchange rates")
+    ap.add_argument("--fee-amount", type=int, help="atoms of --fee-asset, "
+                    "which it needs; default: priced from the node's "
+                    "exchange rates")
     ap.add_argument("--min-profit", type=int, default=0, metavar="ATOMS",
                     help="skip a seizure worth less than this much more than "
                          "the debt it pays AND the fee it costs, in debt-asset "
@@ -150,8 +159,10 @@ def main():
                          "the only place it is checked")
     ap.add_argument("--allow-stale", action="store_true",
                     help="act on attestations older than --max-attestation-age")
-    ap.add_argument("--interval", type=float, default=30.0)
-    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--interval", type=float, default=30.0,
+                    help="seconds between passes (default 30)")
+    ap.add_argument("--once", action="store_true",
+                    help="one pass, then exit")
     ap.add_argument("--start-grace", type=float, default=120.0, metavar="S",
                     help="how long start-up keeps trying when the node, the "
                          "book or an oracle does not answer yet, before "
@@ -159,9 +170,12 @@ def main():
                          "restarted together after an update, and this one "
                          "must not fail for coming up first. 0 gives up at "
                          "once, as --once does")
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would be seized, compose nothing and "
+                         "broadcast nothing")
     ap.add_argument("--call-due", action="store_true",
-                    help="also call loans past maturity via DEFAULT")
+                    help="also seize loans past maturity through the DEFAULT "
+                         "exit, at the oracle's signed price")
     args = ap.parse_args()
 
     if not args.loans and not args.book:
