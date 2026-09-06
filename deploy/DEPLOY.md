@@ -581,10 +581,12 @@ watch is skipped.
 
 ## Alerting
 
-Every Pignus unit carries `OnFailure=pignus-alert@%n.service`, and the timer's
-check calls the same script when its verdict changes -- the first failing
-run, and the run that passes again -- so a person hears once, not every five
-minutes. `deploy/pignus-alert.sh` posts one line to an ntfy topic, a push
+Every long-running Pignus unit carries `OnFailure=pignus-alert@%n.service`,
+and the timer's check calls the same script itself, when its verdict changes
+-- the first failing run, and the run that passes again -- rather than through
+`OnFailure=`, which would repeat the news every five minutes; a person hears
+once. A crash of the check before it reaches a verdict is alerted from its
+exit trap. `deploy/pignus-alert.sh` posts one line to an ntfy topic, a push
 channel a phone or a browser subscribes to with no account: the box needs
 `curl` and the topic's name, nothing else.
 
