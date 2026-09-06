@@ -915,6 +915,33 @@ function detailsRow(key, cols, body) {
 }
 
 /** The whole of what a person is asked to trust, in one block they can copy. */
+/** A payout program as a row: the program, its witness version, and whether
+ *  this wallet is known to own it -- with a button to say so when the page
+ *  cannot tell. A wallet on a second device holds none of the coins that
+ *  funded an old loan, so "yours" has to be claimable by hand, and the only
+ *  place the program is visible is here. */
+function payoutRow(prog, ver) {
+  if (!prog) return "—";
+  const p = String(prog).toLowerCase();
+  const own = state.mine && state.mine.has(p);
+  return `<span class="mono">${esc(p)}</span> <span class="small">(witness v${ver ?? 1})</span>` +
+    (own ? ' <span class="tag ok">yours</span>'
+         : ` <button class="sm" data-mineprog="${esc(p)}" title="tell this page the wallet owns this program; the row then shows as yours, with its own buttons">This is mine</button>`);
+}
+
+/** Wire the "This is mine" buttons a details block may carry. */
+function wireMineProg(root) {
+  root.querySelectorAll("[data-mineprog]").forEach(btn => {
+    btn.onclick = () => {
+      const p = btn.dataset.mineprog;
+      rememberMine(p);
+      rebuildMine();
+      renderOffers(); renderLoans(); renderAlerts();
+      note("Noted: that payout program is yours. Rows that pay it now show as yours.", "ok");
+    };
+  });
+}
+
 function detailsBlock({ idLabel, id, copyId, outpoint, spk, terms, t, warnings,
                        extra = "" }) {
   const keys = oracleKeys(t);
@@ -932,6 +959,8 @@ function detailsBlock({ idLabel, id, copyId, outpoint, spk, terms, t, warnings,
       <span class="k">${esc(idLabel)}</span><span class="mono">${esc(id)}</span>
       <span class="k">Outpoint</span><span class="mono">${esc(outpoint || "—")}</span>
       <span class="k">Address these terms compile to</span><span class="mono" data-spk="${esc(spk)}">…</span>
+      <span class="k">Borrower is paid at</span><span>${payoutRow(t.borrower_prog, t.borrower_ver)}</span>
+      <span class="k">Lender is paid at</span><span>${payoutRow(t.lender_prog, t.lender_ver)}</span>
       <span class="k">Price feed</span><span class="mono">${esc(t.market || "")} · ${esc(pig._internals.bytesToHex(pig.feedId(t.market || "")))}</span>
       <span class="k">Oracle key${keys.length === 1 ? "" : "s"}</span><span>${oracleRows}</span>
       <span class="k">Attestations valid from</span><span>${esc(notBefore)}</span>
@@ -1286,6 +1315,7 @@ function renderOffers() {
       return `<tr><td colspan="9" class="hint">an offer this page cannot draw (${esc(explainish(e))}); the book serves it at /v1/offer/${esc(o.offer_id || "")}</td></tr>`;
     } }).join("") + "</tbody></table>";
   paint("#offers", html, (b) => {
+    wireMineProg(b);
     const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
       btn.onclick = () => fn(view[Number(btn.dataset[attr])]);
     });
@@ -1437,6 +1467,7 @@ function renderLoans() {
       return `<tr><td colspan="9" class="hint">a loan this page cannot draw (${esc(explainish(e))}); the book serves it at /v1/loan/${esc(l.loan_id || l.txid || "")}</td></tr>`;
     } }).join("") + "</tbody></table>";
   paint("#loans", html, (b) => {
+    wireMineProg(b);
     const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
       btn.onclick = () => fn(rows[Number(btn.dataset[attr])]);
     });
