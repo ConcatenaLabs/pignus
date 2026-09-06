@@ -640,5 +640,46 @@ if not any(w in err for w in wanted):
 REGWORDS
 echo "  an unlendable market says WHICH of the three things went wrong"
 
+# --- the alerting is wired consistently ---------------------------------------
+#
+# An OnFailure= naming a unit that is not installed makes every failure a
+# second, confusing failure; a long-running unit without one fails in silence;
+# and the check unit alone must have none, because it pages on verdict changes
+# itself. The env file's path is written in three places and they must agree.
+echo
+echo "-- the alerting is wired consistently"
+DEPLOY="$HERE/../deploy"
+for u in "$DEPLOY"/*.service "$DEPLOY"/*.service.example; do
+    for target in $(grep -h "^OnFailure=" "$u" | cut -d= -f2); do
+        tmpl="${target%%@*}@.service"
+        test -f "$DEPLOY/$tmpl" || {
+            echo "$(basename "$u") fails into $target, and deploy/$tmpl does not exist" >&2
+            exit 1; }
+    done
+done
+for u in pignusd pignus-oracle pignus-oracle@ pignus-btc-responder pignus-backup; do
+    grep -q "^OnFailure=pignus-alert@%n.service" "$DEPLOY/$u.service" || {
+        echo "$u.service fails in silence: no OnFailure=" >&2; exit 1; }
+done
+grep -q "^OnFailure=pignus-alert@%n.service" "$DEPLOY/pignus-liquidator.service.example" || {
+    echo "the liquidator example fails in silence: no OnFailure=" >&2; exit 1; }
+if grep -q "^OnFailure=" "$DEPLOY/pignus-check.service"; then
+    echo "pignus-check.service carries OnFailure=, which would page every run" >&2
+    exit 1
+fi
+test -x "$DEPLOY/pignus-alert.sh" || { echo "deploy/pignus-alert.sh is not executable" >&2; exit 1; }
+ENVPATH=$(grep -o "PIGNUS_ALERT_ENV=[^ ]*" "$DEPLOY/pignus-alert@.service" | cut -d= -f2)
+test -n "$ENVPATH" || { echo "pignus-alert@.service names no PIGNUS_ALERT_ENV" >&2; exit 1; }
+grep -q "PIGNUS_ALERT_ENV:-$ENVPATH}" "$DEPLOY/pignus-alert.sh" || {
+    echo "pignus-alert.sh's default env path is not the unit's ($ENVPATH)" >&2; exit 1; }
+grep -qF "$ENVPATH" "$DEPLOY/pignus-backup.service" || {
+    echo "the backup does not archive $ENVPATH" >&2; exit 1; }
+grep -qF "$ENVPATH" "$DEPLOY/DEPLOY.md" || {
+    echo "the runbook does not name $ENVPATH" >&2; exit 1; }
+SCRIPT=$(grep -o "^ExecStart=[^ ]*" "$DEPLOY/pignus-alert@.service" | cut -d= -f2)
+test "$(basename "$SCRIPT")" = pignus-alert.sh || {
+    echo "pignus-alert@.service runs $SCRIPT, not pignus-alert.sh" >&2; exit 1; }
+echo "  every OnFailure= target exists, every long-running unit has one, the check has none, and the env path agrees in the unit, the script, the backup and the runbook"
+
 echo
 echo "all service drills passed"
