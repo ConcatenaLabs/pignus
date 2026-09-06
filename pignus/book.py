@@ -115,6 +115,11 @@ class Book:
         self.path = str(path)
         self.meta = {}
         self._lock = threading.Lock()
+        # Bumped by every save, batched or not. A render of the book is a
+        # function of this number and of what the poll last learned, and
+        # the daemon caches renders by both rather than redoing thousands of
+        # records for every tab that asks.
+        self.generation = 0
         # Deferred writing is per THREAD: the poll thread batches a whole
         # reconciliation into one write, while an HTTP handler's write still
         # lands before it answers the client.
@@ -207,6 +212,7 @@ class Book:
                     self._write()
 
     def _save(self):
+        self.generation += 1
         if getattr(self._batch, "depth", 0):
             self._batch.dirty = True
             return

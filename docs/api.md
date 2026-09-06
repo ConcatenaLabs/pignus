@@ -63,13 +63,29 @@ float, for display only — never compute against it.
 
 **Errors.** Every failure that carries a body carries `{"error": "a sentence"}`
 with the status code below. The sentence is written to be shown to a person, so
-it says what was wrong rather than naming a Python class. A `DELETE` on a listing that is not there answers 404 with `{"removed": false}`.** POST and DELETE are charged to a client at one request a
+it says what was wrong rather than naming a Python class. A `DELETE` on a
+listing that is not there answers 404 with `{"removed": false}`.
+
+**Limits.** POST and DELETE are charged to a client at one request a
 second with a burst of twenty, and to everybody together at twenty a second
 with a burst of two hundred. Reads that make the node work -- `/v1/spend`,
 `/v1/outpoint`, `/v1/scan` and `/v1/btc/outpoint` -- are charged at two a
 second with a burst of thirty per client, and forty a second with a burst of
-four hundred together. Over any of those the answer is 429. Every other read is
-served from memory and is not limited.
+four hundred together. The whole-book listings -- `/v1/loans`, `/v1/offers`,
+`/v1/btc/offers` and `/v1/stats` -- are charged at two a second with a burst
+of thirty per client; the page asks for each once every thirty seconds. Over
+any of those the answer is 429. Every other read is served from memory and is
+not limited.
+
+**Listings.** The four listings are rendered once and served from a cache
+until the book changes, the poll learns something new, or ten seconds pass,
+whichever is first; every tab asking within that window gets the same
+render. They are sent compact, and gzipped when the request carries
+`Accept-Encoding: gzip` (a full book compresses about tenfold). When more
+than a few renders are already running the answer is a 503 with
+`Retry-After: 5` rather than a queue without bound. The server holds at most
+256 connections at once; past that an accept is closed unread and a client
+that retries gets a slot when one frees.
 
 Every write -- each `POST`, and `DELETE` -- must come from this site. A `POST`
 must carry `Content-Type: application/json`, and an `Origin` header naming
