@@ -198,6 +198,9 @@ What each piece costs to lose:
   already been sent. Restore it only from a copy newer than the last
   disbursement, and check the lender wallet's `listtransactions` against
   `/v1/btc/takes?status=disbursed` before you do.
+- **`pignus-alert.env`** — the push channel's name. No coin is at risk; make a
+  new topic, put it in a new file and subscribe again, or failures reach the
+  journal only until you do.
 - **`book.json`** — no coin is at risk: every vault and offer is a covenant on
   chain and reconstructs from its terms. But the book is the only index of them,
   and the cross-chain half (offers, takes, releases, statuses) is not
@@ -708,6 +711,12 @@ ever bound -- is written off, on the record: `pignus-cli btc-responder-clear
 the command takes its lock. The take is then reported as written off rather
 than as needing a person, the responder acts on it no more, and an offer
 served under an old id stops counting it as money in flight.
+
+A take that is simply over needs no write-off. One signed but never paid into,
+whose `d_refund` has passed, will never be paid into by this key, and the
+borrower takes their collateral back at their own height: the responder clears
+its wait itself, whatever its offer verifies as today, and the status stops
+listing it.
 
 ### Reading and repairing a responder
 

@@ -162,6 +162,69 @@ def tier_d_pure():
     check("and the settlement fits the OpenDAMP shape it is built for",
           len(tx.vout) <= 6, str(len(tx.vout)))
 
+    # --- the lender's look before signing. The debt output is the one thing
+    # no covenant checks, and the tool that signs the OpenDAMP inputs signs
+    # what it is handed: every output is judged against the terms here.
+    from pignus.repurchase import inspect_settlement
+    prevouts = [
+        {"asset": verifier.asset, "value": verifier.amount, "script_pubkey": vspk.hex()},
+        {"asset": vault.asset, "value": vault.amount,
+         "script_pubkey": t.script_pubkey().hex()},
+        {"asset": cu.asset, "value": cu.amount, "script_pubkey": "5120" + "12" * 32},
+        {"asset": debt_in.asset, "value": debt_in.amount, "script_pubkey": "0014" + "34" * 20},
+    ]
+    problems, summary = inspect_settlement(raw, prevouts, t)
+    check("inspect_settlement passes the settlement the composer built",
+          problems == [] and summary["debt_to_lender"] == t.debt
+          and summary["bond_to_lender"] == t.bond()
+          and summary["asset_to_borrower"] == t.collateral_amount
+          and summary["fee"] == 5_000, str(problems) + str(summary)[:120])
+    problems, _ = inspect_settlement(raw, prevouts, t, lender_cu="12" * 32)
+    check("and knows the lender's own C_U when told it", problems == [], str(problems))
+    problems, _ = inspect_settlement(raw, prevouts, t, lender_cu="99" * 32)
+    check("...and refuses a C_U that is not theirs",
+          any("input 2" in p for p in problems), str(problems))
+
+    def tampered(edit):
+        tx2 = m.tx_from_hex(raw)
+        edit(tx2)
+        return tx2.serialize().hex()
+
+    def spk(tx2, i, hexspk):
+        tx2.vout[i].scriptPubKey = bytes.fromhex(hexspk)
+
+    def value(tx2, i, atoms):
+        tx2.vout[i].nValue = m.CTxOutValue(atoms)
+
+    for what, edit, names in (
+            ("the debt paid to somebody else",
+             lambda x: spk(x, 1, "0014" + "cd" * 20), "output 1"),
+            ("the debt short by one atom",
+             lambda x: value(x, 1, t.debt - 1), "output 1"),
+            ("the asset delivered short",
+             lambda x: value(x, 2, t.collateral_amount - 1), "output 2"),
+            ("the asset delivered elsewhere",
+             lambda x: spk(x, 2, "5120" + "77" * 32), "output 2"),
+            ("the bond released short",
+             lambda x: value(x, 3, t.bond() - 1), "output 3"),
+            ("the bond released to somebody else",
+             lambda x: spk(x, 3, "0014" + "cd" * 20), "output 3"),
+            ("the verifier not returned whole",
+             lambda x: value(x, 0, 999), "output 0")):
+        problems, _ = inspect_settlement(tampered(edit), prevouts, t)
+        check(f"inspect_settlement refuses {what}, naming {names}",
+              any(names in p for p in problems), str(problems))
+    wrong_cu = [dict(p) for p in prevouts]
+    wrong_cu[2]["value"] = t.collateral_amount - 1
+    problems, _ = inspect_settlement(raw, wrong_cu, t)
+    check("and a C_U(lender) holding the wrong amount, naming input 2",
+          any("input 2" in p for p in problems), str(problems))
+    wrong_vault = [dict(p) for p in prevouts]
+    wrong_vault[1]["script_pubkey"] = "5120" + "00" * 32
+    problems, _ = inspect_settlement(raw, wrong_vault, t)
+    check("and a bond vault that is not these terms', naming input 1",
+          any("input 1" in p for p in problems), str(problems))
+
     # A locktime, for an OpenDAMP rule that binds a transfer to a window.
     timed = m.tx_from_hex(sp.compose_settlement(
         vault, verifier, vspk, cu, debt_in, bytes.fromhex("0014" + "cd" * 20),
