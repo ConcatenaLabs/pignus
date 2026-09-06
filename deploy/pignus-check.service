@@ -16,6 +16,9 @@ After=network-online.target pignus-oracle.service pignusd.service
 
 [Service]
 Type=oneshot
+# Every network call inside is bounded (curl --max-time, timeout around
+# openssl); this is the backstop for one that is not.
+TimeoutStartSec=300
 User=root
 # Every oracle is on its own port, so the set to check is configuration rather
 # than something the script guesses. Match it to what is enabled: the primary
