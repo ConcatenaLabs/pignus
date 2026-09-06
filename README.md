@@ -136,7 +136,7 @@ bin/pignus-cli           selftest, quote, propose, show, address, verify, status
                          (repurchase)
 bin/pignus-liquidator    one liquidator among however many people run one
 web/                     the browser client pignusd serves: pignus.js, offer.js,
-                         repurchase.js, pset.js, flows.js, wallet.js, app.js,
+                         repurchase.js, pset.js, flows.js, wallet.js, alerts.js, app.js,
                          and for Tier B btc.js, adaptor.js, btcborrow.js
 deploy/                  systemd units (oracle, book, cross-chain responder),
                          example configs, DEPLOY.md
@@ -692,6 +692,7 @@ pignus-oracle --config oracle.json
 |---|---|
 | `keyfile` / `logfile` | where the key is created, mode 0600, and where every attestation is appended |
 | `markets` | the feeds this oracle signs, `COLLATERAL/DEBT` |
+| `flat_rounds` | rounds every market may come back byte-identical before the feed is called frozen and signing stops (default 30; 0 turns it off; a `static` source is exempt) |
 | `trusted_proxies` | the peers whose `X-Forwarded-For` this oracle believes when it keys its log rate limit, loopback by default; set it behind a reverse proxy, or the whole internet shares one bucket |
 | `precisions` | each named asset's decimal count. **Give every one an entry**: a missing one is assumed to be 8, and where that is wrong the signed price is wrong by a power of ten, which no signature check downstream can catch. A config that names some and not others is refused at start |
 | `symbols` | the ticker the feed knows an asset by, where it differs from the market's name |
@@ -741,8 +742,10 @@ pignus-oracle --config oracle.json --sign-seize --request seizure.json
 
 `seizure.json` is what `pignus-cli btc-seize-sighash --out` writes: it carries
 the loan, so the oracle rebuilds the sighash from the terms rather than signing
-a number somebody else computed. `--sighash`, `--market` and `--strike` are the
-hand-fed alternative, and they are worse for exactly that reason. `--max-age`
+a number somebody else computed. `--sighash`, `--market`, `--strike` and
+`--price-scale`, together with `--allow-unpinned-strike`, are the hand-fed
+alternative: without the request nothing pins the strike, so the oracle refuses
+unless told the operator has checked it by hand. `--max-age`
 (600 seconds by default) is how recent the justifying price must be, and
 `--allow-stale` co-signs against an older one.
 

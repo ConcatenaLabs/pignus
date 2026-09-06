@@ -769,8 +769,12 @@ class Service:
                     ticker = str(row[1] or "")
                     if not ticker:
                         continue
+                    # 0..18, whatever the registry says: the page raises ten
+                    # to this power, and a precision of -1 or 10**9 from one
+                    # row took every panel down with it.
+                    prec = int(row[3] or 0) if row[3] is not None else 8
                     found[asset] = {"ticker": ticker, "name": str(row[2] or ticker),
-                                    "precision": int(row[3] or 0) if row[3] is not None else 8}
+                                    "precision": min(18, max(0, prec))}
             except Exception as e:                  # noqa: BLE001
                 print(f"registry: {type(e).__name__}: {e}", file=sys.stderr)
         if found:
@@ -2023,6 +2027,34 @@ class Handler(BaseHTTPRequestHandler):
     # that an abandoned socket is not a resource.
     timeout = 30
 
+    # What every response from this daemon says about how a browser may use
+    # it. The page has one inline <style> block and style attributes, no
+    # inline scripts and no on*= handlers -- every handler is assigned in
+    # app.js -- and fetches only same-origin relative paths; the wallet
+    # extension's content script is not subject to a page's policy. So a
+    # policy that forbids everything else costs the page nothing and takes
+    # away: framing, which is how a visitor's own permissionless buttons --
+    # repay for the borrower, liquidate, return to lender -- would be
+    # clicked through an invisible overlay; scripts from anywhere but here;
+    # and a browser guessing a JSON file is HTML.
+    SECURITY_HEADERS = (
+        ("Content-Security-Policy",
+         "default-src 'self'; script-src 'self'; style-src 'self' "
+         "'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
+         "object-src 'none'; base-uri 'none'; form-action 'self'; "
+         "frame-ancestors 'none'"),
+        ("X-Frame-Options", "DENY"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "no-referrer"),
+    )
+
+    def _security_headers(self):
+        for k, v in self.SECURITY_HEADERS:
+            self.send_header(k, v)
+
+    def version_string(self):
+        return "pignusd"          # not the Python version behind it
+
     def _send(self, code, payload, ctype="application/json"):
         # Bytes pass through untouched -- a static .json file is already
         # serialised; only a Python object is turned into JSON. Serialising the
@@ -2046,6 +2078,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._security_headers()
         # The page is served from here, so it is same-origin and needs none of
         # this. Reading the book from elsewhere is welcome; writing to it from
         # a visitor's browser on someone else's site is not, so the wildcard is
@@ -2131,6 +2164,7 @@ class Handler(BaseHTTPRequestHandler):
         self._body_read = True
         self.send_response(204)
         self.send_header("Content-Length", "0")
+        self._security_headers()
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET")
@@ -2150,6 +2184,29 @@ class Handler(BaseHTTPRequestHandler):
             return int(self.headers.get("Content-Length") or 0)
         except ValueError:
             return -1
+
+    def _cross_site(self, need_json=True):
+        """A write from another origin, or one dressed as a plain form.
+
+        Every state-changing endpoint needs a coin or a signature, so a
+        cross-site write cannot move money; what it could do is spend a
+        visitor's per-address rate-limit bucket from their own browser. A
+        browser sends a cross-origin JSON POST only after a preflight, which
+        the OPTIONS handler refuses -- unless the body is sent as text/plain,
+        which needs none. So a POST must say it is JSON, and an Origin that
+        is not this site is refused outright. A DELETE carries no body and
+        already needs a custom header, which no browser sends unasked.
+        """
+        if need_json:
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0]
+            if ctype.strip().lower() != "application/json":
+                return "a write must carry Content-Type: application/json"
+        origin = self.headers.get("Origin")
+        if origin and origin != "null":
+            host = (self.headers.get("Host") or "").lower()
+            if origin.split("//", 1)[-1].lower() != host:
+                return "a write from another origin is refused"
+        return None
 
     def _body(self):
         n = self._length()
@@ -2690,6 +2747,10 @@ class Handler(BaseHTTPRequestHandler):
         if self._rate_limited():
             self._discard_body()
             return self._send(429, {"error": "too many writes; slow down"})
+        why = self._cross_site()
+        if why:
+            self._discard_body()
+            return self._send(400, {"error": why})
         try:
             body = self._body()
             if path == "/v1/offers":
@@ -3218,6 +3279,10 @@ class Handler(BaseHTTPRequestHandler):
         if self._rate_limited():
             self._discard_body()
             return self._send(429, {"error": "too many writes; slow down"})
+        why = self._cross_site(need_json=False)
+        if why:
+            self._discard_body()
+            return self._send(400, {"error": why})
         self._discard_body()
         try:
             if path.startswith("/v1/offers/"):

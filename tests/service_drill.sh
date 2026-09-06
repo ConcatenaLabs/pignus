@@ -79,12 +79,28 @@ rec = b.put_offer({"terms": terms.to_json(), "kind": "funded",
 two = b.put_offer({"terms": terms.to_json(), "kind": "funded",
                    "outpoint": "12" * 32 + ":0", "manage_token": sys.argv[3],
                    "funded_value": str(1450 * 10**8), "confirmations": 6})
+# The token a NEW listing gets is the book's own draw, never the publisher's
+# choice: a chosen token is a chosen strength. So the ones passed in above
+# must NOT come back, and the drill cancels with the ones that do.
+assert rec["manage_token"] != sys.argv[2] and two["manage_token"] != sys.argv[3], \
+    "a new listing kept the publisher's own token"
+# A stored loan is the CANONICAL spelling of its terms, whatever was posted:
+# `from_json` reads "1_500" and the page's BigInt does not. A scratch book,
+# so the daemon's own count of loans is untouched.
+d = json.loads(terms.to_json()); d["debt"] = d["debt"][:1] + "_" + d["debt"][1:]
+ln = Book(sys.argv[1] + ".scratch").put_loan(json.dumps(d), "13" * 32, 0)
+assert json.loads(ln["terms"])["debt"] == str(1500 * 10**8), ln["terms"]
 print(rec["offer_id"])
 print(two["offer_id"])
+print(rec["manage_token"])
+print(two["manage_token"])
 PY
 )
-CLI_ID=$(printf '%s\n' "$CANCEL_ID" | tail -1)
-CANCEL_ID=$(printf '%s\n' "$CANCEL_ID" | head -1)
+CLI_TOKEN=$(printf '%s\n' "$CANCEL_ID" | sed -n 4p)
+CANCEL_TOKEN=$(printf '%s\n' "$CANCEL_ID" | sed -n 3p)
+CLI_ID=$(printf '%s\n' "$CANCEL_ID" | sed -n 2p)
+CANCEL_ID=$(printf '%s\n' "$CANCEL_ID" | sed -n 1p)
+echo "  a new listing's token is the book's own, and a loan is stored canonically"
 
 echo "== starting the oracle on :$OPORT =="
 "$BIN/pignus-oracle" --config "$WORK/oracle.json" > "$WORK/oracle.log" 2>&1 &
@@ -200,6 +216,36 @@ for bad in ../pignusd.json /etc/passwd secrets.txt; do
     test "$code" = "404" || { echo "  served something it should not: $bad -> $code" >&2; exit 1; }
 done
 echo "  path traversal and non-web files are refused"
+
+echo
+echo "== a write must say it is JSON and come from this site; every answer carries the security headers =="
+# A cross-origin JSON POST needs a preflight, which OPTIONS refuses; one sent
+# as text/plain needs none, and could burn a visitor's own rate-limit bucket
+# from a page they happened to open. So a write without the JSON header, or
+# with an Origin that is not this site, is refused before it is read.
+code=$(curl -s -o "$WORK/xs.json" -w '%{http_code}' -X POST "$D/v1/offers" \
+       -H 'Content-Type: text/plain' -d '{}')
+test "$code" = "400" && grep -q "Content-Type: application/json" "$WORK/xs.json" \
+  || { echo "text/plain write -> $code $(cat "$WORK/xs.json")" >&2; exit 1; }
+code=$(curl -s -o "$WORK/xs.json" -w '%{http_code}' -X POST "$D/v1/offers" \
+       -H 'Content-Type: application/json' -H 'Origin: https://elsewhere.example' -d '{}')
+test "$code" = "400" && grep -q "another origin" "$WORK/xs.json" \
+  || { echo "foreign-origin write -> $code $(cat "$WORK/xs.json")" >&2; exit 1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$D/v1/offers/nosuchoffer" \
+       -H 'Origin: https://elsewhere.example')
+test "$code" = "400" || { echo "foreign-origin DELETE -> $code, wanted 400" >&2; exit 1; }
+for p in "" "v1/healthz" "app.js" "v1/nosuchpath"; do
+  curl -sD "$WORK/hdr.txt" -o /dev/null "$D/$p"
+  for h in "content-security-policy: .*frame-ancestors 'none'" \
+           "x-frame-options: DENY" "x-content-type-options: nosniff" \
+           "referrer-policy: no-referrer"; do
+    grep -qi "^$h" "$WORK/hdr.txt" \
+      || { echo "/$p lacks '$h':" >&2; cat "$WORK/hdr.txt" >&2; exit 1; }
+  done
+done
+grep -qi "^server: pignusd" "$WORK/hdr.txt" \
+  || { echo "the Server header names the Python behind the daemon" >&2; exit 1; }
+echo "  refused, and the headers are on every answer"
 
 echo
 echo "== withdrawing an offer that is not there is a clean 404 =="

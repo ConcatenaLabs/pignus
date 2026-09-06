@@ -444,7 +444,7 @@ async function refresh() {
     state.minDepth = hz.min_depth ?? state.minDepth;
     // A self-hosted book is not behind the testnet's reverse proxy, so it can
     // say where its explorer and its oracle actually live.
-    if (hz.explorer_url) $("#crumb").href = hz.explorer_url;
+    if (webUrl(hz.explorer_url)) $("#crumb").href = hz.explorer_url;
     if (hz.rescan_needed_from != null) {
       const d = $("#daemon");
       if (d) { d.textContent = `book degraded: away longer than it can look back; needs a rescan from ${Number(hz.rescan_needed_from).toLocaleString()}`; d.className = "tag warn"; }
@@ -454,7 +454,7 @@ async function refresh() {
     // left two settings for "where is the oracle" meaning two different
     // things, and an operator who set them consistently broke this link.
     // Idempotent, so a config still holding the full link keeps working.
-    if (hz.oracle_public_url) {
+    if (webUrl(hz.oracle_public_url)) {
       $("#oraclelog").href =
         hz.oracle_public_url.replace(/\/+$/, "").replace(/\/v1\/log$/, "")
         + "/v1/log";
@@ -733,6 +733,17 @@ function renderWallet() {
       renderOffers(); renderLoans(); renderAlerts();
     } catch (e) { note(explain(e), "bad"); }
   };
+}
+
+function explainish(e) {
+  return String((e && e.message) || e || "unknown").slice(0, 120);
+}
+
+/** An operator-set URL a link may carry: http(s), or a path on this site.
+ *  Anything else -- javascript:, data: -- is refused, since a config file is
+ *  not where a script should be able to come from. */
+function webUrl(u) {
+  return typeof u === "string" && /^(https?:\/\/|\/)/i.test(u.trim());
 }
 
 function needWallet() {
@@ -1199,7 +1210,7 @@ function renderOffers() {
   const html = `<table><thead><tr><th>market</th><th>borrow</th><th>repay</th>
       <th>collateral to lock</th><th>liquidation price</th><th>matures</th>
       <th>left</th><th>taken</th><th></th></tr></thead><tbody>` +
-    view.map((o, i) => {
+    view.map((o, i) => { try {
       const t = JSON.parse(o.terms);
       const m = marketFor(t);
       const rate = (Number(big(t.debt)) / Number(big(t.principal)) - 1) * 100;
@@ -1268,7 +1279,12 @@ function renderOffers() {
         // `key` is this row's own, and is already unique.
         copyId: key,
         outpoint: o.outpoint, spk, terms: o.terms, t, warnings: o.warnings }));
-    }).join("") + "</tbody></table>";
+    } catch (e) {
+      // ONE row, not the panel: a record the page cannot draw threw out of
+      // the whole map, and every visitor lost the table over one stranger's
+      // listing.
+      return `<tr><td colspan="9" class="hint">an offer this page cannot draw (${esc(explainish(e))}); the book serves it at /v1/offer/${esc(o.offer_id || "")}</td></tr>`;
+    } }).join("") + "</tbody></table>";
   paint("#offers", html, (b) => {
     const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
       btn.onclick = () => fn(view[Number(btn.dataset[attr])]);
@@ -1333,7 +1349,7 @@ function renderLoans() {
   const html = lenderSummary(rows) +
     `<table><thead><tr><th>loan</th><th>market</th><th>owed</th><th>collateral</th>
       <th>price / liquidation</th><th>health</th><th>matures</th><th>state</th><th></th></tr></thead><tbody>` +
-    rows.map((l, i) => {
+    rows.map((l, i) => { try {
       const t = JSON.parse(l.terms);
       const h = l.health != null ? Number(l.health) : null;
       const cls = h == null ? "dim" : h < 1 ? "bad" : h < 1.15 ? "warn" : "ok";
@@ -1417,7 +1433,9 @@ function renderLoans() {
         extra: `<span class="k">Vault</span><span>${l.single_leaf
           ? "single leaf (taken from a funded offer)" : "four leaves (originated directly)"}</span>`
           + (l.spent_by ? `<span class="k">How it ended</span><span data-exit="${esc(l.loan_id || l.txid)}">…</span>` : "") }));
-    }).join("") + "</tbody></table>";
+    } catch (e) {
+      return `<tr><td colspan="9" class="hint">a loan this page cannot draw (${esc(explainish(e))}); the book serves it at /v1/loan/${esc(l.loan_id || l.txid || "")}</td></tr>`;
+    } }).join("") + "</tbody></table>";
   paint("#loans", html, (b) => {
     const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
       btn.onclick = () => fn(rows[Number(btn.dataset[attr])]);

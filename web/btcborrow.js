@@ -700,6 +700,60 @@ export function takeDigest(f) {
     JSON.stringify(obj, Object.keys(obj).sort())));
 }
 
+// The lender's half of a loan, in the order and spelling the relay signs
+// it: `pignus/btc_relay.py`'s OFFER_FIELDS and `_canon_field`. An offer's id
+// is the hash of this, so a relay cannot serve one set of terms under
+// another offer's id -- provided somebody recomputes it, which is what a
+// recovered loan gets below.
+const OFFER_FIELDS = ["btc_amount", "lender_x", "oracle_x", "recover_after",
+  "debt_asset", "debt", "principal", "repay_deadline", "abort_after",
+  "upgrade_fee", "d_refund", "lender_prog", "lender_ver", "market", "strike",
+  "price_scale"];
+const OFFER_BIG = new Set(["btc_amount", "debt", "principal", "strike"]);
+const OFFER_INT = new Set(["recover_after", "repay_deadline", "abort_after",
+  "upgrade_fee", "d_refund", "lender_ver", "price_scale"]);
+
+function canonField(name, v) {
+  if (!OFFER_BIG.has(name) && !OFFER_INT.has(name)) return v === undefined ? "" : v;
+  let n;
+  try { n = (v === undefined || v === null || v === "") ? 0n
+          : BigInt(typeof v === "string" ? v.trim() : v); }
+  catch { return v; }
+  return OFFER_BIG.has(name) ? n.toString() : Number(n);
+}
+
+export function offerPayload(loan, market = "", lots = 1) {
+  const l = {};
+  for (const k of OFFER_FIELDS) l[k] = canonField(k, (loan || {})[k]);
+  return { loan: l, market: market || "", lots: Number(lots || 1) };
+}
+
+/** The id a relay must serve an offer under: the first 24 hex characters of
+ *  the tagged hash of its signed payload. Sorted keys at every level and no
+ *  spaces, byte for byte what the Python signs. */
+export function offerId(loan, market = "", lots = 1) {
+  const keys = [...new Set(["loan", "market", "lots", ...OFFER_FIELDS])].sort();
+  return hex(P.taggedHash("pignus/btc-offer/1", new TextEncoder().encode(
+    JSON.stringify(offerPayload(loan, market, lots), keys)))).slice(0, 24);
+}
+
+/** Did THIS borrower sign the take a relay is serving under their key? The
+ *  relay stores the signature it was given; a record it made up has none
+ *  that verifies, and one whose terms it altered has one that no longer
+ *  covers them. */
+export function borrowerSaid(borrowerX, t) {
+  try {
+    const l = t.loan || {};
+    const auth = String(t.take_auth || "");
+    if (!/^[0-9a-f]{128}$/i.test(auth)) return false;
+    return badaptor.verifySchnorr(borrowerX, hex(takeDigest({
+      btc_offer_id: t.btc_offer_id, borrower_x: borrowerX, h_w: l.h_w,
+      borrower_prog: l.borrower_prog, borrower_ver: l.borrower_ver,
+      prevault_txid: t.prevault_txid, prevault_vout: t.prevault_vout,
+    })), auth);
+  } catch { return false; }
+}
+
 function reportDigest(tag, takeId, fields) {
   const obj = { take_id: String(takeId), ...fields };
   return P.taggedHash(tag, new TextEncoder().encode(
@@ -1020,16 +1074,41 @@ export async function recoverLoans(wallet, ui) {
   const remote = await ui.api("v1/btc/takes?borrower_x=" + borrower_x)
     .then(r => r.takes || []).catch(() => []);
   const local = new Map(savedLoans().map(r => [r.take_id, r]));
+  // A loan this browser has NO copy of is checked before it is believed: the
+  // take must carry this borrower's own signature over what they took, and
+  // the offer id it names must be the hash of the terms the relay serves,
+  // under the offer's own market and lot count. A relay that altered a payout
+  // fails the second; one that invented a take fails the first. A loan the
+  // browser already holds keeps its own copy of the terms below and needs
+  // neither.
+  const offers = new Map();
+  const offerOf = async id => {
+    if (!offers.has(id))
+      offers.set(id, await ui.api("v1/btc/offer/" + encodeURIComponent(id))
+                          .catch(() => null));
+    return offers.get(id);
+  };
   for (const t of remote) {
     const was = local.get(t.take_id) || {};
+    if (!was.loan) {
+      const off = await offerOf(t.btc_offer_id);
+      const idOk = !!off && offerId(t.loan, off.market, off.lots)
+                            === String(t.btc_offer_id || "").toLowerCase();
+      if (!idOk || !borrowerSaid(borrower_x, t)) {
+        console.warn("pignus: the relay served a loan this wallet did not " +
+                     "sign, or under an id that is not the hash of its " +
+                     "terms; it is not recovered", t.take_id);
+        continue;
+      }
+    }
     const rec = {
       ...was,
       take_id: t.take_id,
       btc_offer_id: t.btc_offer_id,
       // What the relay says the loan is, kept only when this browser has no
-      // copy of its own. A recovered loan is checked before it is acted on:
-      // reclaim verifies the release against the terms it rebuilds, and a
-      // relay that changed a payout would fail that check.
+      // copy of its own -- and then only after the checks above. Reclaim
+      // verifies the release against the terms it rebuilds as well, so a
+      // relay that changed a payout is caught twice.
       loan: was.loan || t.loan,
       w_seq: t.w_seq ?? was.w_seq ?? 0,
       prevault_txid: t.prevault_txid ?? was.prevault_txid,

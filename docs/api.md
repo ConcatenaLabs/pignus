@@ -63,28 +63,23 @@ float, for display only — never compute against it.
 
 **Errors.** Every failure that carries a body carries `{"error": "a sentence"}`
 with the status code below. The sentence is written to be shown to a person, so
-it says what was wrong rather than naming a Python class. A `DELETE` on a
-listing that is not there answers 404 with no body at all, because there is
-nothing to say about it; treat an empty body as the code's own meaning.
-
-| code | means |
-|---|---|
-| 200 | done |
-| 400 | the request is malformed, or the chain contradicts it |
-| 403 | the request is not signed or tokenised by the party entitled to make it |
-| 404 | no such endpoint, offer, loan, take or attestation |
-| 409 | that coin is already listed, or that take is already answered |
-| 429 | too many writes from this client, or the book is full |
-| 500 | a bug; the message names the exception |
-| 503 | no node is configured, so a chain lookup cannot be answered |
-
-**Rate limits.** POST and DELETE are charged to a client at one request a
+it says what was wrong rather than naming a Python class. A `DELETE` on a listing that is not there answers 404 with `{"removed": false}`.** POST and DELETE are charged to a client at one request a
 second with a burst of twenty, and to everybody together at twenty a second
 with a burst of two hundred. Reads that make the node work -- `/v1/spend`,
 `/v1/outpoint`, `/v1/scan` and `/v1/btc/outpoint` -- are charged at two a
 second with a burst of thirty per client, and forty a second with a burst of
 four hundred together. Over any of those the answer is 429. Every other read is
 served from memory and is not limited.
+
+Every write -- each `POST`, and `DELETE` -- must come from this site. A `POST`
+must carry `Content-Type: application/json`, and an `Origin` header naming
+another site is refused, both with a 400 before the body is read. Nothing a
+write can do moves money without a coin or a signature; what this refuses is
+a page elsewhere spending a visitor's own rate-limit bucket from their
+browser. Reads stay open to every origin. Every answer carries a content
+security policy that keeps the page's scripts and connections to this site
+and forbids framing it, plus `X-Frame-Options: DENY`,
+`X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
 
 **Behind a proxy.** Every request then arrives from loopback, so `pignusd`
 believes `X-Forwarded-For` (or `X-Real-IP`) only from a peer listed in
@@ -447,8 +442,11 @@ unknown. The book keeps its own last reconciled height in `book.json` (under
 `ok` is false when there is no node, when the node or the **primary** oracle is
 unreachable, while the first sync is still running, when the poll thread has not
 finished within `max(120s, 3 × poll)`, when any market's newest verified
-attestation is older than `max_price_age`, or when offer events are queued up
-unapplied. `error` says which; `stale_markets`, `oracle_errors` and
+attestation is older than `max_price_age`, when offer events are queued up
+unapplied, when the last poll step failed, when a market is priced but not
+lendable (its tickers do not resolve to assets, or their precisions disagree),
+when any record cannot be rendered, or while `rescan_needed_from` is set.
+`error` says which; `stale_markets`, `oracle_errors` and
 `event_errors` name them individually. The status code is always 200 — read
 `ok`, not the code.
 
@@ -821,8 +819,8 @@ one client can make requests at all.
 
 ### `GET /v1/btc/offers`
 
-`?status=` takes the same set as `/v1/offers` -- `open` by default, or `taken`,
-`withdrawn`, `gone`, `ghost`, `expired`, `all` -- and a value outside it is a
+`?status=` takes the same set as `/v1/offers` -- `open` by default, or
+`delisted`, `taken`, `withdrawn`, `gone`, `ghost`, `expired`, `all` -- and a value outside it is a
 400 listing them, not an empty result, because an empty list reads as "there are
 no offers". Only three of those are ever ASSIGNED to a cross-chain offer:
 `open`, `withdrawn` when its lender takes it down, and `expired` when its own
@@ -908,6 +906,9 @@ different offers can never collide.
 - 400 if a required field is missing or a payout program's length does not match
   its witness version (20 bytes at v0, 32 at v1).
 - 403 if the signature is not by the key the offer names as the lender.
+- 400 if `strike` is not positive, or `oracle_x` is the lender's own key.
+- 429 if the book already holds 500 open cross-chain offers. Republishing one it
+  already has is never refused.
 
 ### `POST /v1/btc/offers/{id}/withdraw`
 
@@ -947,7 +948,6 @@ drawn yet, so neither the vault nor the release over it exists at this point.
  "borrower_prog": "<20 or 32-byte hex>", "borrower_ver": 0,
  "borrower_seq_spk": "0014…",
  "prevault_txid": "…", "prevault_vout": 1, "prevault_value": "103000",
- "btc_height": 150773,
  "reclaim_dest": "0014…", "reclaim_fee": 3000,
  "take_auth": "…128 hex…"}
 ```
@@ -993,8 +993,9 @@ their repayment will commit to came from the lender rather than from the relay.
 `200` is `{"ok": true, "take_id": "…"}` and moves the take to
 `status: "reserved"`, recording the `vault_txid` and the `repayment_spk` that
 hash implies — read them back from `GET /v1/btc/take/{id}`. `403` the signature
-is not the lender's. `409` the take already has a different hash. `400` the hash
-is not 32 bytes.
+is not the lender's. `409` the take already has a different hash, or this hash
+is already committed to another loan on this book. `400` the hash is not 32
+bytes, or is the one the principal is locked to (`h_w`).
 
 ### `POST /v1/btc/presig`
 
@@ -1014,7 +1015,12 @@ not move that collateral into that vault.
 
 `?status=`, `?offer_id=`, `?borrower_x=`. `{"takes": [ … ]}`, newest first.
 Asking by borrower key is what lets somebody who cleared their browser storage,
-or moved to another machine, find their own loans again.
+or moved to another machine, find their own loans again. What comes back is
+the book's word, and the page treats it as that: a take it has no copy of is
+kept only if `take_auth` verifies under the wallet's own key over the take it
+describes, and if `btc_offer_id` is the hash of the terms the book serves for
+that offer under the offer's own market and lot count. A record failing
+either is left out, not repaired.
 
 `?oracle_x=` narrows to the takes whose loan names one oracle key, which is what an
 operator retiring a key checks before they stop the instance: on this tier the
@@ -1051,8 +1057,9 @@ The relay derives the vault from the take's own pre-vault outpoint and payment
 hash, rebuilds the reclaim transaction, and refuses a signature that does not
 verify against it. `200` moves the take to `status: "signed"` and serves the
 `vault_txid` it derived. `403` the reply is not the lender's. `409` the take has
-no advance signature yet, the release is for a different payment hash, or one is
-already stored. `400` the signature does not verify.
+no advance signature yet, the release is for a different payment hash, or a
+different release is already stored (re-sending the same one is accepted).
+`400` the signature does not verify.
 
 ### `POST /v1/btc/disbursed`, `/upgraded`, `/claimed`, `/refunded`
 
@@ -1117,7 +1124,8 @@ Everything the oracle serves is a read. The ones that go to disk for it —
 `/v1/log/raw`, `/v1/seizures`, `/v1/seizure/{sighash}`,
 `/v1/attestation/{market}/at/{ts}`, and `/v1/log` whenever `since`, `until` or
 `cursor` sends it to the archive — are limited to one request a second per
-address with a burst of ten, and answer 429 over that. An auditor's query is
+address with a burst of ten, and twenty a second with a burst of two hundred
+for everybody together, and answer 429 over that. An auditor's query is
 cheap once and expensive in a loop, and this process has signing to do.
 Everything else comes out of memory and is not limited.
 
@@ -1206,9 +1214,14 @@ Every native-BTC seizure this oracle has co-signed, each with the attestation
 that justified it:
 
 ```json
-{"sighash": "…", "signature": "…", "market": "BTC/USDX",
- "strike": 18000000, "attestation": { … }, "ts": 1799999999, "oracle_x": "…"}
+{"seizures": [
+  {"sighash": "…", "signature": "…", "market": "BTC/USDX",
+   "strike": 18000000, "attestation": { … }, "ts": 1799999999, "oracle_x": "…",
+   "loan": { … }, "offer_sig": "…", "offer_lots": 1}
+]}
 ```
+
+`GET /v1/seizure/{sighash}` returns one such record on its own.
 
 Tier B collateral sits under a plain 2-of-2, so the oracle's signature *is* the
 liquidation decision — there is no covenant to refuse it. This log is the whole
@@ -1248,7 +1261,9 @@ Everything above exists so that this is possible without asking anybody:
 4. Check the BIP340 signature against the oracle key **the vault bakes in** —
    not the one `/v1/oracle` or `/v1/pubkey` hands you — and confirm the
    attestation's `price_scale` is the loan's:
-   `pignus-cli check-attestation --attestation att.json --oracle-x <key>`.
+   `pignus-cli check-attestation --attestation att.json --oracle-x <key>
+   --price-scale <the loan's>` -- without `--price-scale` the scale is printed
+   but not compared.
 5. `GET <that oracle>/v1/log/raw` for the file that attestation is in, hash it,
    and compare with the `.sha256` beside it and the chain in `/v1/digest`. A log
    that was rewritten to add or remove an attestation stops matching a digest
