@@ -2525,6 +2525,8 @@ async function loadBtcLoans() {
   // loan as live with a Repay button, and the borrower pays a debt for
   // collateral that was taken before they paid it.
   await Promise.all(state.btcLoans.map(
+    (r) => btcborrow.learnFromChain(r, btcUi()).catch(() => false)));
+  await Promise.all(state.btcLoans.map(
     (r) => btcborrow.checkVault(r, btcUi()).catch(() => false)));
 }
 
@@ -2596,7 +2598,7 @@ async function renderBtcLoans() {
       const floor = state.btcFeerate ? btcborrow.reclaimFeeFloor(state.btcFeerate) : 0;
       if (floor && Number(rec.reclaim_fee || 0) < floor
           && ["live", "repaid", "repayment-claimed"].includes(btcborrow.stageOf(rec)))
-        acts.push(`<span class="tag warn" title="your reclaim carries ${esc(rec.reclaim_fee)} satoshis and Bitcoin now charges about ${floor} for it; it cannot be bumped, so repay early enough for it to confirm">reclaim fee low</span>`);
+        acts.push(`<span class="tag warn" title="your reclaim carries ${esc(rec.reclaim_fee)} satoshis and Bitcoin now charges about ${floor} for it; it cannot be replaced, so repay early enough for it to confirm, and if it stalls, spend its output from your wallet at a high fee to pull it in">reclaim fee low</span>`);
       if (health != null && health < 1 && !rec.terminal)
         acts.push('<span class="tag bad" title="the lender and the oracle can co-sign a seizure of your collateral at this price. Repaying is what stops it">seizable now</span>');
       if (step.action)
@@ -2605,6 +2607,17 @@ async function renderBtcLoans() {
         acts.push(`<button data-btcforce="${i}" data-focus="bf:${esc(rec.take_id || i)}" class="sm" title="skip the wait for the Bitcoin block your secret's Sequentia block anchored to. That wait is there because a Bitcoin reorg can undo the secret, and spending your Bitcoin on one that is undone loses both sides">Reclaim anyway</button>`);
       if (btcborrow.canAbort(rec, heights))
         acts.push(`<button data-btcabort="${i}" data-focus="ba:${esc(rec.take_id || i)}" class="warnbtn sm">Take the collateral back</button>`);
+      // A take with nothing of the borrower's on chain: never answered, or
+      // signed but never broadcast. It is not money; it is a row.
+      const stage = btcborrow.stageOf(rec);
+      const dead = ["requested", "reserved", "pending"].includes(stage)
+        || (stage === "signed" && rec.unfunded);
+      if (stage === "signed" && rec.unfunded && rec.funding_hex)
+        acts.push(`<button data-btcfund="${i}" data-focus="bfd:${esc(rec.take_id || i)}" class="primary sm" title="send the signed collateral transaction this browser kept, after checking the release and the deadlines again">Broadcast the collateral</button>`);
+      if (dead)
+        acts.push(`<button data-btcforget="${i}" data-focus="bfg:${esc(rec.take_id || i)}" class="sm" title="drop this take from the page; nothing of yours is on chain for it">Forget this take</button>`);
+      if (rec.terminal && (rec.reclaim_txid || rec.abort_txid))
+        acts.push(`<a href="${txLink(rec.reclaim_txid || rec.abort_txid, true)}" class="mono small">${shortHex(rec.reclaim_txid || rec.abort_txid, 12)}</a>`);
       // The repayment's own REFUND leaf: if the lender never took the money,
       // it comes home after the deadline, and needs no signature from them.
       // Decided from the facts, not from a word: the repayment went out, no
@@ -2651,7 +2664,32 @@ async function renderBtcLoans() {
     b.querySelectorAll("[data-btcunpay]").forEach(btn => {
       btn.onclick = () => btcRefundRepayment(rows[Number(btn.dataset.btcunpay)]);
     });
+    b.querySelectorAll("[data-btcfund]").forEach(btn => {
+      btn.onclick = () => btcBroadcastFunding(rows[Number(btn.dataset.btcfund)]);
+    });
+    b.querySelectorAll("[data-btcforget]").forEach(btn => {
+      btn.onclick = () => {
+        const rec = rows[Number(btn.dataset.btcforget)];
+        btcborrow.forgetLoan(rec.take_id);
+        note("Forgotten. The book drops the take on its own schedule; nothing of yours was on chain for it.", "info");
+        renderBtcLoans().catch(() => {});
+      };
+    });
   });
+}
+
+async function btcBroadcastFunding(rec) {
+  if (needWallet() || needBtcHeight()) return;
+  try {
+    const go = await confirmLines("Broadcast the collateral", [
+      `Send the ${pig.fixed(BigInt(rec.loan.btc_amount), 8, 8)} BTC funding this browser signed when the offer was taken`,
+      "The lender's release and both chains' deadlines are checked again first; if either fails, nothing is sent",
+    ]);
+    if (!go) { note("Nothing was sent.", "info"); return; }
+    const txid = await btcborrow.broadcastFunding(state.wallet, rec, btcUi());
+    note(`<b>Collateral broadcast.</b> <a href="${txLink(txid, true)}" class="mono">${esc(txid)}</a>.`, "ok");
+    await renderBtcLoans();
+  } catch (e) { note(explain(e), "bad"); } finally { busy(false); }
 }
 
 /** Do whatever this loan is waiting for: claim, repay, or reclaim. */
@@ -2793,7 +2831,7 @@ async function btcAbort(rec) {
     const go = await confirmLines("Take the collateral back", [
       `Spend the pre-vault's ${pig.fixed(BigInt(rec.loan.btc_amount), 8, 8)} BTC (plus the unspent upgrade fee) to ` +
         (rec.reclaim_spk ? btcAddressOfSpk(rec.reclaim_spk) : "a fresh address of your own"),
-      `Fee ${Number(rec.reclaim_fee || 3000).toLocaleString()} satoshis`,
+      `Fee ${btcborrow.abortFeeFor(rec, state.btcFeerate).toLocaleString()} satoshis`,
       "The principal never came, so no loan ever started; this needs nobody's signature but yours",
     ]);
     if (!go) { note("Nothing was signed.", "info"); return; }

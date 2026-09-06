@@ -78,7 +78,7 @@ const live = (o = {}) => ({ state: "LIVE", loan_id: "L1", txid: "11".repeat(32),
   ok("a cross-chain loan near its safe repay deadline warns, in words",
      a.btc.some(x => /Repay in about/.test(x.text) && x.action === "btcstep"), JSON.stringify(a.btc));
   ok("...and a reclaim fee Bitcoin has outgrown is named, with the number it would take",
-     a.btc.some(x => /300 satoshis/.test(x.text) && /cannot be bumped/.test(x.text)));
+     a.btc.some(x => /300 satoshis/.test(x.text) && /cannot be replaced/.test(x.text)));
   ok("the tab title counts both", A.atRiskCount(a) === 2);
   const late = A.alertsFor(view({ btcLoans: [{ ...rec, loan: { ...rec.loan, repay_deadline: 50000 + 120 - 1 } }] }));
   ok("past the safe deadline the alert is bad and carries NO button",
