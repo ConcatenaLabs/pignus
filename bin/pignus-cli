@@ -1196,10 +1196,10 @@ coin_spk = {}
 def _check_settlement_vault(raw, terms, args):
     """The transaction being witnessed really spends the vault named.
 
-    `repo-settle --attach` requires --txid/--vout and used to ignore them. A
-    witness put on the wrong transaction is refused by the node with a script
-    error that names nothing, and a person then looks for a fault in the
-    covenant rather than in the arguments they typed.
+    `repo-settle --attach` names the bond with --txid, and with --vout when
+    the caller has it. A witness put on the wrong transaction is refused by
+    the node with a script error that names nothing, and a person then looks
+    for a fault in the covenant rather than in the arguments they typed.
     """
     from pignus.repurchase import SETTLEMENT_VAULT_INDEX
     from pignus.vault import _tf
@@ -1332,7 +1332,8 @@ def cmd_repo_settle(args):
     print("  sign it in this order: the OpenDAMP verifier spend (input 0), the "
           "lender's C_U (input 2), the borrower's debt coin (input 3). Then:\n"
           f"    pignus-cli repo-settle {args.terms} --txid {args.txid} "
-          f"--vout {args.vout} --attach <signed hex>", file=sys.stderr)
+          + (f"--vout {args.vout} " if args.vout is not None else "")
+          + "--attach <signed hex>", file=sys.stderr)
     if args.skeleton:
         with open(args.skeleton, "w") as f:
             f.write(raw + "\n")

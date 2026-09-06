@@ -236,7 +236,7 @@ fi
 # consequence; this names the cause.
 if command -v systemctl >/dev/null 2>&1 \
         && systemctl list-unit-files pignus-liquidator.service 2>/dev/null | grep -q pignus-liquidator \
-        && [ "$(systemctl is-enabled pignus-liquidator 2>/dev/null)" != "masked" ] \
+        && ! systemctl is-enabled pignus-liquidator 2>/dev/null | grep -q '^masked' \
         && ! systemctl is-active --quiet pignus-liquidator; then
     bad "the liquidator unit pignus-liquidator is installed and not running"
 fi

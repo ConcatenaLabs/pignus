@@ -1749,7 +1749,7 @@ function renderPreview() {
   const drop = (1 - liq / now) * 100;
   const total = x.principal * BigInt(x.lots);
   out.innerHTML = `<div class="kv">
-    <span class="k">You lock</span><span><b>${amount(total, t.debt_asset)}</b> in an offer covenant${x.lots > 1 ? `, takeable ${x.lots} time${x.lots === 1 ? "" : "s"}` : ""}; whatever is untaken you withdraw yourself after ${whenBlock(x.expiry)} (a Withdraw button then appears under Borrow › Mine) \u2014 a Withdraw button appears here, and nothing returns on its own</span>
+    <span class="k">You lock</span><span><b>${amount(total, t.debt_asset)}</b> in an offer covenant${x.lots > 1 ? `, takeable ${x.lots} times` : ""}; whatever is untaken you withdraw yourself after ${whenBlock(x.expiry)}: a Withdraw button then appears under Borrow › Mine, and nothing returns on its own</span>
     <span class="k">Each borrower locks</span><span><b>${amount(t.collateral_amount, t.collateral_asset)}</b> <span class="k">${ref(t.collateral_amount, t.collateral_asset)} at today's price, ${(x.i.openLtv * 100).toFixed(0)}% loan-to-value</span></span>
     <span class="k">and repays</span><span><b>${amount(t.debt, t.debt_asset)}</b> <span class="k">by ${whenBlock(t.maturity)}</span></span>
     <span class="k">Liquidation</span><span>if ${esc(m.collateral_ticker)} falls below <b>${money(liq, liq < 10 ? 4 : 2)} ${esc(m.debt_ticker)}</b> <span class="k">(${drop < 0 ? "above the price now — a loan would be liquidatable immediately"
@@ -2602,7 +2602,8 @@ function btcPriceFor(market) {
 /** The stage, in the word the command line prints for the same state, so a
  *  loan begun on one route reads the same on the other. */
 function stageWord(status) {
-  const words = { "principal-taken": "claimed-principal", "swept": "timed-out" };
+  const words = { "principal-taken": "claimed-principal", "swept": "timed-out",
+                  "repayment-claimed": "claimed", "repayment-refunded": "refunded" };
   return words[status] || status || "funded";
 }
 
