@@ -173,9 +173,48 @@ def main():
     req = BC.seize_request(seizing, "aa" * 32, 0,
                            bytes.fromhex("0014" + "bb" * 20), 3000)
     req["offer_sig"], req["offer_lots"] = offer_sig, 3
+    # ...and the BORROWER's acceptance of that offer, signed over its id.
+    borrower_sec = A.new_secret()
+    seizing = BC.loan_from_dict(dict(BC.loan_to_dict(seizing),
+                                     borrower_x=A.xonly_pubkey(borrower_sec).hex()))
+    offer_sig = R.sign_offer(lender, BC.loan_to_dict(seizing), seizing.market, 3)
+    req = BC.seize_request(seizing, "aa" * 32, 0,
+                           bytes.fromhex("0014" + "bb" * 20), 3000)
+    req["offer_sig"], req["offer_lots"] = offer_sig, 3
+    req["prevault_txid"], req["prevault_vout"] = "cd" * 32, 1
+    req["take_auth"] = R.sign_take(
+        borrower_sec,
+        btc_offer_id=R.offer_id(BC.loan_to_dict(seizing), seizing.market, 3),
+        borrower_x=seizing.borrower_x, h_w=seizing.h_w,
+        borrower_prog=seizing.borrower_prog, borrower_ver=seizing.borrower_ver,
+        prevault_txid="cd" * 32, prevault_vout=1)
     got, _want = BC.check_seize_request(req)
     check("an honest request is accepted, at the offer's own strike",
           int(got.strike) == int(seizing.strike))
+
+    # THE attack the lender's signature alone cannot stop: the lender is the
+    # party asking for the seizure, and can sign the same loan again with any
+    # strike. Only the borrower's acceptance -- over the id of the offer as it
+    # was -- names the strike they agreed to.
+    resigned = dict(req)
+    resigned["loan"] = dict(req["loan"], strike=99_999_999_999)
+    resigned["offer_sig"] = R.sign_offer(
+        lender, resigned["loan"], seizing.market, 3)
+    try:
+        BC.check_seize_request(resigned)
+        check("a strike the lender re-signed higher is refused even with a "
+              "valid offer signature", False, "it was accepted")
+    except ValueError as e:
+        check("a strike the lender re-signed higher is refused even with a "
+              "valid offer signature", "acceptance" in str(e), str(e)[:120])
+    noacc = dict(req)
+    noacc["take_auth"] = ""
+    try:
+        BC.check_seize_request(noacc)
+        check("a request with no borrower acceptance is refused", False, "accepted")
+    except ValueError as e:
+        check("a request with no borrower acceptance is refused",
+              "take_auth" in str(e))
 
     lying = dict(req)
     lying["loan"] = dict(req["loan"], strike=99_999_999_999)
@@ -189,7 +228,8 @@ def main():
         BC.check_seize_request(lying)
         check("an inflated strike is refused", False, "it was accepted")
     except ValueError as e:
-        check("an inflated strike is refused", "offer signature" in str(e))
+        check("an inflated strike is refused",
+              "offer signature" in str(e) or "acceptance" in str(e))
 
     unpinned = dict(req)
     unpinned["offer_sig"] = ""

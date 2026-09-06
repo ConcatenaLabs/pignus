@@ -177,6 +177,15 @@ def main():
         req["offer_sig"] = _R.sign_offer(lender, B.loan_to_dict(loan3),
                                          loan3.market, 1)
         req["offer_lots"] = 1
+        # ...and the BORROWER's acceptance of that offer, which is what pins
+        # the strike: the lender's own signature can be made again over any.
+        req["prevault_txid"], req["prevault_vout"] = txid3, vout3
+        req["take_auth"] = _R.sign_take(
+            borrower, btc_offer_id=_R.offer_id(B.loan_to_dict(loan3),
+                                               loan3.market, 1),
+            borrower_x=loan3.borrower_x, h_w=loan3.h_w,
+            borrower_prog=loan3.borrower_prog, borrower_ver=loan3.borrower_ver,
+            prevault_txid=txid3, prevault_vout=vout3)
         _ln, want = B.check_seize_request(req)
         check("an oracle rebuilds the sighash from the loan rather than "
               "signing what it was handed", want == req["sighash"])

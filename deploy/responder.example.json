@@ -6,7 +6,7 @@
   "book": "http://127.0.0.1:8741",
   "interval": 5,
   "_depth_note": "disburse_conf is how deep the borrower's collateral must be before the principal is paid; claim_depth is how deep the borrower's claim of that principal must be before the collateral is moved into the loan. Both are the lender's own exposure to a reorg on the other chain, so both are configuration.",
-  "disburse_conf": 1,
+  "disburse_conf": 2,
   "claim_depth": 6,
   "_scan_note": "Seconds between chain scans for a repayment whose borrower never told the relay where it landed. The borrower's report only saves this scan; nothing waits on it.",
   "scan_interval": 300,

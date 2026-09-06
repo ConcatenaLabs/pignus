@@ -185,14 +185,20 @@ def main():
                           borrower_prog=b_spk[4:], borrower_ver=0)
             loan = B.loan_from_dict(loan_d)
             ptxid, pvout, _ = B.fund_bitcoin(rig.btc, loan)
-            rig.btc_mine(1)
+            rig.btc_mine(2)          # two deep: what a principal is paid against
             dest = bytes.fromhex("0014" + "55" * 20)
+            from pignus import btc_relay as R                # noqa: PLC0415
             take = post(base + "/v1/btc/take", {
                 "btc_offer_id": offer["btc_offer_id"],
                 "borrower_x": loan.borrower_x,
                 "borrower_seq_spk": b_spk,
                 "borrower_prog": loan.borrower_prog, "borrower_ver": 0,
                 "h_w": loan.h_w, "w_seq": 0,
+                "take_auth": R.sign_take(
+                    borrower, btc_offer_id=offer["btc_offer_id"],
+                    borrower_x=loan.borrower_x, h_w=loan.h_w,
+                    borrower_prog=loan.borrower_prog, borrower_ver=0,
+                    prevault_txid=ptxid, prevault_vout=pvout),
                 "prevault_txid": ptxid, "prevault_vout": pvout,
                 "prevault_value": str(loan.prevault_value()),
                 "btc_height": rig.btc.getblockcount(),

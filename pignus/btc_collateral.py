@@ -729,6 +729,38 @@ def check_seize_request(request, require_offer=True):
             "the offer signature in that seizure request does not verify "
             "against this loan's own lender key. The strike it asks to be "
             "judged against is therefore unpinned; refusing.")
+    # The lender's signature alone pins nothing: the lender is the party asking
+    # for the seizure, and can sign a fresh payload with any strike at any
+    # time -- the strike is in no Bitcoin script, so the funding address is the
+    # same either way. What pins it is the BORROWER's signature over the id of
+    # the offer they took, made when they took it, which is the hash of the
+    # terms as they were then. A request that cannot show it is judged
+    # against a number the requester chose.
+    take_auth = str(request.get("take_auth") or "")
+    if not take_auth:
+        raise ValueError(
+            "this seizure request carries no borrower acceptance (`take_auth`), "
+            "so nothing shows the strike it names is the one the borrower "
+            "agreed to: the lender's own signature over the offer can be made "
+            "again over any strike. Refusing. `btc-seize-sighash --book` "
+            "fetches it from the take.")
+    oid = R.offer_id(offered, loan.market, lots)
+    accepted = {"btc_offer_id": oid, "borrower_x": loan.borrower_x,
+                "h_w": loan.h_w, "borrower_prog": loan.borrower_prog,
+                "borrower_ver": loan.borrower_ver,
+                "prevault_txid": request.get("prevault_txid", ""),
+                "prevault_vout": request.get("prevault_vout", "")}
+    try:
+        ok = R.verify_take(loan.borrower_x, take_auth, **accepted)
+    except ValueError as e:
+        raise ValueError(f"this seizure request cannot be checked against the "
+                         f"borrower's acceptance: {e}") from None
+    if not ok:
+        raise ValueError(
+            "the borrower's acceptance in that seizure request does not verify "
+            "over THIS loan's terms. The borrower signed the id of the offer "
+            "they took, and these terms hash to a different id -- a strike, or "
+            "something else the lender signed, has changed since. Refusing.")
     return loan, want
 
 

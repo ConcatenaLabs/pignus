@@ -305,8 +305,13 @@ n=$(burst 5 -H 'X-Forwarded-For: 203.0.113.6')
 test "$n" = "0" || { echo "another client was charged for the first one's burst" >&2
     exit 1; }
 echo "  and another client still has its own bucket"
+# At least four of five, not exactly five: the bucket refills at one a second,
+# and the ten requests since it was emptied can take longer than that on a
+# loaded machine. The outcomes this must tell apart are far enough apart for
+# that -- keyed on the last hop, the exhausted bucket refuses four or five;
+# keyed on the first hop or on the whole string, a fresh bucket refuses none.
 n=$(burst 5 -H 'X-Forwarded-For: 198.51.100.9, 203.0.113.5')
-test "$n" = "5" || { echo "a chained header was not keyed on its last hop" >&2
+test "$n" -ge 4 || { echo "a chained header was not keyed on its last hop ($n of 5 refused)" >&2
     exit 1; }
 echo "  a chain is keyed on the LAST hop, which is the one the proxy added"
 n=$(burst 25)

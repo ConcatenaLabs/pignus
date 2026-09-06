@@ -211,13 +211,27 @@ def main():
         same check pignus-cli makes, for the same reason.
         """
         for e in entries:
-            t = LoanTerms.from_json(e["terms"])
-            txid, vout = e["txid"], int(e.get("vout", 0))
+            try:
+                t = LoanTerms.from_json(e["terms"])
+                txid, vout = e["txid"], int(e.get("vout", 0))
+            except Exception as ex:                     # noqa: BLE001
+                # One entry this bot cannot read must not stop it reading the
+                # rest: a bad record, or an RPC hiccup on one coin, blinded it
+                # to every loan after it in the list, and at start-up ended it.
+                print(f"skipping an entry it cannot read ({type(ex).__name__}: "
+                      f"{ex})", file=sys.stderr)
+                continue
             key = f"{txid}:{vout}"
             if key in loans:
                 continue
             single = bool(e.get("single_leaf"))
-            got = node.gettxout(txid, vout, True)
+            try:
+                got = node.gettxout(txid, vout, True)
+            except TRANSIENT as ex:
+                print(f"{key}: the node would not say whether the vault is "
+                      f"there ({type(ex).__name__}: {ex}); asking again next "
+                      f"round", file=sys.stderr)
+                continue
             if got is None:
                 continue                   # spent already, or never funded
             want = (offer_vault_address(t) if single else t.script_pubkey()).hex()
@@ -272,7 +286,13 @@ def main():
         for u in node.listunspent():
             if u.get("spendable") and u.get("asset"):
                 have[u["asset"]] = have.get(u["asset"], 0) + atoms(u["amount"])
-        asset, cost = F.pick_fee(table, have, flow, [t.debt_asset])
+        # The seizure pays the lender `debt` out of this wallet before it keeps
+        # any collateral, so the fee asset is chosen from what is left after
+        # that -- otherwise a wallet holding exactly the debt picks the debt
+        # asset for the fee too, and the funding fails every round with an
+        # error that names no asset.
+        asset, cost = F.pick_fee(table, have, flow, [t.debt_asset],
+                                 committed={t.debt_asset: int(t.debt)})
         return asset, cost, rates.get(asset)
 
     def oracle_key(url):

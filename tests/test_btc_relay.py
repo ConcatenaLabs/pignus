@@ -161,7 +161,30 @@ def main():
                  "prevault_value": str(ln0.prevault_value()),
                  "reclaim_dest": dest, "reclaim_fee": 3000}
             b.update(over)
+            # The borrower's acceptance, over what the body actually says, so
+            # an altered body carries a signature that does not match it.
+            if "take_auth" not in over:
+                try:
+                    b["take_auth"] = R.sign_take(
+                        borrower, btc_offer_id=b["btc_offer_id"],
+                        borrower_x=b["borrower_x"], h_w=b["h_w"],
+                        borrower_prog=b["borrower_prog"],
+                        borrower_ver=b["borrower_ver"],
+                        prevault_txid=b["prevault_txid"],
+                        prevault_vout=b["prevault_vout"])
+                except ValueError:
+                    b["take_auth"] = ""
             return b
+
+        check("a take without the borrower's acceptance is refused",
+              post(base + "/v1/btc/take", take_body(take_auth=""))[0] == 400)
+        check("...and one whose acceptance was made by somebody else",
+              post(base + "/v1/btc/take", take_body(
+                  take_auth=R.sign_take(
+                      A.new_secret(), btc_offer_id=offer["btc_offer_id"],
+                      borrower_x=borrower_x, h_w=full["h_w"],
+                      borrower_prog="dd" * 20, borrower_ver=0,
+                      prevault_txid=ptxid, prevault_vout=pvout)))[0] == 400)
 
         check("a take that misstates what the funding holds is refused",
               post(base + "/v1/btc/take",
