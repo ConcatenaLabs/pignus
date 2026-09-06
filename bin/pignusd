@@ -448,6 +448,12 @@ def _views(render, rows):
     return out
 
 
+# Every top-level key of pignusd.json this daemon reads; `main` refuses any
+# other, so a misspelt setting is a start-up error rather than a default
+# silently in force.
+CONFIG_KEYS = ("back_scan_cap", "block_seconds", "book", "btc_explorer_tx_url", "btc_rpc", "explorer_tx_url", "explorer_url", "listen", "markets", "max_price_age", "min_depth", "oracle", "oracle_keys", "oracle_public_url", "oracle_public_urls", "oracles", "poll", "prune_after", "reference_ticker", "registry", "rescan_depth", "rpc", "trusted_proxies")
+
+
 class Service:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -3671,6 +3677,15 @@ def main():
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = json.load(f)
+    # A key this daemon does not read is a setting the operator believes is
+    # protecting them and is not: refused at start, by name. Keys beginning
+    # with "_" are notes.
+    odd = sorted(k for k in cfg if k not in CONFIG_KEYS and not k.startswith("_"))
+    if odd:
+        sys.exit(f"pignusd: {args.config} sets {', '.join(odd)}, which this "
+                 f"daemon does not read. It takes: {', '.join(CONFIG_KEYS)}. "
+                 f"A setting that goes nowhere is one you believe is protecting "
+                 f"you.")
     try:
         # Load the covenant before anything is served. Every vault address this
         # daemon shows is derived from it, and the golden vectors are checked on

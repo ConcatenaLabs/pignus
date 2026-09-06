@@ -640,6 +640,39 @@ if not any(w in err for w in wanted):
 REGWORDS
 echo "  an unlendable market says WHICH of the three things went wrong"
 
+# --- a setting nothing reads is refused at start, by name --------------------
+#
+# A misspelt max_price_age or flat_rounds used to leave the built-in default
+# silently in force while the operator believed their setting was protecting
+# them. Both daemons now refuse to start on a top-level key they do not read;
+# a key beginning with "_" is a note and passes.
+echo
+echo "-- a config key nothing reads is refused"
+python3 - "$WORK/pignusd.json" "$WORK/odd-pignusd.json" <<'ODD'
+import json, sys
+c = json.load(open(sys.argv[1])); c["max_price_ages"] = 600; c["_a_note"] = "fine"
+json.dump(c, open(sys.argv[2], "w"))
+ODD
+set +e
+OUT=$("$BIN/pignusd" --config "$WORK/odd-pignusd.json" 2>&1); rc=$?
+set -e
+test "$rc" != "0" && echo "$OUT" | grep -q "max_price_ages" || {
+    echo "pignusd started, or did not name the key it does not read (exit $rc)" >&2
+    echo "$OUT" | tail -3 | sed 's/^/  /' >&2; exit 1; }
+echo "$OUT" | grep -q "_a_note" && { echo "a note key was refused" >&2; exit 1; }
+python3 - "$WORK/oracle.json" "$WORK/odd-oracle.json" <<'ODD'
+import json, sys
+c = json.load(open(sys.argv[1])); c["flat_round"] = 3
+json.dump(c, open(sys.argv[2], "w"))
+ODD
+set +e
+OUT=$("$BIN/pignus-oracle" --config "$WORK/odd-oracle.json" --print-pubkey 2>&1); rc=$?
+set -e
+test "$rc" != "0" && echo "$OUT" | grep -q "flat_round" || {
+    echo "the oracle ran, or did not name the key it does not read (exit $rc)" >&2
+    echo "$OUT" | tail -3 | sed 's/^/  /' >&2; exit 1; }
+echo "  pignusd and the oracle refuse a key they do not read, naming it; a _note passes"
+
 # --- the alerting is wired consistently ---------------------------------------
 #
 # An OnFailure= naming a unit that is not installed makes every failure a

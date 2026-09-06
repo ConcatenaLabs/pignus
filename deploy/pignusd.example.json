@@ -4,6 +4,8 @@
   "oracle": "http://127.0.0.1:8740",
   "_oracles_note": "Further INDEPENDENT oracles, quoted for m-of-n loans, e.g. [\"http://127.0.0.1:8742\", \"http://127.0.0.1:8743\"]. Each must run from its own keyfile, or a 2-of-3 is really a 1-of-1. They never stand in for the primary: a vault verifies against the key baked into it.",
   "oracles": [],
+  "_oracle_keys_note": "Pin each oracle's x-only key, in the order oracle then oracles (an empty entry pins nothing). Pinned, an oracle that starts serving a different key is refused rather than adopted; unpinned, the book takes whatever /v1/pubkey says, which is what a swapped key looks like.",
+  "oracle_keys": [],
   "markets": [
     "GOLD/USDX",
     "SILVR/USDX",

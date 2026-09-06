@@ -449,7 +449,11 @@ does.
 
 ## `pignusd` configuration
 
-`deploy/pignusd.example.json` is the starting point. The keys:
+`deploy/pignusd.example.json` is the starting point. A key the daemon does
+not read is refused at start, by name -- as the oracle refuses one, and the
+responder's commands refuse one in theirs -- so a misspelt setting is a
+start-up error rather than a default silently in force; a key beginning with
+`_` is a note and passes. The keys:
 
 | key | default | what it does |
 |---|---|---|
@@ -707,7 +711,7 @@ key, and never delete it while a loan is open.
 |---|---|---|
 | `lender_key` | — | the key that signs every release, report and claim. This is the lender's whole side of every open loan |
 | `state` | `<lender_key>.state.json` | what this responder has already done, written *before* each send |
-| `book` | — | the relay it reads takes from and reports to |
+| `book` | `$PIGNUS_BOOK`, else `http://127.0.0.1:8741` | the relay it reads takes from and reports to |
 | `interval` | 5 | seconds between passes over the queue |
 | `disburse_conf` | 2 | Bitcoin confirmations on the borrower's collateral before the principal is paid. Two is the shortest depth that survives an ordinary one-block reorg, the same reasoning every other cross-chain step here applies |
 | `claim_depth` | 6 | confirmations on the borrower's claim of that principal before their collateral is moved into the loan |
