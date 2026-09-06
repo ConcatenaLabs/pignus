@@ -198,7 +198,10 @@ def main():
             check("the market carries both asset ids and is lendable",
                   mk["collateral_asset"] == c and mk["debt_asset"] == d
                   and mk["lendable"], json.dumps(mk))
-            fees = get(book + "/v1/fees")
+            # The fees step runs right after the prices step of the same
+            # poll; `priced` alone can be seen between the two.
+            fees = wait_for(lambda: get(book + "/v1/fees")["rates"]
+                            and get(book + "/v1/fees"))
             check("fee rates are keyed by asset id",
                   all(len(k) == 64 for k in fees["rates"]) and fees["rates"],
                   json.dumps(fees)[:200])

@@ -136,6 +136,7 @@ import os
 import re
 import subprocess
 import sys
+import gzip
 import threading
 import time
 import urllib.request
@@ -299,6 +300,25 @@ GLOBAL_WRITE_LIMIT = RateLimiter(rate=20.0, burst=200)
 # instead. Roomier than the write limit, because a page legitimately makes a
 # handful in a row.
 SCAN_LIMIT = RateLimiter(rate=2.0, burst=30)
+# The whole-book listings -- `/v1/loans`, `/v1/offers`, `/v1/btc/offers`,
+# `/v1/stats`. Served from a render cache, so a request is cheap while the
+# cache holds and a full render when it does not; the page polls each every
+# thirty seconds, so two a second is thirty times what any tab needs.
+LIST_LIMIT = RateLimiter(rate=2.0, burst=30)
+# Renders that may run at once. A render of a full book is half a second
+# of CPU and tens of megabytes; past this many the daemon says "busy" for
+# five seconds rather than queue requests without bound, each holding a
+# thread and its memory, which is how one flood turned into an OOM.
+RENDER_SLOTS = 8
+# How long a render may be served from the cache without a change to the
+# book or the poll behind it. An attestation goes stale by the clock alone,
+# so a render cannot live on the epochs alone.
+RENDER_TTL = 10
+# Connections the server holds at once. Beyond this an accept is closed
+# unread: a client that then retries gets a slot when one frees, and one
+# holding hundreds of sockets open cannot make the server hold hundreds of
+# threads for it.
+MAX_CONNECTIONS = 256
 GLOBAL_SCAN_LIMIT = RateLimiter(rate=40.0, burst=400)
 
 # Records that cannot be rendered, and the error each last failed with. Every
@@ -496,6 +516,13 @@ class Service:
         self._btc_feerate_at = 0
         self._btc_height = None
         self._btc_height_at = 0
+        # The render cache; see `Handler._listing`. `view_epoch` is bumped
+        # after every poll step, so a render made before new prices, a new
+        # tip or a re-read registry is never served after them.
+        self.view_epoch = 0
+        self._render_cache = {}
+        self._render_lock = threading.Lock()
+        self._render_slots = threading.BoundedSemaphore(RENDER_SLOTS)
         self.height = None
         self.assets = {}            # asset id -> {ticker, name, precision}
         self.by_ticker = {}         # TICKER (upper) -> asset id
@@ -1204,6 +1231,7 @@ class Service:
                     errors[name] = f"{type(e).__name__}: {e}"
                     print(f"pignusd: the {name} step of the poll failed: "
                           f"{errors[name]}", file=sys.stderr)
+                self.view_epoch += 1
             self.poll_error = ("; ".join(f"{k}: {v}" for k, v in errors.items())
                                if errors else None)
             self.last_poll = int(time.time())
@@ -2038,6 +2066,41 @@ class Service:
             "btc_height": btc_h}
 
 
+class Server(ThreadingHTTPServer):
+    """One thread per connection, up to `MAX_CONNECTIONS` of them.
+
+    The stock server spawns a thread per accept with no ceiling, so a client
+    holding a few hundred sockets open -- or a few hundred tabs -- is a few
+    hundred threads, each able to ask for a full-book render. Past the cap an
+    accepted socket is closed unread; a client that retries gets a slot when
+    one frees.
+    """
+    # Threads that outlive the process are threads that keep it alive: a
+    # shutdown should not wait on a client that has stopped talking.
+    daemon_threads = True
+    # The kernel's accept queue. The stock five means a burst of tab
+    # reloads overflows it, the dropped ones retry a second later, and the
+    # page reads as slow when the server was idle.
+    request_queue_size = 128
+    _slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     svc = None
     server_version = "pignusd"
@@ -2078,12 +2141,19 @@ class Handler(BaseHTTPRequestHandler):
     def version_string(self):
         return "pignusd"          # not the Python version behind it
 
-    def _send(self, code, payload, ctype="application/json"):
+    def _send(self, code, payload, ctype="application/json", gz=None,
+              extra=()):
         # Bytes pass through untouched -- a static .json file is already
         # serialised; only a Python object is turned into JSON. Serialising the
         # bytes (the old behaviour) 500'd every static .json the page fetched.
+        # `gz` is the same bytes already gzipped, from the render cache; it is
+        # what goes out when the client said it takes gzip.
+        encoding = None
         if isinstance(payload, (bytes, bytearray)):
             body = bytes(payload)
+            if gz is not None and "gzip" in (
+                    self.headers.get("Accept-Encoding") or "").lower():
+                body, encoding = gz, "gzip"
         elif ctype == "application/json":
             # allow_nan=False: `Infinity` is valid Python and invalid JSON, and
             # one of them in one record loses the whole document at the reader.
@@ -2101,6 +2171,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
+        for k, v in extra:
+            self.send_header(k, v)
         self._security_headers()
         # The page is served from here, so it is same-origin and needs none of
         # this. Reading the book from elsewhere is welcome; writing to it from
@@ -2145,6 +2220,52 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         return not WRITE_LIMIT.allow(key, now) or \
             not GLOBAL_WRITE_LIMIT.allow("all", now)
+
+    def _list_limited(self):
+        key = self._client_key()
+        if key is None:
+            return False
+        return not LIST_LIMIT.allow(key, time.time())
+
+    def _listing(self, name, key, build):
+        """Answer a whole-book listing from the render cache, or render it.
+
+        A listing is a function of the book (its `generation`), of what the
+        poll last learned (`view_epoch`) and of the clock, because an
+        attestation goes stale by age alone; the cache is keyed by all three
+        and by the query. One render serves every tab that asks within the
+        TTL. Renders run under one lock, so a burst of first-askers waits for
+        one render instead of each making its own; past `RENDER_SLOTS` of
+        them waiting, the answer is a 503 with `Retry-After` rather than a
+        thread and tens of megabytes per request, without bound. The body is
+        serialised once, compact, and gzipped once beside it.
+        """
+        if self._list_limited():
+            return self._send(429, {"error": "too many listing requests; "
+                                             "the page needs one every thirty "
+                                             "seconds"})
+        s = self.svc
+        full = (name, s.book.generation, s.view_epoch,
+                int(time.time() // RENDER_TTL)) + tuple(key)
+        hit = s._render_cache.get(full)
+        if hit is None:
+            if not s._render_slots.acquire(blocking=False):
+                return self._send(503, {"error": "the book is busy rendering; "
+                                                 "ask again in a moment"},
+                                  extra=(("Retry-After", "5"),))
+            try:
+                with s._render_lock:
+                    hit = s._render_cache.get(full)
+                    if hit is None:
+                        raw = json.dumps(build(), allow_nan=False,
+                                         separators=(",", ":")).encode()
+                        hit = (raw, gzip.compress(raw, compresslevel=1))
+                        if len(s._render_cache) >= 64:
+                            s._render_cache.clear()
+                        s._render_cache[full] = hit
+            finally:
+                s._render_slots.release()
+        return self._send(200, hit[0], gz=hit[1])
 
     def _scan_limited(self):
         """A read that costs the NODE work, rather than one served from memory.
@@ -2343,13 +2464,19 @@ class Handler(BaseHTTPRequestHandler):
             # answered by filtering the open ones rather than by a stored
             # status nothing ever writes -- which answered every such query
             # with an empty list, the exact trap the check above exists for.
-            rows = s.book.list_offers(market=q.get("market", [None])[0],
-                                      status="open" if status == "expired"
-                                      else status)
-            views = _views(s.offer_view, _limit(rows, q))
-            if status == "expired":
-                views = [v for v in views if v.get("expired")]
-            return self._send(200, {"offers": views})
+            market = q.get("market", [None])[0]
+            _limit([], q)               # a bad limit is refused here, not cached
+            limit = q.get("limit", [""])[0]
+
+            def build():
+                rows = s.book.list_offers(market=market,
+                                          status="open" if status == "expired"
+                                          else status)
+                views = _views(s.offer_view, _limit(rows, q))
+                if status == "expired":
+                    views = [v for v in views if v.get("expired")]
+                return {"offers": views}
+            return self._listing("offers", (status, market, limit), build)
         if path.startswith("/v1/offer/") or path.startswith("/v1/offers/"):
             rec = s.book.offer(path.partition("/v1/")[2].partition("/")[2])
             if not rec:
@@ -2362,16 +2489,20 @@ class Handler(BaseHTTPRequestHandler):
                 # "you have no loans" rather than "that is not a state".
                 raise ValueError("state must be one of "
                                  + ", ".join(sorted(STATE_NAMES)))
-            rows = s.book.list_loans(state=state,
-                                     market=q.get("market", [None])[0])
+            market = q.get("market", [None])[0]
             # By oracle key, so the loans still baked to a retired key can be
             # listed during a rotation -- that set is exactly what has to mature
             # before the old oracle can be switched off.
             ox = (q.get("oracle_x", [None])[0] or "").lower()
-            if ox:
-                rows = [r for r in rows if ox in _loan_oracle_keys(r)]
-            return self._send(200, {"loans": _views(s.loan_view,
-                                                    _limit(rows, q))})
+            _limit([], q)               # a bad limit is refused here, not cached
+            limit = q.get("limit", [""])[0]
+
+            def build():
+                rows = s.book.list_loans(state=state, market=market)
+                if ox:
+                    rows = [r for r in rows if ox in _loan_oracle_keys(r)]
+                return {"loans": _views(s.loan_view, _limit(rows, q))}
+            return self._listing("loans", (state, market, ox, limit), build)
         if (path.startswith("/v1/loan/") or path.startswith("/v1/loans/")) \
                 and path.endswith("/exit"):
             # How a loan ended, read back off the chain. A liquidated borrower
@@ -2697,10 +2828,13 @@ class Handler(BaseHTTPRequestHandler):
             # true for an instant.
             # One pass over the takes for every offer, not one per offer:
             # this listing is what every open tab polls.
-            left = s.book.btc_lots_left_all(BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)
-            offers = [served_loan(dict(o, lots_left=left.get(o["btc_offer_id"], 0)))
-                for o in s.book.list_btc_offers(status=status)]
-            return self._send(200, {"offers": offers})
+            def build():
+                left = s.book.btc_lots_left_all(BTC_TAKE_TTL, BTC_SIGNED_TAKE_TTL)
+                offers = [served_loan(dict(o, lots_left=left.get(o["btc_offer_id"], 0)))
+                    for o in s.book.list_btc_offers(status=status)]
+
+                return {"offers": offers}
+            return self._listing("btc_offers", (status,), build)
         if path.startswith("/v1/btc/offer/"):
             rec = s.book.btc_offer(path[len("/v1/btc/offer/"):])
             if not rec:
@@ -2744,8 +2878,8 @@ class Handler(BaseHTTPRequestHandler):
             # can go and look at the record rather than at the whole book.
             return self._send(200, {"unrenderable": dict(UNRENDERABLE)})
         if path == "/v1/stats":
-            return self._send(200, s.book.stats(s.fresh_prices(),
-                                               price_for=s.price_for))
+            return self._listing("stats", (), lambda: s.book.stats(
+                s.fresh_prices(), price_for=s.price_for))
         return self._send(404, {"error": "no such endpoint", "path": path})
 
     def do_GET(self):
@@ -3388,10 +3522,7 @@ def main():
 
     host, _, port = cfg.get("listen", "127.0.0.1:8741").rpartition(":")
     Handler.svc = svc
-    srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
-    # Threads that outlive the process are threads that keep it alive: a
-    # shutdown should not wait on a client that has stopped talking.
-    srv.daemon_threads = True
+    srv = Server((host or "127.0.0.1", int(port)), Handler)
     # Bind and serve BEFORE the first sync. That sync re-tracks every loan and
     # can walk a long way back for spends it missed; done first, the page is a
     # proxy error for as long as it takes and nothing says why. Served first,

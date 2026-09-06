@@ -218,6 +218,49 @@ done
 echo "  path traversal and non-web files are refused"
 
 echo
+echo "== listings are compact, gzipped on request, cached, limited, and connections are capped =="
+# Every open tab polls the four listings; a full book is a render each time
+# unless it is cached, and tens of megabytes on the wire unless it is gzipped.
+curl -sD "$WORK/hdr.txt" -o "$WORK/plain.json" "$D/v1/loans"
+grep -qi "^content-encoding" "$WORK/hdr.txt" && { echo "gzipped without being asked" >&2; exit 1; }
+curl -sD "$WORK/hdr.txt" -o "$WORK/gz.bin" -H 'Accept-Encoding: gzip' "$D/v1/loans"
+grep -qi "^content-encoding: gzip" "$WORK/hdr.txt" || { echo "not gzipped when asked" >&2; cat "$WORK/hdr.txt" >&2; exit 1; }
+python3 - "$WORK/plain.json" "$WORK/gz.bin" <<'PY'
+import gzip, json, sys
+plain = open(sys.argv[1], "rb").read()
+assert b"\n" not in plain.strip(), "a listing is not compact"
+assert json.loads(plain) == json.loads(gzip.decompress(open(sys.argv[2], "rb").read())), \
+    "the gzipped listing is not the plain one"
+PY
+# A burst past the listing allowance is a 429, for a client the limiter can
+# see; the drill itself is a trusted peer and is never limited.
+n=0
+for _ in $(seq 40); do
+  c=$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 203.0.113.77' "$D/v1/stats")
+  test "$c" = "429" && n=$((n + 1))
+done
+test "$n" -ge 1 || { echo "40 listing requests in a burst and no 429" >&2; exit 1; }
+# Past the connection cap an accept is closed unread; when the sockets go,
+# the next request is served.
+python3 - "$DPORT" <<'PY'
+import socket, sys, time, urllib.request
+port = int(sys.argv[1])
+held = [socket.create_connection(("127.0.0.1", port)) for _ in range(300)]
+time.sleep(2)                     # accepted, each holding a thread
+refused = False
+try:
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=3).read()
+except Exception:                                   # noqa: BLE001
+    refused = True
+for s in held:
+    s.close()
+time.sleep(0.5)
+assert refused, "a 301st connection was served while 300 were held"
+urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5).read()
+PY
+echo "  compact, gzipped on request, limited past a burst, capped at 256 connections"
+
+echo
 echo "== a write must say it is JSON and come from this site; every answer carries the security headers =="
 # A cross-origin JSON POST needs a preflight, which OPTIONS refuses; one sent
 # as text/plain needs none, and could burn a visitor's own rate-limit bucket
