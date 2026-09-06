@@ -142,6 +142,11 @@ SOURCE_KEYS = {
 }
 
 
+# Every top-level key of an oracle config this service reads; `main` refuses
+# any other, the way build_source refuses an unknown source key.
+CONFIG_KEYS = ("book", "compromised_keys", "flat_rounds", "interval", "jump_rounds", "keyfile", "listen", "log_max_bytes", "logfile", "markets", "max_jump", "precisions", "previous_keys", "price_scale", "seizures", "source", "symbols", "trusted_proxies")
+
+
 def build_source(cfg):
     s = cfg.get("source", {})
     kind = s.get("type", "static")
@@ -1107,6 +1112,14 @@ def main():
 
     with open(args.config) as f:
         cfg = json.load(f)
+    # The source's keys are checked in build_source; the top level was not,
+    # and a misspelt flat_rounds or max_jump was a guard that was never there.
+    odd = sorted(k for k in cfg if k not in CONFIG_KEYS and not k.startswith("_"))
+    if odd:
+        raise SystemExit(f"{args.config} sets {', '.join(odd)}, which this "
+                         f"oracle does not read. It takes: "
+                         f"{', '.join(CONFIG_KEYS)}. A setting that goes "
+                         f"nowhere is one you believe is protecting you.")
     # Only the SERVING path may create a key. Asking what the key is must never
     # answer with a new one -- and neither must signing a seizure: an oracle
     # whose keyfile has gone missing and signs with a fresh key produces a

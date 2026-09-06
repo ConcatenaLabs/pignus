@@ -1166,6 +1166,57 @@ except SystemExit as e:
 print("  disburse_conf below two is refused")
 CFG
 
+# --- a responder config is read whole, and a URL flag wins over it ------------
+#
+# A key nothing reads is refused by name, in the file and inside rpc/btc_rpc;
+# and a --btc-rpc given on the command line beside --config is used, where the
+# file used to win silently whatever the flag said.
+python3 - "$BIN/pignus-cli" "$WORK" <<'RCFG'
+import argparse, contextlib, importlib.machinery, importlib.util, io, json, os, sys
+cli, work = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_loader(
+    "pcli_cfg", importlib.machinery.SourceFileLoader("pcli_cfg", cli))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+def load(cfg, **flags):
+    path = os.path.join(work, "rcfg.json")
+    json.dump(cfg, open(path, "w"))
+    args = argparse.Namespace(config=path, book=None, lender_key=None,
+                              interval=None, fee_asset=None, disburse_conf=None,
+                              claim_depth=None, state=None, scan_interval=None,
+                              rpc=m.RPC_URL_DEFAULTS["rpc"], rpc_user=None,
+                              rpc_password=None, rpc_cookie=None, rpc_wallet=None,
+                              btc_rpc=m.RPC_URL_DEFAULTS["btc_rpc"], btc_rpc_user=None,
+                              btc_rpc_password=None, btc_rpc_cookie=None,
+                              btc_rpc_wallet=None)
+    for k, v in flags.items():
+        setattr(args, k, v)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            m._btc_cfg(args)
+    except SystemExit as e:
+        return e.code, err.getvalue(), args
+    return 0, err.getvalue(), args
+
+base = {"lender_key": os.path.join(work, "lender.key"),
+        "btc_rpc": {"url": "http://file:1", "wallet": "w"}, "_note": "ok"}
+rc, said, args = load(base)
+if rc != 0 or args.btc_rpc != "http://file:1" or args.btc_rpc_wallet != "w":
+    sys.exit(f"FAIL: a sound config was refused or not applied: {rc} {said} {args.btc_rpc}")
+rc, said, args = load(base, btc_rpc="http://flag:2")
+if rc != 0 or args.btc_rpc != "http://flag:2":
+    sys.exit(f"FAIL: a --btc-rpc given beside --config lost to the file: {args.btc_rpc}")
+rc, said, _ = load({**base, "disburse_confs": 3})
+if rc != 2 or "disburse_confs" not in said:
+    sys.exit(f"FAIL: a misspelt key was not refused by name: {rc} {said}")
+rc, said, _ = load({**base, "btc_rpc": {"url": "http://file:1", "cookie_path": "x"}})
+if rc != 2 or "cookie_path" not in said:
+    sys.exit(f"FAIL: a misspelt rpc field was not refused by name: {rc} {said}")
+print("  a responder config refuses a key nothing reads, in the file and in rpc/btc_rpc, and a URL flag wins over the file")
+RCFG
+
 # --- a settlement witness finds the bond it is being attached to --------------
 #
 # `repo-settle --attach` without --vout, the invocation the README shows,

@@ -2667,6 +2667,14 @@ def cmd_btc_keygen(args):
 # They live here rather than in `add_argument(default=...)` because a truthy
 # argparse default is indistinguishable from a value the operator chose -- and
 # the merge below would then let it outrank the config file, silently.
+# Every key a responder config may carry; `_btc_cfg` refuses any other.
+RESPONDER_CONFIG_KEYS = ("lender_key", "state", "book", "interval", "fee_asset",
+                         "disburse_conf", "claim_depth", "scan_interval",
+                         "rpc", "btc_rpc")
+RPC_CONFIG_FIELDS = ("url", "user", "password", "cookie", "wallet")
+# What the --rpc and --btc-rpc flags say when nobody gave them.
+RPC_URL_DEFAULTS = {"rpc": os.environ.get("PIGNUS_RPC_URL", "http://127.0.0.1:18776"),
+                    "btc_rpc": "http://127.0.0.1:8332"}
 RESPONDER_DEFAULTS = {
     "book": os.environ.get("PIGNUS_BOOK", "http://127.0.0.1:8741"),
     "interval": 5.0,
@@ -2697,6 +2705,20 @@ def _btc_cfg(args):
     if path:
         with open(path) as f:
             cfg = json.load(f)
+        # A key nothing reads is a setting believed to be in force and not:
+        # refused by name, as the daemons refuse theirs.
+        odd = sorted(k for k in cfg
+                     if k not in RESPONDER_CONFIG_KEYS and not k.startswith("_"))
+        if odd:
+            refuse(f"{path} sets {', '.join(odd)}, which nothing reads. A "
+                   f"responder config takes: {', '.join(RESPONDER_CONFIG_KEYS)}.")
+        for prefix in ("rpc", "btc_rpc"):
+            block = cfg.get(prefix) or {}
+            odd = sorted(k for k in block
+                         if k not in RPC_CONFIG_FIELDS and not k.startswith("_"))
+            if odd:
+                refuse(f"{path}: {prefix} sets {', '.join(odd)}, which nothing "
+                       f"reads; it takes {', '.join(RPC_CONFIG_FIELDS)}.")
         for key, dest in (("book", "book"), ("lender_key", "lender_key"),
                           ("interval", "interval"), ("fee_asset", "fee_asset"),
                           ("disburse_conf", "disburse_conf"),
@@ -2720,8 +2742,13 @@ def _btc_cfg(args):
             if not block.get(field):
                 continue
             dest = f"{prefix}" if field == "url" else f"{prefix}_{field}"
-            dest = dest.replace("rpc_cookie", "rpc_cookie")
-            if not getattr(args, dest, None) or field == "url":
+            if field == "url":
+                # The URL flags carry a built-in default rather than None, so
+                # "the flag was not given" is "the flag still says its
+                # default"; a URL given on the command line wins over the file.
+                if getattr(args, dest, None) in (None, "", RPC_URL_DEFAULTS[prefix]):
+                    setattr(args, dest, block[field])
+            elif not getattr(args, dest, None):
                 setattr(args, dest, block[field])
     return cfg
 
