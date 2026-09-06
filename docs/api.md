@@ -928,6 +928,9 @@ different offers can never collide.
   its witness version (20 bytes at v0, 32 at v1).
 - 403 if the signature is not by the key the offer names as the lender.
 - 400 if `strike` is not positive, or `oracle_x` is the lender's own key.
+- 400 if the four deadlines leave no room, judged against both chains' tips
+  the way every responder judges them; the message names each margin that is
+  short. Only when this relay has both nodes.
 - 429 if the book already holds 500 open cross-chain offers. Republishing one it
   already has is never refused.
 

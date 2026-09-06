@@ -3052,6 +3052,25 @@ class Handler(BaseHTTPRequestHandler):
                         "transaction is signed in advance and cannot be "
                         "replaced or fee-bumped, so a fee too low to confirm "
                         "is a loan that cannot start")
+                # The four deadlines, against both tips, when this relay
+                # has both. An offer past the margins was accepted with a
+                # 200 and expired by the next poll, with a note only in this
+                # daemon's own log; the lender saw an offer id.
+                btc_h = s.btc_height()
+                if btc_h is not None and s.height:
+                    judged = dict(loan, borrower_x="00" * 32, h_w="00" * 32)
+                    try:
+                        problems = BC.timelocks_sane(
+                            BC.loan_from_dict(judged), int(btc_h),
+                            int(s.height))
+                    except Exception as e:              # noqa: BLE001
+                        raise ValueError(f"the offer's deadlines cannot be "
+                                         f"judged: {type(e).__name__}: {e}")
+                    if problems:
+                        raise ValueError(
+                            "the offer's deadlines leave no room, judged from "
+                            f"Bitcoin block {btc_h} and Sequentia block "
+                            f"{s.height}: " + "; ".join(problems))
                 loan["lender_prog"] = R.check_program(loan["lender_prog"],
                                                       loan.get("lender_ver", 0))
                 loan["lender_ver"] = int(loan.get("lender_ver", 0))

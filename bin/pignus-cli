@@ -77,7 +77,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..
 from pignus import __version__ as PIGNUS_VERSION  # noqa: E402
 from pignus import atoms, compat, oracle as O    # noqa: E402
 from pignus import atoms as _atoms, units      # noqa: E402
-from pignus.btc_collateral import MIN_UPGRADE_FEE   # noqa: E402
+from pignus.btc_collateral import MIN_UPGRADE_FEE, MIN_ANCHOR_DEPTH   # noqa: E402
 from pignus import locktime_open as _pkg_locktime_open   # noqa: E402
 from pignus.node import Node                    # noqa: E402
 from pignus.openamp import PledgeError          # noqa: E402
@@ -2448,6 +2448,9 @@ def _btc_cfg(args):
     """
     path = getattr(args, "config", None)
     cfg = {}
+    # A flag wins, then the environment, then the file, then the default.
+    if getattr(args, "book", None) is None and os.environ.get("PIGNUS_BOOK"):
+        args.book = os.environ["PIGNUS_BOOK"]
     if path:
         with open(path) as f:
             cfg = json.load(f)
@@ -2462,6 +2465,12 @@ def _btc_cfg(args):
     for dest, value in RESPONDER_DEFAULTS.items():
         if getattr(args, dest, None) is None and hasattr(args, dest):
             setattr(args, dest, value)
+    conf = getattr(args, "disburse_conf", None)
+    if conf is not None and int(conf) < MIN_ANCHOR_DEPTH:
+        refuse(f"disburse_conf is {conf}; the floor is {MIN_ANCHOR_DEPTH}. A "
+               f"principal paid against fewer Bitcoin confirmations than that "
+               f"is paid against a funding the borrower can replace the "
+               f"moment one block is orphaned.")
     for prefix, block in (("rpc", cfg.get("rpc") or {}),
                           ("btc_rpc", cfg.get("btc_rpc") or {})):
         for field in ("url", "user", "password", "cookie", "wallet"):
@@ -2860,6 +2869,7 @@ def cmd_btc_adaptor(args):
     here is an ordinary signature they can check.
     """
     from pignus import adaptor as A
+    from pignus.btc_collateral import NotBroadcast
     from pignus.btc_collateral import (lender_release, reclaim_tx, upgrade_tx,
                                        sha256, loan_from_dict)
     lender = _read_key(args.lender_key)
@@ -3243,8 +3253,10 @@ def _disowned_offers(args, lender_x):
         return {"bad_sig": [], "bad_id": []}
     try:
         offers = book_get(book, "/v1/btc/offers?status=all")["offers"]
-    except Exception:                                    # noqa: BLE001
-        return {"bad_sig": [], "bad_id": []}
+    except Exception as e:                               # noqa: BLE001
+        print(f"could not read {book} ({type(e).__name__}: {e}); offer "
+              f"signatures were NOT checked", file=sys.stderr)
+        return {"bad_sig": [], "bad_id": [], "unchecked": book}
     from pignus import btc_relay as R                    # noqa: PLC0415
     # Only offers a person could still be needed for: one still on the board,
     # or one with money in flight under it. A withdrawn offer whose every
@@ -3397,13 +3409,19 @@ def cmd_btc_responder_status(args):
     dis = _disowned_offers(args, lender_x_of(args))
     disowned = dis["bad_sig"]
     unfixable = dis["bad_id"]
+    unchecked = dis.get("unchecked")
     print(json.dumps({"state": path, "takes": len(rows),
                       "needing_attention": (len(stuck) + len(disowned)
                                             + len(unfixable) + len(slow)),
                       "recovering": len(healing),
                       "disowned_offers": disowned,
                       "offers_under_an_old_id": unfixable,
+                      "offers_unchecked_at": unchecked,
                       "rows": rows}, indent=2))
+    if unchecked:
+        print(f"the book at {unchecked} could not be read, so the offers "
+              f"served under this key were NOT checked; a stale or forged one "
+              f"would not show here. Exit 1 says so.", file=sys.stderr)
     if unfixable:
         print(f"{len(unfixable)} offer(s) carry this key's signature but are "
               f"served under an id that is not the hash of their terms: "
@@ -3469,7 +3487,9 @@ def cmd_btc_responder_status(args):
     # not safe to act on", which a take blocked on an unclearing reason is: a
     # borrower's collateral is committed and nothing is going to move it. A
     # timer that only looks at the exit code was told everything was fine.
-    return 4 if (stuck or disowned or unfixable or slow) else 0
+    if stuck or disowned or unfixable or slow:
+        return 4
+    return 1 if unchecked else 0
 
 
 def cmd_btc_responder_clear(args):
@@ -4267,10 +4287,12 @@ def cmd_btc_offer_publish(args):
                   f"Bitcoin node. It cannot be raised later.", file=sys.stderr)
         except Exception as e:                          # noqa: BLE001
             refuse(
-                f"no --upgrade-fee given and this node would not price one "
-                f"({type(e).__name__}: {e}). That fee is fixed at origination "
-                f"and can never be raised, so it must not be guessed: give "
-                f"--upgrade-fee, or point --btc-rpc at a node.")
+                f"no --upgrade-fee given and the Bitcoin node at "
+                f"{args.btc_rpc} would not price one ({type(e).__name__}: "
+                f"{e}). That fee is fixed at origination and can never be "
+                f"raised, so it must not be guessed: give --upgrade-fee, or "
+                f"point --btc-rpc at a node (the example configuration's "
+                f"48332 is testnet4).")
     loan = {
         "btc_amount": args.btc_amount, "lender_x": lender_x,
         "oracle_x": args.oracle_x, "recover_after": args.recover_after,
@@ -4282,6 +4304,28 @@ def cmd_btc_offer_publish(args):
         "lender_ver": args.lender_ver, "market": args.market or "",
         "strike": args.strike or 0, "price_scale": args.price_scale,
     }
+    # The four deadlines, judged the way the relay's expiry sweep and every
+    # responder will judge them. An offer past these margins is accepted by
+    # nobody: the relay expires it on its next poll and says so only in its
+    # own log, while the lender's terminal has printed an offer id.
+    try:
+        tips = book_get(args.book, "/v1/markets")
+        btc_h, seq_h = tips.get("btc_height"), tips.get("height")
+    except Exception as e:                              # noqa: BLE001
+        refuse(f"could not read the chain tips from {args.book} "
+               f"({type(e).__name__}: {e}); the deadlines cannot be judged")
+    if btc_h is not None and seq_h is not None:
+        from pignus.btc_collateral import loan_from_dict, timelocks_sane
+        judged = dict(loan, borrower_x="00" * 32, h_w="00" * 32)
+        problems = timelocks_sane(loan_from_dict(judged), int(btc_h), int(seq_h))
+        if problems:
+            refuse("these deadlines leave no room, judged from Bitcoin block "
+                   f"{btc_h} and Sequentia block {seq_h}: " + "; ".join(problems)
+                   + ". The rules, in time: d_refund at least two hours "
+                   "ahead; abort_after at least a day after d_refund; "
+                   "repay_deadline at least a day after d_refund plus the "
+                   "two-hour claim margin; recover_after at least a day after "
+                   "repay_deadline, and past abort_after.")
     lots = max(1, int(args.lots))
     body = {"loan": loan, "market": args.market or "", "lots": lots,
             "note": args.note or "",
@@ -4292,6 +4336,21 @@ def cmd_btc_offer_publish(args):
     print(json.dumps({"btc_offer_id": rec["btc_offer_id"], "lots": lots,
                       "note": "keep the responder running while this rests"},
                      indent=2))
+    return 0
+
+
+def cmd_payout_program(args):
+    """A fresh payout program from the node wallet, in the form the offer and
+    take commands want it: `--lender-prog`/`--borrower-prog` and the matching
+    `--*-ver`. Nothing else prints one, and a program typed from memory is
+    money paid to nobody."""
+    from pignus.vault import wallet_payout
+    node = node_from(args)
+    ver, prog, spk = wallet_payout(node)
+    print(json.dumps({"ver": ver, "prog": prog, "spk": spk.hex(),
+                      "note": "20 bytes at version 0, 32 at version 1; it is "
+                              "baked into addresses and cannot be changed "
+                              "afterwards"}, indent=2))
     return 0
 
 
@@ -4389,6 +4448,19 @@ def cmd_btc_respond(args):
     btc_node = (btc_node_from(args)
                 if (args.btc_rpc_user or args.btc_rpc_password
                     or args.btc_rpc_cookie) else None)
+    # The paying wallet, checked now rather than at the first disbursement. A
+    # wallet loaded by hand is gone after a node restart, and the first sign
+    # of that used to be a principal "in flight" that had never gone out,
+    # with a borrower's collateral committed behind it.
+    if seq_node is not None:
+        try:
+            seq_node.getwalletinfo()
+        except Exception as e:                          # noqa: BLE001
+            refuse(f"the Sequentia wallet {args.rpc_wallet or '(default)'} "
+                   f"cannot be reached ({type(e).__name__}: {e}). It is the "
+                   f"one that pays every principal; load it on the node -- and "
+                   f"name it in the node's `wallet=` configuration so a restart "
+                   f"reloads it -- then start again.")
     # A responder without BOTH nodes can still draw secrets and sign releases,
     # and can do nothing else: `disburse_pass`, `upgrade_pass` and `claim_pass`
     # all return immediately. That is the worst possible half-working state --
@@ -4576,6 +4648,8 @@ def cmd_btc_respond(args):
         for take_id, have in state.items():
             if take_id in served or take_id in missing_said:
                 continue
+            if have.get("secret_published") or have.get("principal_refunded"):
+                continue            # finished; the book pruning it is routine
             if have.get("disbursement_txid") or have.get("disbursing"):
                 missing_said.add(take_id)
                 print(f"take {take_id}: this key paid a principal for it and "
@@ -4645,6 +4719,42 @@ def cmd_btc_respond(args):
                   f"report: {r.get('error')}", file=sys.stderr)
         return code, r
 
+    def wallet_short(loan):
+        """What the paying wallet lacks for this loan's principal, or None.
+
+        Asked BEFORE a release is signed, because a signature is a promise:
+        the borrower funds collateral against it, and a wallet that cannot
+        then pay leaves that collateral sitting until they abort.
+        """
+        if seq_node is None:
+            return None
+        need = int(loan.principal) or int(loan.debt)
+        try:
+            bal = seq_node.getbalance()
+            labels = seq_node.dumpassetlabels()
+        except Exception as e:                          # noqa: BLE001
+            return f"wallet: {type(e).__name__}: {e}"
+        by_hex = {v: k for k, v in labels.items()}
+        amt = bal.get(loan.debt_asset)
+        if amt is None:
+            amt = bal.get(by_hex.get(loan.debt_asset, ""), 0)
+        have_atoms = int(Decimal(str(amt)) * 100_000_000)
+        if have_atoms < need:
+            return (f"wallet: holds {have_atoms} atoms of the debt asset, the "
+                    f"principal is {need}")
+        return None
+
+    def refused(tk, why):
+        """Say why a take is not being answered, once per reason, and RECORD
+        it: a refusal that lives only in the journal is one the status
+        command and the timer's check cannot see, while the offer keeps
+        attracting takes that fail the same way."""
+        have = state.get(tk["take_id"])
+        if have.get("waiting") != why:
+            state.set(tk["take_id"], waiting=why,
+                      btc_offer_id=tk.get("btc_offer_id"))
+            print(f"take {tk['take_id']}: {why}", file=sys.stderr)
+
     def hash_pass(offers):
         """Draw this loan's secret and publish its hash.
 
@@ -4659,14 +4769,13 @@ def cmd_btc_respond(args):
             try:
                 loan = loan_for(offer, tk, {"t": t.hex()})
             except ValueError as e:
-                print(f"take {tk['take_id']}: {e}", file=sys.stderr)
+                refused(tk, f"terms: {e}")
                 continue
             if not heights_known(tk["take_id"], "answering"):
                 continue
             problems = timelocks_sane(loan, btc_height(), seq_height())
             if problems:
-                print(f"take {tk['take_id']}: not answering -- "
-                      + "; ".join(problems), file=sys.stderr)
+                refused(tk, "not answering -- " + "; ".join(problems))
                 continue
             # The OFFER, in this key's own record. Everything that bounds what
             # this lender may spend is counted from the state file, and a take
@@ -4742,17 +4851,30 @@ def cmd_btc_respond(args):
 
     def sign_pass(offers):
         n = 0
+        used = lots_committed(offers)
         for offer, tk, have in our_takes(offers, status="pending"):
             if not have.get("t"):
-                print(f"take {tk['take_id']}: no secret recorded for it; it "
-                      "was reserved by another responder or the state file was "
-                      "lost", file=sys.stderr)
+                refused(tk, "no secret recorded for it; it was reserved by "
+                            "another responder or the state file was lost")
                 continue
             t = bytes.fromhex(have["t"])
             try:
                 loan = loan_for(offer, tk, {"t": t.hex()})
             except ValueError as e:
-                print(f"take {tk['take_id']}: {e}", file=sys.stderr)
+                refused(tk, f"terms: {e}")
+                continue
+            # The lot cap, HERE and not only at disbursement: a release signed
+            # for a lot this key has already funded is a borrower who commits
+            # collateral and waits until they abort.
+            lots = int(offer.get("lots", 1) or 1)
+            if used.get(tk.get("btc_offer_id"), 0) >= lots:
+                refused(tk, f"lots: offer {tk.get('btc_offer_id')} has already "
+                            f"funded all {lots} of its lots; not signing")
+                continue
+            short = wallet_short(loan)
+            if short:
+                refused(tk, short + "; not signing a release the wallet could "
+                                    "not honour")
                 continue
             # The pre-vault THIS key already verified, when it has one. A
             # take served `pending` again after this key signed and paid --
@@ -4769,11 +4891,10 @@ def cmd_btc_respond(args):
                           int(tk.get("prevault_vout", 0) or 0),
                           str(tk.get("upgrade_presig", "")))
                 if theirs != (str(mine[0]), int(mine[1]), str(mine[2])):
-                    print(f"take {tk['take_id']}: the relay now serves this "
-                          f"take with a different pre-vault or advance "
-                          f"signature from the one this key signed against; "
-                          f"not signing again. The recorded release stands.",
-                          file=sys.stderr)
+                    refused(tk, "the relay now serves this take with a "
+                                "different pre-vault or advance signature "
+                                "from the one this key signed against; not "
+                                "signing again. The recorded release stands.")
                     continue
                 pv_txid, pv_vout, presig = str(mine[0]), int(mine[1]), str(mine[2])
             else:
@@ -4782,17 +4903,17 @@ def cmd_btc_respond(args):
                                             str(tk["upgrade_presig"]))
             if not check_upgrade_presig(loan, pv_txid, pv_vout,
                                         bytes.fromhex(presig)):
-                print(f"take {tk['take_id']}: the advance signature does not "
-                      "move that collateral into this loan; not signing",
-                      file=sys.stderr)
+                refused(tk, "the advance signature does not move that "
+                            "collateral into this loan; not signing")
                 continue
             if not heights_known(tk["take_id"], "signing"):
                 continue
             problems = timelocks_sane(loan, btc_height(), seq_height())
             if problems:
-                print(f"take {tk['take_id']}: not signing -- " + "; ".join(problems),
-                      file=sys.stderr)
+                refused(tk, "not signing -- " + "; ".join(problems))
                 continue
+            if have.get("waiting"):
+                state.set(tk["take_id"], waiting=None)
             # The vault's address depends on the payment hash, so it is only
             # knowable now. Deriving it here rather than reading the relay's
             # copy is what stops a relay making every release useless.
@@ -5051,6 +5172,18 @@ def cmd_btc_respond(args):
             try:
                 txid, vout = pay_disbursement(seq_node, loan,
                                               fee_asset=args.fee_asset or None)
+            except NotBroadcast as e:
+                # Nothing went out: the wallet is not loaded, could not fund
+                # it, or could not sign it. The flag is cleared and the
+                # reason recorded, and the next pass tries again -- a person
+                # is needed only if it keeps failing, which the status
+                # command's waiting clock will say.
+                state.set(tk["take_id"], disbursing=None,
+                          waiting=f"wallet: {e}", last_error=str(e))
+                used[tk.get("btc_offer_id")] -= 1
+                print(f"disburse {tk['take_id']}: not sent -- {e}",
+                      file=sys.stderr)
+                continue
             except Exception as e:                      # noqa: BLE001
                 # The flag STAYS. pay_disbursement broadcasts before it reads
                 # the transaction back, so a failure here can mean the payment
@@ -5986,6 +6119,7 @@ def add_btc_commands(sub):
     # of every loan taken from this offer and can never be raised, so it must
     # come from the chain rather than from a constant.
     add_btc_node_args(p)
+    p.set_defaults(book=None)  # ...so a config file's `book` is not outranked
     p.set_defaults(fn=cmd_btc_offer_publish)
 
     p = sub.add_parser("btc-offer-take",
@@ -6011,12 +6145,19 @@ def add_btc_commands(sub):
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_offer_take, ticket=None)
 
+    p = sub.add_parser("payout-program",
+                       help="a fresh payout program from the node wallet, "
+                            "for --lender-prog/--borrower-prog")
+    add_node_args(p)
+    p.set_defaults(fn=cmd_payout_program)
+
     p = sub.add_parser("btc-offer-withdraw",
                        help="LENDER: take one of your offers down")
     p.add_argument("--offer", required=True)
     p.add_argument("--config")
     p.add_argument("--lender-key")
     add_book_arg(p)
+    p.set_defaults(book=None)  # ...so a config file's `book` is not outranked
     p.set_defaults(fn=cmd_btc_offer_withdraw)
 
     p = sub.add_parser("btc-offer-resign",
@@ -6026,6 +6167,7 @@ def add_btc_commands(sub):
     p.add_argument("--lender-key")
     p.add_argument("--config", help="a responder config file")
     add_book_arg(p)
+    p.set_defaults(book=None)  # ...so a config file's `book` is not outranked
     p.set_defaults(fn=cmd_btc_offer_resign)
 
     p = sub.add_parser("btc-responder-status",
@@ -6043,6 +6185,7 @@ def add_btc_commands(sub):
     # under that key still verify under it -- one that does not is one whose
     # takes the responder is silently skipping.
     add_book_arg(p)
+    p.set_defaults(book=None)  # ...so a config file's `book` is not outranked
     p.set_defaults(fn=cmd_btc_responder_status)
 
     p = sub.add_parser("btc-responder-clear",
