@@ -23,6 +23,11 @@ BIN="$HERE/../bin"
 PKG="$HERE/.."
 WORK="$(mktemp -d)"
 PIDS=()
+# Nothing a drill runs may page a person or touch the box's own verdict: the
+# check script it exercises alerts through this file and records through
+# PIGNUS_CHECK_STATE, and both are pointed away from the real ones here.
+export PIGNUS_ALERT_ENV=/dev/null
+unset INVOCATION_ID
 # Kill what this drill started, not just what it wrote. It brings up a pignusd
 # for the offer-resign checks, and a trap that only removes the directory
 # leaves that daemon running on a port for the rest of the session -- so the
@@ -765,10 +770,25 @@ cat > "$WORK/disowned-responder.json" <<J
 {"lender_key": "$LKEY2", "state": "$WORK/disowned.state.json",
  "book": "http://127.0.0.1:$DPORT2"}
 J
-set +e
-CHK=$(PIGNUS_ORACLES="" PIGNUS_BOOK="http://127.0.0.1:$DPORT2" \
+# The check is run as the TIMER runs it -- a named state file stands in for
+# systemd's INVOCATION_ID -- against a copy of deploy/ whose alert script
+# only writes down what it was told, so what would have been pushed is read
+# back here.
+mkdir -p "$WORK/deploy"
+cp "$PKG/deploy/pignus-check.sh" "$WORK/deploy/"
+ln -s "$PKG/bin" "$WORK/bin"          # the script finds pignus-cli beside itself
+cat > "$WORK/deploy/pignus-alert.sh" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$WORK/alerts.log"
+STUB
+chmod +x "$WORK/deploy/pignus-alert.sh"
+run_check() {
+    PIGNUS_ORACLES="" PIGNUS_BOOK="http://127.0.0.1:$DPORT2" \
       PIGNUS_RESPONDER_CONFIG="$WORK/disowned-responder.json" \
-      bash "$PKG/deploy/pignus-check.sh" 2>&1)
+      "$@" bash "$WORK/deploy/pignus-check.sh" 2>&1
+}
+set +e
+CHK=$(run_check env PIGNUS_CHECK_STATE="$WORK/check.state")
 rc=$?
 set -e
 echo "$CHK" | grep -q "the responder needs a person" || {
@@ -776,6 +796,24 @@ echo "$CHK" | grep -q "the responder needs a person" || {
     echo "$CHK" | sed 's/^/  /' >&2; exit 1; }
 test "$rc" = "1" || { echo "the checker exited $rc with a responder needing a person" >&2; exit 1; }
 echo "  and the timer's check reports it too, rather than a quiet night"
+
+# ...ONCE. The first failing run pages a person; the next, with nothing
+# changed, does not; and a run by hand -- no timer, no named state -- records
+# no verdict and pages nobody, whatever it finds.
+test "$(cat "$WORK/check.state")" = fail || {
+    echo "the timer's run did not record its verdict" >&2; exit 1; }
+grep -q "pignus check FAILED" "$WORK/alerts.log" || {
+    echo "the first failing run did not page anyone" >&2; exit 1; }
+set +e; run_check env PIGNUS_CHECK_STATE="$WORK/check.state" >/dev/null; set -e
+test "$(wc -l < "$WORK/alerts.log")" = 1 || {
+    echo "a second failing run paged again:" >&2; cat "$WORK/alerts.log" >&2; exit 1; }
+set +e; HAND=$(run_check env -u PIGNUS_CHECK_STATE); set -e
+echo "$HAND" | grep -q "run by hand" || {
+    echo "a run by hand did not say it records nothing" >&2
+    echo "$HAND" | tail -3 | sed 's/^/  /' >&2; exit 1; }
+test "$(wc -l < "$WORK/alerts.log")" = 1 || {
+    echo "a run by hand paged someone" >&2; exit 1; }
+echo "  a failure pages once, not every run, and a run by hand pages nobody"
 
 # ...and the lender can repair it, which is the whole point of noticing. The
 # book verifies the new signature over the terms it ALREADY holds, so this can

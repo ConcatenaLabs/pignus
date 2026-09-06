@@ -335,7 +335,8 @@ rather than deriving addresses from a builder that has drifted.
 ## Checking it
 
 ```bash
-/root/sequentia/pignus/deploy/pignus-check.sh   # the whole answer, yes or no
+/root/sequentia/pignus/deploy/pignus-check.sh   # the whole answer, yes or no;
+                                                # by hand it records no verdict and pages nobody
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8740/healthz   # 503 if the oracle is not signing
 curl -s localhost:8741/healthz | jq '{ok, error, git_rev, covenant_vectors}'
 curl -s localhost:8741/v1/markets | head -40
