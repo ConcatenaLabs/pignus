@@ -616,8 +616,10 @@ systemctl start pignus-alert@test.service     # one test line arrives
 
 Subscribe at `https://ntfy.sh/<topic>` (the ntfy app, or the page itself in a
 browser tab). `NTFY_URL` in the same file points at a self-hosted ntfy;
-`ALERT_PREFIX` sets the message's title. The same message is not sent twice
-within ten minutes (`PIGNUS_ALERT_MUTE` seconds), so a unit that crash-loops
+`ALERT_PREFIX` sets the message's title. The same message -- judged by its
+first three words, since a check's line carries counts that change every run
+-- is not sent twice within ten minutes (`PIGNUS_ALERT_MUTE` seconds), so a
+unit that crash-loops
 every thirty seconds pages once per ten minutes and a flapping check does the
 same; a different message -- a recovery, another unit -- always goes out. The
 topic is the whole of the channel's secrecy, so it is in the backup and

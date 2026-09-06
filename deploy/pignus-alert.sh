@@ -15,8 +15,11 @@
 # The same message is not sent twice within MUTE_SECONDS: a unit that
 # crash-loops every thirty seconds, or a check whose verdict flaps, would
 # otherwise page a person until they muted the topic and heard nothing
-# else. A DIFFERENT message always goes out, so a recovery is never muted by
-# the failure before it. The marks live under PIGNUS_ALERT_STATE.
+# else. "The same" is judged by the message's first three words -- "<unit>
+# failed; journalctl", "pignus check FAILED", "pignus check passes" -- because
+# the rest of a check's line carries counts and hours that change every run.
+# A DIFFERENT message always goes out, so a recovery is never muted by the
+# failure before it. The marks live under PIGNUS_ALERT_STATE.
 set -u
 ENV="${PIGNUS_ALERT_ENV:-/root/sequentia/pignus-alert.env}"
 [ -r "$ENV" ] && { set -a; . "$ENV"; set +a; }
@@ -24,7 +27,7 @@ title="${ALERT_PREFIX:-pignus} $(hostname -s)"
 msg="${*:-something failed and nothing said what}"
 MUTE_SECONDS="${PIGNUS_ALERT_MUTE:-600}"
 STATE="${PIGNUS_ALERT_STATE:-/var/lib/pignus-alert}"
-key=$(printf '%s' "$msg" | sha256sum | cut -c1-32)
+key=$(printf '%s' "$msg" | awk '{print $1, $2, $3}' | sha256sum | cut -c1-32)
 if mkdir -p "$STATE" 2>/dev/null && [ -w "$STATE" ]; then
     mark="$STATE/$key"
     if [ -f "$mark" ] && [ "$(( $(date +%s) - $(stat -c %Y "$mark") ))" -lt "$MUTE_SECONDS" ]; then
