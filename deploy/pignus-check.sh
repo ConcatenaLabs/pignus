@@ -64,6 +64,12 @@ MAX_AGE="${PIGNUS_MAX_PRICE_AGE:-600}"
 # so would otherwise be a principal paid and not recorded.
 DATA_DIR="${PIGNUS_DATA_DIR:-/root/sequentia/pignus-data}"
 MIN_FREE_MB="${PIGNUS_MIN_FREE_MB:-512}"
+# The same services as the WORLD reaches them, space separated: the health
+# endpoints through the reverse proxy and its certificate. Everything above
+# talks to loopback, so a proxy that has died, a route that has moved or a
+# certificate that has expired leaves every local check green and the page
+# down.
+PUBLIC_URLS="${PIGNUS_PUBLIC_URLS:-}"
 
 fails=0
 ok()  { echo "  ok    $1"; }
@@ -254,6 +260,25 @@ if old:
         bad "take(s) unanswered for over a minute: $unanswered"
     fi
 fi
+
+# Reached the way a visitor reaches them. An answer of 200 or 503 is the
+# service itself speaking through the proxy (503 is a healthz saying no, which
+# the loopback checks above already judge); anything else -- no connection, a
+# certificate curl will not accept, the proxy's own 502 -- is the way in that
+# is broken.
+if [ -z "$PUBLIC_URLS" ]; then
+    ok "the public URLs are not checked (PIGNUS_PUBLIC_URLS is unset)"
+fi
+for u in $PUBLIC_URLS; do
+    # curl writes the status code last, after any error of its own.
+    out=$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "$u" 2>&1)
+    code=$(printf '%s' "$out" | tail -c 3)
+    err=$(printf '%s' "$out" | head -c -3 | tr -d '\n' | cut -c1-160)
+    case "$code" in
+        200|503) ok "$u answers through the proxy ($code)" ;;
+        *) bad "$u did not answer through the proxy (HTTP $code): $err" ;;
+    esac
+done
 
 # The disk under the data directory, or under this checkout on a machine
 # that has none: the book's writes, the attestation log and the responder's

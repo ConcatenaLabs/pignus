@@ -34,6 +34,9 @@ Environment="PIGNUS_ORACLES=http://127.0.0.1:8740 http://127.0.0.1:8742 http://1
 Environment=PIGNUS_BOOK=http://127.0.0.1:8741
 # Keep this equal to max_price_age in pignusd.json.
 Environment=PIGNUS_MAX_PRICE_AGE=600
+# The same services as a visitor reaches them: through Caddy and its
+# certificate. Everything else the check does is on loopback.
+Environment="PIGNUS_PUBLIC_URLS=https://sequentiatestnet.com/lending/healthz https://sequentiatestnet.com/pignus-oracle/healthz https://sequentiatestnet.com/pignus-oracle-2/healthz https://sequentiatestnet.com/pignus-oracle-3/healthz"
 # The responder's config, when this box runs one: the check then reads its
 # state through `pignus-cli btc-responder-status`, fails when a take has
 # waited on a person or the unit is down, and skips itself when the file

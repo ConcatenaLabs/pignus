@@ -372,7 +372,11 @@ while the book is already withholding prices. `PIGNUS_MIN_FREE_MB` (512) is
 the floor for free space on the disk under `PIGNUS_DATA_DIR`
 (`/root/sequentia/pignus-data`), where every service writes; a disk that
 fills stops the book, the attestation logs and the responder's state file
-before anything else says so. `PIGNUS_RESPONDER_CONFIG` is
+before anything else says so. `PIGNUS_PUBLIC_URLS` are the health endpoints
+as a visitor reaches them, through Caddy and its certificate, space separated
+and quoted; every other check is on loopback, so without these a proxy that
+has died or a certificate that has expired leaves every check green and the
+page down. `PIGNUS_RESPONDER_CONFIG` is
 commented out in the shipped unit; on a box that runs a responder, set it in
 a drop-in (`systemctl edit pignus-check.service`, then `[Service]` /
 `Environment=PIGNUS_RESPONDER_CONFIG=/root/sequentia/pignus-responder.json`).
