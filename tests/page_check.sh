@@ -136,6 +136,21 @@ if [ ! -s "$WORK/dom.html" ]; then
     tail -5 "$WORK/console.log"
     exit 1
 fi
+# PIGNUS_SHOTS=<dir> keeps a desktop and a phone screenshot of the seeded page
+# there, for a person to look at: the checks below read the DOM, and a cell
+# that wraps one word per line or a tag that runs off the edge is a defect
+# only an eye catches.
+if [ -n "${PIGNUS_SHOTS:-}" ]; then
+    mkdir -p "$PIGNUS_SHOTS"
+    for size in 1280,2400 390,2600; do
+        timeout 90 "$CHROME" --headless=new --no-sandbox --disable-gpu \
+            --no-first-run --disable-extensions --hide-scrollbars \
+            --virtual-time-budget=6000 --window-size="$size" \
+            --screenshot="$PIGNUS_SHOTS/page-${size%,*}.png" \
+            "http://127.0.0.1:$DPORT/" >/dev/null 2>&1 || true
+    done
+    echo "  screenshots in $PIGNUS_SHOTS"
+fi
 
 python3 - "$WORK/dom.html" "$WORK/console.log" "$BIG_DEBT" "$BIG_PRINCIPAL" <<'PY'
 import re, sys

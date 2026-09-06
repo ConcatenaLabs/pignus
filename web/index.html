@@ -112,12 +112,17 @@
     table,thead,tbody,tr,th,td{display:block}
     thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
     tr{border:1px solid var(--line);border-radius:10px;margin:0 0 10px;padding:6px 4px}
-    td{border-bottom:1px solid var(--card2);display:flex;justify-content:space-between;
-       gap:12px;text-align:right;padding:7px 10px}
+    /* The label floats left and the value flows right of it as ONE block.
+       A flex cell made every text node and span its own column, so a date
+       with a note beside it came out one word per line. */
+    td{border-bottom:1px solid var(--card2);display:block;text-align:right;
+       padding:7px 10px}
     td:last-child{border-bottom:0}
     td::before{content:attr(data-label);color:var(--mute);font-size:12px;
-       text-align:left;font-variant-numeric:normal}
+       text-align:left;font-variant-numeric:normal;float:left;margin-right:12px}
     td .sub2{text-align:right}
+    /* A long status tag wraps on a phone rather than running off the edge. */
+    .tag{white-space:normal}
     button.sm,.tabs button{padding:9px 13px}
   }
 </style></head><body><div class="wrap">
