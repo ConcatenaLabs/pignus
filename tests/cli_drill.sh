@@ -841,6 +841,14 @@ set +e; run_check env PIGNUS_CHECK_STATE="$WORK/check.state" >/dev/null; set -e
 test "$(wc -l < "$WORK/alerts.log")" = 1 || {
     echo "a second failing run paged again:" >&2; cat "$WORK/alerts.log" >&2; exit 1; }
 set +e; HAND=$(run_check env -u PIGNUS_CHECK_STATE); set -e
+# ...and the disk under the data directory is watched, with a floor that can
+# be set: a machine this full of nothing else would be paged about.
+set +e; FULL=$(run_check env -u PIGNUS_CHECK_STATE PIGNUS_MIN_FREE_MB=999999999); set -e
+echo "$FULL" | grep -q "MB free, under the 999999999 MB floor" || {
+    echo "the checker did not report a disk under its floor" >&2
+    echo "$FULL" | grep -i "free" | sed 's/^/  /' >&2; exit 1; }
+echo "$HAND" | grep -q "  ok    the filesystem under" || {
+    echo "the checker did not report the free space when it is enough" >&2; exit 1; }
 echo "$HAND" | grep -q "run by hand" || {
     echo "a run by hand did not say it records nothing" >&2
     echo "$HAND" | tail -3 | sed 's/^/  /' >&2; exit 1; }

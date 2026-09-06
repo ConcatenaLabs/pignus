@@ -368,7 +368,11 @@ still open. `pignus-check.timer` runs it every five minutes, and
 is every oracle's URL, space separated and quoted; the shipped unit names
 8740, 8742 and 8743. `PIGNUS_MAX_PRICE_AGE` stays equal to `max_price_age` in
 `pignusd.json`: a check looser than the book's own limit reports healthy
-while the book is already withholding prices. `PIGNUS_RESPONDER_CONFIG` is
+while the book is already withholding prices. `PIGNUS_MIN_FREE_MB` (512) is
+the floor for free space on the disk under `PIGNUS_DATA_DIR`
+(`/root/sequentia/pignus-data`), where every service writes; a disk that
+fills stops the book, the attestation logs and the responder's state file
+before anything else says so. `PIGNUS_RESPONDER_CONFIG` is
 commented out in the shipped unit; on a box that runs a responder, set it in
 a drop-in (`systemctl edit pignus-check.service`, then `[Service]` /
 `Environment=PIGNUS_RESPONDER_CONFIG=/root/sequentia/pignus-responder.json`).

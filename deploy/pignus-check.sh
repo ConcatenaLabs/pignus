@@ -59,6 +59,11 @@ BOOK="${PIGNUS_BOOK:-http://127.0.0.1:8741}"
 # check looser than the book's own limit reports healthy while the book is
 # already withholding prices.
 MAX_AGE="${PIGNUS_MAX_PRICE_AGE:-600}"
+# Where every service writes: the book, the attestation logs, the responder's
+# state file. A disk that fills stops all of them, and the first thing to say
+# so would otherwise be a principal paid and not recorded.
+DATA_DIR="${PIGNUS_DATA_DIR:-/root/sequentia/pignus-data}"
+MIN_FREE_MB="${PIGNUS_MIN_FREE_MB:-512}"
 
 fails=0
 ok()  { echo "  ok    $1"; }
@@ -248,6 +253,21 @@ if old:
     if [ -n "$unanswered" ]; then
         bad "take(s) unanswered for over a minute: $unanswered"
     fi
+fi
+
+# The disk under the data directory, or under this checkout on a machine
+# that has none: the book's writes, the attestation log and the responder's
+# state file all go there, and the last of those is the record of a principal
+# paid.
+where="$DATA_DIR"
+[ -d "$where" ] || where="$(dirname "$0")"
+avail=$(df -Pm "$where" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -z "$avail" ]; then
+    bad "cannot read the free space under $where"
+elif [ "$avail" -lt "$MIN_FREE_MB" ]; then
+    bad "the filesystem under $where has ${avail} MB free, under the ${MIN_FREE_MB} MB floor: the book, the attestation logs and the responder's state file all stop being written before anything else says so"
+else
+    ok "the filesystem under $where has ${avail} MB free"
 fi
 
 # A liquidator unit that exists and is not running is a bot everybody thinks
