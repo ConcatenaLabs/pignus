@@ -658,6 +658,49 @@ def test_explain():
     check("nothing is wrong with it", e["problems"] == [], str(e["problems"]))
 
 
+def test_batched_poll():
+    print("a poll asks its gettxouts in one round trip when the node offers one")
+    # Same answers, same states, one exchange instead of one per record. A
+    # node without `batch` -- every stub above -- is asked one at a time.
+
+    class BatchNode(StubNode):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def rpc_batch(self, calls):
+            self.batches.append(len(calls))
+            out = []
+            for method, params in calls:
+                assert method == "gettxout", method
+                out.append((self.utxos.get((params[0], int(params[1]))), None))
+            return out
+
+    n = BatchNode()
+    w = VaultWatcher(n, min_depth=2, rescan_depth=50)
+    for i in range(7):
+        n.utxos[(f"fund{i}", 0)] = {"value": 1.0, "confirmations": 5}
+        w.track(f"loan{i}", StubTerms(), f"fund{i}", 0)
+    del n.utxos[("fund3", 0)]           # one of them is gone
+    w.poll()
+    check("one batch carried every question", n.batches == [7], str(n.batches))
+    check("and no record was asked one at a time", n.calls["gettxout"] == 0,
+          str(n.calls["gettxout"]))
+    check("the answers were read: six live, one not there",
+          sum(1 for v in w.vaults.values() if v.state is State.LIVE) == 6
+          and w.vaults["loan3"].state is not State.LIVE,
+          str({k: v.state.value for k, v in w.vaults.items()}))
+    # A record the batch did not cover is asked directly, as before.
+    n.utxos[("late", 0)] = {"value": 1.0, "confirmations": 5}
+    w.track("late", StubTerms(), "late", 0)
+    n.rpc_batch = lambda calls: (_ for _ in ()).throw(RuntimeError("no batch today"))
+    before = n.calls["gettxout"]
+    w.poll()
+    check("a batch the node refuses falls back to one question each",
+          n.calls["gettxout"] - before == 8 and not w.cut_short,
+          str(n.calls["gettxout"] - before))
+
+
 def test_node_gone():
     print("a node that stops answering ends the poll, not the daemon's day")
     # Every unanswered question is left for the next poll -- right for one
@@ -706,7 +749,7 @@ def test_node_gone():
 
 
 def main():
-    for fn in (test_node_gone, test_offer_not_ghosted_while_the_scan_is_behind, test_ghost, test_provisional_exit, test_restart,
+    for fn in (test_batched_poll, test_node_gone, test_offer_not_ghosted_while_the_scan_is_behind, test_ghost, test_provisional_exit, test_restart,
                test_reorg_after_restart,
                test_bounded_walk, test_failed_block, test_offers,
                test_rescan_from, test_explain):

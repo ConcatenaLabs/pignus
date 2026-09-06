@@ -713,6 +713,51 @@ def test_fee_is_priced_in_the_asset_that_pays_it():
         _F.fee_table = real
 
 
+def test_node_batch():
+    print("a batch is one round trip, answered in order, errors kept apart")
+    import json as _json                                   # noqa: PLC0415
+    import threading                                       # noqa: PLC0415
+    from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: PLC0415
+    from pignus.node import Node, RpcError                 # noqa: PLC0415
+    hits = []
+
+    class Stub(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_POST(self):
+            reqs = _json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            hits.append(len(reqs) if isinstance(reqs, list) else 1)
+            # Answered out of order on purpose: the client must key by id.
+            out = []
+            for r in reversed(reqs):
+                if r["method"] == "gettxout":
+                    out.append({"id": r["id"], "result": {"value": r["params"][1]}})
+                else:
+                    out.append({"id": r["id"], "error": {"code": -32601, "message": "no such method"}})
+            body = _json.dumps(out).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = HTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        n = Node(f"http://127.0.0.1:{srv.server_port}", user="u", password="p")
+        got = n.rpc_batch([("gettxout", ["aa", 0, True]), ("nosuch", []),
+                       ("gettxout", ["bb", 7, True])])
+        check("three calls were one request", hits == [3], str(hits))
+        check("answers come back in the order asked, whatever order they arrived",
+              [g[0] for g in got] == [{"value": 0}, None, {"value": 7}], str(got))
+        check("a refused call is an error in its slot, not a raised batch",
+              got[1][1] is not None and isinstance(got[1][1], RpcError)
+              and got[0][1] is None and got[2][1] is None)
+        check("an empty batch asks nothing", n.rpc_batch([]) == [] and hits == [3])
+    finally:
+        srv.shutdown()
+
+
 def test_rate_limiter():
     """The bucket that is every public service's only defence.
 
@@ -839,7 +884,8 @@ def main():
                test_page_shaped_terms, test_oracle,
                test_amounts,
                test_attestation_log, test_adaptor, test_dlc,
-               test_rate_limiter, test_at_risk_stamp_and_meta):
+               test_rate_limiter, test_at_risk_stamp_and_meta,
+               test_node_batch):
         fn()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0

@@ -172,6 +172,7 @@ class VaultWatcher:
     def __init__(self, node, min_depth=2, rescan_depth=1500, back_scan_cap=200):
         self._unanswered = 0
         self.cut_short = False
+        self._txout_cache = {}          # (txid, vout) -> gettxout answer
         self.node = node
         self.min_depth = min_depth
         self.rescan_depth = rescan_depth
@@ -297,6 +298,7 @@ class VaultWatcher:
         self._blocks_fetched = 0
         self._block_budget = self.back_scan_cap
         self.cut_short = False
+        self._prefetch_txouts(tip)
         for v in self.vaults.values():
             if self._node_gone():
                 self.cut_short = True
@@ -311,6 +313,7 @@ class VaultWatcher:
         self._forget_below(tip - self.rescan_depth)
         self._block_cache = {}
         self._mempool_txs = None
+        self._txout_cache = {}
         seen, out = set(), []
         for v in changed:
             if v.loan_id not in seen:
@@ -350,10 +353,69 @@ class VaultWatcher:
         self._unanswered = 0
         return got
 
+    def _prefetch_txouts(self, tip):
+        """Ask every `gettxout` this poll is about to ask in one round trip.
+
+        Each record costs one question, and a question is a connection, a
+        request and a wait -- most of a poll over a full book. A node answers
+        a batch in one exchange, so the answers are fetched here and
+        `_txout` reads them back; a record not in the batch, or a node
+        without one, is asked one at a time exactly as before. The method
+        is looked up under its own name, `rpc_batch`: the test framework's
+        proxy has a `batch` of a different shape, and duck-typing on that
+        name handed this code a list it could not read. Fetched
+        after the forward scan, so a close that scan just recorded is asked
+        about with the scan's knowledge.
+        """
+        self._txout_cache = {}
+        batch = getattr(self.node, "rpc_batch", None)
+        if batch is None:
+            return
+        keys = []
+        for v in self.vaults.values():
+            if not self._final(v, tip):
+                keys.append((v.txid, int(v.vout)))
+        for o in self.offers.values():
+            if o.status in ("open", "ghost", "delisted"):
+                keys.append((o.txid, int(o.vout)))
+        keys = list(dict.fromkeys(keys))
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            try:
+                answers = batch([("gettxout", [t, v, True]) for t, v in chunk])
+            except RpcFailure:
+                return                  # one at a time, and counted there
+            for key, (res, err) in zip(chunk, answers):
+                if err is None:
+                    self._txout_cache[key] = res
+
+    def refresh_one(self, tip, loan_id=None, offer_id=None):
+        """Bring ONE record up to date outside a poll, for a caller about to
+        serve it back. A publish or a registration used to run the whole
+        reconciliation in the request's thread -- every record's question --
+        and answered after all of them; the record it is about to serve is
+        the only one it needs."""
+        self._block_cache, self._blocks_fetched = {}, 0
+        self._block_budget = self.back_scan_cap
+        self._mempool_txs = None
+        changed = False
+        v = self.vaults.get(loan_id) if loan_id else None
+        if v is not None:
+            changed = self._refresh(v, tip)
+        o = self.offers.get(offer_id) if offer_id else None
+        if o is not None:
+            self._refresh_offer(o, tip)
+        self._block_cache, self._mempool_txs = {}, None
+        return changed
+
     def _txout(self, txid, vout):
         """(output or None, answered). "The node could not be asked" is not the
         same answer as "the output is not there", and reading it as one is how a
         watcher invents a reorg out of an RPC timeout."""
+        key = (txid, int(vout))
+        if key in self._txout_cache:
+            self._unanswered = 0
+            return self._txout_cache.pop(key), True
         try:
             got = self.node.gettxout(txid, int(vout), True)         # w/ mempool
         except RpcFailure:

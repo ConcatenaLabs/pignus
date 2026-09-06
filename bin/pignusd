@@ -882,7 +882,8 @@ class Service:
         finally:
             self._chain_lock.release()
 
-    def _reconcile(self, w):
+    def _track_new(self, w):
+        """Hand the watcher every record the book holds and it does not."""
         for rec in self.book.list_loans():
             if rec["loan_id"] in w.vaults:
                 continue
@@ -925,6 +926,39 @@ class Service:
             except Exception as e:              # noqa: BLE001
                 print(f"offer {off.get('offer_id','?')[:12]}: cannot track, "
                       f"skipping: {e}", file=sys.stderr)
+
+    def refresh_one(self, loan_id=None, offer_id=None, wait=2):
+        """Reconcile ONE record, now, for the request about to serve it.
+
+        A publish or a registration ran the whole reconciliation in its own
+        thread and answered after every record's question -- fifteen seconds
+        on a full book, longer than a reverse proxy waits. The record about
+        to be served back is the only one the caller reads confirmations
+        off; the rest are the poll's, a few seconds later.
+        """
+        if not self.watcher:
+            return
+        w = self.watcher
+        if not self._chain_lock.acquire(timeout=wait):
+            return          # a reconcile is in flight; it will cover this too
+        try:
+            tip = self.node.getblockcount()
+            self.height = tip
+            self._track_new(w)
+            with self.book.batch():
+                w.refresh_one(tip, loan_id=loan_id, offer_id=offer_id)
+                if loan_id and loan_id in w.vaults:
+                    self._reconcile_loan(w.vaults[loan_id])
+                if offer_id and offer_id in w.offers:
+                    self._reconcile_offer(w.offers[offer_id])
+            self.node_error = None
+        except Exception as e:                      # noqa: BLE001
+            self.node_error = f"node: {type(e).__name__}: {e}"
+        finally:
+            self._chain_lock.release()
+
+    def _reconcile(self, w):
+        self._track_new(w)
         try:
             w.poll()
             self.node_error = None
@@ -2930,7 +2964,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(429, {"error": "the book is full"})
                 s.verify_offer(offer)
                 rec = s.book.put_offer(offer)     # carries manage_token once
-                s.refresh_chain(wait=2)
+                s.refresh_one(offer_id=rec["offer_id"])
                 view = s.offer_view(s.book.offer(rec["offer_id"]) or rec)
                 view["manage_token"] = rec.get("manage_token")
                 return self._send(200, view)
@@ -3405,7 +3439,7 @@ class Handler(BaseHTTPRequestHandler):
                               if body.get("offer_id") in s.book.offers
                               else None))
                 s.note_registration(who, rec["loan_id"])
-                s.refresh_chain(wait=2)
+                s.refresh_one(loan_id=rec["loan_id"])
                 return self._send(200, s.loan_view(
                     s.book.loans.get(rec["loan_id"], rec)))
             return self._send(404, {"error": "no such endpoint", "path": path})
