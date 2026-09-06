@@ -713,6 +713,12 @@ terms; `repo-settle` composes the buyback, which pays the bond to the lender in
 the same transaction that returns the asset; and `repo-forfeit` pays the bond to
 the BORROWER if the deadline passes with no settlement.
 
+A holder's `C_U` is their address under the asset's policy, a P2TR, and the
+32-byte program the commands take -- `repo-propose --borrower-cu`,
+`repo-verify --lender-cu`, `repo-settle --inspect --lender-cu` -- is the last
+32 bytes of the script `opendamp derive --snapshot <policy snapshot>` prints
+beside `C_U(<their key>)`.
+
 **Settlement takes the lender's OpenDAMP key.** The buyback spends two
 OpenDAMP Simplicity inputs -- the verifier and the lender's restricted output
 -- and the lender signs both with `opendamp transfer-cosign`, the OpenDAMP
