@@ -126,9 +126,12 @@ def main():
                 stdout=log, stderr=log))
             wait_for(lambda: get(base + "/healthz"))
 
+            last_stderr = {}
+
             def cli(*args):
                 r = subprocess.run([sys.executable, os.path.join(BIN, "pignus-cli"), *args],
                                    capture_output=True, text=True)
+                last_stderr["text"] = r.stderr
                 if r.returncode != 0:
                     print(r.stdout); print(r.stderr)
                     raise AssertionError(f"{args[0]} exited {r.returncode}")
@@ -164,6 +167,14 @@ def main():
                       "--book", base)
             check("the lender publishes an offer carrying a principal",
                   bool(off.get("btc_offer_id")))
+            # These deadlines pass the rules with hours to spare, not days:
+            # the lender is told how much room they leave, and that it is
+            # thin, before the board goes quiet on them.
+            said = last_stderr.get("text", "")
+            check("and is told the headroom the deadlines leave, and that it "
+                  "is thin",
+                  "headroom over the margins" in said and "THIN" in said
+                  and "abort_after" in said, said[-400:])
             offer = get(base + "/v1/btc/offers")["offers"][0]
 
             # A forged offer in the lender's name is what the whole scheme has
