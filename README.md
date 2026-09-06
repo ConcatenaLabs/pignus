@@ -821,7 +821,7 @@ pignus-oracle --config oracle.json
 | `listen` | `host:port` |
 | `log_max_bytes` | rotate the attestation log past this size (0, the default, never rotates) |
 | `previous_keys` | x-only keys this oracle used to sign with, published at `/v1/pubkey` so a borrower can tell a rotation from a stranger |
-| `compromised_keys` | keys this operator declares compromised, published at `/v1/pubkey`; a book refuses attestations under them and flags the loans that bake them |
+| `compromised_keys` | keys this operator declares compromised, published at `/v1/pubkey`; a book refuses attestations under them and flags the loans that bake them. Each must also be in `previous_keys` (a book honours a declaration only for the declarer's own keys), and an instance whose own key is listed refuses to start |
 | `max_jump`, `jump_rounds` | a price that moves further than `max_jump` (a fraction of the last signed price, default 0.5) in one step is held, unsigned, until it has stayed there for `jump_rounds` consecutive rounds (default 3). A feed that switched units is a perfectly good signature over a number a thousandfold off; 0 turns the guard off |
 | `book` | the book a cross-chain seizure is checked against before it is co-signed: the take must still be open there. Optional; `--allow-unlisted` co-signs without asking |
 | `seizures` | where Tier B co-signatures are logged (default: `<logfile>.seizures`) |

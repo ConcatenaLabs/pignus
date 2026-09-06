@@ -532,9 +532,11 @@ liquidate every covenant loan baked to it, and co-sign any cross-chain
 seizure with a cooperating lender.
 
 1. Stop the instance.
-2. Start the successor with the old key in `compromised_keys`; `/v1/pubkey`
-   publishes it, and every book that quotes the successor refuses
-   attestations under it from the next poll.
+2. Start the successor with the old key in both `previous_keys` and
+   `compromised_keys` -- a book honours a declaration only for keys the
+   declarer lists as its own, and the oracle refuses to start otherwise;
+   `/v1/pubkey` publishes it, and every book that quotes the successor
+   refuses attestations under it from the next poll.
 3. Tell the book's operator, so they drop the old URL from `oracles`.
 4. Borrowers of loans that bake the key REPAY: the page flags those loans,
    and nothing else protects them.

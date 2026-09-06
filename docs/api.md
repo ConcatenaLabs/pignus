@@ -1298,7 +1298,7 @@ oracle co-signed no such seizure.
 ```json
 {"ok": true, "markets": 6, "signed": 6, "errors": {}, "stale": [],
  "round_error": null, "source_error": null, "clock_skew": 0.3,
- "last_round": 1799999940, "age": 12.4}
+ "last_round": 1799999940, "last_signed": 1799999940, "age": 12.4}
 ```
 
 `ok` means *this oracle is signing*, not *this process is running*: a dead
@@ -1306,7 +1306,9 @@ signing thread, an unwritable log or a feed that stopped answering all leave the
 process happily serving its last attestation. A round that has not completed
 within two intervals, or within thirty seconds where that is longer, is not ok, and the reply
 carries **503** so a check that only reads the status code sees it. A green
-oracle answers 200. `signed` counts the markets neither erroring nor stale;
+oracle answers 200. `signed` counts the markets neither erroring nor stale
+and `last_signed` is the newest attestation's timestamp, which is its
+observation time;
 `clock_skew` is the seconds this host's clock differs from the price source's,
 or `null` when the source does not say.
 

@@ -300,6 +300,20 @@ class Oracle:
         # not.
         self.compromised_keys = [str(k).lower()
                                  for k in cfg.get("compromised_keys", [])]
+        own = {self.xonly.hex().lower()} | {k.lower() for k in self.previous_keys}
+        for k in self.compromised_keys:
+            if k not in own:
+                raise SystemExit(
+                    f"compromised_keys names {k[:16]}…, which is neither this "
+                    f"oracle's key nor one of its previous_keys. A book honours "
+                    f"a declaration only for the declarer's own keys, so this "
+                    f"one would be ignored; list the key under previous_keys "
+                    f"as well, or drop it.")
+        if self.xonly.hex().lower() in self.compromised_keys:
+            raise SystemExit(
+                "this oracle's own key is listed in its compromised_keys. A "
+                "compromised key signs nothing: retire this instance, and "
+                "publish the declaration from its successor.")
         # A price that jumps is signed only once it has stayed jumped. A feed
         # that switched units, a column that points at a percentage, an
         # upstream that started quoting grams: each is a perfectly good
@@ -868,7 +882,10 @@ class Handler(BaseHTTPRequestHandler):
               and last_round > 0 and now - last_round <= window)
         skew = getattr(o.source, "clock_skew", None)
         signed = sum(1 for m in o.markets if m not in errs and m not in stale)
+        with o._lock:
+            last_signed = max(o.signed_at.values(), default=None)
         return ok, {"ok": ok, "markets": len(o.markets), "signed": signed,
+                    "last_signed": last_signed,
                     "errors": errs, "stale": stale, "round_error": round_error,
                     "source_error": source_error,
                     "clock_skew": None if skew is None else round(skew, 1),

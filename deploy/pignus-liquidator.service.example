@@ -13,9 +13,10 @@ Wants=network-online.target
 #
 # Run it by hand with --dry-run first, against the book it will watch:
 #
+#   set -a; . /root/sequentia/pignus-liquidator.env; set +a
 #   bin/pignus-liquidator --book http://127.0.0.1:8741 \
-#       --oracle http://127.0.0.1:8740 --taker-address <addr> \
-#       --rpc-wallet liquidator --once --dry-run
+#       --oracle http://127.0.0.1:8740 --taker-address $PIGNUS_TAKER_ADDRESS \
+#       --once --dry-run
 #
 # It prints every loan it would close and the profit each one leaves, and moves
 # nothing. Only once that reads the way you expect is it worth installing.
@@ -26,14 +27,8 @@ User=root
 WorkingDirectory=/root/sequentia/pignus
 Environment=SEQUENTIA_SRC=/root/sequentia/Sequentia
 Environment=PYTHONUNBUFFERED=1
-# The node's credentials come from the environment or a cookie file, never from
-# the command line: `ps` is readable by every user on the box, and this process
-# runs for the life of the book.
-# The url is the one pignusd already talks to; the cookie is the .cookie file
-# in the node's own data directory -- replace the path below with it. A
-# placeholder with a space in it is not one: systemd splits an Environment=
-# value on whitespace and drops the line with a warning, and the bot then looks
-# for the node's cookie in the wrong place.
+# The node's credentials never sit on the command line: `ps` is readable by
+# every user on the box, and this process runs for the life of the book.
 # The node's credentials and the taker address, in a file only root reads
 # (mode 0600), never in this unit: PIGNUS_RPC_URL, PIGNUS_RPC_USER and
 # PIGNUS_RPC_PASSWORD (or PIGNUS_RPC_COOKIE), PIGNUS_RPC_WALLET, and
