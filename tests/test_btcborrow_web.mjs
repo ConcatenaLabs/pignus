@@ -19,12 +19,14 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as bb from "../web/btcborrow.js";
 import * as btc from "../web/btc.js";
+import * as badaptor from "../web/adaptor.js";
 import { _internals as P } from "../web/pignus.js";
 const toHex = P.bytesToHex;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const v = JSON.parse(readFileSync(join(here, "..", "web", "btc_vectors.json")));
 let pass = 0, fail = 0;
+const hexOf = b => Array.from(b).map(x => x.toString(16).padStart(2, "0")).join("");
 const ok = (n, c, d = "") => { if (c) { pass++; console.log("  ok    " + n); }
                                else { fail++; console.log("  FAIL  " + n + " " + d); } };
 const rejects = async (n, fn, want) => {
@@ -486,6 +488,38 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
                                    witness: witnessFor("seize") }));
   ok("a loan with no vault yet is not asked about at all",
      early.vault_exit === undefined);
+}
+
+{
+  // The id a relay must serve an offer under, recomputed here from the same
+  // bytes the Python signs. Whether a recovered loan is believed hangs on it.
+  const o = v.offer;
+  ok("the page computes the same offer id as the relay",
+     bb.offerId(o.loan, o.market, o.lots) === o.offer_id,
+     bb.offerId(o.loan, o.market, o.lots));
+  ok("over the same canonical payload, field for field",
+     JSON.stringify(bb.offerPayload(o.loan, o.market, o.lots), Object.keys(o.payload.loan).concat(["loan", "market", "lots"]).sort())
+       === JSON.stringify(o.payload, Object.keys(o.payload.loan).concat(["loan", "market", "lots"]).sort()));
+  ok("an amount spelled as a number hashes like the string it is sent as",
+     bb.offerId({ ...o.loan, debt: Number(o.loan.debt) }, o.market, o.lots) === o.offer_id);
+  ok("a changed payout is a different offer",
+     bb.offerId({ ...o.loan, lender_prog: "ee".repeat(20) }, o.market, o.lots) !== o.offer_id);
+  ok("and so is the same offer with one more lot",
+     bb.offerId(o.loan, o.market, o.lots + 1) !== o.offer_id);
+  const keys = Object.keys(o.payload.loan).concat(["loan", "market", "lots"]).sort();
+  const digest = P.taggedHash("pignus/btc-offer/1", new TextEncoder().encode(
+    JSON.stringify(bb.offerPayload(o.loan, o.market, o.lots), keys)));
+  ok("the lender's signature over it verifies under the key the terms name",
+     badaptor.verifySchnorr(o.loan.lender_x, hexOf(digest), o.offer_sig));
+  // A recovered take is believed only under this borrower's own signature.
+  const tk = o.take;
+  ok("a take the borrower signed is theirs", bb.borrowerSaid(tk.borrower_x, tk));
+  ok("not under another key", !bb.borrowerSaid(o.loan.lender_x, tk));
+  ok("not with the payout changed",
+     !bb.borrowerSaid(tk.borrower_x, { ...tk, loan: { ...tk.loan, borrower_prog: "ee".repeat(20) } }));
+  ok("not against another offer",
+     !bb.borrowerSaid(tk.borrower_x, { ...tk, btc_offer_id: "0".repeat(24) }));
+  ok("not without the signature", !bb.borrowerSaid(tk.borrower_x, { ...tk, take_auth: "" }));
 }
 
 console.log(`\n${pass} checks passed, ${fail} failed`);

@@ -181,7 +181,7 @@ fi
 # The responder, when this box runs one. It is the one process whose silence
 # costs the OTHER party -- a take blocked on an unclearing reason, or an offer
 # whose signature stopped verifying, stops every cross-chain loan under it --
-# and until now nothing on a timer looked at it. `btc-responder-status` is
+# and a timer is what has to look at it. `btc-responder-status` is
 # read-only, safe against the running unit, and exits 4 when a person is
 # needed, which is exactly the answer a timer wants.
 if [ -n "${PIGNUS_RESPONDER_CONFIG:-}" ]; then

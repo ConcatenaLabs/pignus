@@ -196,9 +196,46 @@ def adaptor_vectors():
     }
 
 
+def offer_vector():
+    """The relay's offer id and signature over the vector loan, so the page's
+    own `offerId` -- which decides whether a recovered loan is believed -- is
+    pinned to the Python that computes the id every relay serves under. The
+    market is deliberately NOT the loan's own copy, and an optional field is
+    left out, because those are the two spellings that drift."""
+    from pignus import btc_relay as R
+    ln, _t, _w, _b, lender_sec = loan()
+    d = BC.loan_to_dict(ln)
+    d.pop("price_scale")                 # absent counts as zero, not ""
+    return {
+        "loan": d, "market": "BTC/USDX-lots", "lots": 3,
+        "offer_id": R.offer_id(d, "BTC/USDX-lots", 3),
+        "offer_sig": R.sign_offer(lender_sec, d, "BTC/USDX-lots", 3),
+        "payload": json.loads(R.canonical(
+            R.offer_payload(d, "BTC/USDX-lots", 3))),
+        # A take of it, signed by the borrower, in the shape the relay serves
+        # one back: what the page checks before it believes a recovered loan.
+        "take": _take_vector(d, R.offer_id(d, "BTC/USDX-lots", 3)),
+    }
+
+
+def _take_vector(d, oid):
+    from pignus import btc_relay as R
+    ln, _t, _w, borrower_sec, _l = loan()
+    fields = {"btc_offer_id": oid, "borrower_x": ln.borrower_x, "h_w": ln.h_w,
+              "borrower_prog": ln.borrower_prog,
+              "borrower_ver": ln.borrower_ver,
+              "prevault_txid": _fixed("pignus/web-vectors/prevault").hex(),
+              "prevault_vout": 1}
+    return {"btc_offer_id": oid, "loan": BC.loan_to_dict(ln),
+            "prevault_txid": fields["prevault_txid"], "prevault_vout": 1,
+            "take_auth": R.sign_take(borrower_sec, **fields),
+            "borrower_x": ln.borrower_x}
+
+
 def main():
     here = os.path.join(os.path.dirname(__file__), "..", "web")
     btc = btc_vectors()
+    btc["offer"] = offer_vector()
     # No address field. The encoder is browser code and this generator has no
     # independent one to check it against, so a field written here would only
     # be the same code agreeing with itself. `tests/test_btc_web.mjs`

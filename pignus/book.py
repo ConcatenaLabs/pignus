@@ -287,12 +287,15 @@ class Book:
         # publisher; the book keeps only its hash, so a leak of the book file
         # does not hand anyone the ability to cancel someone else's listing.
         supplied = offer.get("manage_token")
-        token = supplied or secrets.token_urlsafe(24)
+        # A NEW listing always gets a token this book drew: a publisher-chosen
+        # one is a publisher-chosen strength. A supplied token only ever
+        # proves a republish of a record that already exists, below.
+        token = secrets.token_urlsafe(24)
         warnings = list(offer.get("warnings") or [])
         warnings += list(terms.sanity_check())
         rec = {
             "offer_id": offer_id,
-            "terms": offer["terms"],
+            "terms": terms.to_json(),
             "kind": "funded",
             "outpoint": outpoint,
             # The address a loan drawn from this offer will actually live at,
@@ -415,7 +418,11 @@ class Book:
         with self._lock:
             rec = self.loans.get(key) or {
                 "loan_id": key, "terms_id": terms.loan_id(),
-                "terms": terms_json, "txid": txid, "vout": int(vout),
+                # CANONICAL, not verbatim. `from_json` accepts spellings the
+                # page's BigInt does not -- "1_000", other digit scripts --
+                # and a stored string the page cannot parse took the whole
+                # loans panel down for every visitor.
+                "terms": terms.to_json(), "txid": txid, "vout": int(vout),
                 "state": state, "market": terms.market,
                 "created": int(time.time())}
             rec.update(extra)
