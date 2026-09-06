@@ -447,7 +447,7 @@ async function refresh() {
     if (webUrl(hz.explorer_url)) $("#crumb").href = hz.explorer_url;
     if (hz.rescan_needed_from != null) {
       const d = $("#daemon");
-      if (d) { d.textContent = `book degraded: away longer than it can look back; needs a rescan from ${Number(hz.rescan_needed_from).toLocaleString()}`; d.className = "tag warn"; }
+      if (d) { d.textContent = `book degraded: it was away longer than it can look back, so loans taken meanwhile may be missing until its operator rescans from block ${Number(hz.rescan_needed_from).toLocaleString()}`; d.className = "tag warn"; }
     }
     // A BASE address, the same thing `oracle_public_urls` holds for every
     // oracle, so one name means one thing. It used to be the full link, which
@@ -1125,7 +1125,7 @@ function exitBlock(x, t) {
     rows.push(`<span class="k">Price it closed at</span><span>${px(x.price_used)}` +
       `<span class="small"> · the strike was ${px(x.strike)}</span></span>`);
   if (x.seize_expected != null || x.seize_paid != null)
-    rows.push(`<span class="k">Seized</span><span>${at(x.seize_paid, c)}` +
+    rows.push(`<span class="k">Taken by the liquidator</span><span>${at(x.seize_paid, c)}` +
       `<span class="small"> · that price buys ${at(x.seize_expected, c)}</span></span>`);
   if (x.surplus_expected != null || x.surplus_paid != null)
     rows.push(`<span class="k">Back to the borrower</span><span>${at(x.surplus_paid, c)}` +
@@ -1270,7 +1270,7 @@ function renderOffers() {
       const key = detKey("offer", o.offer_id || o.outpoint || i);
       const acts = [];
       if (o.unlisted) {
-        acts.push(`<button data-list="${i}" data-focus="list:${esc(o.txid)}" class="primary sm">List</button>`);
+        acts.push(`<button data-list="${i}" data-focus="list:${esc(o.txid)}" class="primary sm">Publish listing</button>`);
         if (o.expired)
           acts.push(`<button data-withdraw="${i}" data-focus="wd:${esc(o.outpoint)}" class="sm">Withdraw</button>`);
       } else if (o.expired) {
@@ -1293,7 +1293,7 @@ function renderOffers() {
       if (isMine && !o.unlisted && !o.expired && status === "open")
         acts.push('<span class="tag gold">your offer</span>');
       if (canCancel && status === "open" && !o.expired)
-        acts.push(`<button data-cancel="${i}" data-focus="ca:${esc(o.offer_id)}" class="sm">Cancel listing</button>`);
+        acts.push(`<button data-cancel="${i}" data-focus="ca:${esc(o.offer_id)}" class="sm">Delist</button>`);
       acts.push(`<button class="sm" data-det="${esc(key)}" data-focus="det:${esc(key)}" aria-expanded="${state.details.has(key)}">Details</button>`);
       const st = status !== "open"
         ? `<span class="tag ${status === "ghost" ? "bad" : "dim"}" title="${
@@ -1375,7 +1375,7 @@ const STATE_WHY = {
   REPAID: "the borrower paid the debt and took the collateral back",
   LIQUIDATED: "someone closed it under the strike; the surplus went back to the borrower",
   DEFAULTED: "it was called after maturity",
-  RECOVERED: "the lender swept the vault with the oracle-liveness backstop",
+  RECOVERED: "the lender swept the vault after maturity without an oracle, the backstop for an oracle that has gone quiet",
   GHOST: "the funding was undone by a Bitcoin reorg. The collateral is back in the borrower's wallet and the loan has to be taken again — Sequentia follows Bitcoin, which is what makes this chain's finality mean anything",
   SPENT_UNKNOWN: "the vault was spent by a transaction this book cannot account for",
 };
@@ -1462,7 +1462,7 @@ function renderLoans() {
           l.state === "LIVE" && mine(t.borrower_prog) && state.utxos.length
             ? (() => { const hv = holdings(true)[t.debt_asset] || 0n;
                        return hv >= big(t.debt) ? "" :
-                         `<span class="sub2" style="color:var(--warn)">this wallet holds ${units(hv, t.debt_asset)} of the ${units(t.debt, t.debt_asset)} a repayment needs, in explicit coins</span>`; })()
+                         `<span class="sub2" style="color:var(--warn)">this wallet holds ${units(hv, t.debt_asset)} of the ${units(t.debt, t.debt_asset)} a repayment needs, in unblinded (explicit) coins</span>`; })()
             : ""}</td>
         <td data-label="collateral">${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}</span></td>
         <td data-label="price / liq.">${now != null ? money(now, now < 10 ? 4 : 2) : "—"} / ${money(liq, liq < 10 ? 4 : 2)}<span class="sub2">${esc(l.debt_ticker)} per ${esc(l.collateral_ticker)}${l.ltv != null ? ` · LTV ${(l.ltv * 100).toFixed(0)}%` : ""}${ownPrice ? ` · <span title="this loan is judged by the oracle keys its own vault bakes in, which are not the ones this book quotes the market at">its own oracle</span>` : ""}</span></td>
@@ -1519,7 +1519,7 @@ function lenderSummary(rows) {
     `${units(v.principal, a)} ${esc(meta(a).ticker)} lent across ${v.n} loan${v.n === 1 ? "" : "s"}` +
     ` · ${units(v.live, a)} still out · ${units(v.interest, a)} interest earned`);
   return `<div class="hint" style="margin:0 0 10px">${parts.join("<br>")}` +
-         (seized ? `<br>${seized} closed by seizure` : "") + "</div>";
+         (seized ? `<br>${seized} closed by liquidation, default or sweep` : "") + "</div>";
 }
 
 /**
@@ -1541,7 +1541,7 @@ function renderAlerts() {
   const byOffer = new Map(state.offers.map(o => [o.offer_id, o]));
   const byTake = new Map((state.btcLoans || []).map(r => [r.take_id, r]));
   const LABEL = { repay: "Repay", withdraw: "Withdraw", default: "Call default",
-                  liquidate: "Liquidate", recover: "Recover", btcstep: "Open" };
+                  liquidate: "Liquidate", recover: "Recover", btcstep: "Repay", btcclaim: "Claim the principal" };
   const all = [...a.borrower.map(x => ({ ...x, seat: "borrower" })),
                ...a.lender.map(x => ({ ...x, seat: "lender" })),
                ...a.btc.map(x => ({ ...x, seat: "btc" }))];
@@ -1558,7 +1558,7 @@ function renderAlerts() {
         if (x.action === "default") return seize(byLoan.get(x.key), true);
         if (x.action === "liquidate") return seize(byLoan.get(x.key), false);
         if (x.action === "recover") return recover(byLoan.get(x.key));
-        if (x.action === "btcstep") return btcStep(byTake.get(x.key), false);
+        if (x.action === "btcstep" || x.action === "btcclaim") return btcStep(byTake.get(x.key), false);
       };
     });
   });
@@ -1749,7 +1749,7 @@ function renderPreview() {
   const drop = (1 - liq / now) * 100;
   const total = x.principal * BigInt(x.lots);
   out.innerHTML = `<div class="kv">
-    <span class="k">You lock</span><span><b>${amount(total, t.debt_asset)}</b> in an offer covenant${x.lots > 1 ? `, takeable ${x.lots} times` : ""}; whatever is untaken you withdraw yourself after ${whenBlock(x.expiry)} \u2014 a Withdraw button appears here, and nothing returns on its own</span>
+    <span class="k">You lock</span><span><b>${amount(total, t.debt_asset)}</b> in an offer covenant${x.lots > 1 ? `, takeable ${x.lots} time${x.lots === 1 ? "" : "s"}` : ""}; whatever is untaken you withdraw yourself after ${whenBlock(x.expiry)} (a Withdraw button then appears under Borrow › Mine) \u2014 a Withdraw button appears here, and nothing returns on its own</span>
     <span class="k">Each borrower locks</span><span><b>${amount(t.collateral_amount, t.collateral_asset)}</b> <span class="k">${ref(t.collateral_amount, t.collateral_asset)} at today's price, ${(x.i.openLtv * 100).toFixed(0)}% loan-to-value</span></span>
     <span class="k">and repays</span><span><b>${amount(t.debt, t.debt_asset)}</b> <span class="k">by ${whenBlock(t.maturity)}</span></span>
     <span class="k">Liquidation</span><span>if ${esc(m.collateral_ticker)} falls below <b>${money(liq, liq < 10 ? 4 : 2)} ${esc(m.debt_ticker)}</b> <span class="k">(${drop < 0 ? "above the price now — a loan would be liquidatable immediately"
@@ -1951,7 +1951,7 @@ async function cancelListing(o) {
     // The record is KEPT by the book and stays in this wallet's "mine" view:
     // it is the only copy of the terms that can build the refund, so the row
     // and its Withdraw button are what bring the principal back.
-    note("Listing taken off the board. Your principal is untouched in the " +
+    note("Delisted. Your principal is untouched in the " +
          "offer covenant; the offer stays under \u201cmine\u201d, and once its " +
          "expiry opens, Withdraw there brings it back. Nothing returns on its " +
          "own.", "ok");
@@ -2004,7 +2004,8 @@ async function borrow(o) {
     const [txid, vout] = String(o.outpoint).split(":");
     const out = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
     if (!out) throw new Error(
-      "cannot see that offer on chain right now; it may just have been taken");
+      "cannot see that offer's coin on chain right now; it may just have " +
+      "been taken. Press Refresh and look again.");
     // The offer's ADDRESS pins the terms but not what the coin holds. Its
     // value is a remainder and can be anything a whole lot fits in, but the
     // asset can only be the debt asset: the TAKE leaf pays the principal out
@@ -2111,7 +2112,8 @@ async function withdraw(o) {
     const t = JSON.parse(o.terms);
     const [txid, vout] = String(o.outpoint).split(":");
     const out = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
-    if (!out) throw new Error("that offer's coin is gone already");
+    if (!out) throw new Error("that offer's coin is already spent: the offer " +
+      "was taken or withdrawn. Press Refresh; the row will say which.");
     if (state.height != null && o.expiry_locktime != null
         && state.height < Number(o.expiry_locktime))
       throw new Error("the offer's expiry has not opened yet: the refund is " +
@@ -2131,7 +2133,7 @@ async function withdraw(o) {
         dustAtoms: dustFor(fee.asset),
       });
       built.summary = [
-        `Return ${amount(out.value, t.debt_asset)} to the lender's pinned address`,
+        `Return ${amount(out.value, t.debt_asset)} to the lender's address baked into the vault`,
         "The offer expired; this is its only remaining exit"];
       return built;
     }, { flow: "withdraw", prefer: [t.debt_asset] });
@@ -2189,7 +2191,7 @@ async function repay(l) {
         yours
           ? `Take back all ${units(args.collateralAmount, t.collateral_asset)} ${c}`
           : `Send all ${units(args.collateralAmount, t.collateral_asset)} ${c} ` +
-            "to the BORROWER, not to you: the vault pays their pinned address " +
+            "to the borrower, not to you: the vault pays the address baked into the vault " +
             "whoever broadcasts this",
         ...(yours ? [] : ["You are paying somebody else's loan off. Nothing " +
                           "comes back to you."]),
@@ -2298,8 +2300,8 @@ async function recover(l) {
       const built = flows.buildRecover({ ...args, feeAsset: fee.asset,
         feeAmount: fee.atoms, dustAtoms: dustFor(fee.asset) });
       built.summary = [
-        `Sweep all ${units(args.collateralAmount, t.collateral_asset)} ${c} to the lender's pinned address`,
-        `Open since ${whenText(t.recover_after)}: the oracle-liveness backstop`];
+        `Sweep all ${units(args.collateralAmount, t.collateral_asset)} ${c} to the lender's address baked into the vault`,
+        `Open since ${whenText(t.recover_after)}: the lender's sweep that needs no oracle`];
       return built;
     }, { flow: l.single_leaf ? "recover" : "recover4", prefer: [t.debt_asset] });
   } catch (e) { note(explain(e), "bad"); }
@@ -2354,7 +2356,7 @@ async function lend(ev) {
         `offer covenant at <span class="mono">${esc(rec.outpoint)}</span>. The book ` +
         `did not accept the listing (${esc(e.message)}), so no borrower can see it ` +
         `yet. It is in your offers under "Mine", where you can list it again or, ` +
-        `after the expiry, withdraw it. <button class="sm" id="retrylist">Retry listing</button>`,
+        `after the expiry, withdraw it. <button class="sm" id="retrylist">Publish listing</button>`,
         "warn");
       const b = $("#retrylist");
       if (b) b.onclick = () => listPending(rec);
@@ -2554,7 +2556,7 @@ async function runBtcBorrow(off) {
       "\" class=\"mono\">" + esc(out.ftxid) + "</a><br>" +
       "It waits in a pre-vault until you take the principal: claiming " +
       units(principal.toString(), l.debt_asset) + " " + d + " is what starts " +
-      "the loan, and until then you can take the collateral back. Your loan is " +
+      "the loan, and if it never comes you take the collateral back after " + whenText(l.abort_after, "Bitcoin") + ". Your loan is " +
       "under \"Your BTC-collateral loans\" below.", "ok");
     await renderBtcLoans();
   } catch (e) { busy(false); note(explain(e), "bad"); }
@@ -2597,6 +2599,13 @@ function btcPriceFor(market) {
   return m ? Number(m.unit_price) : null;
 }
 
+/** The stage, in the word the command line prints for the same state, so a
+ *  loan begun on one route reads the same on the other. */
+function stageWord(status) {
+  const words = { "principal-taken": "claimed-principal", "swept": "timed-out" };
+  return words[status] || status || "funded";
+}
+
 async function renderBtcLoans() {
   const box = $("#btcloans");
   if (!box) return;
@@ -2609,7 +2618,7 @@ async function renderBtcLoans() {
   const rows = all.filter(r => r && r.loan && btcborrow.loanReadable(r.loan));
   const unreadable = all.length - rows.length;
   const dropped = unreadable
-    ? `<div class="hint">${unreadable} of your loan record(s) are not shown: ` +
+    ? `<div class="hint">${unreadable} of your loan records ${unreadable === 1 ? "is" : "are"} not shown: ` +
       `their terms carry a value that is not a number, so nothing here can ` +
       `read them. That is the book serving a malformed record, not a loan ` +
       `you have lost -- the covenant behind it is on chain either way, and ` +
@@ -2617,8 +2626,8 @@ async function renderBtcLoans() {
     : "";
   if (!rows.length) {
     paint("#btcloans", dropped + `<div class="empty">${state.account
-      ? "No Bitcoin-collateral loans for this wallet yet."
-      : "Connect a wallet to see your Bitcoin-collateral loans."}</div>`);
+      ? "No BTC-collateral loans for this wallet yet."
+      : "Connect a wallet to see your BTC-collateral loans."}</div>`);
     return;
   }
   const heights = { btc: state.btcHeight, seq: state.height,
@@ -2689,16 +2698,16 @@ async function renderBtcLoans() {
           : `<span class="tag ${health < 1 ? "bad" : health < 1.15 ? "warn" : "ok"}" title="the current price over the price a seizure would be judged against. Under 1.00 the lender and the oracle can co-sign one">${health.toFixed(3)}</span>`}</td>
         <td data-label="repay by">${whenBlock(btcborrow.effectiveRepayDeadline(l), "Sequentia")}
           <span class="sub2">the lender stops claiming after this; the written
-          deadline is block ${Number(l.repay_deadline).toLocaleString()}</span></td>
+          deadline is Sequentia block ${Number(l.repay_deadline).toLocaleString()}</span></td>
         <td data-label="lender sweep">${whenBlock(l.recover_after, "Bitcoin")}</td>
         <td data-label="where it stands">${step.warn
-          ? `<span class="tag warn">${esc(rec.status || "funded")}</span>`
-          : esc(rec.status || "funded")}${step.note ? `<span class="sub2">${esc(step.note)}</span>` : ""}</td>
+          ? `<span class="tag warn">${esc(stageWord(rec.status))}</span>`
+          : esc(stageWord(rec.status))}${step.note ? `<span class="sub2">${esc(step.note)}</span>` : ""}</td>
         <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>`;
     }).join("") + "</tbody></table>" + dropped +
     `<p class="hint" style="margin:10px 0 0">Repaying pays a hashlocked output the
      lender can only open by publishing the secret that releases your Bitcoin.
-     Before spending Bitcoin on that secret, this page waits for the BITCOIN
+     Before spending Bitcoin on that secret, this page waits for the Bitcoin
      block its Sequentia block anchored to. Sequentia follows Bitcoin reorgs in
      real time, so Sequentia confirmations measure the wrong thing: six of them
      are six minutes, and one ordinary Bitcoin reorg undoes ten at once.</p>`;
@@ -2722,7 +2731,7 @@ async function renderBtcLoans() {
       btn.onclick = () => {
         const rec = rows[Number(btn.dataset.btcforget)];
         btcborrow.forgetLoan(rec.take_id);
-        note("Forgotten. The book drops the take on its own schedule; nothing of yours was on chain for it.", "info");
+        note("Forgotten here. The book drops an unsigned take after five minutes and a signed, unfunded one after six hours; nothing of yours was on chain for it.", "info");
         renderBtcLoans().catch(() => {});
       };
     });
@@ -2790,7 +2799,7 @@ async function btcStep(rec, force) {
         "Your lender can only take it by publishing the secret that releases " +
           "your Bitcoin, so repaying and getting the collateral back are one act",
         `Repay by ${whenText(btcborrow.effectiveRepayDeadline(l), "Sequentia")}; ` +
-          `it is now block ${Number(state.height).toLocaleString()}`,
+          `it is now Sequentia block ${Number(state.height).toLocaleString()}`,
         `If they never claim it, you take the repayment back after ` +
           `${whenText(l.repay_deadline, "Sequentia")}`,
         ...(vs === "unknown"
@@ -2808,7 +2817,7 @@ async function btcStep(rec, force) {
         "your Bitcoin; once that claim is buried, reclaim from here.", "ok");
     } else if (step.action === "reclaim") {
       const go = await confirmLines("Reclaim the collateral", [
-        `Spend the vault's ${pig.fixed(BigInt(l.btc_amount), 8, 8)} BTC to the address you named when you took the loan`,
+        `Spend the vault's ${pig.fixed(BigInt(l.btc_amount), 8, 8)} BTC to ${rec.reclaim_spk ? btcAddressOfSpk(rec.reclaim_spk) : "the address you named when you took the loan"}, less the ${Number(rec.reclaim_fee || 3000).toLocaleString()}-satoshi fee fixed when you took it`,
         `Bitcoin fee: ${Number(rec.reclaim_fee || 3000)} satoshis, fixed when the loan was taken and signed over by the lender's release; it cannot be changed`,
         force ? "Without waiting for the Bitcoin block your secret's Sequentia block anchored to"
               : "Only once the Bitcoin block your secret's Sequentia block anchored to is buried",
@@ -2860,7 +2869,7 @@ async function btcRefundRepayment(rec) {
         locktime: Number(l.repay_deadline),
         summary: [
           `Take back ${units(out.value, l.debt_asset)} ${d} the lender never claimed`,
-          "The refund leaf pays your own pinned address and nobody else's",
+          "The refund leaf pays your own address baked into the output and nobody else's",
           "Your Bitcoin collateral stays where it is: the lender can still sweep it after their own deadline",
         ] }),
       { flow: "btcclaim", prefer: [l.debt_asset] });
@@ -2880,7 +2889,7 @@ async function btcAbort(rec) {
   if (needWallet() || needBtcHeight("abort")) return;
   try {
     const go = await confirmLines("Take the collateral back", [
-      `Spend the pre-vault's ${pig.fixed(BigInt(rec.loan.btc_amount), 8, 8)} BTC (plus the unspent upgrade fee) to ` +
+      `Spend the pre-vault's ${pig.fixed(BigInt(rec.loan.btc_amount), 8, 8)} BTC (plus the unspent fee set aside for its move into the vault) to ` +
         (rec.reclaim_spk ? btcAddressOfSpk(rec.reclaim_spk) : "a fresh address of your own"),
       `Fee ${btcborrow.abortFeeFor(rec, state.btcFeerate).toLocaleString()} satoshis`,
       "The principal never came, so no loan ever started; this needs nobody's signature but yours",
@@ -3017,7 +3026,7 @@ async function checkBtc(ev) {
     lines += `<p><strong>These terms compile to:</strong></p><div class="kv">
       ${preAddr ? `<span class="k">Bitcoin pre-vault — pay this one</span><span>${esc(preAddr)}<br><span class="mono">${preSpk}</span><br><span class="small">exactly ${(Number(preValue)/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC: the collateral plus the fee for the one transaction that moves it on. Yours alone to take back after Bitcoin block ${Number(loan.abort_after).toLocaleString()}.</span></span>` : ""}
       <span class="k">Bitcoin loan vault</span><span>${esc(fundingAddr)}<br><span class="mono">${fundingSpk}</span>${preAddr
-        ? '<br><span class="small">Do NOT pay this address. The collateral reaches it only through the pre-vault, when claiming the principal publishes the secret that releases it.</span>' : ""}</span>
+        ? '<br><span class="small">Do not pay this address. The collateral reaches it only through the pre-vault, when claiming the principal publishes the secret that releases it.</span>' : ""}</span>
       ${principalAddr ? `<span class="k">Where the principal waits</span><span>${esc(principalAddr)}<br><span class="small">claiming it is what starts the loan; until you do, nothing is lent and nothing is locked.</span></span>` : ""}
       <span class="k">Sequentia repayment address</span><span>${esc(repayAddr)}<br><span class="mono">${repaySpk}</span></span>
       <span class="k">Collateral</span><span>${pig.fixed(BigInt(loan.btc_amount), 8, 8)} BTC</span>
@@ -3025,7 +3034,7 @@ async function checkBtc(ev) {
       <span class="k">Both chains' shared secret</span><span class="mono">${esc(loan.payment_hash)}</span>
       <span class="k">Repay deadline</span><span>Sequentia block ${Number(loan.repay_deadline).toLocaleString()}${state.height == null ? ""
         : rdOk ? ` — in the future (now block ${Number(state.height).toLocaleString()})`
-        : ` — <b>ALREADY PAST</b> (now block ${Number(state.height).toLocaleString()}): the lender's Sequentia refund is open, so do not fund`}</span>
+        : ` — <b>already past</b> (now block ${Number(state.height).toLocaleString()}): the lender's Sequentia refund is open, so do not fund`}</span>
       <span class="k">Lender sweep</span><span>${whenBlock(loan.recover_after, "Bitcoin")}${state.btcHeight == null
         ? " — this book publishes no Bitcoin height, so nothing here can say how far away that is; confirm in a Bitcoin explorer that it is well after your repayment deadline"
         : " — and it must sit well after your repayment deadline"}</span>
@@ -3133,7 +3142,7 @@ async function checkRepurchase(ev) {
           `<code>pignus-cli repo-verify terms.json --txid ${esc(txid)} --leg-txid &lt;the transfer&gt; --lender-cu &lt;hex&gt;</code>.</p>` + said);
     }
   } catch (e) {
-    say("bad", "<strong>REFUSED.</strong> " + esc(e.message));
+    say("bad", "<strong>Refused.</strong> " + esc(e.message));
   } finally { busy(false); }
 }
 

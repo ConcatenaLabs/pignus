@@ -69,18 +69,18 @@ export function alertsFor(view) {
     if (l.oracle_compromised && (mine(t.borrower_prog) || mine(t.lender_prog))) {
       (mine(t.borrower_prog) ? borrower : lender).push({
         level: "bad", key, action: mine(t.borrower_prog) ? "repay" : null,
-        text: "An oracle has declared the key this loan bakes COMPROMISED: whoever holds it can sign any price. " +
+        text: "An oracle has declared the key this loan bakes compromised: whoever holds it can sign any price. " +
               (mine(t.borrower_prog) ? "Repay now; nothing else protects the collateral."
                                      : "Expect nothing honest from that oracle; the borrower has been told to repay.") });
     }
     if (mine(t.borrower_prog)) {
       if (l.recover_open) {
         borrower.push({ level: "bad", key, action: "repay",
-          text: "The lender may now sweep the WHOLE collateral, with no oracle " +
+          text: "The lender may now sweep the whole collateral, with no oracle " +
                 "and at no price. Repay this moment or it is gone." });
       } else if (l.past_maturity) {
         borrower.push({ level: "bad", key, action: "repay",
-          text: "This loan has matured: anyone may call it at ANY price and " +
+          text: "This loan has matured: anyone may call it at any price and " +
                 "keep the bonus out of your collateral. Repay it now." +
                 (toRecover != null ? ` The lender's oracle-free sweep opens ${inWords(toRecover)}.` : "") });
       } else if (h != null && h < 1) {
@@ -98,14 +98,14 @@ export function alertsFor(view) {
       }
       if (!canPay && (l.past_maturity || (h != null && h < 1.15))) {
         borrower.push({ level: "warn", key, action: null,
-          text: "This wallet does not hold the debt in explicit coins, so " +
-                "Repay would fail. Get the debt asset first." });
+          text: "This wallet does not hold the debt in unblinded (explicit) coins, so " +
+                "Repay would fail. Get the debt asset, or send what you already hold to your own unblinded address first." });
       }
     }
 
     if (mine(t.lender_prog)) {
       const needs = canPay ? "" : " Calling it pays the debt from your wallet first, " +
-        "and this wallet does not hold it in explicit coins.";
+        "and this wallet does not hold it in unblinded (explicit) coins.";
       if (l.recover_open) {
         lender.push({ level: "warn", key, action: "recover",
           text: "Matured, unrepaid, and the oracle-free sweep is open: Recover " +
@@ -169,10 +169,10 @@ export function alertsFor(view) {
       const left = untilSeq(l.d_refund, view.height, view.blockSeconds);
       if (left != null && left < soon) {
         btc.push({ level: left <= 0 ? "bad" : "warn", key,
-          action: left <= 0 ? null : "btcstep",
+          action: "btcclaim",
           text: left <= 0
-            ? "The lender may now take your unclaimed principal back; your collateral waits in its pre-vault until the abort window opens."
-            : `Your principal is waiting: claim it ${inWords(left)}, or the lender takes it back and your collateral waits until the abort window.` });
+            ? `The lender may now take your unclaimed principal back. Until they do, claiming it still starts the loan; if they do first, your collateral waits in its pre-vault until the abort height.`
+            : `Your principal is waiting: claim it ${inWords(left)}, or the lender takes it back and your collateral waits until the abort height.` });
       }
     }
     if (["live", "repaid", "repayment-claimed"].includes(stage) && view.btcFeerate) {

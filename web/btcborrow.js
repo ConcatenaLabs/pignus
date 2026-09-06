@@ -265,8 +265,9 @@ export function renderOffers(box, offers, ui, onBorrow, write, feerateSatVb) {
   const open = all.filter(o => o.loan && readable(o.loan));
   const dropped = all.length - open.length;
   if (!open.length) {
-    put('<div class="empty">No Bitcoin-collateral offers are open. ' +
-        'A lender publishes one, and keeps a responder online while it rests.</div>');
+    put('<div class="empty">No BTC-collateral offers are open. A lender ' +
+        'publishes one and keeps their side (pignus-cli btc-respond) online ' +
+        'while it rests.</div>');
     return;
   }
   const note = dropped
@@ -505,7 +506,7 @@ export async function borrow(wallet, offer, ui) {
       `Seizable below ${seizePrice(loan, ui)} per BTC: the lender and the oracle sign a seizure together, and no script tests the price`,
       `If the principal never comes, take the collateral back after ` +
         `${ui.blockText ? ui.blockText(loan.abort_after, "Bitcoin") : "Bitcoin block " + loan.abort_after}`,
-      `The reclaim that returns your Bitcoin pays a ${reclaimFee.toLocaleString()}-satoshi fee to ${reclaimAddr}, ` +
+      `The reclaim that returns your Bitcoin pays it to ${reclaimAddr}, less a ${reclaimFee.toLocaleString()}-satoshi fee, ` +
         `and the lender may sweep the collateral after ` +
         `${ui.blockText ? ui.blockText(loan.recover_after, "Bitcoin") : "Bitcoin block " + loan.recover_after}`,
       "Your wallet will ask you to sign four times: twice to derive the origination secret, once to accept the terms, once for the move into the vault; the collateral is broadcast only after the lender's release verifies",
@@ -527,10 +528,12 @@ export async function borrow(wallet, offer, ui) {
       borrower_prog: seqSpk.prog, borrower_ver: seqSpk.ver,
       prevault_txid: prep.txid, prevault_vout: vout,
     })),
-    display: { detail: "Accept this offer's terms. This signature moves " +
-                       "nothing; it is what a seizure is later judged " +
-                       "against, so that the strike cannot be changed on " +
-                       "you afterwards." },
+    display: { detail: `Accept this offer's terms: ${fixed(BigInt(loan.btc_amount), 8, 8)} BTC ` +
+                       `of collateral for ${ui.units((BigInt(loan.principal || 0) || BigInt(loan.debt)).toString(), loan.debt_asset)} ` +
+                       `${ui.ticker(loan.debt_asset)}, repaying ${ui.units(loan.debt, loan.debt_asset)} ` +
+                       `${ui.ticker(loan.debt_asset)}, seizable below ${seizePrice(loan, ui)} per BTC. ` +
+                       "This signature moves nothing; a seizure is later judged " +
+                       "against it, so the strike cannot be changed on you afterwards." },
   })).signature;
 
   ui.busy(true, "asking the lender to open a loan…");
@@ -561,12 +564,14 @@ export async function borrow(wallet, offer, ui) {
   if (!reserved)
     throw new Error("the lender did not answer within 80 seconds, and nothing " +
       "was broadcast; your Bitcoin is untouched. Retrying asks again under a " +
-      "new take, and this one expires from the book after 30 minutes; it " +
+      "new take, and this one expires from the book after five minutes; it " +
       "stays under \"Your BTC-collateral loans\" until then, with a button " +
       "to forget it.");
   const paymentHash = String(reserved.payment_hash || "").toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(paymentHash))
-    throw new Error("the lender's answer carries no usable payment hash.");
+    throw new Error("the lender's answer carries no usable payment hash. " +
+      "Nothing has been broadcast and your Bitcoin is untouched; forget this " +
+      "take and try again.");
   // ...and the LENDER has to have said it. This hash goes into both chains'
   // scripts: it decides the vault the collateral moves into and the address
   // the debt is later paid to. Taken on the relay's word, a substituted one
@@ -590,9 +595,10 @@ export async function borrow(wallet, offer, ui) {
   const vaultTxid = btc.upgradeTx(live, prep.txid, vout).txid();
   const presig = (await wallet.request("signBtcTaproot", {
     sighash: hex(btc.upgradeSighash(live, prep.txid, vout)),
-    display: { detail: "Allow this loan to begin: sign the one transaction " +
-                       "that moves your collateral into the loan vault once " +
-                       "you have taken the principal." },
+    display: { detail: `Allow this loan to begin: move ${fixed(BigInt(loan.btc_amount), 8, 8)} BTC ` +
+                       `from the pre-vault into the loan vault at ${btc.fundingAddress(live, ui.btcHrp || "tb")}, ` +
+                       `paying the ${Number(loan.upgrade_fee || 0).toLocaleString()}-satoshi fee fixed by the offer, ` +
+                       "once you have taken the principal. It cannot be changed afterwards." },
   })).signature;
   await ui.post("v1/btc/presig",
                 { take_id: take.take_id, upgrade_presig: presig });
@@ -603,9 +609,9 @@ export async function borrow(wallet, offer, ui) {
     { tries: 40, gap: 2000 });
   if (!signed)
     throw new Error("the lender did not sign within 80 seconds, and nothing " +
-      "has been broadcast; your Bitcoin is untouched. Try again when their " +
-      "responder is back online: that asks under a new take, and this one " +
-      "expires from the book after 30 minutes.");
+      "has been broadcast; your Bitcoin is untouched. Try again when the " +
+      "lender is back online: that asks under a new take, and this one " +
+      "expires from the book after five minutes.");
 
   // The release is checked against the loan THIS page built, never against the
   // relay's copy of it: a relay that could hand back its own version could move
@@ -663,8 +669,9 @@ export async function claimPrincipal(wallet, rec, ui) {
   const d = await ui.api("v1/btc/take/" + rec.take_id);
   if (!d.disbursement_txid)
     throw new Error("the lender has not paid the principal yet. Nothing to " +
-      "claim; your collateral can still be aborted after Bitcoin block " +
-      Number(loan.abort_after).toLocaleString() + ".");
+      "claim; your collateral can still be taken back after " +
+      (ui.blockText ? ui.blockText(loan.abort_after, "Bitcoin")
+                    : "Bitcoin block " + Number(loan.abort_after).toLocaleString()) + ".");
   const secret = await deriveSecret(wallet, rec.btc_offer_id, loan.borrower_x,
                                     Number(rec.w_seq || 0));
   if (hex(P.sha256(secret)) !== loan.h_w)
@@ -691,10 +698,12 @@ export async function claimPrincipal(wallet, rec, ui) {
       "any more. It may have been claimed already, or never confirmed.");
   if (out.scriptPubKey !== spk)
     throw new Error("the principal was paid into an output these terms do not " +
-      "compile to. Do not act on it; report the offer.");
+      "compile to. Do not act on it; keep this take id (" + rec.take_id +
+      ") and open an issue at the link at the foot of this page.");
   if (out.asset !== loan.debt_asset)
     throw new Error("the coin at that outpoint is not the asset this loan is " +
-      "denominated in. Do not act on it; report the offer.");
+      "denominated in. Do not act on it; keep this take id (" + rec.take_id +
+      ") and open an issue at the link at the foot of this page.");
   const principal = String(out.value);
   const owed = (BigInt(loan.principal || 0) || BigInt(loan.debt));
   if (BigInt(principal) < owed)
@@ -935,8 +944,9 @@ export async function repay(wallet, rec, ui) {
       .catch(() => {});
     throw new Error("this debt is already paid: the repayment is on chain at " +
       `${already.txid}. Nothing further has been sent. If your lender has not ` +
-      "claimed it, you can take it back after Sequentia block " +
-      Number(loan.repay_deadline).toLocaleString() + ".");
+      "claimed it, you can take it back after " +
+      (ui.blockText ? ui.blockText(loan.repay_deadline, "Sequentia")
+                    : "Sequentia block " + Number(loan.repay_deadline).toLocaleString()) + ".");
   }
   ui.busy(true, "paying the debt…");
   const { pset } = await buildPayment({
@@ -983,7 +993,8 @@ export async function reclaim(wallet, rec, ui, { force = false } = {}) {
     throw new Error("the secret that releases your collateral is not on chain " +
       "yet: the lender has not claimed your repayment. Nothing to do but " +
       "wait; if they never claim, you can take the repayment back after " +
-      "Sequentia block " + Number(loan.repay_deadline).toLocaleString() + ".");
+      (ui.blockText ? ui.blockText(loan.repay_deadline, "Sequentia")
+                    : "Sequentia block " + Number(loan.repay_deadline).toLocaleString()) + ".");
   const { secret, claimTxid } = found;
   if (hex(P.sha256(toBytes(secret))) !== loan.payment_hash)
     throw new Error("the secret published does not match this loan. Do not act " +
@@ -1017,9 +1028,14 @@ export async function reclaim(wallet, rec, ui, { force = false } = {}) {
   // again here rather than discovering a bad one as a node rejection.
   if (!badaptor.verifySchnorr(loan.lender_x, sighash, rec.release_sig))
     throw new Error("the release stored for this loan does not verify. Do not " +
-      "broadcast anything; report it.");
+      "broadcast anything; keep this take id (" + rec.take_id + ") and open " +
+      "an issue at the link at the foot of this page.");
   const borrowerSig = (await wallet.request("signBtcTaproot", {
-    sighash, display: { detail: "Take your Bitcoin collateral back." },
+    sighash, display: { detail: "Reclaim your Bitcoin collateral: " +
+      fixed(BigInt(loan.btc_amount), 8, 8) + " BTC less the " +
+      Number(rec.reclaim_fee).toLocaleString() + "-satoshi fee fixed when the " +
+      "loan was taken, to " + (ui.spkToAddress ? ui.spkToAddress(rec.reclaim_spk) : rec.reclaim_spk) +
+      ". Nothing else moves." },
   })).signature;
   const tx = btc.completeReclaimTx(loan, vaultTxid, 0, toBytes(rec.reclaim_spk),
                                    rec.reclaim_fee, rec.release_sig,
@@ -1075,9 +1091,10 @@ export async function abort(wallet, rec, ui) {
   const loan = rec.loan;
   const heights = await ui.heights();
   if (Number(heights.btc) < Number(loan.abort_after))
-    throw new Error("your collateral becomes abortable at Bitcoin block " +
-      Number(loan.abort_after).toLocaleString() + "; the chain is at " +
-      Number(heights.btc).toLocaleString() + ".");
+    throw new Error("your collateral can be taken back from " +
+      (ui.blockText ? ui.blockText(loan.abort_after, "Bitcoin")
+                    : "Bitcoin block " + Number(loan.abort_after).toLocaleString()) +
+      "; Bitcoin is at block " + Number(heights.btc).toLocaleString() + ".");
   // The return address. A record rebuilt from the relay carries the relay's
   // copy of it, and nothing the page checks covers it -- except the lender's
   // release, which was signed over the reclaim to exactly this address. So a
@@ -1109,7 +1126,7 @@ export async function abort(wallet, rec, ui) {
     sighash, display: { detail: "Take back collateral for a loan that never " +
                                 "paid out: " +
                                 fixed(BigInt(loan.btc_amount), 8, 8) +
-                                " BTC plus the unspent upgrade fee, less a " +
+                                " BTC plus the unspent fee set aside for its move into the vault, less a " +
                                 abortFee + " satoshi fee, to " + toAddr + "." },
   })).signature;
   const tx = btc.completeAbortTx(loan, rec.prevault_txid, rec.prevault_vout,
@@ -1666,17 +1683,14 @@ export function nextStep(rec, heights) {
                      "there is no loan. " + abortable };
     case "seized":
       return { action: null, label: "", terminal: true,
-               note: "Your collateral was SEIZED: the lender and the oracle " +
+               note: "Your collateral was seized: the lender and the oracle " +
                      "signed together, which on this tier is the whole of a " +
-                     "liquidation -- no script tests the price. Do not repay: " +
-                     "the debt would pay for collateral that is already gone. " +
-                     "The price it was meant to be justified below is this " +
-                     "loan's strike, and the attestation behind it is " +
-                     "published at /v1/seizures on the oracle THIS loan " +
-                     "names -- key " + String(l.oracle_x || "").slice(0, 16) +
-                     "\u2026, which is not necessarily the one this page " +
-                     "links to. A seizure that was not justified is visible " +
-                     "to anyone who asks that oracle." };
+                     "liquidation. Do not repay; the debt would pay for " +
+                     "collateral that is already gone. The oracle this loan " +
+                     "names (key " + String(l.oracle_x || "") + ", in the " +
+                     "ticket) publishes the attestation behind it at its own " +
+                     "/v1/seizures, which may not be the oracle log linked at " +
+                     "the foot of this page." };
     case "swept":
       return { action: null, label: "", terminal: true,
                note: "The lender swept your collateral at the timeout, which " +
@@ -1707,7 +1721,7 @@ export function nextStep(rec, heights) {
                      "repayment back after Sequentia block " +
                      seqAt(l.repay_deadline) + "." };
     case "repayment-claimed":
-      return { action: "reclaim", label: "Take the collateral back",
+      return { action: "reclaim", label: "Reclaim the collateral",
                note: "Your debt is settled and the secret that releases your " +
                      "collateral is on chain." };
     case "reclaimed":

@@ -239,7 +239,7 @@ a lender who is online.</p>
       <button class="sm" data-lf="all">History</button>
     </span>
   </div>
-  <p class="hint">Health is the current price over the liquidation price. Under
+  <p class="hint">Health is the current price over the liquidation price (the strike). Under
   1.00 anyone may liquidate, and the covenant forces the surplus back to the
   borrower whoever does it &mdash; a liquidation is a race for the bonus, not a
   seizure. After maturity a loan can be called at any price; long after, the
@@ -254,10 +254,10 @@ a lender who is online.</p>
   <div class="card tbl" id="loans"><div class="empty">loading&hellip;</div></div>
   <details class="hint"><summary>Adding collateral</summary>
   To add collateral, repay and take a new offer. The new vault accepts only
-  attestations signed after its own <code>not_before</code>, which for a loan
-  drawn from an offer is the moment the offer was published, not the moment
-  you took it: a top-up retires prices from before the offer, but prices
-  signed between the offer and your take can still close it.</details>
+  attestations signed after its own <code>not_before</code>. For a loan drawn
+  from an offer that is the moment the offer was published, not the moment you
+  took it, so a top-up retires prices signed before the offer but not those
+  signed between the offer and your take.</details>
 </section>
 
 <section data-panel="repo" id="panel-repo" role="tabpanel" aria-labelledby="tab-repo" hidden>
@@ -297,8 +297,9 @@ a lender who is online.</p>
   every address from the terms, checks the lender's release against them, and
   only then asks you to commit anything.</p>
   <p class="hint">Your collateral does not go straight into the loan. It waits
-  in a pre-vault you alone can take back, and the loan begins only when you
-  claim the principal &mdash; which is the same act, so you can never be left
+  in a pre-vault only you can take back &mdash; from its abort height on, if
+  the principal never comes &mdash; and the loan begins only when you claim
+  the principal &mdash; which is the same act, so you can never be left
   having paid in and received nothing. Because Bitcoin has no covenants, this is
   the one tier where the lender has to be online, and where a liquidation needs
   the oracle to co-sign rather than a script to compute it.</p>
