@@ -814,8 +814,8 @@ function renderMarkets() {
         'attestation for this market at all, so there is no price to write a ' +
         'loan against">no price yet</span>');
     else
-      tags.push('<span class="tag dim" title="this book does not currently ' +
-        'lend in this market">not lendable</span>');
+      tags.push('<span class="tag dim" title="this book does not lend in ' +
+        'this market">not lendable</span>');
     // The oracle quotes a price at assumed decimals. If they are not the
     // registry's, the number is right and means something else.
     if (m.precision_mismatch)
@@ -2118,7 +2118,6 @@ async function withdraw(o) {
         && state.height < Number(o.expiry_locktime))
       throw new Error("the offer's expiry has not opened yet: the refund is " +
                       `locked until block ${Number(o.expiry_locktime).toLocaleString()}` +
-                      whenBlock(o.expiry_locktime).replace(/<[^>]*>/g, "").replace(/^.*\(/, " (") +
                       ", and a node would refuse the transaction as non-final");
     if (out.asset !== t.debt_asset)
       throw new Error("that offer's coin does not hold the debt asset the " +
@@ -2508,9 +2507,10 @@ function needBtcHeight(doing = "take") {
   if (state.btcHeight != null) return false;
   note(doing === "abort"
     ? "This book does not publish a Bitcoin height, so the page cannot tell " +
-      "whether the block your collateral becomes abortable at has passed. Run " +
-      "<code>pignus-cli btc-abort</code> against your own node, or check the " +
-      "height in a Bitcoin explorer and try again when this book shows one."
+      "whether the block your collateral becomes abortable at has passed. " +
+      "Check the height in a Bitcoin explorer, and press the button again " +
+      "once this book shows one; the command line cannot abort a loan begun " +
+      "here, because its key lives in your extension."
     : "This book does not publish a Bitcoin height, so the page cannot check " +
       "that the two chains' deadlines leave you enough time to repay and " +
       "reclaim. Take the offer with <code>pignus-cli btc-offer-take</code>, " +
@@ -2622,8 +2622,8 @@ async function renderBtcLoans() {
     ? `<div class="hint">${unreadable} of your loan records ${unreadable === 1 ? "is" : "are"} not shown: ` +
       `their terms carry a value that is not a number, so nothing here can ` +
       `read them. That is the book serving a malformed record, not a loan ` +
-      `you have lost -- the covenant behind it is on chain either way, and ` +
-      `<code>pignus-cli btc-check</code> reads it from the ticket.</div>`
+      `you have lost -- the covenant behind it is on chain either way. Ask ` +
+      `this book's operator to correct the record.</div>`
     : "";
   if (!rows.length) {
     paint("#btcloans", dropped + `<div class="empty">${state.account
@@ -2828,7 +2828,7 @@ async function btcStep(rec, force) {
                                            { force });
       note(`<b>Collateral reclaimed.</b> <a href="${txLink(txid, true)}" class="mono">${esc(txid)}</a>`, "ok");
     } else {
-      note("There is nothing to do with that loan right now.", "info");
+      note("Nothing is waiting on you for that loan; the row's own note says whose move it is.", "info");
       return;
     }
     try { await loadWallet(); renderWallet(); } catch { /* balances lag */ }
@@ -2893,12 +2893,12 @@ async function btcAbort(rec) {
       `Spend the pre-vault's ${pig.fixed(BigInt(rec.loan.btc_amount), 8, 8)} BTC (plus the unspent fee set aside for its move into the vault) to ` +
         (rec.reclaim_spk ? btcAddressOfSpk(rec.reclaim_spk) : "a fresh address of your own"),
       `Fee ${btcborrow.abortFeeFor(rec, state.btcFeerate).toLocaleString()} satoshis`,
-      "The principal never came, so no loan ever started; this needs nobody's signature but yours",
+      "The principal was never claimed, so no loan ever started; this needs nobody's signature but yours",
     ]);
     if (!go) { note("Nothing was signed.", "info"); return; }
     const txid = await btcborrow.abort(state.wallet, rec, btcUi());
     note(`<b>Collateral taken back.</b> <a href="${txLink(txid, true)}" class="mono">${esc(txid)}</a>. ` +
-      "The principal never came, so the loan never started.", "ok");
+      "The principal was never claimed, so the loan never started.", "ok");
     await renderBtcLoans();
   } catch (e) { note(explain(e), "bad"); } finally { busy(false); }
 }
@@ -3061,7 +3061,7 @@ async function checkBtc(ev) {
       lines += ok
         ? `<p class="tag ${rdOk ? "ok" : "bad"}" style="margin-top:10px">The lender's release signature verifies for this reclaim: once the lender takes your repayment, the secret they publish completes it and the collateral comes back to the address in <code>reclaim_dest</code>.</p>` +
           (rdOk
-            ? `<p class="hint">This page cannot see Bitcoin. Before funding, confirm in a Bitcoin explorer that your funding transaction pays ${preAddr
+            ? `<p class="hint">This form does not look the funding up on Bitcoin. Before funding, confirm in a Bitcoin explorer that your funding transaction pays ${preAddr
                 ? `exactly ${(Number(preValue)/1e8).toLocaleString(undefined,{maximumFractionDigits:8})} BTC to the pre-vault address above`
                 : `exactly ${pig.fixed(BigInt(loan.btc_amount), 8, 8)} BTC to the vault address above`}, and that the lender's sweep height is well after your repayment deadline. The lender pays the principal only after your collateral confirms.</p>`
             : `<p class="hint">The repayment deadline has already passed, so do not fund this whatever else checks out.</p>`)
