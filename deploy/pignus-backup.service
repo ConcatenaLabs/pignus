@@ -28,24 +28,27 @@ SuccessExitStatus=1
 # first and fails on the missing path, and the failure names a directory rather
 # than a problem.
 StateDirectory=pignus-backup
-# EVERY key, not just the oracles'. pignus-data holds the oracle keys and this
-# listed only that; a deployment that kept the responder's lender key in its own
-# directory instead was one whose backup restored the book, the logs and the
-# oracles but not the key that signs every release a borrower's reclaim depends
-# on -- a lender restored unable to answer any of their own live loans.
+# EVERY key, not just the oracles': a lender key kept in pignus-btc-keys rather
+# than in pignus-data would otherwise be the one file the archive lacks, and a
+# lender restored without it can answer none of their own live loans. The
+# responder's config and the liquidator's environment file hold credentials
+# and are archived too.
 #
-# It is named CONDITIONALLY because it is the one path here that legitimately
-# may not exist: a deployment following this file's own setup puts lender.key
-# inside pignus-data. Naming a missing path outright would not make the backup
-# wider, it would make tar exit 2 and the unit fail, so the nights it was most
-# needed are the nights there is no archive at all.
+# Each of those three is named CONDITIONALLY, because each legitimately may not
+# exist: lender.key normally lives inside pignus-data, and a box may run no
+# responder or no liquidator. Naming a missing path outright would not make the
+# backup wider; it would make tar exit 2 and the unit fail, so the nights it was
+# most needed would be the nights there is no archive at all.
 ExecStart=/bin/sh -c 'exec tar czf /var/lib/pignus-backup/pignus-$(date +%%F).tgz \
     /root/sequentia/pignus-data \
     $(test -d /root/sequentia/pignus-btc-keys \
       && echo /root/sequentia/pignus-btc-keys) \
     /root/sequentia/pignusd.json \
     /root/sequentia/pignus-oracle*.json \
-    /root/sequentia/pignus-responder.json'
+    $(test -f /root/sequentia/pignus-responder.json \
+      && echo /root/sequentia/pignus-responder.json) \
+    $(test -f /root/sequentia/pignus-liquidator.env \
+      && echo /root/sequentia/pignus-liquidator.env)'
 NoNewPrivileges=true
 PrivateTmp=true
 # /root is where both the source and the destination live, so ProtectSystem=

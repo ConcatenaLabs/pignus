@@ -22,7 +22,7 @@ User=root
 # plus every pignus-oracle@N. The default here lists the three that DEPLOY.md's
 # own setup enables, rather than only the primary -- a threshold oracle nobody
 # watches is one whose silence is discovered at a liquidation. Drop the extras
-# if you run only the primary; the script now also asks the book which keys it
+# if you run only the primary; the script also asks the book which keys it
 # quotes and fails if this list does not cover them, so a mismatch either way
 # is reported rather than assumed.
 # QUOTED, because systemd splits an unquoted Environment= line on whitespace
