@@ -151,7 +151,10 @@ def want(name, cond, detail=""):
 
 # Chromium says a great deal about GPUs and fonts that has nothing to do with
 # the page. What matters is what the PAGE said.
-noise = re.compile(r"GPU|Vulkan|dbus|gbm|EGL|sandbox|DevTools|Fontconfig|voice|"
+# ...and about D-Bus, which a CI runner does not have: "Failed to connect to
+# the bus" comes from bus.cc, not from anything spelt "dbus", and it failed
+# every run of the workflow this check is in without a single script error.
+noise = re.compile(r"GPU|Vulkan|dbus|bus\.cc|connect to the bus|gbm|EGL|sandbox|DevTools|Fontconfig|voice|"
                    r"libva|sqlite_persistent|favicon|Skia|angle|GL |gl_", re.I)
 errors = [l for l in console.splitlines()
           if re.search(r"\bERROR\b|Uncaught|SyntaxError|TypeError|ReferenceError", l)
