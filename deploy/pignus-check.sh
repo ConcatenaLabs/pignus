@@ -184,16 +184,45 @@ fi
 # and a timer is what has to look at it. `btc-responder-status` is
 # read-only, safe against the running unit, and exits 4 when a person is
 # needed, which is exactly the answer a timer wants.
-if [ -n "${PIGNUS_RESPONDER_CONFIG:-}" ]; then
+if [ -n "${PIGNUS_RESPONDER_CONFIG:-}" ] && [ ! -f "$PIGNUS_RESPONDER_CONFIG" ]; then
+    ok "no responder config at $PIGNUS_RESPONDER_CONFIG; this box runs no responder"
+elif [ -n "${PIGNUS_RESPONDER_CONFIG:-}" ]; then
     CLI="$(dirname "$0")/../bin/pignus-cli"
+    # The unit itself, first. The state file looks the same whether the
+    # process is alive or died an hour ago with nothing in flight, and takes
+    # then pile up unanswered at the relay.
+    if command -v systemctl >/dev/null 2>&1 \
+            && systemctl list-unit-files pignus-btc-responder.service >/dev/null 2>&1 \
+            && ! systemctl is-active --quiet pignus-btc-responder; then
+        bad "the responder unit pignus-btc-responder is not running; takes go unanswered"
+    fi
     out=$("$CLI" btc-responder-status --config "$PIGNUS_RESPONDER_CONFIG" \
             --book "$BOOK" 2>&1 >/dev/null)
     rc=$?
     case "$rc" in
         0) ok "the responder ($PIGNUS_RESPONDER_CONFIG) has nothing waiting on a person" ;;
         4) bad "the responder needs a person: $(printf '%s' "$out" | head -3 | tr '\n' ' ')" ;;
+        1) bad "the responder's offers could not be checked against the book: $(printf '%s' "$out" | tail -1)" ;;
         *) bad "the responder could not be read (exit $rc): $(printf '%s' "$out" | tail -1)" ;;
     esac
+    # Takes nobody has answered. A responder answers a take within a pass;
+    # one still `requested` a minute later is a responder that is down, or
+    # one refusing it -- and the refusal is in its state file, above.
+    unanswered=$(curl -sS --max-time 10 "$BOOK/v1/btc/takes?status=requested" 2>/dev/null | python3 -c '
+import json, sys, time
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+now = int(time.time())
+old = [t["take_id"][:12] for t in d.get("takes") or []
+       if now - int(t.get("created") or t.get("updated") or now) > 60]
+if old:
+    print(", ".join(old))
+' 2>/dev/null)
+    if [ -n "$unanswered" ]; then
+        bad "take(s) unanswered for over a minute: $unanswered"
+    fi
 fi
 
 # Loans that are liquidatable and have stayed that way. No liquidator is

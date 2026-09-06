@@ -35,9 +35,13 @@ Environment=PIGNUS_BOOK=http://127.0.0.1:8741
 # Keep this equal to max_price_age in pignusd.json.
 Environment=PIGNUS_MAX_PRICE_AGE=600
 # The responder's config, when this box runs one: the check then reads its
-# state through `pignus-cli btc-responder-status` and fails when a take has
-# waited on a person. Leave it unset on a box with no responder.
-Environment=PIGNUS_RESPONDER_CONFIG=/root/sequentia/pignus-responder.json
+# state through `pignus-cli btc-responder-status`, fails when a take has
+# waited on a person or the unit is down, and skips itself when the file
+# named here does not exist. Set it in a drop-in on a box that runs one:
+#   systemctl edit pignus-check.service
+#   [Service]
+#   Environment=PIGNUS_RESPONDER_CONFIG=/root/sequentia/pignus-responder.json
+#Environment=PIGNUS_RESPONDER_CONFIG=/root/sequentia/pignus-responder.json
 ExecStart=/root/sequentia/pignus/deploy/pignus-check.sh
 NoNewPrivileges=true
 PrivateTmp=true

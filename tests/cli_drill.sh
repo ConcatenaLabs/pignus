@@ -391,6 +391,12 @@ work = sys.argv[1]
 p = os.path.join(work, "responder-state.json")
 held = S(p, exclusive=True)
 print("  a responder starts and takes the lock")
+# ...and the file exists from that moment, empty: a status command or a
+# timer reading it before any take arrived found nothing and reported the
+# responder as unreadable, every five minutes, on every fresh install.
+if not os.path.exists(p) or open(p).read().strip() != "{}":
+    sys.exit("FAIL: a fresh responder did not write its empty state file")
+print("  and its state file exists, empty, before any take")
 
 code, said = refused(lambda: S(p, exclusive=True))
 if code == 0:

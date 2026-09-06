@@ -390,7 +390,7 @@ market that is not cross-chain must have a price signed within
 about how many decimals its assets have. `pignus-check.timer` runs it every
 five minutes and `pignus-check.service` carries the endpoints and that age as
 environment: `PIGNUS_ORACLES` names every oracle's port, and
-`PIGNUS_RESPONDER_CONFIG` names the responder's config on a box that runs one,
+`PIGNUS_RESPONDER_CONFIG` names the responder's config on a box that runs one -- set in a drop-in (`systemctl edit pignus-check.service`), since the shipped unit leaves it commented out; the check skips the responder when the file does not exist, and fails when the unit is down, when a take has gone unanswered for a minute, or when the book could not be read to check the offers --
 and the check then reads its state through `btc-responder-status` and fails
 when a take has waited on a person; it also reads `/v1/stats` and fails for a
 loan that is under its strike and still open, since no liquidator is
@@ -475,7 +475,7 @@ does.
 | `prune_after` | 2592000 | how long a *finished* record is kept: a spent offer, a closed vault, an ended cross-chain take. Nothing pruned is lost — the chain is the record and this book is an index of it — but every list is rendered end to end on every read. Anything still open is kept whatever its age; 0 keeps everything |
 | `trusted_proxies` | `["127.0.0.1", "::1"]` | the peers whose `X-Forwarded-For` this daemon believes |
 | `rpc` | — | the node. Optional: without one the book still serves offers and whatever it last knew, and says so in `/healthz` |
-| `btc_rpc` | — | the parent chain's node, same four fields as `rpc`. Only for cross-chain loans, and it never spends, so no wallet is needed. Without it the Bitcoin half of every cross-chain deadline goes unchecked here, `/healthz` says `btc_node: false`, no `btc_height` is published, and the page refuses to originate rather than check half the timelocks |
+| `btc_rpc` | — | the parent chain's node, same four fields as `rpc`. Only for cross-chain loans, and it never spends, so no wallet is needed. Without it the Bitcoin half of every cross-chain deadline goes unchecked here, `/healthz` says `btc_node: false`, no `btc_height` is published, and the page refuses to originate rather than check half the timelocks. One that is configured and stops answering makes `ok` false, with that reason |
 | `explorer_url` | — | where the page's breadcrumb points. A self-hosted book is not behind the testnet's reverse proxy, so it can say where its explorer really is |
 | `explorer_tx_url` | `/explorer/tx/{txid}` | the link a Sequentia transaction id becomes on the page |
 | `btc_explorer_tx_url` | `/testnet4/tx/{txid}` | the same for a parent-chain transaction |

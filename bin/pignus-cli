@@ -2529,6 +2529,12 @@ class _ResponderState:
         # file exists to prevent, and no report is worth the risk of it.
         if exclusive:
             self._date_old_waits()
+            # Written now, empty, rather than at the first take. A status
+            # command or a timer that reads this file before any take
+            # arrives found nothing there and reported the responder as
+            # unreadable, every five minutes, on every fresh install.
+            if path and not os.path.exists(path):
+                self._save()
 
     def _date_old_waits(self):
         """Give a wait that predates the stamp a date, once.

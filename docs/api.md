@@ -464,7 +464,9 @@ finished within `max(120s, 3 × poll)`, when any market's newest verified
 attestation is older than `max_price_age`, when offer events are queued up
 unapplied, when the last poll step failed, when a market is priced but not
 lendable (its tickers do not resolve to assets, or their precisions disagree),
-when any record cannot be rendered, when the node stopped answering partway
+when any record cannot be rendered, when a configured Bitcoin node is not
+answering (cross-chain deadlines go unchecked and the page will not
+originate), when the node stopped answering partway
 through the last poll (the rest of it is abandoned rather than waited out,
 one RPC timeout per record), or while `rescan_needed_from` is set.
 `error` says which; `stale_markets`, `oracle_errors` and
