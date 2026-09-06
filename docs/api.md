@@ -39,12 +39,11 @@ book that served them as numbers would hold loans its own page could not
 price.
 
 Every one of those amounts is coerced to a decimal string when a record is
-written and again when it is served, so the shape holds for every record
-whatever wrote it. The decimal-string rule holds for the amounts a book
-derives as well as the ones it stores. Heights,
-locktimes, timestamps, confirmations, counts, prices, `price_scale` and
-`expiry_locktime` are JSON numbers. That holds for the amounts a book derives
-as well as the ones it stores: `seizure_if_liquidated` and
+written and again when it is served, so the shape holds for every record,
+whichever client wrote it. Heights, locktimes, timestamps, confirmations,
+counts, prices, `price_scale` and `expiry_locktime` are JSON numbers. The
+decimal-string rule holds for the amounts a book derives as well as the ones
+it stores: `seizure_if_liquidated` and
 `surplus_if_liquidated` on a loan, every amount inside `/v1/loans/{id}/exit`,
 and the totals in `live_debt_by_asset` are all decimal strings too. Those are
 the figures a lender checks a payout against, and a rounded one reads as a
@@ -54,9 +53,8 @@ The `terms` field of an offer or a loan is the JSON **string** that was
 submitted, stored and served back byte for byte -- not a nested object. That is
 deliberate: the terms are what every party's covenant address is derived from,
 so re-serialising them here would be a chance to change them. Parse it
-yourself. Its amount fields are decimal strings whenever this book, the CLI or
-the page writes them; a book accepts either spelling on the way in, because a
-browser cannot serialise an integer above 2^53 exactly.
+yourself. Its amount fields follow the rule under *Numbers*, and a book
+accepts either spelling on the way in.
 
 **Prices.** A price is debt-asset atoms per collateral-asset atom, multiplied by
 `price_scale`. `unit_price` in `/v1/markets` is that number divided out, as a
@@ -89,7 +87,7 @@ than eight renders are already running the answer is a 503 with
 256 connections at once; past that an accept is closed unread and a client
 that retries gets a slot when one frees.
 
-Every write -- each `POST`, and `DELETE` -- must come from this site. A `POST`
+Every write -- every `POST` and every `DELETE` -- must come from this site. A `POST`
 must carry `Content-Type: application/json`, and an `Origin` header naming
 another site is refused, both with a 400 before the body is parsed. Nothing a
 write can do moves money without a coin or a signature; what this refuses is
@@ -250,7 +248,7 @@ file is missing.
 ### `GET /v1/oracle`
 
 ```json
-{"oracle_x": "…64 hex…", "url": "http://127.0.0.1:8740",
+{"oracle_x": "…64 hex…", "url": "https://sequentiatestnet.com/pignus-oracle/",
  "note": "verify every attestation against the key the VAULT bakes in, not against this one"}
 ```
 
@@ -263,7 +261,9 @@ the book itself reads from, which behind a proxy is loopback.
 
 `{"oracles": ["…x-only hex…"], "urls": ["https://…"], "previous": ["…"],
 "compromised": ["…"]}` — every independent oracle this book quotes against, in
-configured order, primary first. A lender picks an m-of-n subset from here.
+configured order, primary first; an oracle the book has not heard from since
+it started is left out, so the list can be shorter than the configured set. A
+lender picks an m-of-n subset from here.
 `previous` lists keys those oracles used to sign with, so a loan baked to one
 reads as rotated rather than as a stranger's; `compromised` lists keys any of
 them has declared compromised, which this book accepts nothing from, and
@@ -282,7 +282,7 @@ seizure is signed by oracles that are not the primary.
 The primary oracle's latest verified attestation for a market. Write the market
 with `_` for the slash: `/v1/attestation/GOLD_USDX`. `?oracle=<x-only hex>`
 returns that particular signer's instead, which is how a loan baked to a key
-this book no longer calls primary is still priced.
+that is not this book's primary is still priced.
 
 The attestation's own fields — `market`, `feed_id`, `timestamp`, `price`,
 `price_scale`, `signature` — are passed through untouched. Only `feed_id`,
@@ -293,9 +293,10 @@ every consumer here compares the scale to the loan's own before using a price.
 
 `oracle_x`, `age` (seconds) and `stale` are added beside them. Age is not a
 signed property and cannot be, but a reader acting on a price needs it: a
-signature stays valid however old the number under it is. It is SIGNED -- a
-negative age is an attestation dated ahead of this book's clock, which is
-exactly the case a reader most needs to see, and `stale` is true whenever the
+signature stays valid however old the number under it is. `age` can be
+negative: a negative value means the attestation is dated ahead of this
+book's clock, which is exactly the case a reader most needs to see, and
+`stale` is true whenever the
 attestation is not current: older than `max_price_age`, or dated more than two
 minutes ahead of this book's clock.
 Verify against the key the **vault** bakes in, not against whichever oracle
@@ -344,7 +345,7 @@ transaction index is needed:
 - 400 if the txid is not 64 hex or the vout is not a number, if the node refuses
   the lookup, or if the output is confidential (it has no public amount, and a
   covenant cannot spend one).
-- 404 if the output is unspent nowhere — it may already be spent.
+- 404 if there is no unspent output at that outpoint — it may already be spent.
 - 429 if this client is reading the chain too fast.
 - 503 if this book has no node.
 
@@ -382,7 +383,7 @@ witness.
 ```json
 {"txid": "…", "vout": 0, "spend_txid": "…",
  "confirmations": 12, "anchor_confirmations": 3,
- "preimages": {"<sha256 of the item>": "<32-byte item, hex>"}}
+ "preimages": {"<sha256 of the item>": "<the item, hex>"}}
 ```
 
 `anchor_confirmations` is how deep the PARENT chain is behind the Bitcoin block
@@ -394,7 +395,8 @@ block, and one ordinary single-block Bitcoin reorg undoes ten at once. It is
 when the anchor is not in the parent chain this book follows — and `null` means
 "not established", never "safe".
 
-`preimages` is every 32-byte witness item keyed by its SHA-256, so a caller
+`preimages` is every witness item of up to 520 bytes keyed by its SHA-256, so
+a caller
 picks by the hash its own loan commits to and this book needs to know nothing
 about that loan. The mempool is searched first, then blocks backwards from the
 tip as far as `back_scan_cap`.
@@ -503,7 +505,8 @@ registered.
 `covenant_vectors` counts the golden vector cases the covenant tripwire checked
 in this process. Zero would mean the builder was never loaded; a non-zero count
 is an operator's proof that the check ran. `git_rev` and `version` say which
-checkout is answering, which is how a box that lags the repository is caught.
+checkout is answering, which is how a box that lags the repository is caught;
+`git_rev` is `null` when the daemon does not run from a git checkout.
 
 ## Offers
 
@@ -618,8 +621,9 @@ The manage token goes in the `X-Manage-Token` header, or as `?token=` if a
 header is impossible. The query form is redacted from the log; the header is the
 right place for it.
 
-`{"removed": true, "note": "…"}` on success. 404 if there is no such listing,
-403 without the token, 429 if this client is writing too fast.
+`{"removed": true, "note": "…"}` on success. 404 (with `removed: false`) if
+there is no such listing or it is already delisted, 403 without the token, 429
+if this client is writing too fast.
 
 From the command line: `pignus-cli offer-delist --offer <id> --token <token>`,
 which sends the token in the header.
@@ -754,6 +758,8 @@ them one client may have in flight is the only thing bounding it.
 
 ### `GET /v1/loans/{id}/exit`
 
+(`/v1/loan/{id}/exit`, singular, is the same route.)
+
 How a closed loan ended, read back off the chain: the exit leaf that was
 revealed, the oracle evidence in the witness — checked against the key the vault
 itself bakes in — and what the transaction actually paid beside what the terms
@@ -849,13 +855,17 @@ the debt was paid, `claim_txid` with `secret_t` that the lender took it, and
 `refund_txid` that an unclaimed principal went home. Each only ever becomes
 true. The page derives everything it shows from them.
 
-`lots_left` on an offer is what a take holds against it. A take that is still
-`requested`, `reserved` or `pending` five minutes after it was made releases
-its lot, and a `signed` one whose collateral never
-appeared releases its lot after six hours: a borrower who asks and walks away
-must not hold a lender's offer shut. `disbursed`, `live` and `claimed` hold
-their lot for good, because money is in flight by then; `refunded` releases
-it, since the principal went home.
+Each take holds one of its offer's lots, and `lots_left` on the offer (under
+`GET /v1/btc/offers`) counts the lots no take is holding. A take that is
+still `requested`, `reserved` or `pending` five minutes after it was made
+releases its lot, and a `signed` one whose collateral never appeared releases
+its lot after six hours: a borrower who asks and walks away must not hold a
+lender's offer shut. `disbursed`, `live` and `claimed` hold their lot for
+good, because money is in flight by then; `refunded` releases it, since the
+principal went home.
+
+Every route that writes a take answers 409 when the step would move the take
+backwards, or out of a status nothing further can happen to.
 
 Those windows are short on purpose. Asking for a loan is free and anonymous, so
 every second an unfinished request holds a lot is a second somebody who is not
@@ -875,13 +885,12 @@ deadlines have gone by -- an expired record carries `expired_at` and
 lender who asks later why there was nothing to take. The rest describe a coin
 on a chain, and a cross-chain offer has none.
 
-Each row is the stored offer plus `lots_left`, computed live: how many of its
-lots are still free, once the takes holding one are counted. A borrower reads
-that before choosing an offer, since a lot somebody else is part-way through is
-not one they can have.
+Each row is the stored offer plus `lots_left`, computed live (which takes
+hold a lot is under *Take statuses*). A borrower reads it before choosing an
+offer, since a lot somebody else is part-way through is not one they can have.
 
 A cross-chain offer carries no coin, so nothing on a chain ends one. The book
-ends it instead: an offer whose own four deadlines no longer leave both sides
+ends it instead: an offer whose own four deadlines do not leave both sides
 the margins a take is checked against becomes `expired` on the next poll, and
 is pruned with the other dead records. That is the same rule that would refuse
 the take, applied one step earlier -- and it is what keeps the ceiling on open
@@ -1096,10 +1105,10 @@ themselves before committing anything.
  "auth": "<64-byte hex>"}
 ```
 
-The field is served back as both `release_sig` and `adaptor_sig`, and either is
-accepted on the way in. The value is an ordinary BIP340 release signature, not
-an adaptor signature; the second name is an alias every client and relay
-understands.
+`adaptor_point` and `payment_hash` are optional and default to the values
+stored on the take. The value is served under both names, `release_sig` and
+`adaptor_sig`, and either name is accepted on the way in; it is an ordinary
+BIP340 release signature, not an adaptor signature.
 
 `auth` is a BIP340 signature by the offer's `lender_x` over
 `tagged("pignus/btc-adaptor/1", canonical({take_id, adaptor_point,
@@ -1150,10 +1159,9 @@ can send it again.
 The borrower's own reports: where they took the principal, and where they paid
 the debt. Both are hints -- everything they say is on chain -- and both are
 stored on the take (`/v1/btc/claimed-principal` as `principal_claim_txid`,
-`/v1/btc/repaid` as `repay_txid` and `repay_vout`) and change NO status,
-because a status a borrower can set is one
-they can use to move a take out from under the step their lender was about to
-take. They are signed by the key the take names all the same: an unsigned hint
+`/v1/btc/repaid` as `repay_txid` and `repay_vout`) and change NO status, for
+the reason under *Take statuses*. They are signed by the key the take names
+all the same: an unsigned hint
 is a way to write into somebody else's loan, and a lender's responder saves a
 whole-UTXO-set scan by believing one that checks out.
 

@@ -188,8 +188,8 @@ a lender who is online.</p>
   take it while they are offline. Taking one locks your collateral in a vault
   whose address the offer's own script recomputes from your wallet's payout
   address, so the loan can pay nobody but you, and nobody can point it
-  elsewhere. Repay any time before maturity and the collateral comes straight
-  back.</p>
+  elsewhere. Repay at any time until the vault is spent, before or after
+  maturity, and the collateral comes straight back.</p>
   <div class="card tbl" id="offers"><div class="empty">loading&hellip;</div></div>
 </section>
 
@@ -197,8 +197,9 @@ a lender who is online.</p>
   <h2>Lend</h2>
   <p class="hint">Your principal goes into an offer covenant with the terms baked
   in. Borrowers take it while you are offline; you cannot oversell it and cannot
-  change a term afterwards. Anything untaken comes back to you after the expiry,
-  permissionlessly, to the address this wallet already has.</p>
+  change a term afterwards. Anything untaken you withdraw yourself after the
+  expiry, from Borrow &rsaquo; Mine; the refund can pay only the address this
+  wallet already has.</p>
   <div id="lendform_err"></div>
   <form class="lend card" id="lendform">
     <div><label for="marketsel">Market</label>
@@ -242,8 +243,9 @@ a lender who is online.</p>
   <p class="hint">Health is the current price over the liquidation price (the strike). Under
   1.00 anyone may liquidate, and the covenant forces the surplus back to the
   borrower whoever does it &mdash; a liquidation is a race for the bonus, not a
-  seizure. After maturity a loan can be called at any price; long after, the
-  lender can sweep it without an oracle.<br>
+  seizure. After maturity a loan can be called at any price; after the
+  recovery date in its terms (30 days past maturity for offers published
+  here), the lender can sweep it without an oracle.<br>
   LIVE means the funding is buried as deep as this book requires; Sequentia
   follows Bitcoin reorgs, so treat a fresh loan as provisional until it is
   deeper than you would accept a Bitcoin payment at.<br>
@@ -272,8 +274,9 @@ a lender who is online.</p>
   <code>pignus-cli repo-settle</code> composes it, because it needs a verifier
   input this page cannot select, and the lender signs it with their OpenDAMP
   key under the issuer's current policy. A lender who cannot produce that
-  signature cannot return the asset, and the bond is all you keep if they do
-  not: sell only under one who can. What this page does is the half that
+  signature cannot return the asset, and the bond is all you keep if they
+  cannot, so sell only to a lender who can produce it. What this page does is
+  the half that
   protects you beforehand: it rebuilds the bond vault's address from the terms
   and checks it against the funded coin, its asset and its amount.</p>
   <form class="lend card" id="repoform">
@@ -300,10 +303,10 @@ a lender who is online.</p>
   every address from the terms, checks the lender's release against them, and
   only then asks you to commit anything.</p>
   <p class="hint">Your collateral does not go straight into the loan. It waits
-  in a pre-vault only you can take back &mdash; from its abort height on, if
-  the principal never comes &mdash; and the loan begins only when you claim
-  the principal &mdash; which is the same act, so you can never be left
-  having paid in and received nothing. Because Bitcoin has no covenants, this is
+  in a pre-vault that only you can take back, from its abort height on, if the
+  principal never comes. The loan begins only when you claim the principal:
+  claiming is what releases the collateral into the vault, so you can never
+  have paid in and received nothing. Because Bitcoin has no covenants, this is
   the one tier where the lender has to be online, and where a liquidation needs
   the oracle to co-sign rather than a script to compute it.</p>
   <h3 style="margin-top:14px">Open BTC-collateral offers</h3>
@@ -318,7 +321,7 @@ a lender who is online.</p>
     <div class="full"><button type="submit">Check it</button>
       <span class="hint" style="display:inline;margin-left:8px">Keyless: this form
       derives addresses and verifies the release; it signs nothing. Only the
-      Borrow buttons above ask your wallet to sign.</span></div>
+      buttons in the offer and loan tables above ask your wallet to sign.</span></div>
   </form>
   <div class="card" id="btcout"><div class="empty">paste a ticket to verify it</div></div>
 </section>
@@ -340,10 +343,12 @@ a lender who is online.</p>
     them, and which one matters.<br><br>
     Sequentia fees are paid in whichever asset you choose at the confirmation
     step, from those your wallet holds and the network prices; Sequentia has no
-    privileged fee coin. Bitcoin fees are fixed when a loan is taken and shown
-    to you before you fund anything. Prefer the command line, or your own node?
-    <code>pignus-cli</code> signs everything this page signs, from a node
-    wallet; a loan begun on one route is finished on the same route.</p>
+    privileged fee coin. The reclaim's Bitcoin fee is fixed when a loan is
+    taken and shown to you before you fund; an abort's is set from the fee rate
+    when you take the collateral back. Prefer the command line, or your own
+    node? <code>pignus-cli</code> signs everything this page signs, from a
+    node wallet; a cross-chain loan begun on one route is finished on the same
+    route.</p>
   </div>
 </section>
 
