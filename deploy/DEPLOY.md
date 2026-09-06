@@ -17,6 +17,7 @@ on the box.
 | `pignus-oracle` | 8740 | the price feed on :8088 | attestations stop within one tick; loans cannot be liquidated until it returns |
 | further oracles | 8742, 8743 | the price feed on :8088 | an m-of-n loan loses a signer |
 | `pignusd` | 8741 | node RPC :18200 (the box's node runs with `-rpcport=18200`; the binary's own default is 18776), registry :3005, the oracles | the page and the book go with it; nothing on chain is affected |
+| `pignus-liquidator` | none (a client) | `pignusd` :8741, the oracles, node RPC :18200 | liquidatable loans stay open until somebody else runs a bot or a person liquidates; the timer's check says so |
 | `pignus-btc-responder` | none (a client) | `pignusd` :8741, node RPC :18200, Bitcoin testnet4 RPC :48332 | cross-chain borrows stall: takes go unsigned, funded ones unpaid |
 | the price server | 8088 | upstream quotes | every oracle stops signing once its feed has come back byte-identical for `flat_rounds` rounds, or sooner if `feed_max_age` is set |
 | `sequentia-registry` | 3005 | — | tickers fall back to the node's own asset labels |
@@ -577,6 +578,21 @@ configuration reads the same price server, so a stale or manipulated feed
 produces the same wrong number under all three keys and a 2-of-3 loan liquidates
 on it. Feed independence means giving each instance a different `source.url`,
 pointing at genuinely different upstreams.
+
+## The liquidator
+
+`pignus-liquidator.service` runs one liquidation bot against the book, from
+the `treasury2026` wallet, so a loan that crosses its strike is closed and
+the timer's "no loan has crossed its strike and been left there" check stays
+green. It is one participant among however many choose to run one: the
+covenant does not know which liquidator wins. The unit takes its credentials
+and its taker address from `/root/sequentia/pignus-liquidator.env` (mode
+0600, box-only, never in git), and names all three oracles so an m-of-n
+loan's price is verified against every key it may bake. Run it by hand with
+`--once --dry-run` first after any change to the wallet or the oracles. The
+bot refuses to decide a seizure when the node publishes no fee rate for the
+loan's debt asset, because it cannot restate a fee paid in another asset;
+`/v1/fees` on the book lists the rates the node has.
 
 ## Rotating the oracle key
 

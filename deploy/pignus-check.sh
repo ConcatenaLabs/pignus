@@ -229,6 +229,15 @@ if old:
     fi
 fi
 
+# A liquidator unit that exists and is not running is a bot everybody thinks
+# is watching the book. The check below on liquidatable loans catches the
+# consequence; this names the cause.
+if command -v systemctl >/dev/null 2>&1 \
+        && systemctl list-unit-files pignus-liquidator.service 2>/dev/null | grep -q pignus-liquidator \
+        && ! systemctl is-active --quiet pignus-liquidator; then
+    bad "the liquidator unit pignus-liquidator is installed and not running"
+fi
+
 # Loans that are liquidatable and have stayed that way. No liquidator is
 # guaranteed to be running, so "liquidatable" is a state the book can watch and
 # nobody sees; this is where somebody sees it.

@@ -34,8 +34,11 @@ Environment=PYTHONUNBUFFERED=1
 # placeholder with a space in it is not one: systemd splits an Environment=
 # value on whitespace and drops the line with a warning, and the bot then looks
 # for the node's cookie in the wrong place.
-Environment=PIGNUS_RPC_URL=http://127.0.0.1:18200
-Environment=PIGNUS_RPC_COOKIE=/path/to/the/node/datadir/.cookie
+# The node's credentials and the taker address, in a file only root reads
+# (mode 0600), never in this unit: PIGNUS_RPC_URL, PIGNUS_RPC_USER and
+# PIGNUS_RPC_PASSWORD (or PIGNUS_RPC_COOKIE), PIGNUS_RPC_WALLET, and
+# PIGNUS_TAKER_ADDRESS, an address of that wallet's own.
+EnvironmentFile=/root/sequentia/pignus-liquidator.env
 #
 # --book is where the live loans come from, re-read every round, so a loan taken
 #   while this runs is watched too.
@@ -52,8 +55,9 @@ Environment=PIGNUS_RPC_COOKIE=/path/to/the/node/datadir/.cookie
 ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignus-liquidator \
     --book http://127.0.0.1:8741 \
     --oracle http://127.0.0.1:8740 \
-    --taker-address <your address> \
-    --rpc-wallet liquidator \
+    --oracle http://127.0.0.1:8742 \
+    --oracle http://127.0.0.1:8743 \
+    --taker-address ${PIGNUS_TAKER_ADDRESS} \
     --min-profit 0 \
     --max-attestation-age 600 \
     --interval 30
