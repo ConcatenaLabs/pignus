@@ -1006,6 +1006,56 @@ except SystemExit as e:
 print("  disburse_conf below two is refused")
 CFG
 
+# --- a settlement witness finds the bond it is being attached to --------------
+#
+# `repo-settle --attach` without --vout, the invocation the README shows,
+# crashed on a None once the other commands learned to find the bond. The
+# check now adopts the outpoint the skeleton spends at input 1, after making
+# sure its txid is the one named, and still refuses a skeleton that spends
+# something else.
+python3 - "$BIN/pignus-cli" <<'ATTACH'
+import argparse, contextlib, importlib.machinery, importlib.util, io, sys
+
+cli = sys.argv[1]
+spec = importlib.util.spec_from_loader(
+    "pcli_attach", importlib.machinery.SourceFileLoader("pcli_attach", cli))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+from pignus.vault import _tf
+msgs, _ = _tf()
+BOND = "ab" * 32
+
+def skeleton(txid, vout):
+    tx = msgs.CTransaction(); tx.nVersion = 2
+    tx.vin.append(msgs.CTxIn(msgs.COutPoint(int("11" * 32, 16), 0)))   # the verifier
+    tx.vin.append(msgs.CTxIn(msgs.COutPoint(int(txid, 16), vout)))      # the bond
+    return tx.serialize().hex()
+
+def run(txid, vout, raw):
+    args = argparse.Namespace(txid=txid, vout=vout)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            m._check_settlement_vault(raw, None, args)
+    except SystemExit as e:
+        return e.code, err.getvalue(), args.vout
+    return 0, err.getvalue(), args.vout
+
+rc, _s, vout = run(BOND, None, skeleton(BOND, 3))
+if rc != 0 or vout != 3:
+    sys.exit(f"FAIL: --attach without --vout did not adopt the bond's output: {rc} {vout}")
+rc, _s, vout = run(BOND, 3, skeleton(BOND, 3))
+if rc != 0:
+    sys.exit(f"FAIL: --attach with the right --vout was refused: {rc}")
+rc, said, _v = run(BOND, 2, skeleton(BOND, 3))
+if rc != 2 or "different settlement" not in said:
+    sys.exit(f"FAIL: --attach with the wrong --vout was not refused: {rc} {said}")
+rc, said, _v = run(BOND, None, skeleton("cd" * 32, 3))
+if rc != 2 or "different settlement" not in said:
+    sys.exit(f"FAIL: a skeleton spending another transaction was not refused: {rc} {said}")
+print("  a settlement witness finds the bond's output from the skeleton, and refuses another transaction")
+ATTACH
+
 # --- a Tier C seizure reports what the issuer actually answered --------------
 #
 # The issuer answers a demo-asset seizure with the delivering txid, and an
