@@ -628,7 +628,9 @@ responder cannot make for itself: telling it that a send it recorded as
 in-flight never went out. It checks the chain first, and it takes the
 responder's own lock, so it cannot run against a live one. The same command
 with `--write-off "<why>"` records that this key can do nothing more about a
-take, so it is reported as written off rather than as needing a person.
+take, so it is reported as written off rather than as needing a person; a
+take with a paid principal and no claim of its repayment needs `--force` as
+well, since no pass will claim it once it is written off.
 
 Give `btc-responder-status` a `--book` and it also checks that the offers that
 book serves under this key still verify under it. One that does not is one

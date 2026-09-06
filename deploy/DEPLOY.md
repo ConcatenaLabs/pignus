@@ -710,7 +710,10 @@ ever bound -- is written off, on the record: `pignus-cli btc-responder-clear
 --config … --take <id> --write-off "<why>"`, with the responder stopped, since
 the command takes its lock. The take is then reported as written off rather
 than as needing a person, the responder acts on it no more, and an offer
-served under an old id stops counting it as money in flight.
+served under an old id stops counting it as money in flight. A take with a
+paid principal and no claim of its repayment needs `--force` as well: written
+off, no pass will claim that repayment, and walking away from it is a
+decision, not a side effect.
 
 A take that is simply over needs no write-off. One signed but never paid into,
 whose `d_refund` has passed, will never be paid into by this key, and the

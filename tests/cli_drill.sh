@@ -674,9 +674,19 @@ if r.returncode == 0:
 print("  a take with nothing in flight is left alone")
 
 # ...but it can be WRITTEN OFF, on the record: kept, reported as written off
-# rather than as needing a person, and not acted on again.
+# rather than as needing a person, and not acted on again. Not by accident,
+# though: this take has a paid principal and no claim, so a write-off is
+# walking away from the repayment the claim pass would collect.
 r = subprocess.run([sys.executable, cli, "btc-responder-clear",
                     "--state", state, "--take", "take-live",
+                    "--write-off", "pre-format record; principal went to a plain address"],
+                   capture_output=True, text=True)
+if r.returncode == 0 or "no claim of its repayment" not in r.stderr:
+    sys.exit(f"FAIL: a take with a paid, unclaimed principal was written off "
+             f"without --force: {r.returncode} {r.stderr[-300:]}")
+print("  a take with a paid, unclaimed principal is not written off by accident")
+r = subprocess.run([sys.executable, cli, "btc-responder-clear",
+                    "--state", state, "--take", "take-live", "--force",
                     "--write-off", "pre-format record; principal went to a plain address"],
                    capture_output=True, text=True)
 if r.returncode != 0:
