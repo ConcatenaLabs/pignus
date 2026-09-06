@@ -559,8 +559,11 @@ export async function borrow(wallet, offer, ui) {
   const reserved = await ui.poll("v1/btc/take/" + take.take_id,
     t => (t.payment_hash ? t : null), { tries: 40, gap: 2000 });
   if (!reserved)
-    throw new Error("the lender did not answer in time, and nothing was " +
-      "broadcast. Your Bitcoin is untouched.");
+    throw new Error("the lender did not answer within 80 seconds, and nothing " +
+      "was broadcast; your Bitcoin is untouched. Retrying asks again under a " +
+      "new take, and this one expires from the book after 30 minutes; it " +
+      "stays under \"Your BTC-collateral loans\" until then, with a button " +
+      "to forget it.");
   const paymentHash = String(reserved.payment_hash || "").toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(paymentHash))
     throw new Error("the lender's answer carries no usable payment hash.");
@@ -599,9 +602,10 @@ export async function borrow(wallet, offer, ui) {
     t => (t.status === "signed" || t.status === "disbursed") ? t : null,
     { tries: 40, gap: 2000 });
   if (!signed)
-    throw new Error("the lender did not sign in time, and nothing has been " +
-      "broadcast. Your Bitcoin is untouched. Try again when their responder " +
-      "is back online.");
+    throw new Error("the lender did not sign within 80 seconds, and nothing " +
+      "has been broadcast; your Bitcoin is untouched. Try again when their " +
+      "responder is back online: that asks under a new take, and this one " +
+      "expires from the book after 30 minutes.");
 
   // The release is checked against the loan THIS page built, never against the
   // relay's copy of it: a relay that could hand back its own version could move
@@ -614,9 +618,13 @@ export async function borrow(wallet, offer, ui) {
     throw new Error("the lender's release does not verify against this loan. " +
       "Refusing to commit any Bitcoin.");
 
-  ui.busy(true, "broadcasting the collateral…");
-  const ftxid = await wallet.request("broadcast", { chain: "bitcoin", hex: prep.hex });
+  // Remembered BEFORE the broadcast, with the signed funding itself. A tab
+  // closed or a broadcast refused between here and the next line left a take
+  // the relay holds as signed, a page that said "your collateral is
+  // committed", and no copy of the transaction to send again.
   const rec = {
+    funding_hex: prep.hex,
+    funded: false,
     take_id: take.take_id,
     btc_offer_id: offer.btc_offer_id,
     loan: live,
@@ -629,13 +637,17 @@ export async function borrow(wallet, offer, ui) {
     reclaim_spk: reclaimSpk,
     reclaim_fee: reclaimFee,
     release_sig: releaseSig,
-    funded: true,
     // This browser built the loan and checked the lender's signature over the
     // payment hash at the time, so it does not have to check it again from a
     // relay's copy later. A record RECOVERED from a relay carries no such
     // history and must prove it.
     originated: true,
   };
+  rec.status = stageOf(rec);
+  rememberLoan(rec);
+  ui.busy(true, "broadcasting the collateral…");
+  const ftxid = await wallet.request("broadcast", { chain: "bitcoin", hex: prep.hex });
+  rec.funded = true;
   rec.status = stageOf(rec);
   rememberLoan(rec);
   return { ftxid, rec, take_id: take.take_id };
@@ -1013,6 +1025,7 @@ export async function reclaim(wallet, rec, ui, { force = false } = {}) {
                                    rec.reclaim_fee, rec.release_sig,
                                    borrowerSig, secret);
   const txid = await wallet.request("broadcast", { chain: "bitcoin", hex: tx.hex() });
+  rec.reclaim_txid = txid; rec.reclaim_hex = tx.hex();
   rec.terminal = "reclaimed"; rec.status = "reclaimed"; rememberLoan(rec);
   return txid;
 }
@@ -1086,19 +1099,56 @@ export async function abort(wallet, rec, ui) {
     dest = await ui.addressToSpk((await wallet.request("getBtcAddress", {})).address);
   }
   const toAddr = ui.spkToAddress ? ui.spkToAddress(dest) : dest;
+  // The abort is signed fresh, so it pays what Bitcoin charges NOW, never
+  // less than the fee fixed at the take. The verification above used that
+  // fixed fee, because that is what the release was signed over.
+  const abortFee = abortFeeFor(rec, heights.feerate);
   const sighash = hex(btc.abortSighash(loan, rec.prevault_txid, rec.prevault_vout,
-                                       toBytes(dest), fee));
+                                       toBytes(dest), abortFee));
   const sig = (await wallet.request("signBtcTaproot", {
     sighash, display: { detail: "Take back collateral for a loan that never " +
                                 "paid out: " +
                                 fixed(BigInt(loan.btc_amount), 8, 8) +
                                 " BTC plus the unspent upgrade fee, less a " +
-                                fee + " satoshi fee, to " + toAddr + "." },
+                                abortFee + " satoshi fee, to " + toAddr + "." },
   })).signature;
   const tx = btc.completeAbortTx(loan, rec.prevault_txid, rec.prevault_vout,
-                                 toBytes(dest), fee, sig);
+                                 toBytes(dest), abortFee, sig);
   const txid = await wallet.request("broadcast", { chain: "bitcoin", hex: tx.hex() });
+  rec.abort_txid = txid; rec.abort_hex = tx.hex();
   rec.terminal = "aborted"; rec.status = "aborted"; rememberLoan(rec);
+  return txid;
+}
+
+/** What an abort pays: the fee fixed at the take, or what Bitcoin charges
+ *  now for a transaction of that size when that is more. */
+export function abortFeeFor(rec, feerateSatVb) {
+  const fixed_ = Number(rec.reclaim_fee || 3000);
+  const now = feerateSatVb ? reclaimFeeFloor(feerateSatVb) : 0;
+  return Math.max(fixed_, now || 0);
+}
+
+/**
+ * Send the collateral for a take whose funding was signed but never reached
+ * the chain -- a tab closed or a broadcast refused after the lender's release
+ * arrived. Checked again first, as the take was: the release must still
+ * verify and the deadlines must still leave room.
+ */
+export async function broadcastFunding(wallet, rec, ui) {
+  if (!rec.funding_hex) throw new Error("this browser holds no signed funding for this take.");
+  const loan = rec.loan;
+  const heights = await ui.heights();
+  const late = timelockProblems(loan, heights.btc, heights.seq, heights.feerate);
+  if (late.length) throw new Error(late.join(" "));
+  const vaultTxid = rec.vault_txid
+    || btc.upgradeTx(loan, rec.prevault_txid, rec.prevault_vout).txid();
+  const over = hex(btc.reclaimSighash(loan, vaultTxid, 0,
+                                      toBytes(rec.reclaim_spk), rec.reclaim_fee));
+  if (!badaptor.verifySchnorr(loan.lender_x, over, rec.release_sig))
+    throw new Error("the lender's release no longer verifies against this " +
+      "take; nothing has been broadcast.");
+  const txid = await wallet.request("broadcast", { chain: "bitcoin", hex: rec.funding_hex });
+  rec.funded = true; rec.unfunded = false; rec.status = stageOf(rec); rememberLoan(rec);
   return txid;
 }
 
@@ -1297,6 +1347,47 @@ export async function checkVault(rec, ui) {
   rec.vault_spent_by = got.spend_txid;
   rememberLoan(rec);
   return true;
+}
+
+/**
+ * What the chain says that the relay was never told. Three facts a borrower's
+ * page hung on a lender's REPORT, each of which the chain states plainly:
+ * that the collateral moved into the vault (the loan is live, and the abort
+ * button must go), that the lender claimed the repayment (the secret is in
+ * the witness, and the reclaim opens), and whether the funding this browser
+ * signed ever reached the chain at all. Read here so that a report lost to
+ * a relay outage costs the borrower nothing.
+ */
+export async function learnFromChain(rec, ui) {
+  const stage = stageOf(rec);
+  let learned = false;
+  if (["funded", "signed", "disbursed", "principal-taken"].includes(stage)
+      && rec.vault_txid && !rec.upgrade_txid) {
+    const got = await ui.api(`v1/btc/outpoint/${rec.vault_txid}/0`).catch(() => null);
+    if (got && (got.unspent === true || got.spend_txid)) {
+      rec.upgrade_txid = rec.vault_txid; learned = true;
+    }
+  }
+  if (stage === "signed" && !rec.funded && !rec.upgrade_txid && rec.prevault_txid) {
+    const got = await ui.api(`v1/btc/outpoint/${rec.prevault_txid}/${rec.prevault_vout}`)
+      .catch(() => null);
+    if (got && (got.unspent === true || got.spend_txid)) {
+      rec.funded = true; rec.unfunded = false; learned = true;
+    } else if (got && got.unspent === false && !got.spend_txid) {
+      // Nothing the node knows at that outpoint: the funding never went out.
+      if (!rec.unfunded) { rec.unfunded = true; learned = true; }
+    }
+  }
+  if (stage === "repaid") {
+    const found = await findSecret(rec, {}, ui).catch(() => null);
+    if (found && found.secret) {
+      rec.secret_t = found.secret;
+      if (found.claimTxid) rec.lender_claim_txid = found.claimTxid;
+      learned = true;
+    }
+  }
+  if (learned) { rec.status = stageOf(rec); rememberLoan(rec); }
+  return learned;
 }
 
 /** "unknown" when the book could not say, "unspent" when the collateral is
@@ -1519,6 +1610,17 @@ export function nextStep(rec, heights) {
                      "Nothing of yours is committed yet." };
     case "funded":
     case "signed":
+      if (rec.unfunded)
+        return { action: null, label: "", warn: true,
+                 note: "Nothing of yours is on chain for this take: the " +
+                       "collateral was signed but never broadcast. " +
+                       (rec.funding_hex
+                         ? "This browser still holds the signed funding, so " +
+                           "it can be sent now if the deadlines still leave " +
+                           "room; or forget the take, and the book drops it " +
+                           "in six hours."
+                         : "Forget the take; the book drops it in six hours, " +
+                           "and nothing of yours was committed.") };
       return { action: null, label: "", warn: feeStuck,
                note: feeStuck
                  ? "This loan carries " + Number(l.upgrade_fee || 0) +

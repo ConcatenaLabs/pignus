@@ -121,6 +121,15 @@ sign. Repay from *Loans* any time before maturity and the collateral returns in
 the same transaction. For native Bitcoin, use *BTC collateral*: the collateral
 waits in a pre-vault you can take back until you claim the principal.
 
+A cross-chain loan is remembered in the browser and rebuilt from the book on
+any device with the same wallet, and what the chain says is read directly:
+that the collateral moved into the vault, that the lender claimed the
+repayment, that the funding reached the chain at all. A report the lender's
+responder never sent costs the borrower nothing. A take the lender never
+answered, or whose funding was signed but never broadcast, has a button to
+forget it; a funding this browser signed and did not send can be broadcast
+later, after the release and both chains' deadlines are checked again.
+
 The alerts at the top of the page say what needs a person in whichever seat
 your wallet is in, and their count goes in the tab title. Each tab has its own
 link -- `#borrow`, `#lend`, `#loans`, `#repo`, `#btc` after the page's address

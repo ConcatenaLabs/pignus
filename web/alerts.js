@@ -174,7 +174,7 @@ export function alertsFor(view) {
       if (fee && fee < floor) {
         btc.push({ level: "warn", key, action: null,
           text: `Your reclaim carries ${fee} satoshis and Bitcoin now charges about ${floor} for it. ` +
-                "It cannot be bumped or replaced, so repay early enough for it to confirm before the lender's sweep opens." });
+                "It cannot be replaced; repay early enough for it to confirm before the lender's sweep opens, and if it stalls, spend its output from your wallet at a high fee to pull it in." });
       }
     }
   }

@@ -500,6 +500,44 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
   // The fetch itself: silent on every failure, because a book that cannot
   // answer must not turn a running loan into a seized one.
   const api = (reply) => ({ api: async () => reply });
+  // What the chain says that the relay never reported.
+  const byPath = (map) => ({ api: async (p) => {
+    for (const k of Object.keys(map)) if (p.startsWith(k)) return map[k];
+    throw new Error("404");
+  } });
+  const EE = "ee".repeat(32), CC = "cc".repeat(32), DD = "dd".repeat(32);
+  const signed = { take_id: "s", loan, vault_txid: EE, prevault_txid: CC,
+                   prevault_vout: 0, release_sig: "ab" };
+  const a = { ...signed };
+  await bb.learnFromChain(a, byPath({ ["v1/btc/outpoint/" + EE]: { unspent: true } }));
+  ok("a vault the chain holds makes the loan live, whatever the relay reported",
+     a.upgrade_txid === EE && bb.stageOf(a) === "live", bb.stageOf(a));
+  const b = { ...signed };
+  await bb.learnFromChain(b, byPath({ ["v1/btc/outpoint/" + EE]: { unspent: false, spend_txid: "" },
+                                      ["v1/btc/outpoint/" + CC]: { unspent: false, spend_txid: "" } }));
+  ok("a funding the chain does not know is said to be unbroadcast",
+     b.unfunded === true && /never broadcast/.test(bb.nextStep(b, heights).note),
+     bb.nextStep(b, heights).note);
+  const c = { ...signed };
+  await bb.learnFromChain(c, byPath({ ["v1/btc/outpoint/" + EE]: { unspent: false, spend_txid: "" },
+                                      ["v1/btc/outpoint/" + CC]: { unspent: true } }));
+  ok("...and one it holds is funded", c.funded === true && !c.unfunded);
+  const repaid = { take_id: "r", loan, upgrade_txid: "ff".repeat(32), repay_txid: DD, repay_vout: 0 };
+  await bb.learnFromChain(repaid, byPath({ ["v1/spend/" + DD]: {
+    preimages: { [loan.payment_hash]: "77".repeat(32) }, spend_txid: "99".repeat(32), anchor_confirmations: 3 } }));
+  ok("a lender's claim read off the chain opens the reclaim without any report",
+     repaid.secret_t === "77".repeat(32) && repaid.lender_claim_txid === "99".repeat(32)
+     && bb.stageOf(repaid) === "repayment-claimed", bb.stageOf(repaid));
+  const quiet = { ...signed };
+  await bb.learnFromChain(quiet, byPath({}));
+  ok("a book that cannot answer changes nothing", !quiet.upgrade_txid && !quiet.unfunded && !quiet.funded);
+  ok("an abort pays the fixed fee, or today's floor when that is more",
+     bb.abortFeeFor({ reclaim_fee: 3000 }, 0) === 3000
+     && bb.abortFeeFor({ reclaim_fee: 3000 }, 100) === Math.max(3000, bb.reclaimFeeFloor(100))
+     && bb.abortFeeFor({ reclaim_fee: 3000 }, 100) > 3000);
+  let refused = "";
+  try { await bb.broadcastFunding({}, { loan }, byPath({})); } catch (e) { refused = e.message; }
+  ok("sending a funding this browser never kept is refused", /no signed funding/.test(refused), refused);
   const seized = { ...live };
   await bb.checkVault(seized, api({ unspent: false, spend_txid: "ab".repeat(32),
                                     witness: witnessFor("seize") }));
