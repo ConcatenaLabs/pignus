@@ -841,6 +841,18 @@ set +e; run_check env PIGNUS_CHECK_STATE="$WORK/check.state" >/dev/null; set -e
 test "$(wc -l < "$WORK/alerts.log")" = 1 || {
     echo "a second failing run paged again:" >&2; cat "$WORK/alerts.log" >&2; exit 1; }
 set +e; HAND=$(run_check env -u PIGNUS_CHECK_STATE); set -e
+# ...and the way in is checked as a visitor finds it: a URL nothing answers
+# is a failure with curl's reason, and one the service itself answers -- here
+# the drill's own book, standing in for the proxy -- is fine.
+set +e; PUB=$(run_check env -u PIGNUS_CHECK_STATE PIGNUS_PUBLIC_URLS="http://127.0.0.1:1/healthz http://127.0.0.1:$DPORT2/healthz"); set -e
+echo "$PUB" | grep -q "FAIL  http://127.0.0.1:1/healthz did not answer through the proxy (HTTP 000)" || {
+    echo "the checker did not report an unreachable public URL" >&2
+    echo "$PUB" | grep -i "proxy" | sed 's/^/  /' >&2; exit 1; }
+echo "$PUB" | grep -q "ok    http://127.0.0.1:$DPORT2/healthz answers through the proxy" || {
+    echo "the checker did not accept a public URL the service answers on" >&2
+    echo "$PUB" | grep -i "proxy" | sed 's/^/  /' >&2; exit 1; }
+echo "$HAND" | grep -q "public URLs are not checked" || {
+    echo "the checker did not say the public URLs go unchecked when none are given" >&2; exit 1; }
 # ...and the disk under the data directory is watched, with a floor that can
 # be set: a machine this full of nothing else would be paged about.
 set +e; FULL=$(run_check env -u PIGNUS_CHECK_STATE PIGNUS_MIN_FREE_MB=999999999); set -e
