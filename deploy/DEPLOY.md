@@ -17,17 +17,20 @@ on the box.
 |---|---|---|---|
 | `pignus-oracle` | 8740 | the price feed on :8088 | attestations stop within one tick; loans cannot be liquidated until it returns |
 | further oracles | 8742, 8743 | the price feed on :8088 | an m-of-n loan loses a signer |
-| `pignusd` | 8741 | node RPC :18200 (the box's node runs with `-rpcport=18200`; `pignusd` has no default, and the CLI and the liquidator default to 18776 when `PIGNUS_RPC_URL` is unset), registry :3005, the oracles | the page and the book go with it; nothing on chain is affected |
+| `pignusd` | 8741 | node RPC :18200, registry :3005, the oracles | the page and the book go with it; nothing on chain is affected |
 | `pignus-liquidator` | none (a client) | `pignusd` :8741, the oracles, node RPC :18200 | liquidatable loans stay open until somebody else runs a bot or a person liquidates; the timer's check says so |
 | `pignus-btc-responder` | none (a client) | `pignusd` :8741, node RPC :18200, Bitcoin testnet4 RPC :48332 | cross-chain borrows stall: takes go unsigned, funded ones unpaid |
 | `bitcoind` (testnet4) | 48332 | the Bitcoin network | cross-chain deadlines go unchecked, `/healthz` says `btc_node: false`, the page refuses to originate, and the responder cannot pay or start a loan |
 | the price server | 8088 | upstream quotes | every oracle stops signing once its feed has come back byte-identical for `flat_rounds` rounds, or sooner if `feed_max_age` is set |
 | `sequentia-registry` | 3005 | — | tickers fall back to the node's own asset labels |
-| `pignus-alert@<unit>` | none (a oneshot) | the ntfy topic in `pignus-alert.env` | a unit's failure, or a change in the check's verdict, reaches nobody's phone; the journal still has it |
+| `pignus-alert@<unit>` | none (a oneshot unit) | the ntfy topic in `pignus-alert.env` | a unit's failure reaches nobody's phone; the journal still has it (the check's verdict changes go through the script directly, see *Alerting*) |
 
 The price server is the node repository's `contrib/price-server`, the same one
 that feeds the any-asset fee market; Pignus deliberately does not run a second
 price pipeline.
+
+The box's node runs with `-rpcport=18200`. `pignusd` has no default RPC URL;
+the CLI and the liquidator default to 18776 when `PIGNUS_RPC_URL` is unset.
 
 The responder is a lender's own process, not part of the service: it holds the
 key that signs releases and the wallet that pays principals. It is listed here
@@ -106,7 +109,9 @@ Every unit runs as root with its state under `/root`, which is exactly where
 and hands back the single directory it has to write: `/root/sequentia/pignus-data`
 for every service that writes (`pignusd`, each oracle instance, the responder;
 the liquidator writes nothing), and `/var/lib/pignus-backup` for the backup, which
-systemd creates from `StateDirectory=`. **Move one of those
+systemd creates from `StateDirectory=` -- as it does `/var/lib/pignus-check`
+for the check's last verdict and `/var/lib/pignus-alert` for the alert's mute
+marks. **Move one of those
 paths and the matching `ReadWritePaths=` moves with it.** Otherwise the service
 starts cleanly and fails at its first write, which for `pignusd` is hours later
 and reads as a bug rather than as a mount.
@@ -162,9 +167,6 @@ named only if they exist: tar fails the whole archive on a missing path rather
 than skipping it, and a box that runs no responder or no liquidator has
 neither file. `pignus-backup.service` carries the same command.
 
-Repairing a responder that has lost the answer to a send is under *Native
-BTC collateral*.
-
 `pignus-backup.service` is that command as a unit, at `UMask=0077` so the
 archive is 0600. It writes to `/var/lib/pignus-backup`, which systemd creates
 and keeps writable for it; `pignus-backup.timer` runs it daily and catches up a day
@@ -197,7 +199,8 @@ What each piece costs to lose:
   a principal twice, because the state file is the only record of what has
   already been sent. Restore it only from a copy newer than the last
   disbursement, and check the lender wallet's `listtransactions` against
-  `/v1/btc/takes?status=disbursed` before you do.
+  `/v1/btc/takes?status=disbursed` before you do. Repairing a responder that
+  has lost the answer to a send is under *Native BTC collateral*.
 - **`pignus-alert.env`** — the push channel's name. No coin is at risk; make a
   new topic, put it in a new file and subscribe again, or failures reach the
   journal only until you do.
@@ -280,10 +283,8 @@ checkable by anyone — the attestation behind it is at that oracle's own
 `/v1/seizures` — and an m-of-n seizure is signed by oracles that are not the
 primary. One with no public route is one whose seizures nobody outside can
 check, which is most of what bounds an oracle's trust. Put the same addresses
-in `oracle_public_urls` in `pignusd.json`, in the order `oracle` then
-`oracles`, so `/v1/oracles` can tell a reader where to look; the book's own
-loopback addresses are never served, because a browser told to fetch
-`127.0.0.1` fetches from the reader's own machine.
+in `oracle_public_urls` in `pignusd.json`; the table under *`pignusd`
+configuration* says how.
 
 `pignusd` sends its own security headers on every response -- a content
 security policy that forbids scripts and connections from anywhere but itself
@@ -325,7 +326,8 @@ it in each oracle's config, the same way.
 cd /root/sequentia/pignus && git fetch origin && git status -sb   # 'behind' if it lags
 git pull --ff-only
 SEQUENTIA_SRC=/root/sequentia/Sequentia tests/cli_drill.sh
-systemctl restart pignus-oracle pignus-oracle@2 pignus-oracle@3 pignusd pignus-btc-responder pignus-liquidator
+systemctl restart pignus-oracle pignus-oracle@2 pignus-oracle@3 pignusd pignus-btc-responder
+systemctl restart pignus-liquidator          # only where one is installed
 curl -s localhost:8741/healthz | jq -r .git_rev; git rev-parse --short HEAD
 ```
 
@@ -335,8 +337,9 @@ covenant pin. The last line must print the same short hash twice.
 
 A unit file that changed in the checkout is not the one systemd is running: the
 copies under `/etc/systemd/system` are what it reads, so copy them over again
-and `systemctl daemon-reload` before restarting. `pignus-check.sh` is the
-exception — it is executed out of the checkout, so a pull is all it needs.
+and `systemctl daemon-reload` before restarting. The two scripts,
+`pignus-check.sh` and `pignus-alert.sh`, are the exception — they are executed
+out of the checkout, so a pull is all they need.
 
 If the node repository's covenant changed, pull that too and re-run the drills
 **before** restarting. `pignusd` loads the covenant and checks it against
@@ -517,12 +520,9 @@ lenders — it is named rather than numbered.
 
 **Distinct keyfiles are what makes the set independent**: three instances
 sharing one key are a 1-of-1 wearing a 2-of-3 label. Print each key with
-`--print-pubkey`, make sure `PIGNUS_ORACLES` covers them -- the shipped unit
-already names 8740, 8742 and 8743; anything else goes in a drop-in
-(`systemctl edit pignus-check.service`) -- and confirm `/v1/oracles` on the
-book lists them all.
-The backup already covers the extra keys and configs, which are under
-`pignus-data` and match the `pignus-oracle*.json` glob.
+`--print-pubkey`, make sure `PIGNUS_ORACLES` covers them (*Checking it* says
+where that is set), and confirm `/v1/oracles` on the book lists them all. The
+backup covers them (*Backups*).
 
 **Every new offer made with `--oracles book` names every oracle the book
 quotes, n-of-n unless `--oracle-threshold` says otherwise.** So the moment a
@@ -546,9 +546,8 @@ they do not run:
    the key up, and the attestation log with it, from that moment.
 3. Send the book's operator your public https URL and the key from
    `--print-pubkey`. They add the URL to `oracles` and `oracle_public_urls`
-   in `pignusd.json` and to `PIGNUS_ORACLES` (in a drop-in on
-   `pignus-check.service` if the shipped default does not cover it), and
-   restart `pignusd`.
+   in `pignusd.json` and to `PIGNUS_ORACLES` (*Checking it*), and restart
+   `pignusd`.
 4. Confirm `/v1/oracles` on the book lists your key and URL, and that
    `/healthz` there shows no `oracle_errors` naming you. The book reads your
    `/v1/pubkey`, `/v1/markets` and `/v1/attestation/*` every `poll` seconds;
@@ -592,8 +591,8 @@ bot refuses to decide a seizure when the node publishes no fee rate for the
 loan's debt asset, because it cannot restate a fee paid in another asset;
 `/v1/fees` on the book lists the rates the node has. At start it keeps
 trying for two minutes (`--start-grace`) when the book or an oracle does not
-answer yet, since every Pignus process is restarted together after an update
-and the bot must not fail, and page, for coming up first.
+answer yet, since every Pignus process is restarted together after an update,
+and a bot that comes up first must not fail and page for it.
 
 Installing it is four steps. `cp
 /root/sequentia/pignus/deploy/pignus-liquidator.service.example
@@ -601,18 +600,19 @@ Installing it is four steps. `cp
 so that the `cp deploy/*.service` in *First install* does not install it
 unasked; write `/root/sequentia/pignus-liquidator.env` with
 `PIGNUS_RPC_URL=http://127.0.0.1:18200`, either `PIGNUS_RPC_COOKIE=<node
-datadir>/.cookie` or `PIGNUS_RPC_USER=` and `PIGNUS_RPC_PASSWORD=`,
+datadir>/testnet3/.cookie` (the `test` chain's subdirectory) or
+`PIGNUS_RPC_USER=` and `PIGNUS_RPC_PASSWORD=`,
 `PIGNUS_RPC_WALLET=treasury2026` and `PIGNUS_TAKER_ADDRESS=<an address of that
 wallet>`, then `chmod 600` it; `systemctl daemon-reload && systemctl enable
 --now pignus-liquidator`. The wallet must be loaded on the node (name it in
 the node's `wallet=`) and the taker address must belong to it: the bot exits
 1 at start on either. `--oracle` may be repeated, and must be: a loan is
-judged against the key it bakes, so a loan naming an oracle this bot does not
-watch is skipped.
+judged against the key it bakes, so a loan naming an oracle neither watched
+here nor aggregated by the book is skipped.
 
 ## Alerting
 
-Every long-running Pignus unit carries `OnFailure=pignus-alert@%n.service`,
+Every Pignus unit except the check carries `OnFailure=pignus-alert@%n.service`,
 and the timer's check calls the same script itself, when its verdict changes
 -- the first failing run, and the run that passes again -- rather than through
 `OnFailure=`, which would repeat the news every five minutes; a person hears
@@ -729,9 +729,9 @@ pignus-cli btc-check loan.json
 **Back up the lender key AND the state file** -- see "What each piece costs to
 lose" under *Backups*.
 
-A take this key can do nothing more about -- one from before the format that
-lets its loan be rebuilt, a principal that went to a plain address no covenant
-ever bound -- is written off, on the record: `pignus-cli btc-responder-clear
+A take this key can do nothing more about -- one whose record lacks the
+fields a loan is rebuilt from, a principal that went to a plain address no
+covenant ever bound -- is written off, on the record: `pignus-cli btc-responder-clear
 --config … --take <id> --write-off "<why>"`, with the responder stopped, since
 the command takes its lock. The take is then reported as written off rather
 than as needing a person, the responder acts on it no more, and an offer
@@ -743,15 +743,15 @@ written-off take that had reached `disbursed` goes on holding one lot of its
 offer there, so if the offer is still open and its lots matter, withdraw it
 and publish it again.
 
-A take that is simply over needs no write-off. One signed but never paid into,
-whose `d_refund` has passed, will never be paid into by this key, and the
-borrower takes their collateral back at their own height: the responder clears
-its wait itself, whatever its offer verifies as today, and the status stops
-listing it.
+A take that is simply over needs no write-off. A take that was signed but
+never funded, and whose `d_refund` has passed, is over: this key will never
+fund it, the borrower reclaims their collateral at their own height, and the
+responder clears its wait on its own (even if the offer no longer verifies),
+so the status stops listing it.
 
 ### Reading and repairing a responder
 
-**Reading and repairing a responder.** `pignus-cli btc-responder-status
+`pignus-cli btc-responder-status
 --config /root/sequentia/pignus-responder.json` prints every take that key has
 touched, what stage it reached, what it is waiting on and for how long. It only
 reads, so it is safe against the running unit, and it exits 4 when something
@@ -868,6 +868,11 @@ pignus-cli btc-seize loan.json --lender-key lender.key \
     --oracle-sig <hex> --dest-spk <hex> --btc-rpc ...
 ```
 
+`--dest-spk` is the destination script from `seizure.json`, the one the
+request named; `--btc-rpc` is the Bitcoin node's URL, with
+`--btc-rpc-cookie <bitcoin datadir>/testnet4/.cookie` or `--btc-rpc-user` and
+`--btc-rpc-password` beside it.
+
 The co-signature and the attestation that justified it are appended to the
 oracle's seizure log and published at `/v1/seizures`, so anyone can check
 afterwards that the price really was under the strike. That publication is the
@@ -882,7 +887,7 @@ live chain from a node wallet with the CLI, against the running book:
 ```bash
 P=/root/sequentia/pignus/bin/pignus-cli
 export PIGNUS_RPC_URL=http://127.0.0.1:18200
-export PIGNUS_RPC_COOKIE=<node datadir>/.cookie   # or PIGNUS_RPC_USER/_PASSWORD
+export PIGNUS_RPC_COOKIE=<node datadir>/testnet3/.cookie   # or PIGNUS_RPC_USER/_PASSWORD
 $P offer-fund --market GOLD/USDX --principal 100 --lots 3 --interest 3 \
     --open-ltv 50 --liq-ltv 75 --term-days 30 --rpc-wallet <lender wallet>
 $P offer-take --offer <offer id> --rpc-wallet <borrower wallet>

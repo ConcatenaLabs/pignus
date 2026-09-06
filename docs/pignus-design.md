@@ -12,9 +12,9 @@ and runs on the testnet at
 OpenDAMP repurchase (8.1) is there too: the bond vault, the verification of both
 legs, the forfeit path, and the four-input settlement `pignus-cli repo-settle`
 composes and attaches the covenant witness to. Two of that settlement's inputs
-are Simplicity spends of the issuer's covenants, and nothing in this repository
-signs them, so a settlement cannot yet be broadcast; section 8.1 says what that
-means for a holder.
+are Simplicity spends of the issuer's covenants, which the lender signs with
+`opendamp transfer-cosign`; this repository signs neither, and section 8.1
+says what that means for a holder.
 
 *Pignus* is the Roman-law term for property pledged as security for a debt: the
 creditor holds the pledge, the debt is owed separately, and redeeming the debt
@@ -46,10 +46,8 @@ here. The vault's spending rules are the loan agreement, compiled. Precisely:
   changes the address, so the borrower verifies terms by reconstructing the
   address before funding it.
 - **No permission to exit.** REPAY is permissionless, needs no signature, no
-  oracle and no witness data whatsoever. A solvent borrower can always leave.
-  In fact NO exit needs a signature: every leaf reads what it enforces out of
-  the transaction and pays a pinned destination, so there is no key anywhere in
-  a loan whose loss costs anybody anything.
+  oracle and no witness data whatsoever. A solvent borrower can always leave
+  (section 2.5 says why no exit at all needs a signature).
 - **No discretionary seizure.** A liquidator cannot choose how much to take.
   The seizure is computed on chain from the attested price and the surplus is
   forced back to the borrower by the same script that lets the seizure happen.
@@ -275,8 +273,8 @@ A direct origination -- both parties signing one transaction that funds the
 vault and pays the principal, with no offer covenant in between -- is the same
 shape, and `build_origination` in `pignus/vault.py` composes it. Either party
 can walk away before signing and neither is ever exposed to the other; it is the
-same PSET co-signing flow SeqDEX already uses for same-chain atomic swaps, so it
-is proven machinery rather than new. It is nevertheless a library and nothing
+PSET co-signing flow SeqDEX uses for same-chain atomic swaps. It is
+nevertheless a library and nothing
 more: no command, page flow or book entry uses it, because a funded offer does
 the same job without needing the lender at the keyboard.
 
@@ -296,8 +294,8 @@ the signed message.
 `price_scale` (default `1e5`). Quoting per *atom* rather than per unit means the
 covenant never has to know either asset's decimal precision.
 
-Prices come from the existing price infrastructure (`contrib/price-server`,
-which already feeds the any-asset fee market from a real quote source). Pignus
+Prices come from the price infrastructure (`contrib/price-server`, which
+feeds the any-asset fee market from a real quote source). Pignus
 adds a signer and a publication endpoint and no second price pipeline; what it
 adds beyond the signature is judgement about when not to sign. An attestation
 is stamped with the time the price was observed -- the feed's own
@@ -385,7 +383,7 @@ collateral.
 Hardening comes in two shapes. The first is open to any operator willing to put
 a threshold signer behind the oracle's key; the second is in the covenant.
 
-**A threshold group key** (FROST, the `PolicySigner` seam OpenAMP already built)
+**A threshold group key** (FROST, OpenAMP's `PolicySigner` seam)
 would have the vault name ONE key, with the m-of-n living in the signing
 protocol and nothing on chain changing. That is the cheapest shape, and the
 group key's invariance under resharing means the signer set can rotate without
@@ -1001,15 +999,14 @@ where any of them is false cannot be settled by the transaction below:
   Settlement is the same transfer in reverse and needs the borrower still
   approved at that moment -- an issuer who removes them in between has stopped
   the settlement, and nothing in the covenant can override that.
-- **A verifier leaf exists for the shape this settlement uses.** OpenDAMP
-  compiles its verifier once per shape, and this settlement saturates `p4x6`
-  exactly. An issuer whose taptree carries only the narrower `p3x5` and `p3x4`
-  leaves cannot confirm it.
+- **The settlement fits a verifier leaf.** OpenDAMP compiles its verifier once
+  per shape and every `C_V(pi)` carries the whole menu, which tops out at
+  `p5x7`; this settlement saturates `p4x6` exactly, and one a slot wider would
+  need the `p5x7` leaf, which Pignus does not build.
 - **Any-asset fees, with the restricted asset barred from the fee output.**
-  The settlement pays its fee in the debt asset, from the borrower's own input,
-  because all four input slots are spoken for. OpenDAMP enforces absolutely
-  that a fee output never carries the restricted asset, which is what makes that
-  safe.
+  OpenDAMP enforces absolutely that a fee output never carries the restricted
+  asset, which is what makes a fee in the debt asset safe (the settlement's
+  fee rule is under *Settlement is one atomic transaction*).
 - **The wider Simplicity budget is active on the chain.** OpenDAMP covenants
   are unspendable under the one-to-one rule; on the live testnet the wider
   budget starts at a stated height, and every fresh chain has it from genesis.
@@ -1018,12 +1015,10 @@ where any of them is false cannot be settled by the transaction below:
 all of these.
 
 **Leg one, off the covenant.** The borrower transfers `q` units of the OpenDAMP
-asset to `C_U(lender)` by an ordinary transfer. Nothing here is special: it is
-the transfer the asset already supports, subject to the whitelist the issuer
-already publishes, and the lender must be an approved holder for it to confirm
-at all -- which is the right gate, because a lender who could not lawfully hold
-the asset has no business financing it. The lender separately pays the borrower
-`principal` in the debt asset.
+asset to `C_U(lender)` by an ordinary transfer, subject to the whitelist
+(above): a lender who could not lawfully hold the asset has no business
+financing it. The lender separately pays the borrower `principal` in the debt
+asset.
 
 **Leg two, on the covenant.** The lender funds a two-leaf vault with `bond` of
 the debt asset, where
@@ -1086,10 +1081,7 @@ spend under the lender's key, the borrower signs the input funding the debt,
 and neither lets a transaction missing what they are owed go out. On the
 lender's side that is `repo-settle --inspect`, which judges the skeleton
 document against the terms, output by output, with no node, and exits 4 rather
-than let a settlement paying the debt elsewhere go on to be signed. What signs
-the two Simplicity inputs -- the verifier at input 0 and `C_U(lender)` at
-input 2 -- is `opendamp transfer-cosign`, the OpenDAMP transfer tool's command
-for a transaction it did not build; this repository signs neither. The full
+than let a settlement paying the debt elsewhere go on to be signed. The full
 shape:
 
 | # | Input | | # | Output |
@@ -1149,17 +1141,17 @@ builds, and the page's *Check a repurchase* tab. That sentence says in one line
 that the borrower is selling the asset and holding a claim.
 
 The loan book and the watcher do not carry repurchases. Each side verifies the
-bond with `repo-verify` -- which demands the exact bond amount, because the
-address cannot pin the money terms, and finds the bond's output by scanning
-the funding transaction for the one paying the address the terms compile to,
-as `repo-fund`, `repo-settle` and `repo-forfeit` do, since a wallet orders its
-own outputs and a lender's change is not the bond; `--vout` names the output
-only to tell a settled or forfeited bond from one never funded, which a scan
-cannot, and a named output that is spent while the bond sits unspent at
-another index is refused -- and leg one with `verify_leg_one`, and
-re-verifies after the depth its risk appetite justifies: a bond whose funding an
+bond with `repo-verify` and leg one with `verify_leg_one`, and re-verifies
+after the depth its risk appetite justifies: a bond whose funding an
 anchor-driven reorg has undone (section 6.4) secures nothing, and there is no
-watcher here to notice.
+watcher here to notice. `repo-verify` demands the exact bond amount, because
+the address cannot pin the money terms, and finds the bond's output by
+scanning the funding transaction for the one paying the address the terms
+compile to, as `repo-fund`, `repo-settle` and `repo-forfeit` do; a wallet
+orders its own outputs, and a lender's change is not the bond. `--vout` names
+the output only to tell a settled or forfeited bond from one never funded,
+which a scan cannot; a named output that is spent while the bond sits unspent
+at another index is refused.
 
 Because both halves matter, `repo-verify` reports a **state** and never an
 "ok": `not-funded`, `leg-one-only`, `bond-only`, `funded-unburied`, `live`,
@@ -1201,8 +1193,9 @@ policy snapshot, which their `openampd` serves at `GET /v1/snapshots?asset=<id>`
 the verifier witness proves the lender as sender and the
 borrower as recipient under that policy, and the `C_U` witness is the lender's
 signature. A lender who cannot produce that signature -- no OpenDAMP key, or
-a policy that no longer names the borrower -- cannot return the asset, and the
-bond is all a settlement that never comes leaves the holder with. A holder
+a policy that no longer names the borrower -- cannot return the asset, and a
+holder whose settlement never comes is left with the bond and nothing else. A
+holder
 should sell only under a lender who can, and `repo-propose` says so on every
 document it writes.
 
@@ -1221,15 +1214,14 @@ What runs where:
   a pre-vault, and the page finds the output paying the loan's own address the
   exact amount and refuses anything else. Every Bitcoin fact it shows comes
   through the book, so with no Bitcoin height it will not originate or abort.
-  It
-  carries the second implementations, because a browser cannot import the
+  It carries the second implementations, because a browser cannot import the
   Python: `web/pignus.js` and `web/offer.js` for the covenant,
   `web/repurchase.js` for the repurchase vault, and `web/btc.js` and
   `web/adaptor.js` for the parent chain. Each is pinned byte for byte to golden
   vectors the proven Python emits (`pignus/vectors.json`,
   `web/btc_vectors.json`, `web/adaptor_vectors.json`). The loan pin is fatal --
   the page refuses to run without it -- while the repurchase and cross-chain
-  pins only disable their own tabs, so a deployment whose vectors predate them
+  pins only disable their own tabs, so a deployment without those vectors
   still serves loans and refuses to check what it cannot verify. The
   borrower's side of a cross-chain loan is settled here too -- claiming the
   principal, repaying and refunding on Sequentia need no signature at all, and
