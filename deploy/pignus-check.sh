@@ -33,6 +33,14 @@
 # not. pignus-check.service runs it on a timer.
 set -uo pipefail
 
+# A verdict is the normal way out, and the tail of this script says it to a
+# person only when it CHANGES. A crash before the verdict is another matter:
+# pignus-check.service carries no OnFailure= (it would repeat the verdict every
+# run), so this is the only thing that would say the check itself has broken.
+ALERT="$(dirname "$0")/pignus-alert.sh"
+VERDICT_SAID=""
+trap 'rc=$?; if [ -z "$VERDICT_SAID" ] && [ -x "$ALERT" ]; then "$ALERT" "pignus check CRASHED (exit $rc) before reaching a verdict; journalctl -u pignus-check.service says where"; fi' EXIT
+
 # Every oracle whose loans this box is responsible for, space separated: the
 # primary, plus any pignus-oracle@N instances. An m-of-n loan needs m of them
 # signing, so a quiet one is not something to find out about at liquidation.
@@ -273,7 +281,7 @@ STATE_FILE="${PIGNUS_CHECK_STATE:-/var/lib/pignus-check/last}"
 was=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 now_verdict=$([ "$fails" -eq 0 ] && echo ok || echo fail)
 mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null && echo "$now_verdict" > "$STATE_FILE" 2>/dev/null
-ALERT="$(dirname "$0")/pignus-alert.sh"
+VERDICT_SAID=1
 if [ "$now_verdict" != "$was" ] && [ -x "$ALERT" ]; then
     if [ "$now_verdict" = fail ]; then
         "$ALERT" "pignus check FAILED ($fails): $(printf '%s' "$OUTPUT_SO_FAR" | grep '  FAIL' | head -3 | cut -c1-200 | tr '\n' ' ')"

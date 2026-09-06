@@ -7,8 +7,12 @@ Description=Pignus service check
 Documentation=https://github.com/ConcatenaLabs/pignus
 After=network-online.target pignus-oracle.service pignusd.service
 #
-# A failure tells a person: see deploy/pignus-alert.sh.
-OnFailure=pignus-alert@%n.service
+# No OnFailure= here, alone among the units: this one FAILS whenever a check
+# does, every five minutes until it is fixed, and pignus-check.sh already tells
+# a person when its verdict changes -- once on the first failing run and once
+# when it passes again. An OnFailure= would repeat the same news every run.
+# A crash of the script before it reaches a verdict is alerted by the script
+# itself, from an exit trap.
 
 [Service]
 Type=oneshot
