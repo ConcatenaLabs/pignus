@@ -18,7 +18,9 @@
 # .github/workflows/ci.yml for exactly which. One of them needs chains even
 # though it sits up here -- the BTC disbursement group drives a real node -- so
 # "everything above the platform test" is not the rule; the workflow is. The
-# rest needs a built sequentiad and a Bitcoin Core release, and is run here.
+# rest needs a built sequentiad, a Bitcoin Core release and, for the Tier D
+# settlement, the opendamp binary (tests/test_repo_opendamp.py says where it
+# looks), and is run here.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
