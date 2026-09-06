@@ -3742,6 +3742,20 @@ def cmd_btc_responder_clear(args):
         if have.get("disbursing"):
             refuse(f"take {args.take} has a disbursement in flight; clear or "
                    f"record that first, then write the take off.")
+        # A paid principal nobody has claimed is a LIVE loan to every pass:
+        # the claim pass is what turns its repayment into this key's money,
+        # and a written-off take is skipped by every pass. Writing one off
+        # is walking away from that claim, which a person may decide -- the
+        # principal went somewhere no covenant bound -- but not by accident.
+        paid = have.get("disbursement_txid")
+        done = have.get("claim_txid") or have.get("secret_published") \
+            or have.get("principal_refunded")
+        if paid and not done and not getattr(args, "force", False):
+            refuse(f"take {args.take} has a paid principal ({str(paid)[:16]}...) "
+                   f"and no claim of its repayment. Written off, no pass will "
+                   f"claim it: this key would be walking away from that money. "
+                   f"If that is the decision -- the principal went somewhere no "
+                   f"covenant bound, say -- repeat with --force.")
         state.set(args.take, written_off=str(args.write_off),
                   written_off_at=int(time.time()), waiting=None)
         print(f"take {args.take} written off: {args.write_off}. It is kept in "
