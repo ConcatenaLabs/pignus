@@ -872,9 +872,9 @@ function oracleTags(t) {
   if (compromisedOracles(t).length)
     out += ' <span class="tag bad" title="an oracle has declared this key compromised: whoever holds it can sign any price for this loan. A borrower repays now; a lender expects nothing from the oracle">oracle key compromised</span>';
   if (t.oracles && t.oracles.length)
-    out = ` <span class="tag dim" title="${esc(t.oracles.join("\n"))}">${esc(t.oracle_threshold)}-of-${t.oracles.length} oracles</span>`;
+    out += ` <span class="tag dim" title="${esc(t.oracles.join("\n"))}">${esc(t.oracle_threshold)}-of-${t.oracles.length} oracles</span>`;
   else if (keys.length)
-    out = ` <span class="tag dim" title="${esc(keys[0])}">oracle ${shortHex(keys[0], 8)}</span>`;
+    out += ` <span class="tag dim" title="${esc(keys[0])}">oracle ${shortHex(keys[0], 8)}</span>`;
   const odd = unknownOracles(t);
   if (odd.length)
     out += ` <span class="tag bad" title="${esc(odd.join("\n"))}">unknown oracle</span>`;

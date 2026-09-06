@@ -384,9 +384,13 @@ def test_documented_configs_start():
     check("a tenfold price is not signed on the round it appears",
           "GOLD/USDX" in jo.errors and jo.latest["GOLD/USDX"].price == first,
           str(jo.errors))
+    # A real feed ticks: the second round after the jump comes back a few
+    # atoms off, and the guard counts it as the price STAYING jumped.
+    jo.source.prices["GOLD"] = 30000.5
     jo.tick()
-    check("...but is once it has held for jump_rounds rounds",
-          "GOLD/USDX" not in jo.errors and jo.latest["GOLD/USDX"].price == first * 10,
+    check("...but is once it has held for jump_rounds rounds, ticking or not",
+          "GOLD/USDX" not in jo.errors
+          and abs(jo.latest["GOLD/USDX"].price - first * 10) <= first * 10 * 0.01,
           str(jo.errors))
     jo.source.prices["GOLD"] = 30000.0 * 1.2
     jo.tick()
@@ -411,6 +415,11 @@ def test_documented_configs_start():
     ho.source.seen = 2000.0
     ho.tick()
     check("a new observation is a new attestation", ho.latest["GOLD/USDX"].timestamp == 2000)
+    # ...and a feed that is answering, unchanged, is not a feed that stopped:
+    # health judges by when the market was last SEEN, not last signed.
+    _ok, hz = om.Handler._health(None, ho)
+    check("a market seen this round with nothing new to sign is not stale",
+          "GOLD/USDX" not in hz["stale"], str(hz))
     check("every documented source key is one its source understands",
           all(accepted(json.loads(open(p2).read()).get("source", {}))
               for p2 in glob.glob(os.path.join(ROOT, "deploy", "oracle*.json"))))

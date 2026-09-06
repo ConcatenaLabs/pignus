@@ -1374,8 +1374,15 @@ export async function learnFromChain(rec, ui) {
     if (got && (got.unspent === true || got.spend_txid)) {
       rec.funded = true; rec.unfunded = false; learned = true;
     } else if (got && got.unspent === false && !got.spend_txid) {
-      // Nothing the node knows at that outpoint: the funding never went out.
-      if (!rec.unfunded) { rec.unfunded = true; learned = true; }
+      // Nothing the node knows at that outpoint. Twice in a row before it
+      // is called never broadcast: a funding still propagating looks the
+      // same for a moment, and a Forget button over money in flight is
+      // worse than a row that waits one more poll.
+      rec.unfunded_misses = (rec.unfunded_misses || 0) + 1;
+      if (rec.unfunded_misses >= 2 && !rec.unfunded) { rec.unfunded = true; learned = true; }
+      else if (rec.unfunded_misses < 2) learned = true;
+    } else if (got) {
+      rec.unfunded_misses = 0;
     }
   }
   if (stage === "repaid") {

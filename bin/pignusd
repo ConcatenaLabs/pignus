@@ -662,8 +662,15 @@ class Service:
                               f"its attestations are ignored until the key "
                               f"is restored or the configuration changed")
                 continue
-            compromised |= {str(k).lower() for k in pub.get("compromised") or []}
-            previous[url] = [str(k).lower() for k in pub.get("previous") or []]
+            # Only the declarer's OWN keys: the one it serves and the ones it
+            # used to sign with. Otherwise any quoted oracle -- or whatever
+            # sits on the path to one -- could knock every other oracle out
+            # of this book by naming its key.
+            prev = [str(k).lower() for k in pub.get("previous") or []]
+            own = set(prev) | {served}
+            compromised |= {str(k).lower() for k in pub.get("compromised") or []
+                            if str(k).lower() in own}
+            previous[url] = prev
             key_by_url[url] = served
         for url, ox in list(key_by_url.items()):
             if ox in compromised:
@@ -3032,13 +3039,13 @@ class Handler(BaseHTTPRequestHandler):
         s = self.svc
         self._body_read = False
         path = urlparse(self.path).path.rstrip("/") or "/"
-        if self._rate_limited():
-            self._discard_body()
-            return self._send(429, {"error": "too many writes; slow down"})
         why = self._cross_site()
         if why:
             self._discard_body()
             return self._send(400, {"error": why})
+        if self._rate_limited():
+            self._discard_body()
+            return self._send(429, {"error": "too many writes; slow down"})
         try:
             body = self._body()
             if path == "/v1/offers":
@@ -3583,13 +3590,13 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         self._body_read = False
         path = u.path.rstrip("/")
-        if self._rate_limited():
-            self._discard_body()
-            return self._send(429, {"error": "too many writes; slow down"})
         why = self._cross_site(need_json=False)
         if why:
             self._discard_body()
             return self._send(400, {"error": why})
+        if self._rate_limited():
+            self._discard_body()
+            return self._send(429, {"error": "too many writes; slow down"})
         self._discard_body()
         try:
             if path.startswith("/v1/offers/"):

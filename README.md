@@ -824,9 +824,10 @@ to case, each value a number or an object whose `field` (default `price`)
 holds one; an optional `_meta.updated` in Unix seconds says when the feed
 last refreshed its own numbers. Booleans are refused, a redirect is refused,
 an answer over a megabyte is refused, and the feed's `Date` header is read to
-measure this machine's clock against it: a clock more than sixty seconds out
-stops signing, because a book refuses an attestation from the future or
-already stale. Run NTP. `symbols` maps a market's asset to the ticker the
+measure this machine's clock against it: more than sixty seconds apart is
+said in the journal and in `/healthz` as `clock_skew`, because a book refuses
+an attestation from the future or already stale -- and it is only said, since
+the header is the feed's clock, which may be the one that is wrong. Run NTP. `symbols` maps a market's asset to the ticker the
 feed knows it by; `--once` prints `X is not in URL (have: …)`, which is how to
 discover the feed's names. `flat_rounds × interval` and `source.max_age`
 should both sit under the book's `max_price_age`, or the book will call a

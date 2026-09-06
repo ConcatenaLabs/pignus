@@ -287,6 +287,7 @@ class VaultWatcher:
         self._block_cache = {}
         self._blocks_fetched = 0
         self._mempool_txs = None
+        self._unanswered = 0            # each poll starts over
         tip = self.node.getblockcount()
         # The forward scan gets its own budget, generous enough to catch a
         # restart up rather than crawl: falling behind the tip is the one

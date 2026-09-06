@@ -277,6 +277,15 @@ test "$code" = "400" && grep -q "another origin" "$WORK/xs.json" \
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$D/v1/offers/nosuchoffer" \
        -H 'Origin: https://elsewhere.example')
 test "$code" = "400" || { echo "foreign-origin DELETE -> $code, wanted 400" >&2; exit 1; }
+# ...and refused BEFORE the visitor's bucket is charged: thirty text/plain
+# posts from a hostile page must not lock the visitor's own next write out.
+for _ in $(seq 30); do
+  curl -s -o /dev/null -X POST "$D/v1/offers" -H 'Content-Type: text/plain' \
+       -H 'X-Forwarded-For: 203.0.113.9' -d '{}'
+done
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$D/v1/offers" \
+       -H 'Content-Type: application/json' -H 'X-Forwarded-For: 203.0.113.9' -d '{}')
+test "$code" != "429" || { echo "cross-site posts charged the visitor's bucket" >&2; exit 1; }
 for p in "" "v1/healthz" "app.js" "v1/nosuchpath"; do
   curl -sD "$WORK/hdr.txt" -o /dev/null "$D/$p"
   for h in "content-security-policy: .*frame-ancestors 'none'" \

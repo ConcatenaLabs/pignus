@@ -68,8 +68,10 @@ except ValueError:
     raise SystemExit(1)
 errs = d.get("oracle_errors") or []
 if errs:
-    print("oracle errors: " + "; ".join(str(e) for e in errs)[:400])
-    raise SystemExit(1)
+    # Said, not failed on: a timeout at a secondary, or a 429 from its
+    # archive, is worth a line; only the verdict of the book itself is
+    # worth a page.
+    print("note: oracle errors: " + "; ".join(str(e) for e in errs)[:400], file=sys.stderr)
 if d.get("ok") is True:
     raise SystemExit(0)
 # The book says "error"; the oracle says "round_error" or "source_error" and

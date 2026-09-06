@@ -11,7 +11,10 @@ and runs on the testnet at
 [sequentiatestnet.com/lending/](https://sequentiatestnet.com/lending/). The
 OpenDAMP repurchase (8.1) is there too: the bond vault, the verification of both
 legs, the forfeit path, and the four-input settlement `pignus-cli repo-settle`
-composes and then attaches the covenant witness to.
+composes and attaches the covenant witness to. Two of that settlement's inputs
+are Simplicity spends of the issuer's covenants, and nothing in this repository
+signs them, so a settlement cannot yet be broadcast; section 8.1 says what that
+means for a holder.
 
 *Pignus* is the Roman-law term for property pledged as security for a debt: the
 creditor holds the pledge, the debt is owed separately, and redeeming the debt
@@ -236,9 +239,15 @@ witness-supplied borrower key with `OP_TWEAKVERIFY` plus the tagged hashes, the
 technique OpenAMP's containment covenant proved.
 
 A *signed* offer -- one the lender must be online to co-sign at take time -- is
-strictly worse and does not exist here: the book refuses any other kind. The
-book itself is pure discovery. It holds no funds and cannot alter terms, because
-the terms are inside the address the borrower reconstructs.
+strictly worse and does not exist for issued-asset collateral: the book refuses
+any other kind, and publishes one only after checking the coin at the offer's
+address on chain. (A cross-chain offer, section 7.4, is necessarily a signed
+promise with no coin behind it, because there is no covenant on Bitcoin to
+fund.) The book itself is discovery. It holds no funds, and an altered record
+would compile to a different address, which is what the borrower's
+reconstruction catches; but a funded offer's record is the only copy of the
+terms that can ever spend the offer's coin, so a delisted offer is kept, hidden,
+until it is withdrawn.
 
 The take is one atomic transaction:
 
@@ -289,8 +298,22 @@ covenant never has to know either asset's decimal precision.
 
 Prices come from the existing price infrastructure (`contrib/price-server`,
 which already feeds the any-asset fee market from a real quote source). Pignus
-adds only a signer and a publication endpoint; it deliberately does not add a
-second price pipeline.
+adds a signer and a publication endpoint and no second price pipeline; what it
+adds beyond the signature is judgement about when not to sign. An attestation
+is stamped with the time the price was observed -- the feed's own
+`_meta.updated` where it publishes one, else the fetch -- rather than the
+signing time, and a snapshot that has not changed is not signed again, so a
+feed that stops answering yields nothing that looks fresh. A price that moves
+further than `max_jump` from the last signed one in a single step is not
+signed until it has stayed there for `jump_rounds` consecutive rounds, because
+a feed that switched units is a perfectly good signature over a number a
+thousandfold off; a board on which every market comes back byte-identical for
+`flat_rounds` is called frozen and left unsigned; a clock more than sixty
+seconds from the feed's is said in the journal and in `/healthz`, since a book
+refuses an attestation from the future or already stale. The feed is read only
+over https unless it is local or the operator says otherwise, and a redirect
+or an answer over a megabyte is refused: the oracle would otherwise sign
+whatever a path in between rewrote.
 
 The oracle is a public, replayable log: attestations are published for everyone,
 not handed to a liquidator, so any watcher can verify a liquidation was
@@ -369,7 +392,11 @@ group key's invariance under resharing means the signer set can rotate without
 moving a single vault address. Its cost is that the signers must run a joint
 protocol -- there is a coordinator, and the signers' liveness is coupled.
 Pignus's oracle daemon signs alone from one keyfile, so an operator who wants
-this brings their own signer.
+this brings their own signer. That key is made only on a fresh install, where
+no attestation log exists yet, and its creation is announced; a machine
+holding the log but not the key is a lost key, and the daemon refuses to start
+until the key is restored or `--create-key` says a new one is meant, because a
+new key signs for nothing the live loans under the old one will accept.
 
 **An on-chain oracle set** (`oracles=[...]`, `oracle_threshold=m`): the vault
 names n keys and the covenant counts valid signatures itself. The oracles never
@@ -397,8 +424,11 @@ m is less than n: at n-of-n every slot is required, so any one outage stops
 every liquidation under that set until it comes back.
 
 Which is the choice a lender is making, and `--oracle-threshold` defaults to
-n-of-n deliberately: it is the setting under which no single oracle outage can
-liquidate, and the price of that is the setting under which one can stall. A
+n-of-n deliberately, for a set the lender typed: it is the setting under which
+no single oracle outage can liquidate, and the price of that is the setting
+under which one can stall. A set taken from the book (`--oracles book`) has a
+size the lender did not type, so there the threshold must be said, and the
+command refuses to let n-of-n happen by default. A
 lender who would rather a liquidation survive an outage sets m below n and
 accepts that m keys agreeing is enough. Neither is the safe answer; they are
 opposite risks, and the default takes the one where nobody's collateral moves
@@ -413,11 +443,32 @@ oracle, not stronger, because ANY of the n can act alone. `sanity_check()` says
 so, and duplicate keys are rejected because one signer filling two slots makes
 the threshold mean less than it says.
 
+**Keys are pinned, retired and disowned in the open.** An oracle publishes at
+`/v1/pubkey` the keys it signed with before (`previous_keys`) and any of its
+own it declares compromised (`compromised_keys`). A book pins the key it
+expects from each oracle it quotes (`oracle_keys`): a served key that differs
+is reported and its attestations are ignored, so a lost-and-recreated key or
+one substituted in transit prices nothing. It accepts no attestation under a
+key its oracle has declared compromised -- a declaration counts only for the
+declarer's own keys, present and previous, so no oracle can disown another --
+and marks every loan and offer whose vault bakes such a key
+`oracle_compromised`. It serves the previous keys at `/v1/oracles`, so a loan
+baked to one reads as a rotation rather than a stranger's. It also checks
+every quoted oracle's precisions against the registry's for each market and
+drops an attestation whose precisions disagree, since a price off by a power
+of ten carries a valid signature. Under an n-of-n set the effect of any of
+these on one oracle is the one described above: the book withholds the loan's
+price, health and `liquidatable` until every oracle is back.
+
 ### 6.2 What the platform can do
 
-Nothing. The book is discovery, the watcher is read-only, and the liquidator bot
-is just the first participant to notice -- anyone can run one, and the covenant
-does not care which one wins.
+For issued-asset collateral, nothing: the book is discovery, the watcher is
+read-only, and the liquidator bot is just the first participant to notice --
+anyone can run one, and the covenant does not care which one wins. The
+cross-chain relay is the exception, and section 7.4 bounds it: it cannot forge
+a message, but it holds handshake material it could lose or withhold, it frees
+a lender's lot from a take that stalls on its own clock, and it refuses offers
+whose deadlines or fees fail the rules every party checks.
 
 ### 6.3 Liquidation races
 
@@ -574,13 +625,30 @@ confirm before `abort_after` is a loan the lender has paid for and cannot
 start. That is why the pre-vault's fee is PRICED FROM A BITCOIN NODE when an
 offer is published rather than left at a constant -- a constant is a fee that
 was right when the parent chain was quiet -- why `timelocks_sane`, which every
-party calls, relay or not, refuses a loan whose upgrade fee is under a flat
+party calls, refuses a loan whose upgrade fee is under a flat
 10,000 satoshis whatever the chain says, why a taker refuses an offer whose
 fixed fee has fallen far behind what the chain now wants, and why the
 margin above is measured in days rather than hours. The same function refuses a
 loan whose `recover_after` does not sit a day past `repay_deadline`, because a
 lender who could claim a repayment after the Bitcoin timeout had opened would
 be racing the borrower for the collateral with the repayment already in hand.
+
+The four deadlines are absolute block heights, judged against both chains'
+tips by everyone who handles them, all by the same rules: `d_refund` at least
+two hours ahead, `abort_after` at least a day after `d_refund`,
+`repay_deadline` at least a day after `d_refund` plus the two-hour claim
+margin, `recover_after` at least a day after `repay_deadline` and past
+`abort_after`. `btc-offer-publish` judges them against the tips the book
+reports and refuses an offer that fails; the relay judges them again at
+`POST /v1/btc/offers` and refuses too, and records a warning on a take whose
+deadlines have drifted -- a warning rather than a refusal, since the offer was
+already admitted; a taker refuses at take time; and the responder judges them
+before it reserves a hash, before it signs and before it pays. A relay whose
+Bitcoin node is not answering cannot judge them at all, says so in
+`/healthz`, and admits the offer unchecked, which is why the other checks
+exist. Because the heights are absolute, the offer leaves the board two hours
+before `d_refund`, and a take made later has a shorter term than an earlier
+one.
 
 **The written repayment deadline is not the one a borrower is held to.**
 Claiming a repayment publishes the secret, so a lender who claimed as the
@@ -593,9 +661,11 @@ the borrower at `repay_deadline`, and their collateral is swept at
 `recover_after` with the debt paid and refunded.
 
 That makes `repay_deadline - CLAIM_MARGIN_BLOCKS` the EFFECTIVE deadline, and
-it is what every tool quotes: `timelocks_sane` measures its margins against it,
-the offer row and the loan row on the page show it with the written figure
-beside it, and `effective_repay_deadline` is the one place it is computed.
+it is what every tool quotes: `timelocks_sane` measures the repayment window
+and the minimum term against it, and the margin to `recover_after` from the
+written figure, which is the stricter of the two; the offer row and the loan
+row on the page show it with the written figure beside it, and
+`effective_repay_deadline` is the one place it is computed.
 `web/btcborrow.js` carries the same constant, and a test compares the two,
 because a borrower told a deadline nobody honours is the whole of this
 paragraph going wrong.
@@ -620,8 +690,14 @@ that key as the money it is.
 The borrower's protection is not the lender's incentive; it is the margin
 `timelocks_sane()` enforces plus the borrower's own duty to repay early enough
 that the claim is buried well before `recover_after`. A borrower who repays at
-the last block has chosen the risk. The page says so where the repay button is,
-rather than in a document nobody reads.
+the last block would be choosing the risk, and the page does not let them:
+until the effective deadline it names the Sequentia block to repay before,
+beside the button, and past it there is no button -- the row, the alert and
+the dialog say a repayment would not be claimed and would release no
+collateral, and the page refuses to build one. It also asks the book whether
+the collateral is still in the vault before composing a repayment, refuses one
+for a vault the lender and the oracle have seized or the lender has swept, and
+says in the dialog when the book could not tell.
 
 ### 7.2 Why an oracle leaf and not a DLC
 
@@ -675,9 +751,19 @@ asks for more, and the list is short enough to state:
   refuse it, so the oracle's signature *is* the liquidation decision. A borrower
   should check the offer's `oracle_x` against the set the book publishes, and
   refuse an offer whose oracle is the lender's own key -- which the tools also
-  refuse to build. Every co-signature the oracle makes is published beside the
-  attestation that justified it, so the decision is checkable afterwards even
-  though it cannot be constrained beforehand. What the oracle judges by is the
+  refuse to build. No script constrains the decision, so the oracle constrains
+  itself before signing and publishes afterwards. It co-signs only a sighash it
+  rebuilt from the loan's own terms, only for a loan that names its key, only
+  against an attestation of its own that is recent (`--max-age`, 600 seconds
+  by default) and whose price is strictly under the strike at the loan's own
+  `price_scale`, only while its own daemon still stands behind that market's
+  price (a market its `/healthz` reports stale or in error is refused), never
+  with a key it has itself declared compromised, and, given a `book` in its
+  configuration, only for a take that book still lists under this oracle's key
+  as signed, disbursed or live -- a loan that has been repaid or aborted is
+  not one to seize. Every co-signature it does make is published at
+  `/v1/seizures` beside the attestation that justified it, so the decision is
+  checkable afterwards as well. What the oracle judges by is the
   strike, and the strike is in no Bitcoin script: the lender's signature over
   the offer would pin it only against a stranger, since the lender is the party
   asking for the seizure and can sign the same loan again over any strike. So a
@@ -697,8 +783,12 @@ Nothing in the list is the relay, and nothing in it is Pignus.
 
 Two people who already know each other exchange a ticket file by hand. To be
 found by strangers, a lender publishes an offer on a `pignusd`, which carries
-messages between the parties: `/v1/btc/offers` (the lender's offers),
-`/v1/btc/take` (a borrower asking for a loan), `/v1/btc/hash` (the lender
+messages between the parties: `/v1/btc/offers` (the lender's offers, judged
+for their deadlines, a fee floor and an oracle that is not the lender before
+they are stored; a lender withdraws one at `/withdraw` and re-signs one at
+`/resign`), `/v1/btc/take` (a borrower asking for a loan, with a reclaim fee
+inside the floor and cap the book prices from the parent chain),
+`/v1/btc/hash` (the lender
 drawing this loan's secret), `/v1/btc/presig` (the borrower signing the move
 into the vault that hash implies), `/v1/btc/adaptor` (the release
 coming back) and the lender's reports that the principal is paid, the loan is
@@ -734,11 +824,44 @@ collateral.
 
 The lender's half runs as a process (`pignus-cli btc-respond`), because the
 lender draws secrets and drawing a secret in a browser means storing it in one.
-It keeps a state file recording what it has already done, which is what stops a
-principal being paid twice across a crash. That process is the one component in
+It keeps a state file recording what it has already done, and around that
+file the things that stop a principal being paid twice across a crash: one
+responder per key, held by a lock beside the file; a refusal to start on a
+state file it cannot read, parse or write; an in-flight mark written before a
+payment goes out and cleared only by the payment being found on chain or by
+an operator running `btc-responder-clear`; and a payment that fails before it
+is broadcast -- a wallet that is not loaded, cannot fund or cannot sign --
+clearing the mark itself, since nothing went out. The responder refuses to
+start when it cannot reach the Sequentia wallet its configuration names or
+without RPC to both chains, will not sign a release that wallet could not pay
+or one past the offer's lot count, and judges the loan's deadlines against
+both tips before every step that commits it. Bitcoin confirmations on the
+collateral before a principal is paid (`--disburse-conf`) have a floor of
+two, the shortest depth that survives a one-block reorg. Every refusal is
+recorded on the take as a dated wait, where `btc-responder-status` and the
+timer see it, rather than as a journal line; a wait on a take the relay has
+since ended is cleared, so a routine refusal is not a standing alarm. That
+process is the one component in
 this tier whose absence costs the other party: a borrower whose take is never
 signed waits and aborts, and a borrower whose collateral is never upgraded keeps
 the principal.
+
+The borrower's half runs in the page, and the page believes the chains before
+it believes the relay. On every load it reads three facts straight off them
+rather than off the lender's reports: whether the collateral is in the vault
+(the vault outpoint on Bitcoin, through the book), whether the lender has
+claimed the repayment (the secret in the witness that spent the repayment
+output, through `/v1/spend`), and whether the funding this browser signed
+ever reached the chain. So a report the responder never sent costs the
+borrower nothing: the abort button goes when the loan is live, the reclaim
+opens when the secret is in a witness, and a take whose funding is missing
+from the chain twice running says so. The signed funding is remembered before
+it is broadcast and can be sent later, after the release and both chains'
+deadlines are checked again; a take the lender never answered has a button to
+forget it. An abort pays only to the address the lender's release was signed
+over -- the page rebuilds the RECLAIM sighash from the terms and verifies the
+release against it before signing -- and pays the parent chain's fee of the
+day where that is more than the one fixed at the take.
 
 ## 8. Collateral tiers
 
@@ -772,21 +895,32 @@ borrower's own enclave for the whole life of the loan.
 
 The two operations that move value are deliberately not satisfied by the
 issuer's own authority. A **release** needs the LENDER's signature, because the
-lender is the only party who can say the debt was settled. A **seizure** needs
+lender is the only party who can say the debt was settled -- and it is the
+lender's word alone: the repaid transaction id it carries is what the lender
+signed over, and nothing checks that the repayment happened. A **seizure** needs
 the lender's signature *and* either a matured loan or the BORROWER's
 countersignature, so a lender cannot take collateral from a borrower still
 inside their term. The issuer may force a release with a written reason -- a
 lender who loses their key would otherwise lock the collateral forever, and a
 forced release only ever returns it to its owner -- and there is deliberately no
 forced seizure, because the direction that takes value away from its owner is
-the direction that must not have a unilateral override. A seizure is an L_claw
-spend with two asset outputs: the pledged atoms to the lender's enclave, the
-remainder straight back to the borrower's, so settling one loan never disturbs
-the borrower's free balance or another lender's collateral.
+the direction that must not have a unilateral override. A seizure is delivered
+by the issuer as an L_claw spend with two asset outputs: the pledged atoms to
+the lender's enclave, the remainder straight back to the borrower's, so
+settling one loan never disturbs the borrower's free balance or another
+lender's collateral. Pignus builds none of that transaction and checks none of
+it; it posts the request and reports the issuer's answer. Where the issuer's
+key is external the seizure is two phases, like a clawback: the request, then
+the issuer signing the sighashes it is handed and completing the spend.
+`pledge-seize` says which of the two it got, reports delivery only for an
+answer that carries a delivering transaction, and exits 4 while the collateral
+is still the issuer's to move.
 
-Pledging an asset issued *without* a clawback leaf is refused outright, because
-the lock would hold but nobody could ever deliver on default: the collateral
-would freeze permanently rather than secure anything.
+Pledging an asset issued *without* a clawback leaf is refused by the issuer's
+policy server, the only party that can see the leaf -- Pignus checks nothing
+about the asset itself -- because the lock would hold but nobody could ever
+deliver on default: the collateral would freeze permanently rather than secure
+anything.
 
 What Tier C costs is not hidden anywhere: the lender's security is the issuer's
 promise, not a script. A policy server that is dishonest or compromised can
@@ -794,8 +928,15 @@ release a pledge without repayment, and no amount of checking on the lender's
 side would reveal it beforehand. A Tier C loan is labelled issuer-permissioned
 wherever a user can see it, because presenting it quietly beside a Tier A loan
 would be a lie. That is the `pledge-*` commands of `pignus-cli`, which print the
-sentence `openamp.describe()` builds: there is no pledge tab on the page and the
-book carries no pledges, so the CLI is the whole of Tier C's surface.
+sentence `openamp.describe()` builds. `pledge-create`, `pledge-list`,
+`pledge-release` and `pledge-seize` speak to `openampd` under the issuer
+operator's bearer token, so they are the issuer's to run, never the
+borrower's or the lender's; the two parties run `pledge-sign` with the key
+they registered for their AID and hand the issuer the signature, and the
+policy server's public `/v1/log`, which records every pledge, release and
+seizure, is their read path. There is no pledge tab on the page and the book
+carries no pledges, so those commands and that log are the whole of Tier C's
+surface.
 
 **Tier D** admits no seizure-backed loan, and the answer is structural rather
 than a matter of effort. Three independent reasons, any one of which is
@@ -939,10 +1080,13 @@ non-zero on each.
 **Settlement is one atomic transaction.** The borrower's payment of `debt` is
 NOT covenant-checked -- the two output slots RETURN inspects are already spent
 on the collateral and the bond -- so it must never be made outside the RETURN
-transaction. It does not need to be checked, because both parties must sign that
-transaction anyway: the lender signs their `C_U(lender)` input, the borrower
-signs the input funding the debt, and neither signs a transaction missing what
-they are owed. The full shape:
+transaction. It does not need to be checked, because the transaction cannot
+confirm without both parties: the lender's `C_U(lender)` input is a Simplicity
+spend under the lender's key, the borrower signs the input funding the debt,
+and neither lets a transaction missing what they are owed go out. What signs
+the two Simplicity inputs -- the verifier at input 0 and `C_U(lender)` at
+input 2 -- is the issuer's OpenDAMP tooling, not this repository, which signs
+neither. The full shape:
 
 | # | Input | | # | Output |
 |---|---|---|---|---|
@@ -1002,7 +1146,13 @@ that the borrower is selling the asset and holding a claim.
 
 The loan book and the watcher do not carry repurchases. Each side verifies the
 bond with `repo-verify` -- which demands the exact bond amount, because the
-address cannot pin the money terms -- and leg one with `verify_leg_one`, and
+address cannot pin the money terms, and finds the bond's output by scanning
+the funding transaction for the one paying the address the terms compile to,
+as `repo-fund`, `repo-settle` and `repo-forfeit` do, since a wallet orders its
+own outputs and a lender's change is not the bond; `--vout` names the output
+only to tell a settled or forfeited bond from one never funded, which a scan
+cannot, and a named output that is spent while the bond sits unspent at
+another index is refused -- and leg one with `verify_leg_one`, and
 re-verifies after the depth its risk appetite justifies: a bond whose funding an
 anchor-driven reorg has undone (section 6.4) secures nothing, and there is no
 watcher here to notice.
@@ -1018,8 +1168,9 @@ the state is `funded-unburied` however correct both halves are. The command's
 exit status says the same thing to a script: 0 for `live`, `forfeitable` and
 `settled`, and 4 for every state that is not one to act on.
 
-The settlement itself is composed in two steps, because it needs signatures from
-both parties and the covenant's witness must go on last. `repo-settle
+The settlement itself is composed in two steps, because it needs signatures
+from both parties, two of them Simplicity witnesses this repository does not
+produce, and the covenant's witness must go on last. `repo-settle
 --skeleton` builds the transaction above from the terms and the four outpoints
 it is given -- refusing a verifier coin carrying the repurchase's own asset, a
 blinded coin, a `C_U` holding the wrong asset or the wrong amount, and a fee in
@@ -1031,6 +1182,16 @@ outputs rather than six. That is fewer, not narrower: a verifier leaf is chosen
 for a SHAPE, and this settlement still spends four inputs, which the `p3x5` and
 `p3x4` leaves do not allow. `p4x6` is the leaf either way.
 
+**Settlement has no signer.** Inputs 0 and 2 are spends of OpenDAMP covenants
+-- the verifier and the lender's `C_U` -- and nothing in this repository or in
+the OpenDAMP transfer tool signs a Simplicity input for a transaction it did
+not build. `repo-settle --skeleton` therefore writes a transaction with no
+witness, `--attach` puts the RETURN witness on input 1, and the two Simplicity
+witnesses are the issuer's tooling to provide. Until it does, an asset sold
+under a repurchase does not come back: a holder who sells under one should
+expect the bond, not the asset, and `repo-propose` says so on every document
+it writes.
+
 ## 9. Where the code lives
 
 The platform lives in this repository, `pignus`, alongside the other
@@ -1040,8 +1201,13 @@ daemon driving it ships separately.
 
 What runs where:
 
-- **the browser**, at `/lending/` -- composes every transaction, derives every
-  address, and sends only a signature request to the wallet extension. It
+- **the browser**, at `/lending/` -- derives every address, composes every
+  Sequentia transaction, and asks the wallet extension only to sign and
+  broadcast; the one transaction the wallet composes is the Bitcoin funding of
+  a pre-vault, and the page finds the output paying the loan's own address the
+  exact amount and refuses anything else. Every Bitcoin fact it shows comes
+  through the book, so with no Bitcoin height it will not originate or abort.
+  It
   carries the second implementations, because a browser cannot import the
   Python: `web/pignus.js` and `web/offer.js` for the covenant,
   `web/repurchase.js` for the repurchase vault, and `web/btc.js` and
@@ -1050,9 +1216,11 @@ What runs where:
   `web/btc_vectors.json`, `web/adaptor_vectors.json`). The loan pin is fatal --
   the page refuses to run without it -- while the repurchase and cross-chain
   pins only disable their own tabs, so a deployment whose vectors predate them
-  still serves loans and refuses to check what it cannot verify. Both legs of a
-  cross-chain loan are settled here too, which is only possible because neither
-  of them needs a signature.
+  still serves loans and refuses to check what it cannot verify. The
+  borrower's side of a cross-chain loan is settled here too -- claiming the
+  principal, repaying and refunding on Sequentia need no signature at all, and
+  reclaiming or aborting on Bitcoin needs only the wallet's ordinary taproot
+  signature; the lender's side is the responder's.
 - **the wallet extension** -- holds every key. It signs its own Sequentia
   inputs and, for a cross-chain loan, the Bitcoin funding and the reclaim. It
   cannot sign a covenant leaf and exposes no x-only key to bake into one, which
@@ -1067,12 +1235,18 @@ What runs where:
   key and can move nothing, and section 7.4 says why nothing it carries has to
   be believed.
 - **the lender's responder**, `pignus-cli btc-respond` on the lender's own
-  machine, holding their key and their two nodes' RPC -- signs each take,
-  disburses the principal, starts the loan and claims the repayment. Whoever
+  machine, holding their key and their two nodes' RPC -- draws each loan's
+  secret and signs each take, disburses the principal, starts the loan, claims
+  the repayment and hands the borrower the secret that releases their
+  collateral, takes back a principal nobody claimed, and re-sends any report
+  the relay lost. Whoever
   publishes a cross-chain offer runs one; on the testnet that is the operator,
   so for native-BTC loans the operator IS a lender, an active counterparty with
   money at stake. It is the one component in that tier whose absence costs the
   other party.
 - **the oracle and the loan book** -- services on the testnet server. Neither
-  can move anything: the book is discovery, and the oracle asserts a number.
+  can move anything on its own: the book is discovery, and the oracle asserts
+  a number -- and, for a native-BTC loan, co-signs a seizure under the
+  conditions section 7.3 lists, which is the one place it does more than
+  assert.
   `docs/api.md` in this repository documents everything both of them serve.
