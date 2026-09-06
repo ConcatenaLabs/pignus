@@ -1073,7 +1073,38 @@ if rc != 2 or "different settlement" not in said:
 rc, said, _v = run(BOND, None, skeleton("cd" * 32, 3))
 if rc != 2 or "different settlement" not in said:
     sys.exit(f"FAIL: a skeleton spending another transaction was not refused: {rc} {said}")
-print("  a settlement witness finds the bond's output from the skeleton, and refuses another transaction")
+
+# ...and RETURN goes on last: a transaction missing any other party's
+# signature is refused by the input's number and who signs it, rather than
+# by the node with a script error naming nothing.
+def with_witness(signed):
+    tx = msgs.CTransaction(); tx.nVersion = 2
+    for i in range(4):
+        tx.vin.append(msgs.CTxIn(msgs.COutPoint(int(("%02x" % (0x10 + i)) * 32, 16), i)))
+        tx.wit.vtxinwit.append(msgs.CTxInWitness())
+        if i in signed:
+            tx.wit.vtxinwit[i].scriptWitness.stack = [b"\xab" * 64]
+    return tx.serialize().hex()
+
+def run_signed(raw):
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            m._check_settlement_signed(raw)
+    except SystemExit as e:
+        return e.code, err.getvalue()
+    return 0, err.getvalue()
+
+rc, _s = run_signed(with_witness({0, 2, 3}))
+if rc != 0:
+    sys.exit(f"FAIL: a settlement every other party signed was refused: {rc} {_s}")
+for missing, name in ((0, "the OpenDAMP verifier"), (2, "the lender's C_U"),
+                      (3, "the borrower's debt coin")):
+    rc, said = run_signed(with_witness({0, 2, 3} - {missing}))
+    if rc != 2 or f"input {missing} ({name})" not in said:
+        sys.exit(f"FAIL: a settlement missing input {missing}'s signature was not "
+                 f"refused by name: {rc} {said}")
+print("  a settlement witness finds the bond's output from the skeleton, refuses another transaction, and names a missing signature")
 ATTACH
 
 # --- a Tier C seizure reports what the issuer actually answered --------------

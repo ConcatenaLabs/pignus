@@ -711,14 +711,14 @@ terms; `repo-settle` composes the buyback, which pays the bond to the lender in
 the same transaction that returns the asset; and `repo-forfeit` pays the bond to
 the BORROWER if the deadline passes with no settlement.
 
-**Settlement has no signer.** The buyback spends two OpenDAMP Simplicity
-inputs -- the verifier and the lender's restricted output -- and nothing in
-this repository or in the OpenDAMP transfer tool signs those for a
-transaction it did not build. `repo-settle` composes the skeleton and attaches
-the covenant's own witness; the two Simplicity witnesses are the issuer's
-tooling to provide, and without them an asset sold under a repurchase does
-not come back. A holder who sells under one should expect the bond, not the
-asset. `repo-propose` says so.
+**Settlement takes the lender's OpenDAMP key.** The buyback spends two
+OpenDAMP Simplicity inputs -- the verifier and the lender's restricted output
+-- and the lender signs both with `opendamp transfer-cosign`, the OpenDAMP
+transfer tool's command for a transaction it did not build, against the
+issuer's current policy snapshot. A lender who cannot produce that signature
+cannot return the asset, and the bond is all a settlement that never comes
+leaves the holder with; sell only under a lender who can. `repo-propose` says
+so on every document it writes.
 
 So a forfeit is not a remedy that makes the borrower whole: they keep the bond
 and the lender keeps the asset, which is the arrangement they agreed and not a
@@ -755,12 +755,21 @@ composed in two steps and signed in between:
 pignus-cli repo-settle terms.json --txid <bond> --verifier <txid:vout> \
     --verifier-spk <hex> --cu-lender <txid:vout> --debt-utxo <txid:vout> \
     --skeleton settle.json
-pignus-cli repo-settle terms.json --txid <bond> --attach settle.json --broadcast
+opendamp transfer-cosign --snapshot <policy snapshot> --transaction settle.json \
+    --sender-privkey <the lender's OpenDAMP key> --out settle.signed.json
+pignus-cli repo-settle terms.json --txid <bond> --attach settle.signed.json --broadcast
 ```
 
-`--skeleton` writes the unsigned settlement for the other party to sign;
-`--attach` puts the covenant's `RETURN` witness on last, which is the only order
-that works. `repo-settle`, `repo-forfeit` and `repo-verify` all FIND the bond:
+`--skeleton` writes a document: the transaction, with the borrower's own debt
+coin already signed by the wallet that composed it, and the four outputs it
+spends, which is what a signer that did not build it needs. The lender signs
+the two OpenDAMP inputs with `opendamp transfer-cosign` from the
+[openamp](https://github.com/ConcatenaLabs/openamp) repository (`cargo build
+--release` in its `opendamp/` directory), which leaves every other witness as
+it found it. `--attach` puts the covenant's `RETURN`
+witness on last, which is the only order that works, and refuses a transaction
+on which any of the three signatures is missing, naming the input and who
+signs it. `repo-settle`, `repo-forfeit` and `repo-verify` all FIND the bond:
 left without `--vout`, they take the unspent output of the funding
 transaction that pays the address the terms compile to, so the lender's own
 change at index 0 is never mistaken for a spent bond. Name `--vout` only to
@@ -1019,6 +1028,9 @@ tests/test_flows.py                the browser's flows through a whole loan
 tests/test_book.py                 the book and the watcher against a chain
 tests/test_watcher_reorg.py        the watcher against a real reorg
 tests/test_tiers.py                Tiers C and D
+tests/test_repo_opendamp.py        Tier D settled against a real OpenDAMP asset; needs the
+                                   `opendamp` binary ($OPENDAMP_BIN, or a build beside this
+                                   checkout at ../openamp/opendamp/target/release/opendamp)
 tests/test_lifecycle.py            the CLI through fund, take, repay,
                                    liquidate, withdraw, default, with the
                                    daemon discovering every step

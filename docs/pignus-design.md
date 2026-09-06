@@ -1085,8 +1085,9 @@ confirm without both parties: the lender's `C_U(lender)` input is a Simplicity
 spend under the lender's key, the borrower signs the input funding the debt,
 and neither lets a transaction missing what they are owed go out. What signs
 the two Simplicity inputs -- the verifier at input 0 and `C_U(lender)` at
-input 2 -- is the issuer's OpenDAMP tooling, not this repository, which signs
-neither. The full shape:
+input 2 -- is `opendamp transfer-cosign`, the OpenDAMP transfer tool's command
+for a transaction it did not build; this repository signs neither. The full
+shape:
 
 | # | Input | | # | Output |
 |---|---|---|---|---|
@@ -1168,29 +1169,34 @@ the state is `funded-unburied` however correct both halves are. The command's
 exit status says the same thing to a script: 0 for `live`, `forfeitable` and
 `settled`, and 4 for every state that is not one to act on.
 
-The settlement itself is composed in two steps, because it needs signatures
+The settlement itself is composed in three steps, because it needs signatures
 from both parties, two of them Simplicity witnesses this repository does not
 produce, and the covenant's witness must go on last. `repo-settle
 --skeleton` builds the transaction above from the terms and the four outpoints
 it is given -- refusing a verifier coin carrying the repurchase's own asset, a
 blinded coin, a `C_U` holding the wrong asset or the wrong amount, and a fee in
-anything but the debt asset -- and `repo-settle --attach` puts the RETURN
-witness on the version everybody has signed. The vault always lands at input 1,
+anything but the debt asset -- signs the borrower's debt coin with the wallet
+that composes, and writes the transaction beside the four outputs it spends;
+`opendamp transfer-cosign` signs the two OpenDAMP inputs and leaves every
+other witness in place; and `repo-settle --attach` puts the RETURN witness on
+the version everybody has signed, refusing one on which a signature is still
+missing by naming the input. The vault always lands at input 1,
 for the reason above; the composer places it there and that is not something a
 caller can choose. A borrower whose debt coin needs no change leaves five
 outputs rather than six. That is fewer, not narrower: a verifier leaf is chosen
 for a SHAPE, and this settlement still spends four inputs, which the `p3x5` and
 `p3x4` leaves do not allow. `p4x6` is the leaf either way.
 
-**Settlement has no signer.** Inputs 0 and 2 are spends of OpenDAMP covenants
--- the verifier and the lender's `C_U` -- and nothing in this repository or in
-the OpenDAMP transfer tool signs a Simplicity input for a transaction it did
-not build. `repo-settle --skeleton` therefore writes a transaction with no
-witness, `--attach` puts the RETURN witness on input 1, and the two Simplicity
-witnesses are the issuer's tooling to provide. Until it does, an asset sold
-under a repurchase does not come back: a holder who sells under one should
-expect the bond, not the asset, and `repo-propose` says so on every document
-it writes.
+**Settlement takes the lender's OpenDAMP key.** Inputs 0 and 2 are spends of
+OpenDAMP covenants -- the verifier and the lender's `C_U` -- and the lender
+signs both with `opendamp transfer-cosign`, against the issuer's current
+policy snapshot: the verifier witness proves the lender as sender and the
+borrower as recipient under that policy, and the `C_U` witness is the lender's
+signature. A lender who cannot produce that signature -- no OpenDAMP key, or
+a policy that no longer names the borrower -- cannot return the asset, and the
+bond is all a settlement that never comes leaves the holder with. A holder
+should sell only under a lender who can, and `repo-propose` says so on every
+document it writes.
 
 ## 9. Where the code lives
 
