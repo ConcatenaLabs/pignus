@@ -270,9 +270,12 @@ a lender who is online.</p>
   obligation to sell it back is secured by a bond in a covenant here. Settling
   one is a single OpenDAMP transfer that also spends the bond vault;
   <code>pignus-cli repo-settle</code> composes it, because it needs a verifier
-  input this page cannot select. What this page does is the half that protects
-  you beforehand: it rebuilds the bond vault's address from the terms and checks
-  it against the funded coin, its asset and its amount.</p>
+  input this page cannot select, and the lender signs it with their OpenDAMP
+  key under the issuer's current policy. A lender who cannot produce that
+  signature cannot return the asset, and the bond is all you keep if they do
+  not: sell only under one who can. What this page does is the half that
+  protects you beforehand: it rebuilds the bond vault's address from the terms
+  and checks it against the funded coin, its asset and its amount.</p>
   <form class="lend card" id="repoform">
     <div class="full"><label for="repoterms">Repurchase terms (JSON)</label>
       <textarea name="terms" id="repoterms" rows="8"

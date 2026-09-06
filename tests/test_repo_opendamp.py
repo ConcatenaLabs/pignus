@@ -33,7 +33,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, ".."))
 
 from pignus import adaptor as A                    # noqa: E402
-from rig import Rig, RPC_USER, RPC_PASS            # noqa: E402
+from rig import Rig, RPC_USER, RPC_PASS, _ensure_wallet   # noqa: E402
 
 BIN = os.path.join(HERE, "..", "bin")
 COIN = 100_000_000
@@ -230,14 +230,48 @@ def main():
               ins.returncode == 4 and "output 1" in ins.stderr,
               f"exit {ins.returncode}: {ins.stderr[-300:]}")
 
+        # --- 3c. composed by a wallet that does NOT hold the debt coin ------
+        # The document then says so and names the RPC; the borrower signs the
+        # transaction with the wallet that does and puts it back. This is the
+        # document the rest of the test settles with, so the instruction is
+        # proven rather than printed.
+        _ensure_wallet(n, "other")
+        other_args = node_args[:-2] + ["--rpc-wallet", "other"]
+        skel2 = os.path.join(root, "settle.other.json")
+        r = cli("repo-settle", terms, "--txid", bond["txid"],
+                "--verifier", f"{cv_txid}:{cv_vout}", "--verifier-spk", cv_spk,
+                "--cu-lender", f"{leg_txid}:{cu_vout}",
+                "--debt-utxo", f"{debt_txid}:{debt_vout}",
+                "--change-spk", n.getaddressinfo(n.getnewaddress())["scriptPubKey"],
+                "--skeleton", skel2, *other_args)
+        doc2 = json.load(open(skel2))
+        check("a wallet that does not hold the debt coin says the coin is NOT "
+              "signed, and names the RPC",
+              doc2.get("debt_input_signed") is False
+              and "signrawtransactionwithwallet" in r.stderr,
+              f"{doc2.get('debt_input_signed')} {r.stderr[-300:]}")
+        doc2["tx"] = n.signrawtransactionwithwallet(doc2["tx"])["hex"]
+        json.dump(doc2, open(skel2, "w"))
+        ins = cli("repo-settle", terms, "--txid", bond["txid"],
+                  "--inspect", skel2, ok=False)
+        check("...and once the borrower has signed it, it inspects the same",
+              ins.returncode == 0, ins.stderr[-200:])
+
         # --- 4. the lender signs the OpenDAMP inputs -------------------------
-        signed = os.path.join(root, "settle.signed.json")
         c = subprocess.run([od, "transfer-cosign", "--snapshot", snap,
                             "--transaction", skel,
-                            "--sender-privkey", lender_sk.hex(), "--out", signed],
+                            "--sender-privkey", lender_sk.hex(), "--out",
+                            os.path.join(root, "settle.signed.unused.json")],
                            capture_output=True, text=True)
         check("opendamp transfer-cosign signs the verifier and C_U(lender)",
               c.returncode == 0 and "p4x6" in c.stderr, c.stderr[-400:])
+        signed = os.path.join(root, "settle.signed.json")
+        c = subprocess.run([od, "transfer-cosign", "--snapshot", snap,
+                            "--transaction", skel2,
+                            "--sender-privkey", lender_sk.hex(), "--out", signed],
+                           capture_output=True, text=True)
+        check("and the borrower-signed document the same way, saying what it signs",
+              c.returncode == 0 and "paid to others" in c.stderr, c.stderr[-400:])
         wrong = subprocess.run([od, "transfer-cosign", "--snapshot", snap,
                                 "--transaction", skel,
                                 "--sender-privkey", borrower_sk.hex()],

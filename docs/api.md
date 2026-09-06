@@ -450,7 +450,7 @@ at the whole book.
 ```json
 {"ok": false,
  "error": "stale price: SILVR/USDX",
- "version": "0.2.0", "git_rev": "0aa3fbb1",
+ "version": "0.3.0", "git_rev": "44aea9f1",
  "covenant_vectors": 15,
  "height": 118432, "last_poll": 1799999950,
  "markets": 6, "priced": 5, "stale_markets": ["SILVR/USDX"],

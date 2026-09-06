@@ -1365,6 +1365,12 @@ def cmd_repo_settle(args):
             "borrower's coin paying the debt")
 
     _RepurchaseSpender, vault = _repo_spender(args, node, t)
+    # The fee comes out of the borrower's debt coin named below, never out of
+    # this wallet: named as the fee asset outright, so the chooser prices it
+    # and does not ask whether the composing wallet holds any -- a lender's
+    # or a third wallet's composing is exactly the case where it does not.
+    if not args.fee_asset:
+        args.fee_asset = t.debt_asset
     fee_asset, fee, rate = choose_fee(node, args, "repay",
                                       prefer=[t.debt_asset],
                                       committed={t.debt_asset: int(t.debt)})
