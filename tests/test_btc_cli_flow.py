@@ -224,6 +224,19 @@ def main():
         run("btc-claim-principal", t3, "--borrower-key", bk, *seq)
         rig.seq_mine(2)
         run("btc-upgrade", t3, "--lender-key", lk, "--min-depth", "1", *seq, *btc)
+        # A seizure request written with --out goes THERE, and the ticket
+        # goes back where it came from: the request the oracle co-signs was
+        # once overwritten by the ticket, so the runbook's own command left
+        # the oracle a ticket to sign.
+        req_file = os.path.join(root, "seize-request.json")
+        run("btc-seize-sighash", t3, "--out", req_file, *btc)
+        req = json.load(open(req_file))
+        tk3 = json.load(open(t3))
+        check("btc-seize-sighash --out writes the oracle's request there, and "
+              "the ticket stays a ticket",
+              "sighash" in req and tk3.get("vault_txid") and tk3.get("seize_dest")
+              and "sighash" not in tk3,
+              f"request keys {sorted(req)[:6]}; ticket keys {sorted(tk3)[:6]}")
         rig.btc_mine(10)
         out = run("btc-timeout", t3, "--lender-key", lk, *btc)
         rig.btc_mine(1)

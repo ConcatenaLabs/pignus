@@ -2430,8 +2430,11 @@ def add_wallet_commands(sub):
         add_node_args(p)
         add_fee_args(p)
         p.add_argument("--dry-run", action="store_true",
-                       help="compose and print, broadcast nothing -- no "
-                            "preparing sends either")
+                       help="broadcast nothing, and prepare no coins. "
+                            "offer-fund and offer-take print only the "
+                            "terms; the other commands print the "
+                            "transaction when the explicit coins are "
+                            "already there")
 
     p = sub.add_parser("offer-fund", help="lock principal in a funded offer, "
                        "and publish it")
@@ -2444,12 +2447,13 @@ def add_wallet_commands(sub):
                    help="collateral required, as loan-to-value %% (default 50)")
     p.add_argument("--liq-ltv", type=float, default=75.0,
                    help="liquidate when loan-to-value crosses this %% (default 75)")
-    p.add_argument("--term-days", type=float, default=30.0)
+    p.add_argument("--term-days", type=float, default=30.0,
+                   help="the loan term, in days (default 30)")
     p.add_argument("--offer-days", type=float,
                    help="how long the offer stays open (default: the term)")
     p.add_argument("--lots", type=int, default=1, help="how many loans")
     p.add_argument("--bonus", type=float, default=5.0,
-                   help="liquidation bonus %% (default 5)")
+                   help="liquidation bonus, whole percent (default 5)")
     p.add_argument("--borrower-ver", type=int, default=0,
                    help="witness version borrowers pay out at: 0 for "
                    "extension/bech32 wallets (default), 1 for taproot")
@@ -2458,8 +2462,10 @@ def add_wallet_commands(sub):
                    "every oracle the book quotes against, for an m-of-n loan")
     p.add_argument("--oracle-threshold", type=int, default=0,
                    help="m in an m-of-n oracle set (default: all of them, "
-                        "which no single oracle outage can then liquidate under)")
-    p.add_argument("--memo", default="")
+                        "which no single oracle outage can then liquidate "
+                        "under). Required with `--oracles book` when it "
+                        "names more than one oracle; 1 is refused")
+    p.add_argument("--memo", default="", help="free text kept in the terms")
     p.add_argument("--no-publish", dest="publish", action="store_false",
                    help="fund the offer without listing it on the book")
     common(p)
@@ -2468,7 +2474,7 @@ def add_wallet_commands(sub):
     p = sub.add_parser("offer-publish",
                        help="list an already-funded offer on the book")
     p.add_argument("--body", required=True,
-                   help="the record offer-fund printed, saved to a file")
+                   help="the offer-<txid>.json file offer-fund wrote")
     add_book_arg(p)
     p.set_defaults(fn=cmd_offer_publish)
 
@@ -2479,7 +2485,9 @@ def add_wallet_commands(sub):
     add_book_arg(p)
     p.set_defaults(fn=cmd_loan_export)
 
-    p = sub.add_parser("offer-take", help="borrow from a funded offer")
+    p = sub.add_parser("offer-take", help="borrow from a funded offer: lock "
+                       "the collateral in the loan's vault and register the "
+                       "loan with the book")
     p.add_argument("--offer", required=True, help="offer id from the book")
     p.add_argument("--force", action="store_true",
                    help="take an offer whose loans have already matured, whose "
@@ -2492,7 +2500,7 @@ def add_wallet_commands(sub):
     p = sub.add_parser("offer-delist",
                        help="LENDER: take a listing off a book early. The coin "
                             "is untouched")
-    p.add_argument("--offer", required=True)
+    p.add_argument("--offer", required=True, help="offer id from the book")
     p.add_argument("--token", required=True,
                    help="the manage token this listing was published with, "
                         "served once and never again")
@@ -2508,17 +2516,23 @@ def add_wallet_commands(sub):
     for name, fn, help_ in (
             ("repay", cmd_repay, "pay the debt and take the collateral back"),
             ("liquidate", cmd_liquidate, "close an under-water loan for the bonus"),
-            ("default", cmd_default, "seize a loan past maturity, at any price"),
+            ("default", cmd_default, "seize a loan past maturity, whatever the "
+                                     "price; a fresh signed price is still "
+                                     "required"),
             ("recover", cmd_recover, "sweep a long-overdue vault to the lender")):
         p = sub.add_parser(name, help=help_)
         g = p.add_mutually_exclusive_group(required=True)
         g.add_argument("--loan", help="loan id from the book")
         g.add_argument("--terms", help="the loan's terms file, for closing a "
-                       "loan the book never listed or cannot serve; needs --txid")
+                       "loan the book never listed or cannot serve; needs "
+                       "--txid unless the file carries the outpoint "
+                       "(loan-export or offer-take output)")
         p.add_argument("--txid", help="the vault's funding transaction, with "
                        "--terms")
         p.add_argument("--vout", type=int, default=None,
-                       help="the vault's output index (default 0)")
+                       help="the vault's output index, with --terms "
+                            "(default: the file's, else 0); ignored with "
+                            "--loan")
         if name in ("liquidate", "default"):
             p.add_argument("--attestation", help="a signed price from the "
                            "oracle this loan names, as a file, instead of the "
@@ -2531,7 +2545,8 @@ def add_wallet_commands(sub):
                            metavar="S",
                            help="refuse a price signed longer ago than this "
                                 "(default 600 s); the covenant cannot check "
-                                "recency, so this is the only place it is")
+                                "recency, so this is the only place it is "
+                                "checked")
             p.add_argument("--allow-stale", action="store_true",
                            help="build against a price older than that anyway")
         common(p)
@@ -2542,13 +2557,16 @@ def add_wallet_commands(sub):
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--loan", help="loan id from the book")
     g.add_argument("--terms", help="the loan's terms file, to rebuild the "
-                   "account from a node with no book involved; needs --txid")
+                   "account from a node with no book involved; needs --txid "
+                   "unless the file carries the outpoint")
     p.add_argument("--txid", help="the vault's funding transaction, with --terms")
     p.add_argument("--vout", type=int, default=None,
-                   help="the vault's output index (default 0)")
+                   help="the vault's output index, with --terms (default: "
+                        "the file's, else 0); ignored with --loan")
     p.add_argument("--single-leaf", action="store_true",
                    help="the vault came from a funded offer; needed once it is "
-                        "spent, since the exit is read from the leaf revealed")
+                        "spent, since the exit is read from the leaf revealed. "
+                        "Also read from a terms file that records it")
     add_book_arg(p)
     add_node_args(p)
     p.set_defaults(fn=cmd_explain)
@@ -2576,11 +2594,19 @@ def btc_node_from(args):
 
 
 def add_btc_node_args(p):
-    p.add_argument("--btc-rpc", default="http://127.0.0.1:8332")
-    p.add_argument("--btc-rpc-user")
-    p.add_argument("--btc-rpc-password")
-    p.add_argument("--btc-rpc-wallet")
-    p.add_argument("--btc-rpc-cookie")
+    p.add_argument("--btc-rpc", default="http://127.0.0.1:8332",
+                   help="the Bitcoin node's JSON-RPC url (default "
+                        "http://127.0.0.1:8332)")
+    p.add_argument("--btc-rpc-user", help="Bitcoin RPC user")
+    p.add_argument("--btc-rpc-password",
+                   help="Bitcoin RPC password; prefer --btc-rpc-cookie or a "
+                        "--config, since a command line is readable by "
+                        "every process on the machine")
+    p.add_argument("--btc-rpc-wallet",
+                   help="the Bitcoin wallet to fund, sign and receive with")
+    p.add_argument("--btc-rpc-cookie",
+                   help="path to the Bitcoin node's .cookie file, used when "
+                        "--btc-rpc-user is not given")
 
 
 def _read_key(path):
@@ -2591,6 +2617,9 @@ def _read_key(path):
     it is a key at all. A truncated or empty file otherwise fails much later,
     as a release the borrower's covenant will not accept.
     """
+    if not path:
+        refuse("no key file: give --lender-key or --borrower-key (the file "
+               "btc-keygen wrote), or a --config naming one")
     try:
         return O.read_key(path, "that key")
     except OSError as e:
@@ -2611,8 +2640,10 @@ def _ticket(args):
         return json.load(f)
 
 
-def _save_ticket(args, tk):
-    dst = getattr(args, "out", None) or args.ticket
+def _save_ticket(args, tk, dst=None):
+    """Write the ticket back: to --out when the command's --out IS the
+    ticket's new home, or to `dst` when --out means something else."""
+    dst = dst or getattr(args, "out", None) or args.ticket
     with open(dst, "w") as f:
         json.dump(tk, f, indent=2, sort_keys=True)
     print(f"wrote {dst}", file=sys.stderr)
@@ -4263,7 +4294,9 @@ def cmd_btc_seize_sighash(args):
             json.dump(req, f, indent=2, sort_keys=True)
         print(f"wrote {args.out}", file=sys.stderr)
     tk.update(seize_dest=dest.hex(), seize_fee=args.btc_fee)
-    _save_ticket(args, tk)
+    # --out is the REQUEST's file; the ticket goes back where it came from,
+    # or the request the oracle needs would be overwritten by it.
+    _save_ticket(args, tk, dst=args.ticket)
     print(json.dumps(req, indent=2))
     return 0
 
@@ -6220,7 +6253,9 @@ def add_btc_commands(sub):
                             "must not be the lender's own key")
         p.add_argument("--btc-amount", type=int, required=True,
                        help="collateral, in satoshis")
-        p.add_argument("--debt-asset", required=True)
+        p.add_argument("--debt-asset", required=True,
+                       help="the asset the principal and the debt are paid "
+                            "in, 64-hex id")
         p.add_argument("--debt", type=int, required=True,
                        help="atoms the borrower repays, principal plus interest")
         p.add_argument("--principal", type=int, default=0,
@@ -6243,27 +6278,34 @@ def add_btc_commands(sub):
                             f"signed in advance and can be neither replaced nor "
                             f"fee-bumped, so whatever is committed here is the "
                             f"only fee it will ever have: a fee too low to "
-                            f"confirm is a loan that cannot start. Left unset "
-                            f"it is PRICED from the Bitcoin node, floored at "
-                            f"{MIN_UPGRADE_FEE}, which every party refuses "
-                            f"below")
+                            f"confirm is a loan that cannot start. Left unset, "
+                            f"btc-offer-publish prices it from its Bitcoin "
+                            f"node; btc-propose has no Bitcoin node and uses "
+                            f"the floor, {MIN_UPGRADE_FEE}, which every party "
+                            f"refuses below")
         p.add_argument("--lender-prog", required=True,
                        help="the lender's Sequentia payout program, hex: 20 "
                             "bytes at witness version 0, 32 at version 1")
-        p.add_argument("--lender-ver", type=int, default=0)
+        p.add_argument("--lender-ver", type=int, default=0,
+                       help="witness version of --lender-prog: 0 or 1 "
+                            "(default 0)")
         p.add_argument("--market", default="",
                        help="the oracle feed a seizure is judged against")
         p.add_argument("--strike", type=int, default=0,
-                       help="the price a seizure is justified below, so it can "
-                            "be checked afterwards")
+                       help="required: the price, at the loan's price scale, a "
+                            "seizure is justified below, and what the lender "
+                            "and the oracle are held to afterwards. Missing "
+                            "or 0 is refused, here and by the relay")
 
     p = sub.add_parser("btc-keygen", help="a party keypair for a BTC loan")
     p.add_argument("--out", required=True, help="keyfile path (0600)")
     p.set_defaults(fn=cmd_btc_keygen)
 
     p = sub.add_parser("btc-propose",
-                       help="LENDER: write the terms and send them to a borrower")
-    p.add_argument("--lender-key", required=True)
+                       help="LENDER: write the terms to a ticket file for the "
+                            "borrower; nothing is sent")
+    p.add_argument("--lender-key", required=True,
+                   help="the keyfile btc-keygen wrote")
     party_terms(p)
     p.add_argument("--out", required=True, help="where to write the ticket")
     p.set_defaults(fn=cmd_btc_propose, ticket=None)
@@ -6272,10 +6314,13 @@ def add_btc_commands(sub):
                        help="BORROWER: choose this loan's origination secret "
                             "and prepare the pre-vault funding, unbroadcast")
     p.add_argument("ticket")
-    p.add_argument("--borrower-key", required=True)
+    p.add_argument("--borrower-key", required=True,
+                   help="the keyfile btc-keygen wrote")
     p.add_argument("--borrower-prog", required=True,
                    help="your Sequentia payout program, hex")
-    p.add_argument("--borrower-ver", type=int, default=0)
+    p.add_argument("--borrower-ver", type=int, default=0,
+                   help="witness version of --borrower-prog: 0 or 1 "
+                        "(default 0)")
     p.add_argument("--reclaim-address", help="where the collateral comes back "
                                              "to (default: a new address)")
     p.add_argument("--feerate", type=float, default=None,
@@ -6285,13 +6330,17 @@ def add_btc_commands(sub):
                         "is not, and a collateral funding that never confirms "
                         "is a loan that never starts")
     p.add_argument("--btc-fee", type=int, default=3000,
-                   help="satoshis the reclaim transaction pays")
+                   help="satoshis the reclaim transaction pays; recorded in "
+                        "the ticket, which the later steps read (default "
+                        "3000)")
     p.add_argument("--seq-height", type=int,
                    help="the Sequentia height to judge the deadlines against, "
-                        "if no Sequentia node is configured")
+                        "if no Sequentia node is configured; given neither, "
+                        "the deadlines are not checked")
     p.add_argument("--force", action="store_true",
                    help="accept terms this refuses as unsafe")
-    p.add_argument("--out")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_node_args(p)
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_prepare)
@@ -6302,21 +6351,34 @@ def add_btc_commands(sub):
     # chains are bound by one hash, and what this hands over is an ordinary
     # release signature.
     p = sub.add_parser("btc-release", aliases=["btc-adaptor"],
-                       help="LENDER: draw this loan's secret, publish its hash "
-                            "and hand over the release signature")
+                       help="LENDER: draw this loan's secret, put its hash in "
+                            "the ticket and hand over the release signature. "
+                            "The secret is kept beside the key as "
+                            "<lender-key>.t.<16 hex of the borrower's hash>, "
+                            "which btc-claim reads")
     p.add_argument("ticket")
-    p.add_argument("--lender-key", required=True)
-    p.add_argument("--btc-fee", type=int, default=3000)
-    p.add_argument("--out")
+    p.add_argument("--lender-key", required=True,
+                   help="the keyfile btc-keygen wrote")
+    p.add_argument("--btc-fee", type=int, default=3000,
+                   help="satoshis for the reclaim transaction, used only "
+                        "when the ticket records no reclaim fee (default "
+                        "3000)")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     p.set_defaults(fn=cmd_btc_adaptor)
 
     p = sub.add_parser("btc-originate",
                        help="BORROWER: verify the release, sign the move into "
                             "the vault, and commit the collateral")
     p.add_argument("ticket")
-    p.add_argument("--borrower-key", required=True)
-    p.add_argument("--btc-fee", type=int, default=3000)
-    p.add_argument("--out")
+    p.add_argument("--borrower-key", required=True,
+                   help="the keyfile btc-keygen wrote")
+    p.add_argument("--btc-fee", type=int, default=3000,
+                   help="satoshis for the reclaim transaction, used only "
+                        "when the ticket records no reclaim fee (default "
+                        "3000)")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_originate)
 
@@ -6333,9 +6395,11 @@ def add_btc_commands(sub):
                         "shows a principal for this loan. A second one sits at "
                         "the same address, opens to the same secret, and the "
                         "borrower takes both")
-    p.add_argument("--fee-asset", help="the asset this pays its fee in "
-                                       "(default: the debt asset)")
-    p.add_argument("--out")
+    p.add_argument("--fee-asset", help="label or 64-hex id; default: the "
+                                       "debt asset, else anything held that "
+                                       "the node publishes a rate for")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_node_args(p)
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_disburse)
@@ -6343,9 +6407,13 @@ def add_btc_commands(sub):
     p = sub.add_parser("btc-claim-principal",
                        help="BORROWER: take the principal, which starts the loan")
     p.add_argument("ticket")
-    p.add_argument("--borrower-key", required=True)
-    p.add_argument("--fee-asset")
-    p.add_argument("--out")
+    p.add_argument("--borrower-key", required=True,
+                   help="the keyfile btc-keygen wrote")
+    p.add_argument("--fee-asset",
+                   help="label or 64-hex id; default: the debt asset, else "
+                        "anything held that the node publishes a rate for")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     # The lender reports where they paid the principal to a relay, so a
     # borrower who took the offer through one can pull it into their ticket
     # rather than being told to ask for an outpoint by hand. Each field is
@@ -6358,13 +6426,15 @@ def add_btc_commands(sub):
                        help="LENDER: start the loan with the secret the "
                             "borrower published")
     p.add_argument("ticket")
-    p.add_argument("--lender-key", required=True)
+    p.add_argument("--lender-key", required=True,
+                   help="the keyfile btc-keygen wrote")
     p.add_argument("--min-depth", type=int, default=6,
                    help="confirmations required on the borrower's claim before "
                         "acting on it")
     p.add_argument("--force", action="store_true",
         help="upgrade even though the claim that published the secret is not yet buried. Sequentia reorgs when Bitcoin does, so a secret read from a shallow block can be un-published under you.")
-    p.add_argument("--out")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_node_args(p)
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_upgrade)
@@ -6373,21 +6443,29 @@ def add_btc_commands(sub):
                        help="BORROWER: take back collateral no principal ever "
                             "came for")
     p.add_argument("ticket")
-    p.add_argument("--borrower-key", required=True)
+    p.add_argument("--borrower-key", required=True,
+                   help="the keyfile btc-keygen wrote")
     p.add_argument("--dest", help="a Bitcoin address (default: the reclaim "
                                   "address in the ticket)")
-    p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--btc-fee", type=int, default=3000,
+                   help="satoshis the abort transaction pays (default 3000)")
     p.add_argument("--force", action="store_true",
-        help="build the abort even though the collateral is not yet abortable. The transaction cannot confirm until abort_after, so this only produces one early.")
-    p.add_argument("--out")
+        help="try the abort before the collateral is abortable. The "
+             "transaction is still broadcast, and the node rejects it as "
+             "non-final until abort_after, so nothing comes back early")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_abort)
 
     p = sub.add_parser("btc-refund-principal",
                        help="LENDER: take back a principal nobody claimed")
     p.add_argument("ticket")
-    p.add_argument("--fee-asset")
-    p.add_argument("--out")
+    p.add_argument("--fee-asset",
+                   help="label or 64-hex id; default: the debt asset, else "
+                        "anything held that the node publishes a rate for")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_node_args(p)
     p.set_defaults(fn=cmd_btc_refund_principal)
 
@@ -6406,8 +6484,11 @@ def add_btc_commands(sub):
                         "repayment for this loan already exists. A second one "
                         "is a second debt at the same address, and the lender "
                         "takes both")
-    p.add_argument("--fee-asset")
-    p.add_argument("--out")
+    p.add_argument("--fee-asset",
+                   help="label or 64-hex id; default: the debt asset, else "
+                        "anything held that the node publishes a rate for")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     # Optional, and only to tell a book where the repayment landed. The lender's
     # responder finds it by scanning the chain either way; the report is what
     # stops a page saying `live` about a loan that is paid.
@@ -6423,9 +6504,12 @@ def add_btc_commands(sub):
                        help="LENDER: take the repayment, publishing the secret "
                             "that releases the collateral")
     p.add_argument("ticket")
-    p.add_argument("--lender-key", required=True)
+    p.add_argument("--lender-key", required=True,
+                   help="the keyfile btc-keygen wrote")
     p.add_argument("--secret-file", help="the secret for this loan (default: "
-                                         "beside the key)")
+                                         "<lender-key>.t.<16 hex of the "
+                                         "borrower's hash>, which "
+                                         "btc-release wrote)")
     p.add_argument("--min-depth", type=int, default=6,
                    help="confirmations the borrower's repayment needs before "
                         "it is claimed. A repayment signals replacement, so "
@@ -6437,8 +6521,11 @@ def add_btc_commands(sub):
                         "own refund opens, or on a repayment that is not "
                         "buried yet. Both are ways to lose the collateral AND "
                         "the repayment")
-    p.add_argument("--fee-asset")
-    p.add_argument("--out")
+    p.add_argument("--fee-asset",
+                   help="label or 64-hex id; default: the debt asset, else "
+                        "anything held that the node publishes a rate for")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_node_args(p)
     p.set_defaults(fn=cmd_btc_claim)
 
@@ -6446,22 +6533,35 @@ def add_btc_commands(sub):
                        help="BORROWER: take the collateral back once the "
                             "secret is public")
     p.add_argument("ticket")
-    p.add_argument("--borrower-key", required=True)
-    p.add_argument("--btc-fee", type=int, default=3000)
-    p.add_argument("--min-depth", type=int, default=6)
+    p.add_argument("--borrower-key", required=True,
+                   help="the keyfile btc-keygen wrote")
+    p.add_argument("--btc-fee", type=int, default=3000,
+                   help="satoshis for the reclaim transaction, used only "
+                        "when the ticket records no reclaim fee (default "
+                        "3000)")
+    p.add_argument("--min-depth", type=int, default=6,
+                   help="confirmations the claim that published the secret "
+                        "needs before Bitcoin is spent on it (default 6)")
     p.add_argument("--force", action="store_true",
         help="reclaim on a secret read from a block that is not yet buried. This spends BITCOIN on a secret Sequentia may still take back, and the collateral is what is at stake.")
-    p.add_argument("--out")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_node_args(p)
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_reclaim)
 
     p = sub.add_parser("btc-seize-sighash",
                        help="LENDER: print the seizure request an oracle "
-                            "co-signs")
+                            "co-signs. Needs a Bitcoin wallet node, and "
+                            "--book (or a ticket carrying take_auth) or the "
+                            "oracle refuses the request")
     p.add_argument("ticket")
-    p.add_argument("--dest", help="a Bitcoin address for the seized collateral")
-    p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--dest", help="a Bitcoin address for the seized "
+                                  "collateral (default: a new one from the "
+                                  "wallet)")
+    p.add_argument("--btc-fee", type=int, default=3000,
+                   help="satoshis the seizure pays; recorded in the ticket "
+                        "for btc-seize (default 3000)")
     p.add_argument("--out", help="write the request here, for the oracle")
     add_btc_node_args(p)
     add_book_arg(p)
@@ -6469,20 +6569,36 @@ def add_btc_commands(sub):
 
     p = sub.add_parser("btc-seize", help="LENDER+oracle: seize the collateral")
     p.add_argument("ticket")
-    p.add_argument("--lender-key", required=True)
-    p.add_argument("--oracle-sig", required=True)
-    p.add_argument("--dest-spk", help="the script the request named")
-    p.add_argument("--btc-fee", type=int, default=3000)
-    p.add_argument("--out")
+    p.add_argument("--lender-key", required=True,
+                   help="the keyfile btc-keygen wrote")
+    p.add_argument("--oracle-sig", required=True,
+                   help="the oracle's signature over the seizure request, "
+                        "hex, from `pignus-oracle --sign-seize`")
+    p.add_argument("--dest-spk",
+                   help="scriptPubKey to seize to, hex (default: the "
+                        "destination btc-seize-sighash recorded in the "
+                        "ticket). The oracle signed over that one, so give "
+                        "this only when the request it signed named another")
+    p.add_argument("--btc-fee", type=int, default=3000,
+                   help="satoshis, used only when the ticket records no "
+                        "seizure fee (default 3000); a fee other than the "
+                        "request's breaks the oracle's signature")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_seize)
 
     p = sub.add_parser("btc-timeout", help="LENDER: sweep after the term")
     p.add_argument("ticket")
-    p.add_argument("--lender-key", required=True)
-    p.add_argument("--dest")
-    p.add_argument("--btc-fee", type=int, default=3000)
-    p.add_argument("--out")
+    p.add_argument("--lender-key", required=True,
+                   help="the keyfile btc-keygen wrote")
+    p.add_argument("--dest", help="a Bitcoin address for the swept "
+                                  "collateral (default: a new one from the "
+                                  "wallet)")
+    p.add_argument("--btc-fee", type=int, default=3000,
+                   help="satoshis the sweep pays (default 3000)")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_btc_node_args(p)
     p.set_defaults(fn=cmd_btc_timeout)
 
@@ -6490,21 +6606,32 @@ def add_btc_commands(sub):
                        help="BORROWER: take the repayment back if the lender "
                             "never claimed it")
     p.add_argument("ticket")
-    p.add_argument("--fee-asset")
-    p.add_argument("--out")
+    p.add_argument("--fee-asset",
+                   help="label or 64-hex id; default: the debt asset, else "
+                        "anything held that the node publishes a rate for")
+    p.add_argument("--out", help="write the updated ticket here (default: "
+                                 "the ticket in place)")
     add_node_args(p)
     p.set_defaults(fn=cmd_btc_refund)
 
     p = sub.add_parser("btc-offer-publish",
-                       help="LENDER: publish a cross-chain offer to a relay")
+                       help="LENDER: publish a cross-chain offer to a relay. "
+                            "Needs --lender-key or a --config naming one, "
+                            "and a Bitcoin node unless --upgrade-fee is "
+                            "given")
     p.add_argument("--config", help="a responder config file; keeps "
                                     "credentials off the command line")
-    p.add_argument("--lender-key")
+    p.add_argument("--lender-key",
+                   help="the keyfile btc-keygen wrote, or a --config naming "
+                        "one")
     party_terms(p)
     p.add_argument("--lots", type=int, default=1,
                    help="how many loans of these terms are on offer")
-    p.add_argument("--price-scale", type=int, default=100000)
-    p.add_argument("--note", default="")
+    p.add_argument("--price-scale", type=int, default=100000,
+                   help="the integer scale --strike is written at (default "
+                        "100000)")
+    p.add_argument("--note", default="",
+                   help="free text shown with the offer")
     add_book_arg(p)
     # A Bitcoin node, to PRICE the upgrade fee. That fee is fixed for the life
     # of every loan taken from this offer and can never be raised, so it must
@@ -6514,20 +6641,30 @@ def add_btc_commands(sub):
     p.set_defaults(fn=cmd_btc_offer_publish)
 
     p = sub.add_parser("btc-offer-take",
-                       help="BORROWER: take a cross-chain offer from a relay")
-    p.add_argument("--offer", required=True)
-    p.add_argument("--borrower-key", required=True)
+                       help="BORROWER: take a cross-chain offer from a relay. "
+                            "Needs a Bitcoin wallet node and a Sequentia "
+                            "node; writes the loan's secret beside "
+                            "--borrower-key as <key>.w")
+    p.add_argument("--offer", required=True, help="offer id from the relay")
+    p.add_argument("--borrower-key", required=True,
+                   help="the keyfile btc-keygen wrote")
     p.add_argument("--borrower-prog", required=True,
                    help="your Sequentia payout program, hex")
-    p.add_argument("--borrower-ver", type=int, default=0)
+    p.add_argument("--borrower-ver", type=int, default=0,
+                   help="witness version of --borrower-prog: 0 or 1 "
+                        "(default 0)")
     p.add_argument("--reclaim-address",
                    help="where the collateral comes back to (default: a new "
                         "address from your Bitcoin wallet)")
     p.add_argument("--feerate", type=float, default=None,
                    help="sat/vB; left unset this asks the Bitcoin node")
-    p.add_argument("--btc-fee", type=int, default=3000)
+    p.add_argument("--btc-fee", type=int, default=3000,
+                   help="satoshis the reclaim transaction pays; recorded in "
+                        "the ticket (default 3000)")
     p.add_argument("--wait", type=float, default=90,
-                   help="seconds to wait for the lender's release")
+                   help="seconds to wait for each of the lender's two "
+                        "answers (the hash, then the release) before giving "
+                        "up with nothing broadcast (default 90)")
     p.add_argument("--force", action="store_true",
         help="take the offer even though a check said not to: deadlines that are already too close, or an upgrade fee too small to confirm. Each refusal says which, and this overrides all of them.")
     p.add_argument("--out", required=True, help="where to write the ticket")
@@ -6543,19 +6680,26 @@ def add_btc_commands(sub):
     p.set_defaults(fn=cmd_payout_program)
 
     p = sub.add_parser("btc-offer-withdraw",
-                       help="LENDER: take one of your offers down")
-    p.add_argument("--offer", required=True)
-    p.add_argument("--config")
-    p.add_argument("--lender-key")
+                       help="LENDER: take one of your offers down; needs "
+                            "--lender-key or a --config naming one")
+    p.add_argument("--offer", required=True, help="offer id from the relay")
+    p.add_argument("--config", help="a responder config file")
+    p.add_argument("--lender-key",
+                   help="the keyfile btc-keygen wrote, or a --config naming "
+                        "one")
     add_book_arg(p)
     p.set_defaults(book=None)  # ...so a config file's `book` is not outranked
     p.set_defaults(fn=cmd_btc_offer_withdraw)
 
     p = sub.add_parser("btc-offer-resign",
-                       help="LENDER: replace the signature on an offer a book "
-                            "already holds, when it stops verifying")
-    p.add_argument("--offer", required=True)
-    p.add_argument("--lender-key")
+                       help="LENDER: re-sign an offer the book holds whose "
+                            "stored signature does not verify; terms and id "
+                            "unchanged. Needs --lender-key or a --config "
+                            "naming one")
+    p.add_argument("--offer", required=True, help="offer id from the relay")
+    p.add_argument("--lender-key",
+                   help="the keyfile btc-keygen wrote, or a --config naming "
+                        "one")
     p.add_argument("--config", help="a responder config file")
     add_book_arg(p)
     p.set_defaults(book=None)  # ...so a config file's `book` is not outranked
@@ -6565,12 +6709,15 @@ def add_btc_commands(sub):
                        help="LENDER: what this responder has done, and what it "
                             "is waiting on. Read-only and safe on a live one")
     p.add_argument("--config", help="a responder config file")
-    p.add_argument("--lender-key")
-    p.add_argument("--state", help="the state file (default: beside the key)")
+    p.add_argument("--lender-key",
+                   help="the keyfile btc-keygen wrote, or a --config naming "
+                        "one")
+    p.add_argument("--state", help="the state file (default: "
+                                   "<lender-key>.state.json)")
     p.add_argument("--expect-offer", action="store_true",
-                   help="with --book: exit 4 when this key has no open, "
-                        "takeable offer on it, naming the last one and why "
-                        "it ended. What the timer's check asks, since a "
+                   help="exit 4 when this key has no open, takeable offer "
+                        "on the book, naming the last one and why it "
+                        "ended. What the timer's check asks, since a "
                         "responder with nothing on the board is a lender "
                         "nobody can borrow from")
     p.add_argument("--waiting-hours", type=float, default=6.0, metavar="H",
@@ -6587,10 +6734,15 @@ def add_btc_commands(sub):
 
     p = sub.add_parser("btc-responder-clear",
                        help="LENDER: tell a responder that a send it recorded "
-                            "as in-flight never went out")
+                            "as in-flight never went out. It checks the "
+                            "chain first, so it needs the Sequentia RPC "
+                            "flags (or a --config naming them) or --force")
     p.add_argument("--config", help="a responder config file")
-    p.add_argument("--lender-key")
-    p.add_argument("--state", help="the state file (default: beside the key)")
+    p.add_argument("--lender-key",
+                   help="the keyfile btc-keygen wrote, or a --config naming "
+                        "one")
+    p.add_argument("--state", help="the state file (default: "
+                                   "<lender-key>.state.json)")
     p.add_argument("--take", required=True, help="the take id to clear")
     p.add_argument("--write-off", metavar="REASON",
                    help="record that this key can do nothing more about the "
@@ -6610,10 +6762,16 @@ def add_btc_commands(sub):
     p = sub.add_parser("btc-respond",
                        help="LENDER responder: sign releases, pay principals, "
                             "start loans, claim repayments")
-    p.add_argument("--config", help="a JSON file with the key, the node "
-                                    "credentials and the state file; nothing "
-                                    "secret then appears in `ps`")
-    p.add_argument("--lender-key")
+    p.add_argument("--config", help="a JSON file with the key, both nodes' "
+                                    "credentials and the state file, and "
+                                    "optionally book, interval, fee_asset, "
+                                    "disburse_conf, claim_depth and "
+                                    "scan_interval; a flag given here "
+                                    "outranks it, and nothing secret then "
+                                    "appears in `ps`")
+    p.add_argument("--lender-key",
+                   help="the keyfile btc-keygen wrote, or a --config naming "
+                        "one")
     p.add_argument("--sign-only", action="store_true",
                    help="run without both chains' nodes: draw secrets and sign "
                         "releases, and do nothing else. Every loan taken "
@@ -6621,8 +6779,11 @@ def add_btc_commands(sub):
                         "because no principal is ever paid and no repayment "
                         "ever claimed. For a deliberate test, not for lending")
     p.add_argument("--state", help="where this responder records what it has "
-                                   "already done (default: beside the key)")
-    p.add_argument("--watch", action="store_true")
+                                   "already done (default: "
+                                   "<lender-key>.state.json)")
+    p.add_argument("--watch", action="store_true",
+                   help="keep running, a pass every --interval; without "
+                        "it, one pass and exit")
     # These default to None so that "not supplied" is distinguishable from
     # "supplied with the default value". `_btc_cfg` fills them from the config
     # file and then applies RESPONDER_DEFAULTS to whatever is still unset --
@@ -6630,7 +6791,8 @@ def add_btc_commands(sub):
     # these keys in the file, and an operator who set `claim_depth: 12` would
     # get 6 with nothing said.
     p.add_argument("--interval", type=float, default=None,
-                   help=f"seconds between passes (default {RESPONDER_DEFAULTS['interval']})")
+                   help="seconds between passes, with --watch (default "
+                        f"{RESPONDER_DEFAULTS['interval']})")
     p.add_argument("--disburse-conf", type=int, default=None,
                    help="Bitcoin confirmations required before disbursing "
                         f"(default {RESPONDER_DEFAULTS['disburse_conf']})")
@@ -6642,8 +6804,10 @@ def add_btc_commands(sub):
                    help="confirmations required on a borrower's claim before "
                         "moving their collateral into the loan (default "
                         f"{RESPONDER_DEFAULTS['claim_depth']})")
-    p.add_argument("--fee-asset", help="fee asset for the Sequentia legs "
-                                       "(default: the debt asset)")
+    p.add_argument("--fee-asset", help="label or 64-hex id for the Sequentia "
+                                       "legs; default: the debt asset, else "
+                                       "anything held that the node "
+                                       "publishes a rate for")
     add_book_arg(p)
     p.set_defaults(book=None)  # ...so a config file's `book` is not outranked
     add_node_args(p)           # the lender's Sequentia wallet
@@ -6671,9 +6835,10 @@ def main():
             "PIGNUS_ISSUER", "http://127.0.0.1:8722"),
             help="the issuer's openampd base url")
         q.add_argument("--token", default=os.environ.get("PIGNUS_ISSUER_TOKEN", ""),
-                       help="the issuer operator's bearer token: the pledge "
-                            "commands are the issuer's to run, never the "
-                            "borrower's or the lender's")
+                       help="required, or PIGNUS_ISSUER_TOKEN: the issuer "
+                            "operator's bearer token. The pledge commands "
+                            "are the issuer's to run, never the borrower's "
+                            "or the lender's")
         q.add_argument("--allow-insecure-issuer", action="store_true",
                        help="talk to a non-https issuer that is not on this "
                             "machine. The token goes on every call, so anything "
@@ -6683,7 +6848,7 @@ def main():
     p = sub.add_parser("pledge-sign",
                        help="sign a Tier C release or seizure with your own key")
     p.add_argument("--action", choices=("release", "seize"), required=True)
-    p.add_argument("--pledge", required=True)
+    p.add_argument("--pledge", required=True, help="the pledge id")
     p.add_argument("--extra", default="",
                    help="the repayment txid for a release, the reason for a seizure")
     p.add_argument("--key", required=True,
@@ -6696,8 +6861,12 @@ def main():
     p = sub.add_parser("pledge-list",
                        help="Tier C pledges at an issuer, all or one by id")
     issuer_args(p)
-    for name in ("asset", "holder", "lender", "state"):
-        p.add_argument("--" + name, default=None)
+    for name, what in (("asset", "only pledges of this asset, 64-hex id"),
+                       ("holder", "only pledges by this borrower AID"),
+                       ("lender", "only pledges to this lender AID"),
+                       ("state", "only pledges in this state, as the "
+                                 "issuer names it")):
+        p.add_argument("--" + name, default=None, help=what)
     p.add_argument("--pledge", default=None,
                    help="one pledge by id, which is what a lender checks after "
                         "a seizure the issuer has accepted but not delivered")
@@ -6714,16 +6883,23 @@ def main():
                    help="the borrower's AID, registered with an enclave for the asset")
     p.add_argument("--lender", required=True,
                    help="the lender's AID, registered with an enclave for the asset")
-    p.add_argument("--atoms", type=int, required=True)
+    p.add_argument("--atoms", type=int, required=True,
+                   help="collateral to lock, in atoms")
     p.add_argument("--maturity", type=int, required=True,
                    help="block height, above the current tip")
-    p.add_argument("--debt-asset", default="")
-    p.add_argument("--debt-atoms", type=int, default=0)
-    p.add_argument("--note", default="")
+    p.add_argument("--debt-asset", default="",
+                   help="the debt asset's 64-hex id, kept on the record")
+    p.add_argument("--debt-atoms", type=int, default=0,
+                   help="the debt, in atoms of --debt-asset, kept on the "
+                        "record")
+    p.add_argument("--note", default="",
+                   help="free text kept with the pledge")
     p.set_defaults(fn=cmd_pledge_create)
 
     p = sub.add_parser("pledge-release",
-                       help="Tier C: the debt is settled, unlock the collateral")
+                       help="Tier C: the debt is settled, unlock the collateral; "
+                            "needs --key or --lender-sig, or --force with "
+                            "--reason")
     issuer_args(p)
     p.add_argument("--pledge", required=True)
     p.add_argument("--key", default=None,
@@ -6736,17 +6912,25 @@ def main():
     p.add_argument("--lender-x", default=None,
                    help="the lender's x-only key, to check --lender-sig "
                         "against (the pledge-sign JSON already carries it)")
-    p.add_argument("--repaid-txid", default="")
+    p.add_argument("--repaid-txid", default="",
+                   help="the repayment transaction, recorded with the "
+                        "release and covered by the lender's signature")
     p.add_argument("--force", action="store_true",
                    help="issuer override for a lender who cannot sign; needs --reason")
-    p.add_argument("--reason", default="")
+    p.add_argument("--reason", default="",
+                   help="why the collateral is released without the "
+                        "lender's signature, with --force")
     p.set_defaults(fn=cmd_pledge_release)
 
     p = sub.add_parser("pledge-seize",
-                       help="Tier C: deliver defaulted collateral to the lender")
+                       help="Tier C: deliver defaulted collateral to the lender; "
+                            "needs --key or --lender-sig, and --holder-sig "
+                            "before maturity")
     issuer_args(p)
     p.add_argument("--pledge", required=True)
-    p.add_argument("--reason", required=True)
+    p.add_argument("--reason", required=True,
+                   help="why the collateral is seized; the signatures "
+                        "cover it")
     p.add_argument("--key", default=None,
                    help="file holding the LENDER's private key, hex (0600); "
                         "'-' reads it from stdin")
@@ -6768,37 +6952,56 @@ def main():
     # --- Tier D ---------------------------------------------------------------
     p = sub.add_parser("repo-propose",
                        help="write a REPURCHASE document (Tier D; not a loan)")
-    for name in ("collateral-asset", "debt-asset", "borrower-cu",
-                 "borrower-prog", "lender-prog"):
-        p.add_argument("--" + name, required=True)
-    for name in ("collateral-amount", "principal", "debt", "collateral-value",
-                 "forfeit-after"):
-        p.add_argument("--" + name, type=int, required=True)
-    p.add_argument("--borrower-ver", type=int, default=1)
-    p.add_argument("--lender-ver", type=int, default=1)
-    p.add_argument("--out", default=None)
+    for name, what in (
+            ("collateral-asset", "the OpenDAMP asset's 64-hex id"),
+            ("debt-asset", "the asset the bond and the debt are paid in, "
+                           "64-hex id"),
+            ("borrower-cu", "the borrower's C_U program, 32 bytes of hex"),
+            ("borrower-prog", "the borrower's payout program, hex"),
+            ("lender-prog", "the lender's payout program, hex")):
+        p.add_argument("--" + name, required=True, help=what)
+    for name, what in (
+            ("collateral-amount", "atoms of the asset sold"),
+            ("principal", "atoms the lender pays for it now"),
+            ("debt", "atoms the borrower buys it back for"),
+            ("collateral-value", "the asset's worth at origination, in "
+                                 "debt-asset atoms; the bond is this less "
+                                 "the debt"),
+            ("forfeit-after", "height or Unix time from which the borrower "
+                              "may sweep the bond")):
+        p.add_argument("--" + name, type=int, required=True, help=what)
+    p.add_argument("--borrower-ver", type=int, default=1,
+                   help="witness version of --borrower-prog, 0 or 1 "
+                        "(default 1)")
+    p.add_argument("--lender-ver", type=int, default=1,
+                   help="witness version of --lender-prog, 0 or 1 "
+                        "(default 1)")
+    p.add_argument("--out", default=None,
+                   help="write the document here (default: stdout)")
     p.set_defaults(fn=cmd_repo_propose)
 
     p = sub.add_parser("repo-show", help="describe a repurchase and its settlement")
-    p.add_argument("terms")
+    p.add_argument("terms", help="the repurchase document repo-propose wrote")
     p.set_defaults(fn=cmd_repo_show)
 
     from pignus.repurchase import BURIAL_DEPTH
 
     p = sub.add_parser("repo-verify",
-                       help="THE check: both halves of a repurchase, on chain")
-    p.add_argument("terms")
+                       help="check both halves of a repurchase, on chain")
+    p.add_argument("terms", help="the repurchase document repo-propose wrote")
     p.add_argument("--txid", required=True,
                    help="the transaction that funded the bond")
     p.add_argument("--vout", type=int, default=None,
                    help="the bond's output index (default: find it in the "
                         "transaction)")
     p.add_argument("--leg-txid", help="the transaction that moved the "
-                   "collateral to the lender, which is what the bond secures")
+                   "collateral to the lender, which is what the bond secures; "
+                   "goes with --lender-cu")
     p.add_argument("--leg-vout", type=int, default=None,
                    help="its output index (default: find it)")
     p.add_argument("--lender-cu", help="the lender's C_U program, 32 bytes of "
-                   "hex: the address leg one must have paid")
+                   "hex: the address leg one must have paid; goes with "
+                   "--leg-txid")
     p.add_argument("--min-confirmations", type=int, default=BURIAL_DEPTH,
                    metavar="N", help=f"how deep both halves must be buried "
                    f"before this is live (default {BURIAL_DEPTH})")
@@ -6806,7 +7009,7 @@ def main():
     p.set_defaults(fn=cmd_repo_verify)
 
     p = sub.add_parser("repo-fund", help="pay the bond into the repurchase vault")
-    p.add_argument("terms")
+    p.add_argument("terms", help="the repurchase document repo-propose wrote")
     add_node_args(p)
     add_fee_args(p, "the bond asset")
     p.add_argument("--dry-run", action="store_true",
@@ -6816,10 +7019,12 @@ def main():
     p = sub.add_parser("repo-forfeit",
                        help="after the deadline, sweep the bond back to the "
                             "borrower")
-    p.add_argument("terms")
+    p.add_argument("terms", help="the repurchase document repo-propose wrote")
     p.add_argument("--txid", required=True, help="the bond vault's coin")
     p.add_argument("--vout", type=int, default=None,
-                   help="the bond vault's output index, as repo-fund reported it")
+                   help="the bond vault's output index (default: the output "
+                        "paying the bond address, found by scanning the "
+                        "transaction)")
     add_node_args(p)
     add_fee_args(p, "the bond asset")
     p.add_argument("--dry-run", action="store_true",
@@ -6830,10 +7035,12 @@ def main():
     p = sub.add_parser("repo-settle",
                        help="compose the settlement: the asset home to the "
                             "borrower, the bond to the lender")
-    p.add_argument("terms")
+    p.add_argument("terms", help="the repurchase document repo-propose wrote")
     p.add_argument("--txid", required=True, help="the bond vault's coin")
     p.add_argument("--vout", type=int, default=None,
-                   help="the bond vault's output index, as repo-fund reported it")
+                   help="the bond vault's output index (default: the output "
+                        "paying the bond address, found by scanning the "
+                        "transaction)")
     p.add_argument("--verifier", metavar="TXID:VOUT",
                    help="the OpenDAMP verifier output every transfer of the "
                         "restricted asset spends; it goes at input 0")
@@ -6871,7 +7078,8 @@ def main():
                    help="the settlement once every other party has signed "
                         "it (the document transfer-cosign wrote, or hex): "
                         "puts the covenant's RETURN witness on, which must "
-                        "be last")
+                        "be last, and prints the finished transaction "
+                        "unless --broadcast")
     p.add_argument("--broadcast", action="store_true",
                    help="with --attach, send the finished transaction")
     add_node_args(p)
@@ -6882,11 +7090,19 @@ def main():
 
     p = sub.add_parser("quote", help="reference prices -> the covenant's integer price")
     p.add_argument("--market", required=True, help="e.g. GOLD/USDX")
-    p.add_argument("--collateral-ref", type=float, required=True)
-    p.add_argument("--debt-ref", type=float, required=True)
-    p.add_argument("--collateral-precision", type=int, default=8)
-    p.add_argument("--debt-precision", type=int, default=8)
-    p.add_argument("--price-scale", type=int, default=100_000)
+    p.add_argument("--collateral-ref", type=float, required=True,
+                   help="the collateral asset's price in the reference "
+                        "currency, per whole unit")
+    p.add_argument("--debt-ref", type=float, required=True,
+                   help="the debt asset's price in the same reference "
+                        "currency, per whole unit")
+    p.add_argument("--collateral-precision", type=int, default=8,
+                   help="decimals of the collateral asset (default 8)")
+    p.add_argument("--debt-precision", type=int, default=8,
+                   help="decimals of the debt asset (default 8)")
+    p.add_argument("--price-scale", type=int, default=100_000,
+                   help="the integer scale the covenant's price is written "
+                        "at (default 100000)")
     p.add_argument("--open-ltv", type=float, default=50.0,
                    help="the loan-to-value a loan opens at, which with each "
                         "liquidation ratio gives the strike (default 50)")
@@ -6898,40 +7114,71 @@ def main():
     p.set_defaults(fn=cmd_quote)
 
     p = sub.add_parser("propose", help="write a loan terms document")
-    for name in ("collateral-asset", "debt-asset", "borrower-x", "lender-x",
-                 "market"):
-        p.add_argument("--" + name, required=True)
+    for name, what in (
+            ("collateral-asset", "64-hex id"),
+            ("debt-asset", "64-hex id"),
+            ("borrower-x", "the borrower's x-only key, hex, which is "
+                           "also their payout program"),
+            ("lender-x", "the lender's x-only key, hex, which is also "
+                         "their payout program"),
+            ("market", "the oracle feed the loan is priced on, e.g. "
+                       "GOLD/USDX")):
+        p.add_argument("--" + name, required=True, help=what)
     p.add_argument("--oracle-x", default="",
                    help="a single oracle key; or use --oracles for m-of-n")
     p.add_argument("--oracles", default="",
                    help="comma-separated oracle keys for an m-of-n loan")
-    p.add_argument("--oracle-threshold", type=int, default=0)
-    for name, default in (("collateral-amount", None), ("principal", None),
-                          ("debt", None), ("strike", None), ("maturity", None),
-                          ("recover-after", None), ("not-before", 0),
-                          ("bonus-num", 105), ("bonus-den", 100),
-                          ("price-scale", 100_000), ("max-price", 0)):
+    p.add_argument("--oracle-threshold", type=int, default=0,
+                   help="m in an m-of-n --oracles set (default: all of "
+                        "them). Required with `--oracles book` when it "
+                        "names more than one oracle; 1 is refused")
+    for name, default, what in (
+            ("collateral-amount", None, "atoms locked in the vault"),
+            ("principal", None, "atoms the borrower receives"),
+            ("debt", None, "atoms the borrower repays, principal plus "
+                           "interest"),
+            ("strike", None, "the price a liquidation opens below, at "
+                             "--price-scale"),
+            ("maturity", None, "when DEFAULT opens: a block height or a "
+                               "Unix time"),
+            ("recover-after", None, "when the lender's RECOVER sweep opens: "
+                                    "a block height or a Unix time"),
+            ("not-before", 0, "Unix time; a signed price stamped before "
+                              "it is refused (default 0: any the oracle "
+                              "ever signed)"),
+            ("bonus-num", 105, "the liquidation bonus as a fraction, "
+                               "bonus-num over bonus-den (default 105/100)"),
+            ("bonus-den", 100, "see --bonus-num (default 100)"),
+            ("price-scale", 100_000, "the integer scale every price is "
+                                     "written at (default 100000)"),
+            ("max-price", 0, "the ceiling DEFAULT's arithmetic is bounded "
+                             "at, at --price-scale (default 0: derived)")):
         p.add_argument("--" + name, type=int, default=default,
-                       required=default is None)
-    p.add_argument("--memo", default="")
+                       required=default is None, help=what)
+    p.add_argument("--memo", default="", help="free text kept in the terms")
     p.set_defaults(fn=cmd_propose)
 
     p = sub.add_parser("show", help="describe a loan, optionally at a price")
-    p.add_argument("--terms", required=True)
-    p.add_argument("--price", type=int)
+    p.add_argument("--terms", required=True, help="the terms file")
+    p.add_argument("--price", type=int,
+                   help="a price at the terms' scale, to describe the loan "
+                        "at it")
     p.set_defaults(fn=cmd_show)
 
     p = sub.add_parser("address", help="the vault scriptPubKey these terms compile to")
-    p.add_argument("--terms", required=True)
+    p.add_argument("--terms", required=True, help="the terms file")
     p.set_defaults(fn=cmd_address)
 
-    p = sub.add_parser("verify", help="THE check: do these terms match the funded vault")
+    p = sub.add_parser("verify", help="check that these terms match the funded vault")
     p.add_argument("--terms", required=True,
                    help="the terms document, or the record offer-take printed")
     p.add_argument("--spk", help="the funded scriptPubKey, if you have it directly")
     p.add_argument("--txid", help="the funding transaction; read from the "
                    "utxo set, so no transaction index is needed")
-    p.add_argument("--vout", type=int, default=0)
+    p.add_argument("--vout", type=int, default=0,
+                   help="the funding output index (default 0); without "
+                        "--txid, both come from the terms file when it "
+                        "carries them")
     p.add_argument("--blockhash", help="the block the funding is in, needed "
                    "only to check a vault that has already been spent")
     g = p.add_mutually_exclusive_group()
@@ -6944,10 +7191,11 @@ def main():
     p.set_defaults(fn=cmd_verify)
 
     p = sub.add_parser("loans", help="list a book's loans, or only this "
-                                     "wallet's (--mine); exits 4 when one of "
-                                     "yours needs a person")
+                                     "wallet's (--mine); exits 4 with --mine "
+                                     "when one of your loans can be "
+                                     "liquidated, called or swept")
     p.add_argument("--state", help="LIVE, REPAID, LIQUIDATED, ...; default all")
-    p.add_argument("--market")
+    p.add_argument("--market", help="only this market, e.g. GOLD/USDX")
     p.add_argument("--mine", action="store_true",
                    help="only loans whose borrower or lender program is one "
                         "this wallet's coins or payout address use")
@@ -6973,12 +7221,19 @@ def main():
                    help="the terms document, or the record offer-take printed")
     p.add_argument("--txid", help="the funding transaction (default: the one "
                    "the terms file carries)")
-    p.add_argument("--vout", type=int, default=0)
+    p.add_argument("--vout", type=int, default=0,
+                   help="the funding output index (default 0); without "
+                        "--txid, both come from the terms file when it "
+                        "carries them")
     p.add_argument("--single-leaf", action="store_true",
                    help="the vault came from a funded offer; needed only once "
                         "it is spent, since until then the chain says which it is")
-    p.add_argument("--price", type=int)
-    p.add_argument("--min-depth", type=int, default=2)
+    p.add_argument("--price", type=int,
+                   help="a price at the loan's scale, to report health, "
+                        "LTV and whether it is liquidatable at that price")
+    p.add_argument("--min-depth", type=int, default=2,
+                   help="confirmations a spend of the vault needs before "
+                        "it counts (default 2)")
     p.add_argument("--watch", action="store_true",
                    help="keep reconciling, printing a line whenever the state, "
                         "liquidatable, matured or recover_open changes; exit "
@@ -7000,7 +7255,9 @@ def main():
                         "is in the vault's leaf -- so the same number means a "
                         "different price at a different scale, and this is the "
                         "only place the two are compared")
-    p.add_argument("--attestation", required=True)
+    p.add_argument("--attestation", required=True,
+                   help="a file holding the signed price as JSON: a row "
+                        "from a book's /v1/attestations or an oracle's log")
     p.set_defaults(fn=cmd_check_attestation)
 
     add_wallet_commands(sub)
