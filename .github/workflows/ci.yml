@@ -90,6 +90,9 @@ jobs:
           python3 tests/test_arith_parity.py
           python3 tests/test_openamp.py
           python3 tests/test_watcher.py
+          # Five reproduced reorg cases against a fake node: offline, and the
+          # README lists it in the half that runs here.
+          python3 tests/test_watcher_reorgs.py
           python3 tests/test_oracle_service.py
           python3 tests/test_liquidator.py
           python3 tests/test_btc_relay_auth.py
