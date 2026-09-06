@@ -895,6 +895,39 @@ echo "$OUT" | grep -q '"disowned_offers": \[\]' || {
     echo "$OUT" | sed 's/^/  /' >&2; exit 1; }
 echo "  and its own lender repairs it with one signature, changing no term"
 
+# ...and, asked to, the status also says whether this key has anything
+# takeable on the board: the repaired offer counts, and a key with nothing
+# open is a lender nobody can borrow from, which is a person's job to fix.
+set +e
+OUT=$("$BIN/pignus-cli" btc-responder-status --lender-key "$LKEY2" \
+        --state "$WORK/disowned.state.json" \
+        --book "http://127.0.0.1:$DPORT2" --expect-offer 2>&1)
+rc=$?
+set -e
+test "$rc" = "0" || { echo "a key with an open, sound offer was told it has none (exit $rc)" >&2
+    echo "$OUT" | sed 's/^/  /' >&2; exit 1; }
+echo "$OUT" | grep -q "\"$DIS_ID\"" || {
+    echo "the status did not list the open offer" >&2; exit 1; }
+LKEY3="$WORK/idle.key"
+"$BIN/pignus-cli" btc-keygen --out "$LKEY3" >/dev/null
+echo '{}' > "$WORK/idle.state.json"
+set +e
+OUT=$("$BIN/pignus-cli" btc-responder-status --lender-key "$LKEY3" \
+        --state "$WORK/idle.state.json" \
+        --book "http://127.0.0.1:$DPORT2" --expect-offer 2>&1)
+rc=$?
+set -e
+test "$rc" = "4" || { echo "a key with nothing on the board was not reported (exit $rc)" >&2; exit 1; }
+echo "$OUT" | grep -q "no open cross-chain offer" || {
+    echo "it exited 4 but did not say why" >&2; echo "$OUT" | tail -3 | sed 's/^/  /' >&2; exit 1; }
+set +e
+OUT=$("$BIN/pignus-cli" btc-responder-status --lender-key "$LKEY3" \
+        --state "$WORK/idle.state.json" --book "http://127.0.0.1:$DPORT2" 2>&1)
+rc=$?
+set -e
+test "$rc" = "0" || { echo "without --expect-offer an idle key is not a person needed (exit $rc)" >&2; exit 1; }
+echo "  --expect-offer counts a sound open offer, and reports a key with nothing takeable on the board"
+
 # Twice is a no-op rather than an error: an operator running the repair over
 # every offer they hold should not have to know which ones needed it.
 AGAIN=$("$BIN/pignus-cli" btc-offer-resign --offer "$DIS_ID" \

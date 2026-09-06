@@ -1326,7 +1326,12 @@ class Service:
                 continue
             if not problems:
                 continue
-            self.book.update_btc_offer(o["btc_offer_id"], status="expired")
+            # WHY, on the record: the journal line below is gone with the
+            # journal, and the lender asking "why is there nothing to take"
+            # reads the book.
+            self.book.update_btc_offer(o["btc_offer_id"], status="expired",
+                                       expired_at=int(time.time()),
+                                       expired_reason="; ".join(problems)[:300])
             print(f"pignusd: cross-chain offer {o['btc_offer_id']} has expired: "
                   + "; ".join(problems)[:200], file=sys.stderr)
             n += 1

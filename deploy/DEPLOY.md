@@ -364,7 +364,10 @@ seconds, no market may disagree with the registry about its assets' decimals,
 every key the book quotes must belong to a listed oracle, a liquidator unit
 that is installed must be running, no loan may sit under its strike and
 still open, the responder (when `PIGNUS_RESPONDER_CONFIG` names one) must
-have no take waiting on a person, the disk every service writes to must have
+have no take waiting on a person and must have an open, takeable offer on the
+book (an offer expires quietly when the parent chain's height outruns its
+margins; `btc-responder-status --expect-offer` names the last one and why it
+ended), the disk every service writes to must have
 room, and the services must answer through the proxy with a certificate that
 has a week left. `pignus-check.timer` runs it every five minutes, and
 `pignus-check.service` carries its settings as environment. `PIGNUS_ORACLES`

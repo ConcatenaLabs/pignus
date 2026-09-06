@@ -3493,12 +3493,18 @@ def _disowned_offers(args, lender_x, written_off=()):
                  and not t.get("secret_t")
                  and t.get("take_id") not in set(written_off)
                  and (t.get("loan") or {}).get("borrower_prog")}
-    out = {"bad_sig": [], "bad_id": []}
+    out = {"bad_sig": [], "bad_id": [], "open": [], "last_dead": None}
+    dead = []
     for o in offers:
         loan = o.get("loan") or {}
         if loan.get("lender_x") != lender_x:
             continue
         oid = str(o.get("btc_offer_id", "?"))
+        if o.get("status", "open") != "open":
+            # The most recent offer of this key that is no longer on the
+            # board, and why: the answer to "why is there nothing to take".
+            dead.append((int(o.get("updated") or o.get("created") or 0), oid,
+                         str(o.get("status")), o.get("expired_reason")))
         if o.get("status", "open") != "open" and oid not in in_flight:
             continue
         lots = int(o.get("lots", 1) or 1)
@@ -3512,6 +3518,12 @@ def _disowned_offers(args, lender_x, written_off=()):
             # the record's key. What repairs it is withdrawing and publishing
             # the coin again, once nothing is in flight under it.
             out["bad_id"].append(oid)
+        elif o.get("status", "open") == "open":
+            out["open"].append(oid)          # on the board, and takeable
+    if dead:
+        when, oid, st, why = max(dead)
+        out["last_dead"] = {"btc_offer_id": oid, "status": st,
+                            "expired_reason": why, "at": when}
     return out
 
 
@@ -3637,15 +3649,35 @@ def cmd_btc_responder_status(args):
     disowned = dis["bad_sig"]
     unfixable = dis["bad_id"]
     unchecked = dis.get("unchecked")
+    # A responder with no takeable offer on the board is a lender nobody can
+    # borrow from, which is what an offer expiring quietly leaves behind. Said
+    # only when asked (--expect-offer): a key that has deliberately withdrawn
+    # is not a person needed.
+    no_offer = bool(getattr(args, "expect_offer", False)) and not unchecked \
+        and lender_x_of(args) and not dis.get("open")
     print(json.dumps({"state": path, "takes": len(rows),
                       "needing_attention": (len(stuck) + len(disowned)
-                                            + len(unfixable) + len(slow)),
+                                            + len(unfixable) + len(slow)
+                                            + (1 if no_offer else 0)),
                       "recovering": len(healing),
                       "disowned_offers": disowned,
                       "offers_under_an_old_id": unfixable,
                       "offers_unchecked_at": unchecked,
+                      "open_offers": dis.get("open", []),
+                      "last_dead_offer": dis.get("last_dead"),
                       "written_off": [r["take_id"] for r in written],
                       "rows": rows}, indent=2))
+    if no_offer:
+        last = dis.get("last_dead") or {}
+        print("this key has no open cross-chain offer on the book, so nobody "
+              "can borrow from it"
+              + (f"; the last one, {last.get('btc_offer_id')}, is "
+                 f"{last.get('status')}"
+                 + (f": {last.get('expired_reason')}" if last.get("expired_reason") else "")
+                 if last else "")
+              + ". Publish one (pignus-cli btc-offer-publish), with deadlines "
+              "that leave the margins room: the parent chain's height does "
+              "not advance at a steady pace.", file=sys.stderr)
     if unchecked:
         print(f"the book at {unchecked} could not be read, so the offers "
               f"served under this key were NOT checked; a stale or forged one "
@@ -3715,7 +3747,7 @@ def cmd_btc_responder_status(args):
     # not safe to act on", which a take blocked on an unclearing reason is: a
     # borrower's collateral is committed and nothing is going to move it. A
     # timer that only looks at the exit code was told everything was fine.
-    if stuck or disowned or unfixable or slow:
+    if stuck or disowned or unfixable or slow or no_offer:
         return 4
     return 1 if unchecked else 0
 
@@ -6484,6 +6516,12 @@ def add_btc_commands(sub):
     p.add_argument("--config", help="a responder config file")
     p.add_argument("--lender-key")
     p.add_argument("--state", help="the state file (default: beside the key)")
+    p.add_argument("--expect-offer", action="store_true",
+                   help="with --book: exit 4 when this key has no open, "
+                        "takeable offer on it, naming the last one and why "
+                        "it ended. What the timer's check asks, since a "
+                        "responder with nothing on the board is a lender "
+                        "nobody can borrow from")
     p.add_argument("--waiting-hours", type=float, default=6.0, metavar="H",
                    help="how long a take may wait on ONE reason before this "
                         "reports it (default 6). Most reasons clear within a "
