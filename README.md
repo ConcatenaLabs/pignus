@@ -11,10 +11,7 @@ Design and security analysis: [`docs/pignus-design.md`](docs/pignus-design.md).
 ## What it actually guarantees
 
 A borrower locks collateral in one taproot UTXO with a NUMS internal key -- so
-there is no key path -- whose only ways out are the four exits below. A
-directly originated loan carries them as four leaves; a loan taken from a
-funded offer compiles the same terms into a single leaf, and `verify` reports
-which layout it found.
+there is no key path -- whose only ways out are the four exits below.
 
 | leaf | who | needs | does |
 |---|---|---|---|
@@ -251,11 +248,11 @@ pignus-cli offer-withdraw --offer <id> --rpc-wallet me
 book's advertisement down so nobody new takes the terms, and touches no coin;
 withdrawing brings the principal itself back, and only once the offer's expiry
 has opened. A delisted offer's record stays in the book, hidden from the board,
-because it is the only copy of the terms the refund is built from; `offer-
-withdraw` finds it by id, and the page keeps it under "mine" with its
-Withdraw button. Nothing returns on its own. The manage token `offer-publish`
-prints is served once and stored only as a hash, so a lender who loses it waits
-for the expiry.
+because it is the only copy of the terms the refund is built from;
+`offer-withdraw` finds it by id, and the page keeps it under "mine" with its
+Withdraw button. Nothing returns on its own. The manage token printed when the
+offer is listed (by `offer-fund`, or by `offer-publish`) is served once and
+stored only as a hash, so a lender who loses it waits for the expiry.
 
 `pignus-cli <command> --help` is the complete list of options for any command.
 What shapes an offer is worth having here:
@@ -309,8 +306,8 @@ broadcast -- 3 when the covenant builder could not be loaded or has drifted
 from the golden vectors, and 4 when a check command ran and found a state that
 is not safe to act on. Status 2 is the one worth scripting against: it is the
 promise that nothing happened. Status 4 is what `loans --mine`, `offers
---mine`, `btc-responder-status`, `pledge-seize` and `repo-verify` report; each
-section says which states earn it.
+--mine`, `btc-responder-status`, `pledge-seize`, `repo-verify` and
+`repo-settle --inspect` report; each section says which states earn it.
 
 A loan does not need the book at all. `--loan <id>` is a convenience that looks
 the terms up; with the terms file in hand, `pignus-cli repay --terms loan.json
@@ -399,7 +396,8 @@ touches nothing.
 | `--call-due` | also call loans past maturity, through DEFAULT |
 | `--interval` / `--once` | how often a round runs, or run one and stop |
 
-At least one of `--book` and `--oracle` is required. The RPC flags take the same
+`--book` or `--loans` is required, and `--oracle` as well whenever there is no
+`--book`. The RPC flags take the same
 `PIGNUS_RPC_*` environment defaults as `pignus-cli`, so credentials need not be
 on the command line.
 
@@ -473,8 +471,9 @@ has opened the principal, which is what publishes the secret `btc-upgrade`
 needs. Every step before `btc-originate` commits nothing at all. `btc-check`
 names the next move at each stage, so the sequence need not be memorised.
 
-Give `btc-claim-principal` and `btc-repay` a `--book` and a `--borrower-key` and
-each tells the book where the payment landed. Nothing depends on it -- the
+`btc-claim-principal` tells the book where the principal was claimed; give
+`btc-repay` a `--borrower-key` and it does the same for the repayment. Nothing
+depends on it -- the
 lender's responder reads both off the chain -- but it saves that scan and keeps
 the borrower's own page from showing a loan as running after they have paid it.
 
@@ -508,7 +507,8 @@ then. A constant in either place would be a transaction that confirms when the
 parent chain is quiet and sits in the mempool when it is not. `--btc-fee` is
 the flat satoshi fee the transactions spending the vault carry.
 
-That is not a delay here, it is a loan that never starts. The funding is
+A funding that does not confirm is not a delay here; it is a loan that never
+starts. The funding is
 broadcast after the borrower has already signed the move into the vault, so a
 funding stuck in the mempool leaves their collateral committed with no way out
 until `abort_after`. And the upgrade is signed in advance by both parties,
@@ -545,8 +545,8 @@ co-sign on the Bitcoin side are in the design doc, section 7.
 A seizure is the one move that needs a third party while a loan is live: there
 is no covenant on the Bitcoin side, so the oracle's signature *is* the decision.
 `btc-seize-sighash --out --book` writes a request carrying the loan, the
-lender's signed offer, and the borrower's own acceptance of it (`take_auth`,
-fetched from the take); the oracle operator co-signs it with `pignus-oracle
+lender's signed offer, and the borrower's own acceptance of it; the oracle
+operator co-signs it with `pignus-oracle
 --sign-seize --request`, and both the signature and the attestation behind it
 are published at the oracle's `/v1/seizures` -- so a seizure that was not
 justified is visible to anyone afterwards, which is the whole of the
@@ -631,8 +631,11 @@ failure carries the time it began, and a step that succeeds clears the failure
 recorded before it, so an old error is never shown as current beside a take
 that has since recovered. `btc-responder-clear` is the one recovery a
 responder cannot make for itself: telling it that a send it recorded as
-in-flight never went out. It checks the chain first, and it takes the
-responder's own lock, so it cannot run against a live one. The same command
+in-flight never went out. `btc-responder-clear --take <id>`, given node
+credentials, checks the chain first and refuses without them unless
+`--force`; when the payment IS on chain, `--found <txid:vout>` records it
+instead. It takes the responder's own lock, so it cannot run against a live
+one. The same command
 with `--write-off "<why>"` records that this key can do nothing more about a
 take, so it is reported as written off rather than as needing a person; a
 take with a paid principal and no claim of its repayment needs `--force` as
@@ -674,7 +677,8 @@ believing what it is told. [`docs/api.md`](docs/api.md) documents each endpoint.
 
 Two asset models on Sequentia cannot use the covenant vault, and each gets a
 different answer rather than a pretence. The loan book carries neither. Tier C
-is command-line only; Tier D has a *Check a repurchase* tab on the page that
+is command-line only; Tier D has a *Repurchase* tab on the page (its panel is
+headed *Check a repurchase*) that
 reads a terms document and its bond back, while everything that moves money is
 a command.
 
@@ -731,9 +735,9 @@ OpenDAMP Simplicity inputs -- the verifier and the lender's restricted output
 transfer tool's command for a transaction it did not build, against the
 issuer's current policy snapshot (their `openampd` serves it at
 `GET /v1/snapshots?asset=<id>`). A lender who cannot produce that signature
-cannot return the asset, and the bond is all a settlement that never comes
-leaves the holder with; sell only under a lender who can. `repo-propose` says
-so on every document it writes.
+cannot return the asset, and if the settlement never comes, the bond is all
+the holder is left with; sell only to a lender who can produce that
+signature. `repo-propose` says so on every document it writes.
 
 So a forfeit is not a remedy that makes the borrower whole: they keep the bond
 and the lender keeps the asset, which is the arrangement they agreed and not a
@@ -938,13 +942,9 @@ hand, and nothing then holds the lender to any strike. `--max-age`
 (600 seconds by default) is how recent the justifying price must be, and
 `--allow-stale` co-signs against an older one.
 
-The request also carries the **lender's signature over the offer** the loan
-was taken from, and without it the oracle refuses. The strike is the number a
-seizure is judged by and it is in no Bitcoin script -- Bitcoin cannot read it
--- so recomputing the sighash cannot check it: a lender can raise the strike
-in the request and the sighash comes out byte for byte identical. That
-signature and the borrower's acceptance beside it are what pin the strike to
-the one they published. The published record carries the loan and that
+The request also carries the lender's signed offer and the borrower's
+acceptance of it, which pin the strike (*Native BTC collateral* above says
+why a sighash alone cannot). The published record carries the loan and that
 signature too, so a borrower disputing a seizure can re-check the judgement and
 not only the price.
 
@@ -1046,7 +1046,8 @@ tests/page_check.sh                the page, in a real browser; it skips
                                    phone screenshot there for a person to look at
 ```
 
-Against a running chain (a `sequentiad`, and for the BTC ones a `bitcoind` too):
+Needing node binaries (a `sequentiad`, and for the BTC ones a `bitcoind`),
+which the tests start themselves:
 
 ```
 tests/test_btc_disburse.py         paying the principal
@@ -1058,7 +1059,7 @@ tests/test_watcher_reorg.py        the watcher against a real reorg
 tests/test_tiers.py                Tiers C and D
 tests/test_repo_opendamp.py        Tier D settled against a real OpenDAMP asset; needs the
                                    `opendamp` binary ($OPENDAMP_BIN, or a build beside this
-                                   checkout at ../openamp/opendamp/target/release/opendamp)
+                                   checkout at ../openamp/opendamp/target/{release,debug}/opendamp)
 tests/test_lifecycle.py            the CLI through fund, take, repay,
                                    liquidate, withdraw, default, with the
                                    daemon discovering every step
