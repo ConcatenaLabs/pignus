@@ -1268,17 +1268,30 @@ def spend_witness(node, txid, vout, since_height=None,
     return None
 
 
+# The most a witness item can be, so a hash is never computed over something
+# that could not have been on the stack in the first place.
+MAX_WITNESS_ITEM = 520
+
+
 def _preimage_from_witness(witness, expect_hash=None):
-    """The 32-byte secret a CLAIM witness published.
+    """The secret a CLAIM witness published, whatever its length.
 
     A hashlock claim carries [preimage, leaf, control]. Rather than trusting a
-    position, every 32-byte item is tested against the hash the loan commits to
-    -- so a witness that happens to carry another 32-byte value cannot be
-    mistaken for the secret, and a secret that does not match this loan is not
-    returned at all.
+    position, every item is hashed and tested against the hash the loan commits
+    to -- so a witness that happens to carry another value cannot be mistaken
+    for the secret, and a secret that does not match this loan is not returned
+    at all.
+
+    EVERY item, not only the 32-byte ones. The leaf says `OP_SHA256 <h>
+    OP_EQUALVERIFY` and nothing about size, so a claimant who chose a 33-byte
+    secret has spent the output just as validly -- and an extractor that only
+    looked at 32-byte items would report that they published nothing. For the
+    lender that is a principal gone with no secret to start the loan; for the
+    borrower it is collateral they can never reclaim. Whoever chose the odd
+    length did so on purpose, and this is the one place the trick is caught.
     """
     for item in witness:
-        if not isinstance(item, str) or len(item) != 64:
+        if not isinstance(item, str) or len(item) > 2 * MAX_WITNESS_ITEM:
             continue
         try:
             raw = bytes.fromhex(item)

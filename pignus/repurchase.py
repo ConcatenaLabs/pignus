@@ -319,9 +319,10 @@ class RepurchaseTerms:
             f"{deadline_phrase(self.forfeit_after)}. If the lender never sells "
             f"it back, you take a bond of {show(b, self.debt_asset)} after "
             f"{deadline_phrase(self.forfeit_after)}, which is what the asset "
-            f"was worth today minus "
-            f"what you would have paid. You do NOT get the asset's later gains: "
-            f"you are made whole at today's price, not the price on the day.")
+            f"was worth when the deal was struck, minus what you would have "
+            f"paid. You do NOT get the asset's later gains: you are made whole "
+            f"at the price the deal was struck at, not at the price on the day "
+            f"the lender fails to return it.")
 
     def verify_funding(self, node, txid, vout=None):
         """THE check, and it needs both halves to be worth anything.

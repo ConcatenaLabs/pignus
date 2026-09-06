@@ -325,9 +325,10 @@ export function describe(terms, fmt) {
     `settlement, at any time before ${deadlinePhrase(t.recoverAfter)}. If the ` +
     `lender never sells it back, you take a bond of ` +
     `${show(t.bond, terms.debt_asset)} after ${deadlinePhrase(t.recoverAfter)}, ` +
-    `which is what the asset was worth today minus ` +
-    `what you would have paid. You do NOT get the asset's later gains: ` +
-    `you are made whole at today's price, not the price on the day.`);
+    `which is what the asset was worth when the deal was struck, minus what ` +
+    `you would have paid. You do NOT get the asset's later gains: you are made ` +
+    `whole at the price the deal was struck at, not at the price on the day ` +
+    `the lender fails to return it.`);
 }
 
 /**

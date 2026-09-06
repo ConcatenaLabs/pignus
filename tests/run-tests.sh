@@ -60,6 +60,7 @@ run "unit: covenant vectors + oracle" python3 tests/test_units.py
 run "the same arithmetic in two languages" python3 tests/test_arith_parity.py
 run "unit: Tier C pledge message pin" python3 tests/test_openamp.py
 run "watcher: reorgs, and reading an exit" python3 tests/test_watcher.py
+run "watcher: the reorgs that were its blind spots" python3 tests/test_watcher_reorgs.py
 run "oracle service: what it will not sign" python3 tests/test_oracle_service.py
 run "liquidation bot: what it refuses" python3 tests/test_liquidator.py
 run "browser: covenant vs vectors"    node tests/test_web.mjs

@@ -182,7 +182,8 @@ BTC_TAKE_TTL = 300
 # Every value `?status=` accepts on an offer listing. A misspelling is refused
 # rather than answered with an empty list, which reads as "there are none".
 OFFER_STATUS_NAMES = frozenset(
-    ("open", "taken", "withdrawn", "gone", "ghost", "expired", "all"))
+    ("open", "delisted", "taken", "withdrawn", "gone", "ghost", "expired",
+     "all"))
 
 # The upgrade fee's floor, from the library that every other party checks it
 # with. Typed here as well, it would drift the day one of them changed and the
@@ -847,7 +848,7 @@ class Service:
             # Ghosts too: a funding undone by a Bitcoin reorg can come back,
             # and only a watched offer can be seen to come back. Everything
             # else -- taken, withdrawn, gone -- is finished.
-            if off.get("status", "open") not in ("open", "ghost"):
+            if off.get("status", "open") not in ("open", "ghost", "delisted"):
                 continue
             if off.get("kind") != "funded" or off["offer_id"] in w.offers:
                 continue
@@ -988,16 +989,25 @@ class Service:
                   f"loan {rec['loan_id'][:12]} at {v['txid'][:12]}:{v['vout']}",
                   file=sys.stderr)
             rem = ev.get("remainder")
+            # Counted once per TRANSACTION. A take seen in the mempool, then
+            # in a block, then again after a reorg re-mines it is one take
+            # reported three times, and a counter that grew on each report
+            # drifted upward for the life of the offer.
+            seen = list(off.get("taken_txids") or [])
+            count = int(off.get("taken", 0))
+            if ev["txid"] not in seen:
+                seen.append(ev["txid"])
+                count += 1
             if rem:
                 self.book.update_offer(off["offer_id"],
                                        outpoint=f"{rem['txid']}:{rem['vout']}",
                                        funded_value=str(rem["value"]),
                                        confirmations=0,
-                                       taken=int(off.get("taken", 0)) + 1)
+                                       taken=count, taken_txids=seen)
             else:
                 self.book.update_offer(off["offer_id"], status="taken",
                                        funded_value="0",
-                                       taken=int(off.get("taken", 0)) + 1,
+                                       taken=count, taken_txids=seen,
                                        spent_by=ev["txid"])
         elif kind == "withdrawn":
             self.book.update_offer(off["offer_id"], status="withdrawn",
@@ -1177,7 +1187,33 @@ class Service:
         unchecked book can be filled with offers that do not exist, and every
         one of them wastes somebody's attention.
         """
+        # A STRING, as the reference says and as every reader assumes: the
+        # page does JSON.parse on it, and the watcher's event applier does
+        # json.loads. An object stored verbatim rendered as "[object Object]"
+        # in the browser, which took the whole offers panel down for every
+        # visitor, and raised a TypeError in the applier that was read as a
+        # permanent verdict -- so a take of that offer was never registered.
+        if not isinstance(body.get("terms"), str):
+            raise ValueError("terms must be the loan terms as a JSON STRING, "
+                             "not an object")
         terms = LoanTerms.from_json(body["terms"])
+        # Heights, only. An absolute locktime at or above LOCKTIME_THRESHOLD is
+        # a Unix time to a node, and every comparison on the offer path -- the
+        # page's "matured", the CLI's take and withdraw gates, this book's own
+        # `expired` -- compares against a block height. A maturity written as
+        # a time from the past passes all of them as "thousands of years away"
+        # while the loan's DEFAULT leaf is already open the block it exists.
+        from pignus import LOCKTIME_THRESHOLD
+        for name, val in (("maturity", terms.maturity),
+                          ("recover_after", terms.recover_after),
+                          ("expiry_locktime",
+                           body.get("expiry_locktime") or terms.maturity)):
+            if int(val) >= LOCKTIME_THRESHOLD:
+                raise ValueError(
+                    f"this offer's {name} is {int(val)}, which a node reads as "
+                    f"a Unix time rather than a block height. Offers are "
+                    f"written in heights, because everything that checks a "
+                    f"deadline on this path compares it to one.")
         if body.get("kind") != "funded":
             raise ValueError('an offer must be funded: set kind to "funded" '
                              "and name the outpoint its principal rests in")
@@ -2186,10 +2222,17 @@ class Handler(BaseHTTPRequestHandler):
             if status not in OFFER_STATUS_NAMES:
                 raise ValueError("status must be one of "
                                  + ", ".join(sorted(OFFER_STATUS_NAMES)))
+            # `expired` is derived from the chain, never stored, so it is
+            # answered by filtering the open ones rather than by a stored
+            # status nothing ever writes -- which answered every such query
+            # with an empty list, the exact trap the check above exists for.
             rows = s.book.list_offers(market=q.get("market", [None])[0],
-                                      status=status)
-            return self._send(200, {"offers": _views(s.offer_view,
-                                                     _limit(rows, q))})
+                                      status="open" if status == "expired"
+                                      else status)
+            views = _views(s.offer_view, _limit(rows, q))
+            if status == "expired":
+                views = [v for v in views if v.get("expired")]
+            return self._send(200, {"offers": views})
         if path.startswith("/v1/offer/") or path.startswith("/v1/offers/"):
             rec = s.book.offer(path.partition("/v1/")[2].partition("/")[2])
             if not rec:
@@ -2440,13 +2483,20 @@ class Handler(BaseHTTPRequestHandler):
             # which hash its own loan commits to, so it can pick without this
             # book having to know anything about their loan.
             import hashlib
+            # EVERY item is hashed, not only the 32-byte ones. The hashlock
+            # leaf constrains the preimage's hash and nothing about its size,
+            # so a claimant who chose a 33-byte secret spent the output just as
+            # validly -- and a map that only held 32-byte items told the other
+            # party they published nothing, which for a lender is a principal
+            # gone with no way to start the loan and for a borrower collateral
+            # they can never reclaim.
             preimages = {}
             for item in witness:
                 try:
                     raw = bytes.fromhex(item)
                 except ValueError:
                     continue
-                if len(raw) == 32:
+                if 0 < len(raw) <= 520:
                     preimages[hashlib.sha256(raw).hexdigest()] = item
             # And how deep the PARENT chain is behind it. Sequentia reorgs
             # whenever Bitcoin reorgs, so Sequentia confirmations measure the
@@ -3128,8 +3178,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(403, {"error": "a listing can only be "
                                             "cancelled with the manage token "
                                             "returned when it was published"})
-                gone = self.svc.book.drop_offer(offer_id)
-                return self._send(200 if gone else 404, {"removed": gone})
+                gone = self.svc.book.delist_offer(offer_id)
+                return self._send(200 if gone else 404, {
+                    "removed": gone,
+                    "note": "the listing is off the board; the record is kept, "
+                            "because it is the only copy of the terms that can "
+                            "withdraw the coin. Publish the coin again to "
+                            "relist it, or withdraw it once the expiry opens"})
             return self._send(404, {"error": "no such endpoint"})
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True

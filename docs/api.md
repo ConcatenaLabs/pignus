@@ -38,10 +38,9 @@ outright rather than compute a debt `JSON.parse` may already have rounded, so a
 book that served them as numbers would hold loans its own page could not
 price.
 
-Those four are coerced when an offer is published AND again on the way out, so
-the shape is a property of this API rather than of the day a record happened to
-be written. A book carrying records from before the rule serves them the same
-way as any other. Heights,
+Every one of those amounts is coerced to a decimal string when a record is
+written and again when it is served, so the shape holds for every record
+whatever wrote it. Heights,
 locktimes, timestamps, confirmations, counts, prices, `price_scale` and
 `expiry_locktime` are JSON numbers. That holds for the amounts a book derives
 as well as the ones it stores: `seizure_if_liquidated` and
@@ -79,10 +78,13 @@ nothing to say about it; treat an empty body as the code's own meaning.
 | 500 | a bug; the message names the exception |
 | 503 | no node is configured, so a chain lookup cannot be answered |
 
-**Writes are rate limited.** POST and DELETE are charged to a client at one
-request a second with a burst of twenty, and to everybody together at twenty a
-second with a burst of two hundred. Over either, the answer is 429. Reads are
-not limited.
+**Rate limits.** POST and DELETE are charged to a client at one request a
+second with a burst of twenty, and to everybody together at twenty a second
+with a burst of two hundred. Reads that make the node work -- `/v1/spend`,
+`/v1/outpoint`, `/v1/scan` and `/v1/btc/outpoint` -- are charged at two a
+second with a burst of thirty per client, and forty a second with a burst of
+four hundred together. Over any of those the answer is 429. Every other read is
+served from memory and is not limited.
 
 **Behind a proxy.** Every request then arrives from loopback, so `pignusd`
 believes `X-Forwarded-For` (or `X-Real-IP`) only from a peer listed in
@@ -470,7 +472,7 @@ one it cannot find on chain.
 | parameter | default | meaning |
 |---|---|---|
 | `market` | every market | `GOLD/USDX` |
-| `status` | `open` | `open`, `taken`, `withdrawn`, `gone`, `ghost`, `expired`, or `all`. A value outside that set is a 400 listing them, never an empty result |
+| `status` | `open` | `open`, `delisted`, `taken`, `withdrawn`, `gone`, `ghost`, `expired`, or `all`. `expired` is derived from the chain rather than stored, so it answers with the open offers whose expiry has passed. A value outside that set is a 400 listing them, never an empty result |
 | `limit` | the whole book | how many of the newest to return |
 
 `{"offers": [ … ]}`, newest first. A stored record that cannot be rendered is
@@ -556,15 +558,22 @@ its hash.
 
 ### `DELETE /v1/offers/{id}`
 
-Drop a listing. The coin is untouched — the coin is the truth, and the lender
-withdraws it with `pignus-cli offer-withdraw`.
+Take a listing off the board. The record is KEPT, marked `delisted`: it is the
+only copy of the terms that can ever spend the coin, because the offer address
+is their hash and nothing on chain carries them, so a book that forgot it would
+be forgetting the lender's principal. A delisted offer is absent from
+`GET /v1/offers`, listed by `?status=delisted`, still served by `GET
+/v1/offer/{id}`, and still watched, so the withdraw at expiry works exactly as
+for one that expired on the board. Publishing the same coin again reopens it.
+The coin is untouched throughout — the coin is the truth, and the lender
+withdraws it with `pignus-cli offer-withdraw` or the page's Withdraw button.
 
 The manage token goes in the `X-Manage-Token` header, or as `?token=` if a
 header is impossible. The query form is redacted from the log; the header is the
 right place for it.
 
-`{"removed": true}` on success. 404 if there is no such listing, 403 without the
-token, 429 if this client is writing too fast.
+`{"removed": true, "note": "…"}` on success. 404 if there is no such listing,
+403 without the token, 429 if this client is writing too fast.
 
 From the command line: `pignus-cli offer-delist --offer <id> --token <token>`,
 which sends the token in the header.
@@ -636,7 +645,11 @@ CLOSE is, which is a different question from how deep the funding was: a
 repayment or a liquidation one block old can still be reorged out, and zero
 means either not closed at all or closed only in the mempool. `min_depth` is the
 number both are counted towards, repeated on the loan so a reader is not made to
-fetch `/v1/markets` to learn what it is.
+fetch `/v1/markets` to learn what it is. It is a display threshold and nothing
+more: the watcher goes on re-reading a closed vault's output every poll until
+the close is `rescan_depth` blocks deep, because Sequentia reorgs whenever
+Bitcoin does and a Sequentia depth is never finality. A close undone by a reorg
+reopens the loan, however deep the book had shown it.
 
 `single_leaf` says which vault layout this loan lives in: a loan originated
 through a funded offer is in the single-leaf vault, a directly originated one is
@@ -778,8 +791,9 @@ the debt was paid, `claim_txid` with `secret_t` that the lender took it, and
 `refund_txid` that an unclaimed principal went home. Each only ever becomes
 true. The page derives everything it shows from them.
 
-`lots_left` on an offer is what a take holds against it. A take still `pending`
-after five minutes releases its lot, and a `signed` one whose collateral never
+`lots_left` on an offer is what a take holds against it. A take that is still
+`requested`, `reserved` or `pending` five minutes after it was made releases
+its lot, and a `signed` one whose collateral never
 appeared releases its lot after six hours: a borrower who asks and walks away
 must not hold a lender's offer shut. Every status past that holds its lot for
 good, because money is in flight by then.
@@ -994,10 +1008,9 @@ themselves before committing anything.
 ```
 
 The field is served back as both `release_sig` and `adaptor_sig`, and either is
-accepted on the way in. The second name is what the wire has always called it,
-from when this really was an adaptor signature; what it carries now is a plain
-release, and the older name is kept only so a client and a relay of different
-vintages still understand each other.
+accepted on the way in. The value is an ordinary BIP340 release signature, not
+an adaptor signature; the second name is an alias every client and relay
+understands.
 
 `auth` is a BIP340 signature by the offer's `lender_x` over
 `tagged("pignus/btc-adaptor/1", canonical({take_id, adaptor_point,
@@ -1183,7 +1196,7 @@ oracle co-signed no such seizure.
 `ok` means *this oracle is signing*, not *this process is running*: a dead
 signing thread, an unwritable log or a feed that stopped answering all leave the
 process happily serving its last attestation. A round that has not completed
-within two intervals (never less than thirty seconds) is not ok, and the reply
+within two intervals, or within thirty seconds where that is longer, is not ok, and the reply
 carries **503** so a check that only reads the status code sees it. A green
 oracle answers 200.
 

@@ -20,9 +20,15 @@ const { hexToBytes, bytesToHex, taggedHash, pointAdd, pointMul, liftX, mod,
         N, Gx, Gy } = P;
 
 function toBig(b) { return BigInt("0x" + bytesToHex(b)); }
+// 32 bytes big-endian, of whatever it is given. NOT reduced mod N: this
+// encodes x-coordinates as well as scalars, an x-coordinate is a field
+// element in [0, p), and p - N is about 2^128 -- so a point with x >= N was
+// encoded wrong, silently, for the completed signature's r and the adaptor
+// point both. Unreachable in practice at 2^-128 a point, and wrong all the
+// same. Callers that need a scalar reduce it themselves.
 function be32(n) {
-  let h = (n % N).toString(16).padStart(64, "0");
-  return hexToBytes(h);
+  if (n < 0n || n >= (1n << 256n)) throw new Error("be32: out of range");
+  return hexToBytes(n.toString(16).padStart(64, "0"));
 }
 function xOf(pt) { return be32(pt[0]); }
 function hasEvenY(pt) { return (pt[1] & 1n) === 0n; }

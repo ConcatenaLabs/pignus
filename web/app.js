@@ -1613,7 +1613,7 @@ function renderPreview() {
   const drop = (1 - liq / now) * 100;
   const total = x.principal * BigInt(x.lots);
   out.innerHTML = `<div class="kv">
-    <span class="k">You lock</span><span><b>${amount(total, t.debt_asset)}</b> in an offer covenant${x.lots > 1 ? `, takeable ${x.lots} times` : ""}; untaken principal comes back to you after ${whenBlock(x.expiry)}</span>
+    <span class="k">You lock</span><span><b>${amount(total, t.debt_asset)}</b> in an offer covenant${x.lots > 1 ? `, takeable ${x.lots} times` : ""}; whatever is untaken you withdraw yourself after ${whenBlock(x.expiry)} \u2014 a Withdraw button appears here, and nothing returns on its own</span>
     <span class="k">Each borrower locks</span><span><b>${amount(t.collateral_amount, t.collateral_asset)}</b> <span class="k">${ref(t.collateral_amount, t.collateral_asset)} at today's price, ${(x.i.openLtv * 100).toFixed(0)}% loan-to-value</span></span>
     <span class="k">and repays</span><span><b>${amount(t.debt, t.debt_asset)}</b> <span class="k">by ${whenBlock(t.maturity)}</span></span>
     <span class="k">Liquidation</span><span>if ${esc(m.collateral_ticker)} falls below <b>${money(liq, liq < 10 ? 4 : 2)} ${esc(m.debt_ticker)}</b> <span class="k">(${drop < 0 ? "above the price now — a loan would be liquidatable immediately"
@@ -1803,8 +1803,8 @@ function manageToken(offerId) {
 async function cancelListing(o) {
   const token = manageToken(o.offer_id);
   if (!token) { note("This browser did not publish that offer, so it has no " +
-    "token to cancel the listing. The coin is untouched either way; it returns " +
-    "to you on the offer's own expiry.", "warn"); return; }
+    "token to cancel the listing. The coin is untouched either way: once the " +
+    "offer's expiry opens, Withdraw brings it back.", "warn"); return; }
   busy(true, "cancelling the listing…");
   try {
     // The token goes in a header, never in the query string: the daemon logs
@@ -1812,8 +1812,13 @@ async function cancelListing(o) {
     const r = await fetch(`v1/offers/${encodeURIComponent(o.offer_id)}`,
                           { method: "DELETE", headers: { "X-Manage-Token": token } });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `DELETE -> ${r.status}`);
-    note("Listing removed. Your principal is untouched in the offer covenant " +
-         "and returns to you after the expiry.", "ok");
+    // The record is KEPT by the book and stays in this wallet's "mine" view:
+    // it is the only copy of the terms that can build the refund, so the row
+    // and its Withdraw button are what bring the principal back.
+    note("Listing taken off the board. Your principal is untouched in the " +
+         "offer covenant; the offer stays under \u201cmine\u201d, and once its " +
+         "expiry opens, Withdraw there brings it back. Nothing returns on its " +
+         "own.", "ok");
     refresh().catch(() => {});
   } catch (e) { note(explain(e), "bad"); } finally { busy(false); }
 }
@@ -1832,7 +1837,8 @@ async function listPending(rec) {
     refresh().catch(() => {});
   } catch (e) {
     note(`The book still will not list it: ${explain(e)} Your principal is safe ` +
-         "in the offer covenant either way, and comes back to you at the expiry.", "bad");
+         "in the offer covenant either way; once the expiry opens, Withdraw " +
+         "brings it back.", "bad");
   } finally { busy(false); renderOffers(); }
 }
 
@@ -1846,6 +1852,19 @@ async function borrow(o) {
     if (state.height != null && Number(t.maturity) <= state.height)
       throw new Error("this offer's loans have already matured: one taken now " +
                       "could be called at any price immediately");
+    // What the row was rendered from can be minutes old. The CLI re-checks
+    // every one of these at the moment of the take; a page that checked them
+    // only at render time let a stale tab broadcast a take at or after the
+    // expiry, whose fee went to the lender's refund.
+    if ((o.status || "open") !== "open")
+      throw new Error(`this offer is ${o.status}; it cannot be taken`);
+    if (o.expired || (state.height != null && o.expiry_locktime != null
+                      && Number(o.expiry_locktime) <= state.height))
+      throw new Error("this offer has expired: the lender can take the coin " +
+                      "back at any moment, and a take racing that loses its fee");
+    if (state.height != null && Number(t.recover_after) <= state.height)
+      throw new Error("this offer's loans let the lender sweep the collateral " +
+                      "without an oracle already");
     const [txid, vout] = String(o.outpoint).split(":");
     const out = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
     if (!out) throw new Error(
@@ -1957,6 +1976,12 @@ async function withdraw(o) {
     const [txid, vout] = String(o.outpoint).split(":");
     const out = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
     if (!out) throw new Error("that offer's coin is gone already");
+    if (state.height != null && o.expiry_locktime != null
+        && state.height < Number(o.expiry_locktime))
+      throw new Error("the offer's expiry has not opened yet: the refund is " +
+                      `locked until block ${Number(o.expiry_locktime).toLocaleString()}` +
+                      whenBlock(o.expiry_locktime).replace(/<[^>]*>/g, "").replace(/^.*\(/, " (") +
+                      ", and a node would refuse the transaction as non-final");
     if (out.asset !== t.debt_asset)
       throw new Error("that offer's coin does not hold the debt asset the " +
                       "refund leaf pays out, so there is nothing to return");
@@ -2161,7 +2186,7 @@ async function lend(ev) {
       built.summary = [
         `Lock ${units(total, x.terms.debt_asset)} ${d} in an offer covenant, takeable ${x.lots} time(s) at ${units(x.principal, x.terms.debt_asset)} each`,
         `Each borrower locks ${units(x.collateral, x.terms.collateral_asset)} ${c} and repays ${units(x.debt, x.terms.debt_asset)} ${d}`,
-        `Anything untaken returns to you after ${whenText(x.expiry)}`,
+        `Anything untaken you withdraw yourself after ${whenText(x.expiry)}; nothing returns on its own`,
       ];
       built.extra = [`Offer address: ${built.offerScriptPubKey.slice(0, 24)}…`];
       return built;

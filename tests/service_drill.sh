@@ -229,8 +229,11 @@ python3 -c '
 import json,sys
 assert json.load(open(sys.argv[1]))["removed"] is True, "removed was not true"' \
   "$WORK/del.json"
+# A second cancel is a clean 200, not a 404: the record is KEPT when a listing
+# comes off the board, so there is still a listing to take down and nothing to
+# have gone missing.
 code=$(del "$CANCEL_TOKEN")
-test "$code" = "404" || { echo "second cancel -> $code, wanted 404" >&2; exit 1; }
+test "$code" = "200" || { echo "second cancel -> $code, wanted 200" >&2; exit 1; }
 echo "  cancelled with its own token, then gone"
 
 # ...and from the COMMAND LINE. The endpoint existed and the documentation told
@@ -252,9 +255,28 @@ echo "  the command refuses a wrong token and leaves the listing alone"
 
 "$BIN/pignus-cli" offer-delist --offer "$CLI_ID" --token "$CLI_TOKEN" \
     --book "$D" >/dev/null
-code=$(curl -s -o /dev/null -w '%{http_code}' "$D/v1/offer/$CLI_ID")
-test "$code" = "404" || { echo "after delisting, /v1/offer -> $code" >&2; exit 1; }
-echo "  and takes it down with the right one"
+# Off the board, and KEPT. The record is the only copy of the terms that can
+# ever spend the coin -- the offer address is their hash and nothing on chain
+# carries them -- so a delist that deleted it deleted the lender's principal:
+# withdrawn at expiry through a refund leaf that needs the terms to build.
+# This drill used to assert the 404 that proved the deletion had happened.
+curl -fsS "$D/v1/offers" | python3 -c '
+import json, sys
+ids = [o["offer_id"] for o in json.load(sys.stdin)["offers"]]
+assert sys.argv[1] not in ids, "a delisted offer is still on the open board"
+' "$CLI_ID" || exit 1
+curl -fsS "$D/v1/offer/$CLI_ID" | python3 -c '
+import json, sys
+rec = json.load(sys.stdin)
+assert rec.get("status") == "delisted", "delisted offer reads as " + str(rec.get("status"))
+assert rec.get("terms"), "the terms went with the listing"
+' || { echo "a delisted offer's record was not kept, or not marked" >&2; exit 1; }
+curl -fsS "$D/v1/offers?status=delisted" | python3 -c '
+import json, sys
+ids = [o["offer_id"] for o in json.load(sys.stdin)["offers"]]
+assert sys.argv[1] in ids, "?status=delisted does not list it"
+' "$CLI_ID" || exit 1
+echo "  and takes it off the board with the right one, keeping the record the withdraw needs"
 
 echo
 echo "== the write rate limit is charged to the client, not to the proxy =="
