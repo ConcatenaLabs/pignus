@@ -98,6 +98,7 @@ run "browser flows through a loan"    python3 tests/test_flows.py
 run "loan book against a chain"       python3 tests/test_book.py
 run "watcher against a real reorg"    python3 tests/test_watcher_reorg.py
 run "tiers C and D on a chain"         python3 tests/test_tiers.py
+run "tier D settled against OpenDAMP"  python3 tests/test_repo_opendamp.py
 run "CLI lifecycle + book discovery"   python3 tests/test_lifecycle.py
 run "threshold oracles end to end"     python3 tests/test_threshold.py
 run "BTC collateral: the covenant + crypto" python3 tests/test_btc_collateral.py

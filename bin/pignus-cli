@@ -866,12 +866,12 @@ def cmd_repo_propose(args):
     else:
         print(out)
     # Said every time, because it decides whether to sell under it at all.
-    print("NOTE: settlement has no signer yet. The buyback spends two OpenDAMP "
-          "Simplicity inputs that nothing here or in the OpenDAMP transfer "
-          "tool signs for a transaction it did not build, so an asset sold "
-          "under this repurchase does not come back until the issuer's "
-          "tooling can sign them. A holder who sells under it should expect "
-          "the bond, not the asset.", file=sys.stderr)
+    print("NOTE: the buyback is signed by the lender with their OpenDAMP key, "
+          "against the issuer's current policy snapshot (opendamp "
+          "transfer-cosign). A lender who cannot produce that signature "
+          "cannot return the asset, and the bond is all a settlement that "
+          "never comes leaves the holder with. Sell only under a lender who "
+          "can.", file=sys.stderr)
 
 
 def cmd_repo_show(args):
@@ -1193,6 +1193,37 @@ def _coin_from_chain(node, spec, what):
 coin_spk = {}
 
 
+def _input_has_witness(raw, index):
+    """Whether input `index` of this transaction carries a witness stack."""
+    from pignus.vault import _tf
+    m, _ = _tf()
+    tx = m.tx_from_hex(raw)
+    wit = tx.wit.vtxinwit
+    return index < len(wit) and bool(wit[index].scriptWitness.stack)
+
+
+def _check_settlement_signed(raw):
+    """Every signature but RETURN's is on, or the missing one is named.
+
+    Three parties sign a settlement and none of them can see the others'
+    work in a node's refusal, which is a script error naming nothing.
+    """
+    from pignus.repurchase import SETTLEMENT_DEBT_INDEX
+    who = {0: ("the OpenDAMP verifier", "the lender, with `opendamp "
+               "transfer-cosign --snapshot <policy snapshot> --transaction "
+               "<the skeleton> --sender-privkey <their OpenDAMP key>`"),
+           2: ("the lender's C_U", "the lender, with the same "
+               "`opendamp transfer-cosign` that signs input 0"),
+           SETTLEMENT_DEBT_INDEX: ("the borrower's debt coin", "the borrower's "
+               "wallet, which `repo-settle --skeleton` does when that wallet "
+               "composes, and `signrawtransactionwithwallet` does otherwise")}
+    for idx, (what, signer) in who.items():
+        if not _input_has_witness(raw, idx):
+            refuse(f"input {idx} ({what}) carries no witness. It is signed by "
+                   f"{signer}. RETURN goes on last, so nothing is attached "
+                   "until every other signature is on.")
+
+
 def _check_settlement_vault(raw, terms, args):
     """The transaction being witnessed really spends the vault named.
 
@@ -1253,6 +1284,17 @@ def cmd_repo_settle(args):
         if os.path.exists(raw):
             with open(raw) as f:
                 raw = f.read().strip()
+        elif "/" in raw or raw.endswith(".json"):
+            refuse(f"--attach names {raw}, and there is no such file")
+        # The document --skeleton wrote and `opendamp transfer-cosign` wrote
+        # back, or the bare transaction.
+        if raw.startswith("{"):
+            try:
+                raw = str(json.loads(raw)["tx"])
+            except (ValueError, KeyError, TypeError):
+                refuse("--attach is a document with no `tx` field. The "
+                       "skeleton repo-settle writes carries one, and so does "
+                       "what opendamp transfer-cosign writes back")
         # The fee is already in the transaction being witnessed; this spender
         # COMPOSES NOTHING -- it is constructed only for the leaf and the
         # control block, so it makes no change output and needs no dust
@@ -1263,6 +1305,10 @@ def cmd_repo_settle(args):
         # somebody else's settlement, where it fails at the node with a script
         # error that names nothing.
         _check_settlement_vault(raw, t, args)
+        # Every other party's signature is on before RETURN goes on last. A
+        # node refuses a transaction missing one with a script error that
+        # names nothing; this names the input and who signs it.
+        _check_settlement_signed(raw)
         signed = sp.attach_return_witness(raw)
         if args.broadcast:
             txid = node.sendrawtransaction(signed)
@@ -1329,19 +1375,55 @@ def cmd_repo_settle(args):
           f"{t.collateral_asset[:12]}... home to the borrower's C_U, {t.debt} "
           f"to the lender, the {t.bond()}-atom bond released, fee {fee} atoms "
           f"of {fee_asset[:8]}…", file=sys.stderr)
-    print("  sign it in this order: the OpenDAMP verifier spend (input 0), the "
-          "lender's C_U (input 2), the borrower's debt coin (input 3). Then:\n"
+    # The borrower's own coin is signed HERE, by the wallet that composes,
+    # before anybody else touches the transaction: a wallet rewrites the
+    # witness structure when it signs, so it goes first. The OpenDAMP tool
+    # leaves every witness it finds in place, and RETURN goes on last.
+    try:
+        hexed = str(node.signrawtransactionwithwallet(raw).get("hex") or raw)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"  this wallet could not sign the debt coin: {e}", file=sys.stderr)
+        hexed = raw
+    debt_signed = _input_has_witness(hexed, R.SETTLEMENT_DEBT_INDEX)
+    # What a signer that did not build this needs beside it: the four outputs
+    # it spends, in input order, every one read off the chain above.
+    prevouts = []
+    for coin in (verifier, vault, cu_lender, debt_input):
+        spk = coin_spk.get((coin.txid, coin.vout))
+        if coin is vault:
+            spk = t.script_pubkey().hex()
+        prevouts.append({"asset": coin.asset, "value": int(coin.amount),
+                         "script_pubkey": spk})
+    doc = {"tx": hexed, "prevouts": prevouts,
+           "vault_index": R.SETTLEMENT_VAULT_INDEX,
+           "debt_input_signed": debt_signed}
+    if debt_signed:
+        print("  the borrower's debt coin (input 3) is signed", file=sys.stderr)
+    else:
+        print("  the borrower's debt coin (input 3) is NOT signed: this wallet "
+              "does not hold it. The borrower signs the document's `tx` with "
+              "signrawtransactionwithwallet and puts the result back in it, "
+              "BEFORE the lender signs.", file=sys.stderr)
+    print("  next, the lender signs the OpenDAMP inputs (0 and 2), which "
+          "needs their OpenDAMP key and the issuer's current policy "
+          "snapshot:\n"
+          "    opendamp transfer-cosign --snapshot <policy snapshot> "
+          f"--transaction {args.skeleton or 'settle.json'} "
+          "--sender-privkey <the lender's OpenDAMP key> "
+          "--out settle.signed.json\n"
+          "  then RETURN goes on last, and it is broadcast:\n"
           f"    pignus-cli repo-settle {args.terms} --txid {args.txid} "
           + (f"--vout {args.vout} " if args.vout is not None else "")
-          + "--attach <signed hex>", file=sys.stderr)
+          + "--attach settle.signed.json --broadcast", file=sys.stderr)
     if args.skeleton:
         with open(args.skeleton, "w") as f:
-            f.write(raw + "\n")
+            f.write(json.dumps(doc, indent=1) + "\n")
         print(f"wrote {args.skeleton}", file=sys.stderr)
         print(json.dumps({"skeleton": args.skeleton,
-                          "vault_index": R.SETTLEMENT_VAULT_INDEX}))
+                          "vault_index": R.SETTLEMENT_VAULT_INDEX,
+                          "debt_input_signed": debt_signed}))
         return 0
-    print(raw)
+    print(json.dumps(doc, indent=1))
     return 0
 
 
@@ -6633,10 +6715,15 @@ def main():
                         "final, so this enforces the locktime without opting "
                         "into replacement")
     p.add_argument("--skeleton", metavar="FILE",
-                   help="write the unsigned settlement here instead of stdout")
+                   help="write the settlement document here instead of "
+                        "stdout: the transaction, with this wallet's debt "
+                        "coin signed, and the four outputs it spends, which "
+                        "is what `opendamp transfer-cosign` takes")
     p.add_argument("--attach", metavar="FILE|HEX",
-                   help="the settlement once every party has signed it: puts "
-                        "the covenant's RETURN witness on, which must be last")
+                   help="the settlement once every other party has signed "
+                        "it (the document transfer-cosign wrote, or hex): "
+                        "puts the covenant's RETURN witness on, which must "
+                        "be last")
     p.add_argument("--broadcast", action="store_true",
                    help="with --attach, send the finished transaction")
     add_node_args(p)

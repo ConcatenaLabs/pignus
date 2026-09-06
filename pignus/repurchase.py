@@ -71,6 +71,8 @@ DAMP_MAX_OUTPUTS = 6
 # would land at 4 and 5, which are the borrower's change and the fee -- and a
 # fee output may not carry the restricted asset at all.
 SETTLEMENT_VAULT_INDEX = 1
+# The borrower's debt coin: the one input a wallet signs.
+SETTLEMENT_DEBT_INDEX = 3
 
 # How deep both halves of a repurchase must be buried before it is live. The
 # same depth the loan watcher uses, because a repurchase confirmed to a shallower
@@ -686,11 +688,13 @@ class RepurchaseSpender:
         composing against a coin nobody verified is composing against a vault
         somebody else chose.
 
-        What comes back carries no witness at all. Input 0 and input 2 are
-        Simplicity spends this repository does not build (the OpenDAMP transfer
-        tool does), input 3 is the borrower's, and the covenant witness goes on
-        with `attach_return_witness` once every party has signed -- last,
-        because a wallet rewrites the witness structure when it signs, which is
+        What comes back carries no witness at all. Input 3 is the borrower's,
+        and the wallet that composes signs it first, because a wallet rewrites
+        the witness structure when it signs; input 0 and input 2 are
+        Simplicity spends this repository does not build (`opendamp
+        transfer-cosign` does, leaving every other witness in place); and the
+        covenant witness goes on with `attach_return_witness` once every party
+        has signed -- last, which is
         the same order `vault.VaultSpender._assemble` uses.
         """
         t = self.terms
