@@ -421,11 +421,19 @@ def inspect_settlement(tx_hex, prevouts, terms, lender_cu=None):
     m, _ = _tf()
     t = terms
     problems = []
-    tx = m.tx_from_hex(tx_hex)
+    try:
+        tx = m.tx_from_hex(tx_hex)
+    except Exception as e:                                  # noqa: BLE001
+        return [f"not a transaction this can read: {e}"], {}
     try:
         check_settlement(len(tx.vin), len(tx.vout))
     except ValueError as e:
         return [str(e)], {}
+    # The shape has a floor as well as a ceiling: four named inputs, and the
+    # verifier, the debt, the asset, the bond and a fee at the least.
+    if len(tx.vin) != 4 or len(tx.vout) < 5:
+        return [f"a settlement spends four inputs and pays at least five "
+                f"outputs; this has {len(tx.vin)} and {len(tx.vout)}"], {}
     if len(prevouts) != len(tx.vin):
         return [f"the document carries {len(prevouts)} prevouts for "
                 f"{len(tx.vin)} inputs"], {}
