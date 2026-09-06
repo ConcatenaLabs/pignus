@@ -70,6 +70,9 @@ MIN_FREE_MB="${PIGNUS_MIN_FREE_MB:-512}"
 # certificate that has expired leaves every local check green and the page
 # down.
 PUBLIC_URLS="${PIGNUS_PUBLIC_URLS:-}"
+# ...and how long the certificate behind them has left. Caddy renews it on
+# its own; this is for the day it cannot, said a week before visitors see it.
+MIN_CERT_DAYS="${PIGNUS_MIN_CERT_DAYS:-7}"
 
 fails=0
 ok()  { echo "  ok    $1"; }
@@ -278,6 +281,30 @@ for u in $PUBLIC_URLS; do
         200|503) ok "$u answers through the proxy ($code)" ;;
         *) bad "$u did not answer through the proxy (HTTP $code): $err" ;;
     esac
+done
+# One host's certificate is read once, however many URLs it serves.
+seen_hosts=""
+for u in $PUBLIC_URLS; do
+    case "$u" in https://*) ;; *) continue ;; esac
+    host=${u#https://}; host=${host%%/*}; host=${host%%:*}
+    case " $seen_hosts " in *" $host "*) continue ;; esac
+    seen_hosts="$seen_hosts $host"
+    if ! command -v openssl >/dev/null 2>&1; then
+        ok "$host's certificate is not checked (no openssl here)"
+        continue
+    fi
+    notafter=$(echo | openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null \
+               | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+    if [ -z "$notafter" ]; then
+        bad "$host's certificate could not be read"
+        continue
+    fi
+    left=$(( ( $(date -d "$notafter" +%s) - $(date +%s) ) / 86400 ))
+    if [ "$left" -lt "$MIN_CERT_DAYS" ]; then
+        bad "$host's certificate expires in $left day(s) ($notafter): Caddy has not renewed it"
+    else
+        ok "$host's certificate is good for $left more days"
+    fi
 done
 
 # The disk under the data directory, or under this checkout on a machine
