@@ -12,6 +12,9 @@ Type=oneshot
 User=root
 Environment=PIGNUS_ALERT_ENV=/root/sequentia/pignus-alert.env
 ExecStart=/root/sequentia/pignus/deploy/pignus-alert.sh "%i failed; journalctl -u %i says why"
+# Where the script remembers what it sent, so a crash-looping unit pages once
+# per ten minutes rather than once per restart.
+StateDirectory=pignus-alert
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

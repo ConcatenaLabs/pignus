@@ -11,11 +11,30 @@
 # Subscribe at $NTFY_URL/$NTFY_TOPIC. Without a topic this prints to the
 # journal and exits 0, so a box that has not set one up loses nothing but the
 # push.
+#
+# The same message is not sent twice within MUTE_SECONDS: a unit that
+# crash-loops every thirty seconds, or a check whose verdict flaps, would
+# otherwise page a person until they muted the topic and heard nothing
+# else. A DIFFERENT message always goes out, so a recovery is never muted by
+# the failure before it. The marks live under PIGNUS_ALERT_STATE.
 set -u
 ENV="${PIGNUS_ALERT_ENV:-/root/sequentia/pignus-alert.env}"
 [ -r "$ENV" ] && { set -a; . "$ENV"; set +a; }
 title="${ALERT_PREFIX:-pignus} $(hostname -s)"
 msg="${*:-something failed and nothing said what}"
+MUTE_SECONDS="${PIGNUS_ALERT_MUTE:-600}"
+STATE="${PIGNUS_ALERT_STATE:-/var/lib/pignus-alert}"
+key=$(printf '%s' "$msg" | sha256sum | cut -c1-32)
+if mkdir -p "$STATE" 2>/dev/null && [ -w "$STATE" ]; then
+    mark="$STATE/$key"
+    if [ -f "$mark" ] && [ "$(( $(date +%s) - $(stat -c %Y "$mark") ))" -lt "$MUTE_SECONDS" ]; then
+        echo "alert (muted: the same message went out within ${MUTE_SECONDS}s): $msg" >&2
+        exit 0
+    fi
+    touch "$mark"
+    # Marks older than a day are of no use and would otherwise accumulate.
+    find "$STATE" -type f -mmin +1440 -delete 2>/dev/null
+fi
 echo "alert: $msg" >&2
 if [ -z "${NTFY_TOPIC:-}" ]; then
     echo "alert: no NTFY_TOPIC in $ENV; the journal is the only record" >&2
