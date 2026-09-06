@@ -3123,10 +3123,14 @@ async function checkRepurchase(ev) {
           `transfer the asset yet: an unconfirmed bond can be replaced, and Sequentia ` +
           `reorgs when Bitcoin reorgs. Check again once it is buried.</p>` + said);
     } else {
-      say("ok", `<p><strong>This is the repurchase you were shown.</strong> The coin at ` +
+      // The same word the command line uses for this state: the bond is
+      // there and nothing here has looked at the half it secures.
+      say("ok", `<p><strong>bond-only: the bond you were shown is funded.</strong> The coin at ` +
           `<code>${esc(txid)}:${vout}</code> pays the address these terms compile to, ` +
           `and holds exactly the bond they name, in the bond asset. It is buried ` +
-          `${conf} block${conf === 1 ? "" : "s"} deep.</p>` + said);
+          `${conf} block${conf === 1 ? "" : "s"} deep. Nothing here has checked that the ` +
+          `asset reached the lender; for that half run ` +
+          `<code>pignus-cli repo-verify terms.json --txid ${esc(txid)} --leg-txid &lt;the transfer&gt; --lender-cu &lt;hex&gt;</code>.</p>` + said);
     }
   } catch (e) {
     say("bad", "<strong>REFUSED.</strong> " + esc(e.message));

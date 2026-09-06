@@ -33,6 +33,7 @@ be run first against any real book.
 
 import argparse
 import json
+from decimal import Decimal
 import os
 import sys
 import time
@@ -137,9 +138,12 @@ def main():
                     help="skip a seizure worth less than this much more than "
                          "the debt it pays AND the fee it costs, in debt-asset "
                          "atoms (default 0: never take one at a loss). "
-                         "Negative to allow it. A fee in another asset is not "
-                         "subtracted, because there is no rate here to compare "
-                         "the two with")
+                         "Negative to allow it. A fee paid in another asset is "
+                         "restated at the node's rate for the debt asset; when "
+                         "the node publishes none, the loan is skipped rather "
+                         "than priced")
+    ap.add_argument("--allow-foreign-taker", action="store_true",
+                    help="accept a --taker-address this wallet does not own")
     ap.add_argument("--max-attestation-age", type=int, default=600, metavar="S",
                     help="ignore a price signed longer ago than this (default "
                          "600 s); the covenant cannot check recency, so this is "
@@ -295,11 +299,34 @@ def main():
                                  committed={t.debt_asset: int(t.debt)})
         return asset, cost, rates.get(asset)
 
-    def oracle_key(url):
+    def oracle_key(url, refetch=False):
+        """Fetched once, and again when a verification fails: an oracle that
+        rotated its key is otherwise a bot that runs green and closes nothing,
+        every attestation "failing verification" against a key it no longer
+        signs with."""
         ox = oracle_keys.get(url)
-        if ox is None:
-            ox = oracle_keys[url] = fetch_oracle_key(url)
+        if ox is None or refetch:
+            try:
+                fresh = fetch_oracle_key(url)
+            except Exception as e:                  # noqa: BLE001
+                if ox is None:
+                    raise
+                print(f"oracle: {url}: could not re-read its key "
+                      f"({type(e).__name__}: {e}); keeping the last one",
+                      file=sys.stderr)
+                return ox
+            if ox is not None and fresh != ox:
+                print(f"oracle: {url}: its key changed from {ox[:16]}… to "
+                      f"{fresh[:16]}…; loans baked to the old key are no "
+                      f"longer priced by it", file=sys.stderr)
+            ox = oracle_keys[url] = fresh
         return ox
+
+    def holdings():
+        """{asset hex: atoms} the wallet can spend, for saying before a spend
+        whether the debt can be paid at all."""
+        from pignus.vault import _holdings
+        return {str(k).lower(): int(v) for k, v in _holdings(node).items()}
 
     def gather(markets):
         """{(oracle_x, market): Attestation}, each verified against the key that
@@ -317,6 +344,10 @@ def main():
             if not O.verify(ox, att):
                 print(f"oracle: {att.market}: an attestation from {where} "
                       "FAILED verification, ignoring", file=sys.stderr)
+                # A key that stopped verifying may have rotated; re-read
+                # every oracle's key once so the next round has the new one.
+                for u in list(oracle_keys):
+                    oracle_key(u, refetch=True)
                 return
             # Two-sided. A one-sided test reads a price dated AHEAD of this
             # machine's clock as infinitely fresh, so an oracle whose host
@@ -567,6 +598,27 @@ def main():
                          " repriced at the node's rate for the debt asset)"))
                      + f" is under --min-profit {args.min_profit}")
                 continue
+            # Can this wallet PAY? A seizure pays the lender the whole debt
+            # first, and a wallet without it failed every round with
+            # "Insufficient funds", naming neither asset nor amount, while a
+            # dry run printed the seizure as if it could be made.
+            try:
+                have = holdings()
+            except Exception as e:                      # noqa: BLE001
+                have = None
+                note(v.loan_id, f"the wallet's balances could not be read "
+                                f"({type(e).__name__}: {e})")
+            if have is not None:
+                need = int(t.debt) + (fee_atoms if fee_paid_in == t.debt_asset else 0)
+                got = have.get(str(t.debt_asset).lower(), 0)
+                if got < need:
+                    note(v.loan_id,
+                         f"the wallet holds {got} atoms of the debt asset "
+                         f"{t.debt_asset[:8]}; this seizure pays the lender "
+                         f"{t.debt}" + (f" plus a {fee_atoms}-atom fee"
+                                        if fee_paid_in == t.debt_asset else "")
+                         + ", so it cannot be made from here")
+                    continue
             if args.dry_run:
                 continue
             try:
@@ -613,7 +665,16 @@ def main():
         else:
             info = node.getaddressinfo(args.taker_address)
             unconf = info.get("unconfidential", args.taker_address)
-            taker_spk = bytes.fromhex(node.getaddressinfo(unconf)["scriptPubKey"])
+            info = node.getaddressinfo(unconf)
+            taker_spk = bytes.fromhex(info["scriptPubKey"])
+            # The wallet's own, unless said otherwise. Every seizure this bot
+            # makes pays the surplus there for good; a pasted stranger's
+            # address, or a typo, is every seizure given away.
+            if not info.get("ismine") and not args.allow_foreign_taker:
+                raise SystemExit(
+                    f"--taker-address {args.taker_address} is not in this "
+                    f"wallet. Every seizure pays its surplus there for good; "
+                    f"pass --allow-foreign-taker if that is deliberate.")
         fee_asset = resolve_asset(args.fee_asset) if args.fee_asset else None
         for url in args.oracle or []:
             oracle_key(url)

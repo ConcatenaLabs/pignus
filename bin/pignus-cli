@@ -781,7 +781,11 @@ def cmd_pledge_release(args):
     except ValueError as e:
         refuse(str(e))
     print(json.dumps(out, indent=2))
-    _say_tier_c(out if isinstance(out, dict) and out.get("id") else None)
+    p = out.get("pledge") if isinstance(out, dict) else None
+    _say_tier_c(p if isinstance(p, dict) and p.get("id") else None)
+    if isinstance(out, dict) and out.get("idempotent"):
+        print("this pledge was already released earlier; nothing changed",
+              file=sys.stderr)
 
 
 def cmd_pledge_seize(args):
@@ -810,19 +814,30 @@ def cmd_pledge_seize(args):
     except ValueError as e:
         refuse(str(e))
     print(json.dumps(out, indent=2))
-    _say_tier_c(out if isinstance(out, dict) and out.get("id") else None)
-    # Say what actually happened. A seizure before maturity is TWO phases --
-    # the request, then the issuer's delivery once the borrower's
-    # countersignature is in -- and reporting the first as "seized" tells a
-    # lender the collateral is theirs while the issuer is still holding it.
-    state = str(out.get("state") or "").lower()
-    if state and state not in ("seized", "delivered", "closed"):
-        print(f"the issuer accepted the request and the pledge is now "
-              f"'{state}': the collateral has NOT been delivered yet. Check "
-              f"`pignus-cli pledge-list --pledge {args.pledge}` before "
-              "treating it as yours.", file=sys.stderr)
+    _say_tier_c(out.get("pledge") if isinstance(out, dict)
+                and isinstance(out.get("pledge"), dict) else None)
+    # Say what actually happened, from the SHAPE of the answer. The issuer
+    # answers a demo-asset seizure with the delivering `txid`; an
+    # external-issuer asset answers with sighashes `to_sign` and where to
+    # complete them, and holds the asset until the issuer signs. Reporting
+    # the second as delivered told a lender the collateral was theirs while
+    # the pending sweep quietly expired.
+    if isinstance(out, dict) and out.get("to_sign"):
+        n = len(out.get("to_sign") or [])
+        print(f"the issuer accepted the request and holds the collateral: "
+              f"{n} sighash(es) must be signed by the issuer's key and posted "
+              f"to {out.get('complete_at') or 'the completion endpoint'} "
+              f"before it moves. The pledge is still open; nothing has been "
+              f"delivered.", file=sys.stderr)
         return 4
-    print("the collateral has been delivered to the lender", file=sys.stderr)
+    if isinstance(out, dict) and out.get("txid"):
+        print(f"the collateral has been delivered to the lender in "
+              f"{out['txid']}", file=sys.stderr)
+        return 0
+    print("the issuer answered, but with neither a delivering transaction nor "
+          "sighashes to complete; check the pledge before treating the "
+          "collateral as delivered", file=sys.stderr)
+    return 4
 
 
 # --- Tier D: a repurchase against an OpenDAMP asset --------------------------
@@ -850,6 +865,13 @@ def cmd_repo_propose(args):
         print(f"wrote {args.out}")
     else:
         print(out)
+    # Said every time, because it decides whether to sell under it at all.
+    print("NOTE: settlement has no signer yet. The buyback spends two OpenDAMP "
+          "Simplicity inputs that nothing here or in the OpenDAMP transfer "
+          "tool signs for a transaction it did not build, so an asset sold "
+          "under this repurchase does not come back until the issuer's "
+          "tooling can sign them. A holder who sells under it should expect "
+          "the bond, not the asset.", file=sys.stderr)
 
 
 def cmd_repo_show(args):
@@ -995,7 +1017,11 @@ def cmd_repo_fund(args):
     spk = t.script_pubkey()
     addr = node.deriveaddresses(
         node.getdescriptorinfo(f"raw({spk.hex()})")["descriptor"])[0]
-    fee_asset, fee, rate = choose_fee(node, args, "fund", prefer=[t.debt_asset])
+    # The bond set aside first: a wallet funded with exactly the bond picked
+    # the bond asset for its own fee and failed at the send with a message
+    # naming nothing.
+    fee_asset, fee, rate = choose_fee(node, args, "fund", prefer=[t.debt_asset],
+                                      committed={t.debt_asset: t.bond()})
     if args.dry_run:
         print(json.dumps({"dry_run": True, "address": addr,
                           "scriptPubKey": spk.hex(), "bond": t.bond(),
@@ -6282,7 +6308,9 @@ def main():
             "PIGNUS_ISSUER", "http://127.0.0.1:8722"),
             help="the issuer's openampd base url")
         q.add_argument("--token", default=os.environ.get("PIGNUS_ISSUER_TOKEN", ""),
-                       help="issuer token; authenticates the caller only")
+                       help="the issuer operator's bearer token: the pledge "
+                            "commands are the issuer's to run, never the "
+                            "borrower's or the lender's")
         q.add_argument("--allow-insecure-issuer", action="store_true",
                        help="talk to a non-https issuer that is not on this "
                             "machine. The token goes on every call, so anything "
@@ -6296,7 +6324,9 @@ def main():
     p.add_argument("--extra", default="",
                    help="the repayment txid for a release, the reason for a seizure")
     p.add_argument("--key", required=True,
-                   help="file holding your private key, hex (0600); '-' reads "
+                   help="the key whose x-only public key you registered with "
+                        "the issuer for your AID (pubkeys[0]); nothing else "
+                        "verifies. A file holding it, hex (0600); '-' reads "
                         "it from stdin")
     p.set_defaults(fn=cmd_pledge_sign)
 
@@ -6314,11 +6344,16 @@ def main():
 
     p = sub.add_parser("pledge-create", help="lock Tier C collateral in place")
     issuer_args(p)
-    p.add_argument("--asset", required=True)
-    p.add_argument("--borrower", required=True, help="the borrower's AID")
-    p.add_argument("--lender", required=True, help="the lender's AID")
+    p.add_argument("--asset", required=True,
+                   help="the asset's 64-hex id, as openampd knows it; it must "
+                        "carry a clawback leaf")
+    p.add_argument("--borrower", required=True,
+                   help="the borrower's AID, registered with an enclave for the asset")
+    p.add_argument("--lender", required=True,
+                   help="the lender's AID, registered with an enclave for the asset")
     p.add_argument("--atoms", type=int, required=True)
-    p.add_argument("--maturity", type=int, required=True, help="height")
+    p.add_argument("--maturity", type=int, required=True,
+                   help="block height, above the current tip")
     p.add_argument("--debt-asset", default="")
     p.add_argument("--debt-atoms", type=int, default=0)
     p.add_argument("--note", default="")

@@ -1006,6 +1006,47 @@ except SystemExit as e:
 print("  disburse_conf below two is refused")
 CFG
 
+# --- a Tier C seizure reports what the issuer actually answered --------------
+#
+# The issuer answers a demo-asset seizure with the delivering txid, and an
+# external-issuer asset with sighashes it still has to sign; reporting the
+# second as "delivered" told a lender the collateral was theirs while the
+# issuer held it and the pending sweep expired.
+python3 - "$BIN/pignus-cli" <<'SEIZE'
+import argparse, contextlib, importlib.machinery, importlib.util, io, sys
+
+cli = sys.argv[1]
+spec = importlib.util.spec_from_loader(
+    "pcli_seize", importlib.machinery.SourceFileLoader("pcli_seize", cli))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+class Client:
+    def __init__(self, answer): self.answer = answer
+    def seize(self, *a, **k): return self.answer
+
+def run(answer):
+    m._pledge_client = lambda args: Client(answer)
+    m._party_key = lambda *a, **k: b"\x01" * 32
+    args = argparse.Namespace(key="k", lender_sig=None, holder_sig=None,
+                              pledge="p1", reason="default", holder_x="", lender_x="")
+    err, out = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+        rc = m.cmd_pledge_seize(args)
+    return rc, err.getvalue()
+
+rc, said = run({"id": "p1", "txid": "ab" * 32, "atoms": 5})
+if rc not in (0, None) or "delivered to the lender" not in said:
+    sys.exit(f"FAIL: a delivering txid was not reported as delivered: {rc} {said}")
+rc, said = run({"id": "c1", "to_sign": ["aa" * 32, "bb" * 32], "complete_at": "/v1/x/complete"})
+if rc != 4 or "2 sighash" not in said or "nothing has been delivered" not in said.lower():
+    sys.exit(f"FAIL: a pending two-phase seizure read as delivered: {rc} {said}")
+rc, said = run({"pledge": {"id": "p1", "state": "open"}})
+if rc != 4:
+    sys.exit(f"FAIL: an answer with neither was treated as done: {rc} {said}")
+print("  a seizure says delivered only for a delivering transaction, and exits 4 while the issuer still holds the asset")
+SEIZE
+
 # --- a composer gets the NODE's dust threshold, never a fallback -------------
 #
 # `dust_fold` is where fee-asset change stops being worth an output and is given
