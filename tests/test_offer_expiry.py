@@ -128,6 +128,10 @@ def main():
     check("the offer whose window has closed is expired",
           book.btc_offer(stale["btc_offer_id"])["status"] == "expired",
           book.btc_offer(stale["btc_offer_id"])["status"])
+    rec = book.btc_offer(stale["btc_offer_id"])
+    check("and the record says WHY, and when, for the lender who asks later",
+          bool(rec.get("expired_reason")) and int(rec.get("expired_at") or 0) > 0,
+          str({k: rec.get(k) for k in ("expired_reason", "expired_at")})[:200])
     check("and the healthy one is left alone, which is the other half",
           book.btc_offer(live["btc_offer_id"])["status"] == "open",
           book.btc_offer(live["btc_offer_id"])["status"])

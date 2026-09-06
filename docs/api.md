@@ -870,8 +870,10 @@ one client can make requests at all.
 400 listing them, not an empty result, because an empty list reads as "there are
 no offers". Only three of those are ever ASSIGNED to a cross-chain offer:
 `open`, `withdrawn` when its lender takes it down, and `expired` when its own
-deadlines have gone by. The rest describe a coin on a chain, and a cross-chain
-offer has none.
+deadlines have gone by -- an expired record carries `expired_at` and
+`expired_reason`, the margin that failed in the sweep's own words, for the
+lender who asks later why there was nothing to take. The rest describe a coin
+on a chain, and a cross-chain offer has none.
 
 Each row is the stored offer plus `lots_left`, computed live: how many of its
 lots are still free, once the takes holding one are counted. A borrower reads

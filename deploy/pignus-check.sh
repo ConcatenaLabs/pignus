@@ -235,8 +235,10 @@ elif [ -n "${PIGNUS_RESPONDER_CONFIG:-}" ]; then
             && ! systemctl is-active --quiet pignus-btc-responder; then
         bad "the responder unit pignus-btc-responder is not running; takes go unanswered"
     fi
+    # --expect-offer: a responder with nothing takeable on the board is a
+    # lender nobody can borrow from, and an offer expires quietly.
     out=$("$CLI" btc-responder-status --config "$PIGNUS_RESPONDER_CONFIG" \
-            --book "$BOOK" 2>&1 >/dev/null)
+            --book "$BOOK" --expect-offer 2>&1 >/dev/null)
     rc=$?
     case "$rc" in
         0) ok "the responder ($PIGNUS_RESPONDER_CONFIG) has nothing waiting on a person" ;;
