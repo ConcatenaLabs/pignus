@@ -574,7 +574,10 @@ loan's price is verified against every key it may bake. Run it by hand with
 `--once --dry-run` first after any change to the wallet or the oracles. The
 bot refuses to decide a seizure when the node publishes no fee rate for the
 loan's debt asset, because it cannot restate a fee paid in another asset;
-`/v1/fees` on the book lists the rates the node has.
+`/v1/fees` on the book lists the rates the node has. At start it keeps
+trying for two minutes (`--start-grace`) when the book or an oracle does not
+answer yet, since every Pignus process is restarted together after an update
+and the bot must not fail, and page, for coming up first.
 
 Installing it is four steps. `cp
 /root/sequentia/pignus/deploy/pignus-liquidator.service.example

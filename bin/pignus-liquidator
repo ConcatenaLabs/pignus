@@ -152,6 +152,13 @@ def main():
                     help="act on attestations older than --max-attestation-age")
     ap.add_argument("--interval", type=float, default=30.0)
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--start-grace", type=float, default=120.0, metavar="S",
+                    help="how long start-up keeps trying when the node, the "
+                         "book or an oracle does not answer yet, before "
+                         "giving up (default 120). Every Pignus process is "
+                         "restarted together after an update, and this one "
+                         "must not fail for coming up first. 0 gives up at "
+                         "once, as --once does")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--call-due", action="store_true",
                     help="also call loans past maturity via DEFAULT")
@@ -658,8 +665,13 @@ def main():
                 loans.pop(v.loan_id, None)
 
     # Start-up talks to the node, the book and the oracles, all of which can be
-    # unreachable or misconfigured. One line each, rather than a traceback.
-    try:
+    # unreachable or misconfigured. One line each, rather than a traceback --
+    # and, for a while, another try: after an update every Pignus process is
+    # restarted at once, and a book that refuses a connection for the seconds
+    # it takes to come up is not a reason for this bot to fail (and page).
+    started = time.monotonic()
+    while True:
+      try:
         if args.taker_spk:
             taker_spk = bytes.fromhex(args.taker_spk)
         else:
@@ -683,8 +695,15 @@ def main():
                 track(json.load(f))
         if args.book:
             track(fetch_book_loans(args.book))
-    except TRANSIENT as e:
-        sys.exit(f"pignus-liquidator: {type(e).__name__}: {e}")
+        break
+      except TRANSIENT as e:
+        waited = time.monotonic() - started
+        if args.once or args.start_grace <= 0 or waited >= args.start_grace:
+            sys.exit(f"pignus-liquidator: {type(e).__name__}: {e}"
+                     + (f" (after waiting {int(waited)}s)" if waited >= 1 else ""))
+        print(f"start-up: {type(e).__name__}: {e}; trying again in 5s "
+              f"({int(args.start_grace - waited)}s left)", file=sys.stderr)
+        time.sleep(5)
 
     print(f"watching {len(loans)} loan(s); "
           f"{len(oracle_keys)} oracle(s) named directly"

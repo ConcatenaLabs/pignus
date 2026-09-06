@@ -355,6 +355,29 @@ grep -q "need --loans or --book" "$WORK/err" || {
     exit 1; }
 echo "  neither --loans nor --book exits 2, saying which"
 
+# A book that does not answer YET is not a reason to fail: after an update
+# every Pignus process is restarted at once, and the bot that came up first
+# failed, paged a person, and was restarted thirty seconds later as if
+# nothing had happened. It keeps trying for --start-grace, then gives up
+# saying how long it waited; --once gives up at once, as before.
+set +e
+"$BIN/pignus-liquidator" --taker-spk "0014$(python3 -c "print('22'*20)")" \
+  --book http://127.0.0.1:1 --start-grace 6 > "$WORK/out" 2> "$WORK/err"
+rc=$?
+set -e
+test "$rc" = "1" || { echo "FAIL: expected exit 1 after the grace, got $rc" >&2; exit 1; }
+grep -q "trying again" "$WORK/err" && grep -q "after waiting" "$WORK/err" || {
+    echo "FAIL: start-up did not keep trying, or did not say how long it waited" >&2
+    sed 's/^/  /' "$WORK/err" >&2; exit 1; }
+set +e
+"$BIN/pignus-liquidator" --once --taker-spk "0014$(python3 -c "print('22'*20)")" \
+  --book http://127.0.0.1:1 > "$WORK/out" 2> "$WORK/err"
+rc=$?
+set -e
+test "$rc" = "1" || { echo "FAIL: --once against a dead book should exit 1 at once, got $rc" >&2; exit 1; }
+grep -q "trying again" "$WORK/err" && { echo "FAIL: --once waited" >&2; exit 1; }
+echo "  a book that does not answer yet is waited for, and --once is not"
+
 # --- one responder per lender key, and only for the right reason -----------
 #
 # Two responders on one key each draw their own secret for the same take, and
