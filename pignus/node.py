@@ -88,6 +88,47 @@ class Node:
             raise RpcError(err.get("code", -1), err.get("message", str(err)))
         return payload["result"]
 
+    def rpc_batch(self, calls):
+        """Many calls in ONE round trip: `[(method, params), ...]` in, a list
+        of `(result, error)` in the same order out, `error` an `RpcError` for
+        the calls the node refused and None for the rest.
+
+        A poll asks one `gettxout` per tracked record, and each call here
+        opens a connection, sends a request and waits: two milliseconds on a
+        quiet box, which over thousands of records is most of a poll. The
+        node answers a JSON array of requests with a JSON array of answers,
+        keyed by id, in one exchange.
+        """
+        if not calls:
+            return []
+        reqs = []
+        for method, params in calls:
+            self._id += 1
+            reqs.append({"jsonrpc": "2.0", "id": self._id, "method": method,
+                         "params": list(params)})
+        if self._auth is None and self._cookie_path:
+            self._load_cookie()
+        payload = self._post(json.dumps(reqs).encode(),
+                             reauth=bool(self._cookie_path))
+        if isinstance(payload, dict):
+            # One envelope for the whole batch is the node refusing it.
+            err = payload.get("error") or {}
+            raise RpcError(err.get("code", -1),
+                           err.get("message", "the batch was refused"))
+        by_id = {p.get("id"): p for p in payload if isinstance(p, dict)}
+        out = []
+        for r in reqs:
+            p = by_id.get(r["id"])
+            if p is None:
+                out.append((None, RpcError(-1, "no answer in the batch")))
+            elif p.get("error"):
+                e = p["error"]
+                out.append((None, RpcError(e.get("code", -1),
+                                           e.get("message", str(e)))))
+            else:
+                out.append((p.get("result"), None))
+        return out
+
     def _post(self, body, reauth):
         headers = {"Content-Type": "application/json"}
         if self._auth:

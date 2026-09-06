@@ -60,6 +60,19 @@ class StubNode(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n).decode())
+        # A batch -- a JSON array of requests -- is answered with an array,
+        # one answer per request, as a node does.
+        if isinstance(req, list):
+            body = json.dumps([self._answer(r) for r in req]).encode()
+        else:
+            body = json.dumps(self._answer(req)).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _answer(self, req):
         method, params = req["method"], req.get("params") or []
         SEEN.append(method)
         result, error = None, None
@@ -84,13 +97,7 @@ class StubNode(BaseHTTPRequestHandler):
             result = {"relayfee": 0.000001}
         else:
             error = {"code": -32601, "message": f"stub has no {method}"}
-        body = json.dumps({"result": result, "error": error,
-                           "id": req.get("id")}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        return {"result": result, "error": error, "id": req.get("id")}
 
 
 def free_port():
