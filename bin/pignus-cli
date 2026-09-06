@@ -1493,6 +1493,13 @@ def resolve_oracle_set(oracle_x, spec, threshold, book=None):
         refuse("--oracles resolved to no keys")
     if len(keys) == 1:
         return keys[0], (), 0
+    if not threshold and spec.lower() == "book":
+        refuse(f"--oracles book resolved to {len(keys)} oracles and no "
+               f"--oracle-threshold was given. The default would be "
+               f"{len(keys)}-of-{len(keys)}, which makes every liquidation of "
+               f"this offer's loans depend on every one of those oracles "
+               f"being up; say the threshold you mean (a majority, "
+               f"{max(2, (len(keys) + 2) // 2)}, is the usual answer).")
     thr = threshold or len(keys)
     if not 1 <= thr <= len(keys):
         refuse(f"--oracle-threshold {thr} outside 1..{len(keys)}")

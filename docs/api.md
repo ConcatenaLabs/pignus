@@ -259,9 +259,13 @@ the book itself reads from, which behind a proxy is loopback.
 
 ### `GET /v1/oracles`
 
-`{"oracles": ["…x-only hex…"], "urls": ["https://…"]}` — every independent
-oracle this book quotes against, in configured order, primary first. A lender
-picks an m-of-n subset from here.
+`{"oracles": ["…x-only hex…"], "urls": ["https://…"], "previous": ["…"],
+"compromised": ["…"]}` — every independent oracle this book quotes against, in
+configured order, primary first. A lender picks an m-of-n subset from here.
+`previous` lists keys those oracles used to sign with, so a loan baked to one
+reads as rotated rather than as a stranger's; `compromised` lists keys any of
+them has declared compromised, which this book accepts nothing from, and
+every loan or offer view carries `oracle_compromised` when it bakes one.
 
 `urls` are the PUBLIC addresses, from `oracle_public_urls` in the book's
 configuration, and are `""` for an oracle that has none. They are not the
@@ -1151,7 +1155,7 @@ Everything the oracle serves is a read. The ones that go to disk for it —
 `/v1/attestation/{market}/at/{ts}`, and `/v1/log` whenever `since`, `until` or
 `cursor` sends it to the archive — are limited to one request a second per
 address with a burst of ten, and twenty a second with a burst of two hundred
-for everybody together, and answer 429 over that. An auditor's query is
+for everybody together, and answer 429 over that. `/v1/attestation/{market}` is limited the same way while the market has no attestation in memory and the answer has to come from the archive; a book treats that 429 as the oracle erroring, not as no price. An auditor's query is
 cheap once and expensive in a loop, and this process has signing to do.
 Everything else comes out of memory and is not limited.
 
@@ -1159,10 +1163,13 @@ Everything else comes out of memory and is not limited.
 
 ### `GET /v1/pubkey`
 
-`{"oracle_x": "…64 hex…", "price_scale": 100000, "previous": ["…"]}` — the key
-vaults bake in. `previous` lists keys this oracle used to sign with, so a
-borrower's page can tell a rotation from a stranger. Live vaults bake the key
-they were originated against, so a rotation is never a swap.
+`{"oracle_x": "…64 hex…", "price_scale": 100000, "previous": ["…"],
+"compromised": ["…"]}` — the key vaults bake in. `previous` lists keys this
+oracle used to sign with, so a borrower's page can tell a rotation from a
+stranger; live vaults bake the key they were originated against, so a
+rotation is never a swap. `compromised` lists keys this operator has declared
+compromised: a book refuses attestations under them and flags the loans that
+bake them.
 
 ### `GET /v1/markets`
 

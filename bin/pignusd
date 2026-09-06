@@ -139,6 +139,7 @@ import sys
 import gzip
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -468,6 +469,17 @@ class Service:
             if u and u not in urls:
                 urls.append(u)
         self.oracle_urls = urls
+        # The key each oracle is EXPECTED to serve, parallel to the URL list
+        # (the primary first, then `oracles`); an empty entry pins nothing.
+        # Unpinned, the book adopts whatever `/v1/pubkey` serves on every
+        # poll: a lost-and-recreated key, or a substituted one on a plain-http
+        # URL, is accepted silently while every loan baked to the old key
+        # goes unpriced.
+        keys = [str(k).lower() for k in cfg.get("oracle_keys", [])]
+        self.oracle_expected = {u: keys[i] for i, u in enumerate(urls)
+                                if i < len(keys) and keys[i]}
+        self.compromised_keys = set()       # declared by any quoted oracle
+        self.previous_keys = {}             # url -> keys it used to sign with
         self.oracle_keys = []                       # x-only hex, in url order
         self.oracle_key_by_url = {}
         self.att_by_oracle = {}                     # (oracle_x, market) -> att
@@ -632,17 +644,39 @@ class Service:
             return
         primary = self.oracle_urls[0]
         key_by_url, errors = {}, []
+        compromised, previous = set(), {}
         for url in self.oracle_urls:
             try:
                 with urllib.request.urlopen(f"{url}/v1/pubkey", timeout=8) as r:
-                    key_by_url[url] = json.loads(r.read().decode())["oracle_x"]
+                    pub = json.loads(r.read().decode())
+                served = str(pub["oracle_x"]).lower()
             except Exception as e:                  # noqa: BLE001
                 errors.append(f"{url}: {type(e).__name__}: {e}")
+                continue
+            want = self.oracle_expected.get(url)
+            if want and served != want:
+                # Not adopted. The vaults bake the pinned key; a different one
+                # here is a lost key recreated, or a substitution in transit.
+                errors.append(f"{url}: serves key {served[:16]}…, not the "
+                              f"{want[:16]}… this book is configured to expect; "
+                              f"its attestations are ignored until the key "
+                              f"is restored or the configuration changed")
+                continue
+            compromised |= {str(k).lower() for k in pub.get("compromised") or []}
+            previous[url] = [str(k).lower() for k in pub.get("previous") or []]
+            key_by_url[url] = served
+        for url, ox in list(key_by_url.items()):
+            if ox in compromised:
+                errors.append(f"{url}: its key {ox[:16]}… is declared "
+                              f"compromised; nothing it signs is accepted")
+                del key_by_url[url]
         with self._lock:
             # Configured order, not the order they happened to answer in.
             self.oracle_keys = [key_by_url[u] for u in self.oracle_urls
                                 if u in key_by_url]
             self.oracle_key_by_url = key_by_url
+            self.compromised_keys = compromised
+            self.previous_keys = previous
             # The FIRST oracle is the "primary": its price is what the page
             # shows and what a plain single-oracle loan bakes in. An outage of
             # the primary must NOT promote the next oracle. A vault verifies
@@ -668,12 +702,31 @@ class Service:
                     with urllib.request.urlopen(a_url, timeout=8) as r:
                         att = O.Attestation.from_dict(
                             json.loads(r.read().decode()))
+                except urllib.error.HTTPError as e:
+                    # A 404 is "no attestation yet"; anything else -- a 429
+                    # from the oracle's own archive ration, a 503 -- is the
+                    # oracle erroring, and is said, not read as no price.
+                    if e.code != 404:
+                        errors.append(f"{url}: {m}: HTTP {e.code}")
+                    continue
                 except Exception:                   # noqa: BLE001
                     continue
                 # Verify before storing. A price this service displays is a
                 # price someone may act on, and an oracle is trusted for the
                 # number, not for the transport that carried it.
                 if not O.verify(ox, att):
+                    continue
+                # EVERY oracle's precisions, not only the primary's. A
+                # secondary configured to 2 decimals where the registry says
+                # 8 is a good signature over a number a millionfold off, and
+                # the lowest price is what a threshold seizure presents first.
+                said = self.oracle_precisions.get(self._att_key(ox, m))
+                reg = self._registry_precisions(m)
+                if said and reg and tuple(said) != reg:
+                    errors.append(
+                        f"{url}: prices {m} at precisions {list(said)}, but "
+                        f"the registry denominates it at {list(reg)}; that "
+                        f"attestation was dropped")
                     continue
                 scale = int(att.price_scale)
                 if url == primary:
@@ -703,6 +756,24 @@ class Service:
             self.book.stamp_at_risk(self.price_for)
         except Exception as e:                          # noqa: BLE001
             print(f"at-risk stamp: {type(e).__name__}: {e}", file=sys.stderr)
+
+    def _oracle_compromised(self, t):
+        """Does this loan bake a key some quoted oracle has declared
+        compromised? Whoever holds that key can sign any price for it."""
+        keys = {str(t.oracle_x or "").lower()} | {
+            str(k).lower() for k in (t.oracle_keys or ())}
+        return bool(keys & self.compromised_keys)
+
+    def _registry_precisions(self, market):
+        """(collateral, debt) decimals the registry gives a market's assets,
+        or None when either asset is unknown to it."""
+        c_sym, _, d_sym = market.partition("/")
+        c_asset, _ct = self.resolve(c_sym)
+        d_asset, _dt = self.resolve(d_sym)
+        if not c_asset or not d_asset:
+            return None
+        return (int((self.assets.get(c_asset) or {}).get("precision", 8)),
+                int((self.assets.get(d_asset) or {}).get("precision", 8)))
 
     def _refresh_oracle_precisions(self, url, ox, errors):
         """What each oracle believes the two assets of a market are denominated
@@ -1484,6 +1555,7 @@ class Service:
         out["lender_prog"] = t.payout_programs[0]
         out["lender_ver"] = t.lender_ver
         out["oracle_x"] = t.oracle_x
+        out["oracle_compromised"] = self._oracle_compromised(t)
         price = self.price_for(t)
         if rec.get("liquidatable_since"):
             out["liquidatable_since"] = int(rec["liquidatable_since"])
@@ -1532,6 +1604,7 @@ class Service:
         out["oracle"] = f"{t.threshold}-of-{len(t.oracle_keys)}"
         out["oracle_x"] = t.oracle_x
         out["oracle_keys"] = list(t.oracle_keys)
+        out["oracle_compromised"] = self._oracle_compromised(t)
         # A loan originated through a funded offer lives in the SINGLE-LEAF
         # vault; the browser needs to know which, because the two have
         # different addresses and different witnesses.
@@ -2104,7 +2177,8 @@ class Service:
             # borrower is shown or checks is measured against it. A page with
             # no parent-chain height cannot tell them when their collateral
             # becomes abortable, so it refuses to originate at all.
-            "btc_height": btc_h}
+            "btc_height": btc_h,
+            "compromised_keys": sorted(self.compromised_keys)}
 
 
 class Server(ThreadingHTTPServer):
@@ -2497,8 +2571,16 @@ class Handler(BaseHTTPRequestHandler):
                                         # name an address for
                 pairs.append((key, s.oracle_public_urls[i]
                               if i < len(s.oracle_public_urls) else ""))
+            prev = sorted({k for ks in s.previous_keys.values() for k in ks})
             return self._send(200, {"oracles": [k for k, _u in pairs],
-                                    "urls": [u for _k, u in pairs]})
+                                    "urls": [u for _k, u in pairs],
+                                    # Keys these oracles USED to sign with,
+                                    # so a loan baked to one reads as
+                                    # rotated rather than as a stranger's,
+                                    # and keys any of them has declared
+                                    # compromised.
+                                    "previous": prev,
+                                    "compromised": sorted(s.compromised_keys)})
         if path == "/v1/offers":
             # A misspelt status returned an empty list, which reads as "there
             # are no offers" rather than "that is not a status" -- the same

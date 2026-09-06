@@ -291,6 +291,22 @@ grep -qi "^server: pignusd" "$WORK/hdr.txt" \
 echo "  refused, and the headers are on every answer"
 
 echo
+echo "== the oracle set is served with what each oracle declared =="
+curl -sS "$D/v1/oracles" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["oracles"] and d["urls"], d
+assert d["previous"] == [] and d["compromised"] == [], d
+'
+curl -sS "$D/healthz" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d.get("compromised_keys") == [], d.get("compromised_keys")
+assert not d.get("oracle_errors"), d.get("oracle_errors")
+'
+echo "  previous and compromised are empty lists, and no oracle error is recorded"
+
+echo
 echo "== withdrawing an offer that is not there is a clean 404 =="
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$D/v1/offers/nosuchoffer")
 test "$code" = "404" || { echo "expected 404, got $code" >&2; exit 1; }

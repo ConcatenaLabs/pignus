@@ -66,6 +66,13 @@ export function alertsFor(view) {
     const liqFor = hoursSince(l.liquidatable_since, now);
     const canPay = have[t.debt_asset] != null && have[t.debt_asset] >= BigInt(t.debt);
 
+    if (l.oracle_compromised && (mine(t.borrower_prog) || mine(t.lender_prog))) {
+      (mine(t.borrower_prog) ? borrower : lender).push({
+        level: "bad", key, action: mine(t.borrower_prog) ? "repay" : null,
+        text: "An oracle has declared the key this loan bakes COMPROMISED: whoever holds it can sign any price. " +
+              (mine(t.borrower_prog) ? "Repay now; nothing else protects the collateral."
+                                     : "Expect nothing honest from that oracle; the borrower has been told to repay.") });
+    }
     if (mine(t.borrower_prog)) {
       if (l.recover_open) {
         borrower.push({ level: "bad", key, action: "repay",

@@ -7,6 +7,13 @@
     "127.0.0.1",
     "::1"
   ],
+  "_flat_note": "How many signing rounds every market may come back byte-identical before the feed is called frozen and this oracle stops signing it. Defaults to 30 for an http feed; a static source is exempt; 0 turns it off.",
+  "flat_rounds": 30,
+  "_jump_note": "A price that moves further than max_jump (a fraction of the last signed price) in one step is held, unsigned, until it has stayed there for jump_rounds consecutive rounds. A feed that switched units, or a column pointing at a percentage, is a perfectly good signature over a number a thousandfold off; this is what stands between that and every loan on the market. 0 turns it off.",
+  "max_jump": 0.5,
+  "jump_rounds": 3,
+  "_book_note": "The book this oracle's cross-chain seizures are checked against before they are co-signed: a loan the borrower has already repaid is refused. Optional; --allow-unlisted co-signs without asking.",
+  "book": "http://127.0.0.1:8741",
   "interval": 60,
   "price_scale": 100000,
   "markets": [
