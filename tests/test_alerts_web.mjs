@@ -80,6 +80,21 @@ const live = (o = {}) => ({ state: "LIVE", loan_id: "L1", txid: "11".repeat(32),
   ok("...and a reclaim fee Bitcoin has outgrown is named, with the number it would take",
      a.btc.some(x => /300 satoshis/.test(x.text) && /cannot be bumped/.test(x.text)));
   ok("the tab title counts both", A.atRiskCount(a) === 2);
+  const late = A.alertsFor(view({ btcLoans: [{ ...rec, loan: { ...rec.loan, repay_deadline: 50000 + 120 - 1 } }] }));
+  ok("past the safe deadline the alert is bad and carries NO button",
+     late.btc.some(x => x.level === "bad" && x.action === null && /Do not repay/.test(x.text)), JSON.stringify(late.btc));
+  const waiting = { take_id: "T2", disbursement_txid: "dd".repeat(32),
+                    loan: { d_refund: 50000 + 60, abort_after: 1, recover_after: 1, repay_deadline: 99999, btc_amount: "100000" } };
+  const w = A.alertsFor(view({ btcLoans: [waiting] }));
+  ok("a principal waiting to be claimed near d_refund is an alert with a button",
+     w.btc.some(x => x.action === "btcstep" && /claim it/.test(x.text)), JSON.stringify(w.btc));
+  const gone = A.alertsFor(view({ btcLoans: [{ ...waiting, loan: { ...waiting.loan, d_refund: 49999 } }] }));
+  const under = A.alertsFor(view({ btcLoans: [{ ...rec, loan: { ...rec.loan, strike: "5218666667", price_scale: 100000, market: "BTC/USDX", debt_asset: "11".repeat(32) } }],
+                                   btcPrice: () => 40000, debtPrecision: () => 8 }));
+  ok("a live loan under its seizure price is a bad alert with Repay",
+     under.btc.some(x => x.level === "bad" && x.action === "btcstep" && /seizure price/.test(x.text)), JSON.stringify(under.btc));
+  ok("...and past d_refund it says the lender may take it back, with no button",
+     gone.btc.some(x => x.level === "bad" && x.action === null), JSON.stringify(gone.btc));
 }
 {
   const a = A.alertsFor(view({ offers: [{ offer_id: "O1", lender_prog: "1e".repeat(20), expired: true, lots_left: 1 }] }));

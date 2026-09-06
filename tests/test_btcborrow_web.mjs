@@ -211,6 +211,26 @@ const offer = {
   ok("the offer list shows the price a seizure is judged against",
      html.includes("seized below") && html.includes("52186.66667"),
      html.slice(0, 200));
+  ok("...and Borrow is live when nothing is known against it", !/disabled/.test(html));
+  const gated = [];
+  const offer = { btc_offer_id: "x", status: "open", loan: {
+    btc_amount: 100000, debt: 3914000000, principal: 3800000000,
+    debt_asset: "11".repeat(32), repay_deadline: 1, recover_after: 2,
+    strike: 5218666667, price_scale: 100000, market: "BTC/USDX" } };
+  bb.renderOffers({ set innerHTML(v) { gated.push(v); }, querySelectorAll: () => [] },
+    [offer], { ...ui, canBtc: false }, () => {});
+  ok("a wallet with no Bitcoin signing sees Borrow disabled, and why",
+     /disabled title="[^"]*Ambra/.test(gated.join("")), gated.join("").slice(-300));
+  const under = [];
+  bb.renderOffers({ set innerHTML(v) { under.push(v); }, querySelectorAll: () => [] },
+    [offer], { ...ui, btcPrice: () => 40000, debtPrecision: () => 8 }, () => {});
+  ok("an offer already under its seizure price says so in the row and is not offered",
+     /seizable the moment it starts/.test(under.join("")) && /disabled title="[^"]*seizure price/.test(under.join("")),
+     under.join("").slice(-400));
+  const above = [];
+  bb.renderOffers({ set innerHTML(v) { above.push(v); }, querySelectorAll: () => [] },
+    [offer], { ...ui, btcPrice: () => 80000, debtPrecision: () => 8 }, () => {});
+  ok("...and one above it is offered", !/disabled/.test(above.join("")));
   const bare = [];
   bb.renderOffers({ set innerHTML(v) { bare.push(v); },
                     querySelectorAll: () => [] },
@@ -379,6 +399,15 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
   const heights = { btc: 900000, seq: 200000 };
   const live = { take_id: "t", loan, upgrade_txid: "ff".repeat(32) };
   ok("a live loan offers Repay", bb.nextStep(live, heights).action === "repay");
+  const lateH = { btc: 900000, seq: Number(loan.repay_deadline) - bb.CLAIM_MARGIN_BLOCKS };
+  ok("past the safe deadline it offers nothing and says not to repay",
+     bb.nextStep(live, lateH).action === null && /do not repay/i.test(bb.nextStep(live, lateH).note),
+     bb.nextStep(live, lateH).note);
+  const waitingRec = { take_id: "t", loan, disbursement_txid: "dd".repeat(32) };
+  ok("a principal waiting to be claimed names the block it must be claimed by",
+     bb.nextStep(waitingRec, heights).action === "claim"
+     && new RegExp(Number(loan.d_refund).toLocaleString().replace(/[.,]/g, "[.,]")).test(bb.nextStep(waitingRec, heights).note),
+     bb.nextStep(waitingRec, heights).note);
   ok("a SEIZED one does not, and says the collateral is already gone",
      bb.nextStep({ ...live, vault_exit: "seize" }, heights).action === null
      && /already gone/.test(bb.nextStep({ ...live, vault_exit: "seize" },
@@ -438,8 +467,8 @@ ok("a transaction can name itself, which binding the reclaim to the vault needs"
   // ...and when it has arrived it says THAT, which for a borrower whose loan
   // never started is the sentence that matters: the money can come back now.
   ok("an abort deadline already reached says so rather than a bare number",
-     /\(reached\)/.test(bb.nextStep(waiting, heights).note),
-     bb.nextStep(waiting, heights).note);
+     /\(reached\)/.test(bb.nextStep(waitingRec, heights).note),
+     bb.nextStep(waitingRec, heights).note);
   ok("a chain whose height is unknown says nothing rather than guessing",
      !/in about/.test(bb.nextStep(waiting, {}).note)
      && /Bitcoin block/.test(bb.nextStep(waiting, {}).note));

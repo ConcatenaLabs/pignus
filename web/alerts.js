@@ -133,10 +133,39 @@ export function alertsFor(view) {
     if (stage === "live") {
       const left = untilSeq(bb.effectiveRepayDeadline(l), view.height, view.blockSeconds);
       if (left != null && left < soon) {
-        btc.push({ level: left <= 0 ? "bad" : "warn", key, action: "btcstep",
+        // Past the deadline there is nothing to open: a repayment now would
+        // not be claimed and would release no collateral, so the alert
+        // carries no button rather than one that pays for nothing.
+        btc.push({ level: left <= 0 ? "bad" : "warn", key,
+          action: left <= 0 ? null : "btcstep",
           text: left <= 0
-            ? "The lender has stopped claiming repayments for this loan: the safe deadline has passed."
+            ? "The lender has stopped claiming repayments for this loan: the safe deadline has passed. Do not repay; the collateral is theirs to sweep at the timeout."
             : `Repay ${inWords(left)}: after that the lender stops claiming, and a repayment nobody claims releases no collateral.` });
+      }
+    }
+    if (["live", "principal-taken"].includes(stage) && view.btcPrice) {
+      // No script tests the price on this tier: under the strike the
+      // lender and the oracle can co-sign a seizure at any moment, and the
+      // only warning a borrower gets is the one written here.
+      const health = bb.seizeHealth(l, view.btcPrice(l.market),
+                                    view.debtPrecision ? view.debtPrecision(l.debt_asset) : 8);
+      if (health != null && health < 1) {
+        btc.push({ level: "bad", key, action: stage === "live" ? "btcstep" : null,
+          text: `BTC is below this loan's seizure price (health ${health.toFixed(2)}): the lender and the oracle can co-sign a seizure now.` +
+                (stage === "live" ? " Repay." : "") });
+      }
+    }
+    if (stage === "disbursed") {
+      // The principal is waiting and the lender can take it back at
+      // d_refund, which can be hours away; a borrower who misses it has
+      // collateral sitting in a pre-vault until abort_after for nothing.
+      const left = untilSeq(l.d_refund, view.height, view.blockSeconds);
+      if (left != null && left < soon) {
+        btc.push({ level: left <= 0 ? "bad" : "warn", key,
+          action: left <= 0 ? null : "btcstep",
+          text: left <= 0
+            ? "The lender may now take your unclaimed principal back; your collateral waits in its pre-vault until the abort window opens."
+            : `Your principal is waiting: claim it ${inWords(left)}, or the lender takes it back and your collateral waits until the abort window.` });
       }
     }
     if (["live", "repaid", "repayment-claimed"].includes(stage) && view.btcFeerate) {

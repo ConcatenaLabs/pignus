@@ -1487,6 +1487,8 @@ function renderAlerts() {
     mine: (p) => mine(p), holdings: holdings(true),
     height: state.height, btcHeight: state.btcHeight,
     blockSeconds: blockSeconds(), btcFeerate: state.btcFeerate,
+    btcPrice: (market) => btcPriceFor(market),
+    debtPrecision: (asset) => meta(asset).precision ?? 8,
   });
   const byLoan = new Map(state.loans.map(l => [l.loan_id || l.txid, l]));
   const byOffer = new Map(state.offers.map(o => [o.offer_id, o]));
@@ -2409,9 +2411,16 @@ function btcUi({ flow = "btcrepay", prefer = [], committed = {},
     payoutProgram: async () => state.payout,
     heights: async () => ({ btc: state.btcHeight, seq: state.height,
                             feerate: state.btcFeerate }),
+    blockText: (h, chain = "") => whenText(h, chain),
+    confirmFunding: (label, lines) => confirmLines(label, lines),
+    btcPrice: (market) => btcPriceFor(market),
+    debtPrecision: (asset) => meta(asset).precision ?? 8,
+    canBtc: state.wallet ? state.canBtc : undefined,
+    btcHeightKnown: state.btcHeight != null,
     confirmations,
     btcHrp: btcHrp(),
     addressToSpk: async (addr) => programFromAddress(addr).spk,
+    spkToAddress: (spk) => btcAddressOfSpk(spk),
     utxos: async () => state.utxos,
     changeSpk: async () => state.payout.spk,
     feeRates: async () => {
@@ -2442,12 +2451,31 @@ function renderBtcOffers() {
  * A Bitcoin-collateral loan binds deadlines on two chains, and this page can
  * only see one of them. Rather than check half of it, refuse.
  */
-function needBtcHeight() {
+function needBtcHeight(doing = "take") {
   if (state.btcHeight != null) return false;
-  note("This book does not publish a Bitcoin height, so the page cannot check " +
-       "that the two chains' deadlines leave you enough time to repay and " +
-       "reclaim. Take the offer with <code>pignus-cli btc-offer-take</code>, " +
-       "which reads a Bitcoin node directly.", "warn");
+  note(doing === "abort"
+    ? "This book does not publish a Bitcoin height, so the page cannot tell " +
+      "whether the block your collateral becomes abortable at has passed. Run " +
+      "<code>pignus-cli btc-abort</code> against your own node, or check the " +
+      "height in a Bitcoin explorer and try again when this book shows one."
+    : "This book does not publish a Bitcoin height, so the page cannot check " +
+      "that the two chains' deadlines leave you enough time to repay and " +
+      "reclaim. Take the offer with <code>pignus-cli btc-offer-take</code>, " +
+      "which reads a Bitcoin node directly.", "warn");
+  return true;
+}
+
+/** Under the strike right now? Said, and refused: on this tier a seizure is
+ *  two signatures with no price test, so a loan that starts under water can
+ *  be taken the moment it begins. */
+function seizableNow(l) {
+  const health = btcborrow.seizeHealth(l, btcPriceFor(l.market),
+                                       meta(l.debt_asset).precision ?? 8);
+  if (health == null || health >= 1) return false;
+  note(`BTC is ${esc(String(btcPriceFor(l.market)))} ${esc(meta(l.debt_asset).ticker)} and this ` +
+       `loan is seizable below ${esc(btcborrow.seizePrice(l, btcUi()))}: the lender ` +
+       "and the oracle could take your collateral the moment it starts. Nothing " +
+       "has been signed.", "bad");
   return true;
 }
 
@@ -2468,6 +2496,7 @@ async function runBtcBorrow(off) {
     const l = off.loan;
     const principal = BigInt(l.principal || 0) || BigInt(l.debt);
     const d = esc(meta(l.debt_asset).ticker);
+    if (seizableNow(l)) return;
     const out = await btcborrow.borrow(state.wallet, off, btcUi());
     busy(false);
     note("<b>Collateral committed.</b> <a href=\"" + txLink(out.ftxid, true) +
@@ -2481,7 +2510,9 @@ async function runBtcBorrow(off) {
 }
 
 async function loadBtcLoans() {
-  if (state.wallet && state.account && await btcborrow.walletCanBtc(state.wallet)) {
+  state.canBtc = !!(state.wallet && state.account
+                    && await btcborrow.walletCanBtc(state.wallet).catch(() => false));
+  if (state.canBtc) {
     state.btcLoans = await btcborrow.recoverLoans(state.wallet, btcUi())
       .catch(() => btcborrow.savedLoans());
   } else {
@@ -2634,6 +2665,7 @@ async function btcStep(rec, force) {
   const d = esc(meta(l.debt_asset).ticker);
   try {
     if (step.action === "claim") {
+      if (seizableNow(l)) return;
       // Asked FIRST. This builds and broadcasts a Sequentia payment, and the
       // page's own copy promises a confirmation step with a choice of fee
       // asset before anything is spent.
@@ -2641,7 +2673,7 @@ async function btcStep(rec, force) {
         `Take ${units(principal, l.debt_asset)} ${d}, which starts this loan`,
         "Claiming it publishes the secret your lender needs to move your " +
           "collateral into its vault",
-        `Repay by Sequentia block ${btcborrow.effectiveRepayDeadline(l).toLocaleString()} to get the Bitcoin back`,
+        `Repay by ${whenText(btcborrow.effectiveRepayDeadline(l), "Sequentia")} to get the Bitcoin back`,
       ], { flow: "btcclaim", prefer: [l.debt_asset] });
       if (!fee) return;
       const ui = btcUi({ flow: "btcclaim", prefer: [l.debt_asset], fee });
@@ -2656,16 +2688,26 @@ async function btcStep(rec, force) {
         "Claiming it published the secret the lender needs, and they start the " +
         "loan by moving your collateral into its vault, which takes a " +
         "confirmation or two. Until then your collateral is still abortable at " +
-        `Bitcoin block ${Number(l.abort_after).toLocaleString()}. Once the loan ` +
+        `${whenText(l.abort_after, "Bitcoin")}. Once the loan ` +
         `is live, repay by ${whenText(btcborrow.effectiveRepayDeadline(l), "Sequentia")} to ` +
         "get the Bitcoin back.", "ok");
     } else if (step.action === "repay") {
+      // Whether the collateral is still there, asked before anything is
+      // committed. A book that cannot say is a line in the dialog, not a
+      // silence.
+      const vs = await btcborrow.vaultStatus(rec, btcUi()).catch(() => "unknown");
       const fee = await confirmBtcSpend("Repay", [
         `Pay ${units(l.debt, l.debt_asset)} ${d} into a hashlocked output`,
         "Your lender can only take it by publishing the secret that releases " +
           "your Bitcoin, so repaying and getting the collateral back are one act",
-        `If they never claim it, you take the repayment back after Sequentia ` +
-          `block ${Number(l.repay_deadline).toLocaleString()}`,
+        `Repay by ${whenText(btcborrow.effectiveRepayDeadline(l), "Sequentia")}; ` +
+          `it is now block ${Number(state.height).toLocaleString()}`,
+        `If they never claim it, you take the repayment back after ` +
+          `${whenText(l.repay_deadline, "Sequentia")}`,
+        ...(vs === "unknown"
+          ? ["This book could not confirm your collateral is still in its " +
+             "vault; if it has been seized, this pays for nothing"]
+          : []),
       ], { flow: "btcrepay", prefer: [l.debt_asset],
            committed: { [l.debt_asset]: big(l.debt) } });
       if (!fee) return;
@@ -2746,10 +2788,12 @@ async function btcRefundRepayment(rec) {
 }
 
 async function btcAbort(rec) {
-  if (needWallet() || needBtcHeight()) return;
+  if (needWallet() || needBtcHeight("abort")) return;
   try {
     const go = await confirmLines("Take the collateral back", [
-      `Spend the pre-vault's ${pig.fixed(BigInt(rec.loan.btc_amount), 8, 8)} BTC (plus the unspent upgrade fee) to an address of your own`,
+      `Spend the pre-vault's ${pig.fixed(BigInt(rec.loan.btc_amount), 8, 8)} BTC (plus the unspent upgrade fee) to ` +
+        (rec.reclaim_spk ? btcAddressOfSpk(rec.reclaim_spk) : "a fresh address of your own"),
+      `Fee ${Number(rec.reclaim_fee || 3000).toLocaleString()} satoshis`,
       "The principal never came, so no loan ever started; this needs nobody's signature but yours",
     ]);
     if (!go) { note("Nothing was signed.", "info"); return; }
@@ -2758,6 +2802,19 @@ async function btcAbort(rec) {
       "The principal never came, so the loan never started.", "ok");
     await renderBtcLoans();
   } catch (e) { note(explain(e), "bad"); } finally { busy(false); }
+}
+
+/** A Bitcoin address for a witness program, or the hex itself when the
+ *  program is not one this page knows how to spell. */
+function btcAddressOfSpk(spkHex) {
+  try {
+    const b = pig._internals.hexToBytes(String(spkHex));
+    if (b.length === 22 && b[0] === 0x00 && b[1] === 0x14)
+      return btc.segwitAddress(0, b.slice(2), btcHrp());
+    if (b.length === 34 && b[0] === 0x51 && b[1] === 0x20)
+      return btc.segwitAddress(1, b.slice(2), btcHrp());
+  } catch { /* fall through */ }
+  return String(spkHex);
 }
 
 function btcHrp() {
