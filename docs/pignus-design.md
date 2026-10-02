@@ -193,11 +193,10 @@ Measured leaf sizes for a real loan: REPAY 192 bytes, LIQUIDATE 352,
 DEFAULT 346, RECOVER 98. DEFAULT and RECOVER vary by a byte with the size of
 the locktime they carry, so those are the figures for an ordinary height.
 A REPAY spend is in the same class as a covenant CLOB fill (a few hundred
-vbytes; the measured user capacity of a block is about 89,999 vB), which
-matters: doing
-this in Simplicity instead would cost 7,459 vB and cap the platform at 12
-operations per block. Tapscript introspection is the right tool and needs no
-consensus change at all -- 0xc4 is gated only by always-active
+vbytes; the measured user capacity of a block is about 89,999 vB). The vault
+exists only as tapscript; no Simplicity version of it has been written, so
+there is no Simplicity size to compare it with. Tapscript introspection needs
+no consensus change at all -- 0xc4 is gated only by always-active
 `SCRIPT_VERIFY_TAPROOT`.
 
 **64-bit bound.** `OP_ADD64` aborts on signed-64-bit overflow. The only large
