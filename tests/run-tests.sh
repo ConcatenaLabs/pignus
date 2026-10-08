@@ -64,6 +64,7 @@ run "unit: Tier C pledge message pin" python3 tests/test_openamp.py
 run "watcher: reorgs, and reading an exit" python3 tests/test_watcher.py
 run "watcher: the reorgs that were its blind spots" python3 tests/test_watcher_reorgs.py
 run "oracle service: what it will not sign" python3 tests/test_oracle_service.py
+run "attestation formats, and a separate signer" python3 tests/test_attestation_formats.py
 run "liquidation bot: what it refuses" python3 tests/test_liquidator.py
 run "browser: covenant vs vectors"    node tests/test_web.mjs
 run "browser: offers vs vectors"      node tests/test_offer_web.mjs

@@ -32,6 +32,15 @@ import time
 from dataclasses import dataclass, asdict, fields
 
 from .compat import load_covenant
+from .sequentia_oracle import attestation as AF
+
+# The attestation formats (sequentia-oracle's doc/format.md). Every covenant
+# this repository builds checks FORMAT_1: the 48-byte message below, signed
+# raw, which only OP_CHECKSIGFROMSTACK can take. FORMAT_2 is the fixed-width
+# message a Simplicity program can check too; the oracle's signer publishes
+# both for the same observations while any FORMAT_1 loan is open.
+FORMAT_1 = 1
+FORMAT_2 = 2
 
 
 def _key_module():
@@ -672,11 +681,6 @@ def _parse_line(line):
         return None
 
 
-def _line_timestamp(line):
-    att = _parse_line(line)
-    return None if att is None else int(att.timestamp)
-
-
 class AttestationLog:
     """An append-only record of everything the oracle has signed.
 
@@ -723,6 +727,7 @@ class AttestationLog:
     # ------------------------------------------------------------- start-up
 
     def _load(self):
+        self._offset = 0
         try:
             with open(self.path + ".chain") as f:
                 seed = f.read().strip()
@@ -738,13 +743,14 @@ class AttestationLog:
                 size = f.tell()
         except FileNotFoundError:
             return
+        self._offset = size
         try:
             with open(self.path, "rb") as f:
                 if size > self.TAIL_BYTES:
                     f.seek(size - self.TAIL_BYTES)
                     f.readline()          # drop the partial line at the seam
                 for line in f:
-                    att = _parse_line(line)
+                    att = self._parse(line)
                     if att is not None:
                         self._push(att)
         except OSError:
@@ -765,9 +771,48 @@ class AttestationLog:
             with open(self.path, "a") as f:
                 f.write(data)
             self._hash.update(data.encode())
+            self._offset += len(data.encode())
             self._push(att)
             if self.max_bytes and os.path.getsize(self.path) >= self.max_bytes:
                 self._rotate()
+
+    def follow(self):
+        """Take in what another process appended since the last look: the
+        separate signer writes this file and the web process only reads it.
+        Only whole lines are taken, so a line being written is read next time.
+        A file that SHRANK was rewritten, not appended to, and the running
+        digest no longer describes it; that is refused rather than papered
+        over, because the digest is the log's whole claim."""
+        with self._lock:
+            try:
+                size = os.path.getsize(self.path)
+            except FileNotFoundError:
+                size = 0
+            if size < self._offset:
+                raise RuntimeError(
+                    f"{self.path} shrank from {self._offset} to {size} bytes: "
+                    f"it was rewritten, not appended to")
+            if size == self._offset:
+                return 0
+            with open(self.path, "rb") as f:
+                f.seek(self._offset)
+                chunk = f.read(size - self._offset)
+            end = chunk.rfind(b"\n") + 1
+            if not end:
+                return 0
+            chunk = chunk[:end]
+            self._hash.update(chunk)
+            self._offset += len(chunk)
+            n = 0
+            for line in chunk.splitlines():
+                att = self._parse(line)
+                if att is not None:
+                    self._push(att)
+                    n += 1
+            return n
+
+    def _parse(self, line):
+        return _parse_line(line)
 
     def _rotate(self):
         """Close the current file and start a new one, chaining the digest.
@@ -837,7 +882,7 @@ class AttestationLog:
             try:
                 with open(path, "rb") as f:
                     for line in f:
-                        att = _parse_line(line)
+                        att = self._parse(line)
                         if att is None or att.market != market:
                             continue
                         if best is None or att.timestamp > best.timestamp:
@@ -874,7 +919,8 @@ class AttestationLog:
                 f.readline()          # the partial line belongs to the block before
             start = f.tell()
             line = f.readline()
-            got = _line_timestamp(line) if line else None
+            rec = self._parse(line) if line else None
+            got = None if rec is None else int(rec.timestamp)
             if got is not None and got < ts:
                 if start + len(line) <= mid:
                     break             # no progress to be made; take what we have
@@ -912,7 +958,7 @@ class AttestationLog:
                     line = f.readline()
                     if not line:
                         break
-                    att = _parse_line(line)
+                    att = self._parse(line)
                     if att is None:
                         continue
                     if since is not None and att.timestamp < since:
@@ -1005,3 +1051,103 @@ def _size(path):
         return os.path.getsize(path)
     except OSError:
         return 0
+
+
+# ------------------------------------------------------------------ format 2
+
+@dataclass(frozen=True)
+class AttestationV2Record:
+    """A format-2 record as the signer logs it: the signed message and its
+    signature, with the market label beside them (not signed). `att` is the
+    decoded attestation; its fields are what a contract rebuilds."""
+    market: str
+    att: object
+
+    @property
+    def timestamp(self):
+        return self.att.time
+
+    @property
+    def price(self):
+        return self.att.price
+
+    def to_dict(self):
+        return self.att.to_dict(market=self.market)
+
+
+def parse_v2(d):
+    """A format-2 record from its JSON form, or ValueError. The fields beside
+    the message must agree with it (AF.AttestationV2.from_dict)."""
+    if not isinstance(d, dict) or AF.format_of(d) != FORMAT_2:
+        raise ValueError("not a format-2 record")
+    return AttestationV2Record(str(d.get("market") or ""), AF.AttestationV2.from_dict(d))
+
+
+def market_ids(market, resolve):
+    """(base, quote) as a format-2 message names them, for a market written
+    COLLATERAL/DEBT. `resolve(symbol)` gives an asset id in RPC display order,
+    or `"unit:BTC"` / `"unit:USD"` for a unit that is not a Sequentia asset
+    (native bitcoin is the unit `BTC`, never an asset). A symbol it cannot
+    resolve is a ValueError, never a guess: an id is what the signature binds,
+    and a wrong one makes a genuine attestation fail or a foreign one pass."""
+    out = []
+    for sym in (p.strip() for p in str(market).split("/")):
+        got = resolve(sym)
+        if not got:
+            raise ValueError(f"no asset id for {sym!r}")
+        got = str(got)
+        out.append(AF.unit_id(got[5:]) if got.startswith("unit:")
+                   else AF.asset_from_display(got))
+    if len(out) != 2:
+        raise ValueError(f"a market is BASE/QUOTE, not {market!r}")
+    return tuple(out)
+
+
+def verify_v2(oracle_x, rec, base, quote, precision=None):
+    """Check a format-2 record as a contract would, plus what only a reader
+    can: it is THIS key's, of THIS pair, at the precision the caller computes
+    with, with no beacon (none is specified yet, and a contract pinning a zero
+    beacon accepts nothing else)."""
+    if isinstance(oracle_x, str):
+        oracle_x = bytes.fromhex(oracle_x)
+    a = rec.att if isinstance(rec, AttestationV2Record) else rec
+    if (a.base, a.quote) != (bytes(base), bytes(quote)):
+        return False
+    if precision is not None and a.precision != int(precision):
+        return False
+    if a.beacon != AF.NO_BEACON:
+        return False
+    return a.verify(oracle_x)
+
+
+def precision_of(price_scale):
+    """The format-2 precision that matches a format-1 price scale, or None
+    when the scale is not a power of ten (and so has no format-2 twin)."""
+    p, n = 0, int(price_scale)
+    while n > 1 and n % 10 == 0:
+        n //= 10
+        p += 1
+    return p if n == 1 and p <= AF.MAX_PRECISION else None
+
+
+class AttestationLogV2(AttestationLog):
+    """The signer's format-2 log: the same append-only file, digest and
+    recent view as format 1, holding format-2 records. Its records are signed
+    by the signer; this class only reads them, and a reader verifies."""
+
+    def _parse(self, line):
+        if isinstance(line, bytes):
+            try:
+                line = line.decode()
+            except UnicodeDecodeError:
+                return None
+        line = line.strip()
+        if not line:
+            return None
+        try:
+            return parse_v2(json.loads(line))
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def append(self, att):
+        raise RuntimeError("the format-2 log is written by the signer alone")

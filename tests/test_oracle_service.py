@@ -643,63 +643,6 @@ def main():
               pk["oracle_x"] not in pk["previous"])
 
         print("a seizure is co-signed only against this oracle's own price")
-        sighash = "ab" * 32
-        # A bare --sighash pins NOTHING: no loan for this oracle to rebuild the
-        # sighash from, and no lender-signed offer pinning the strike -- so the
-        # figure the price is judged against is one the party asking for the
-        # seizure typed, and any strike above today's price passes. That is the
-        # act this oracle exists to refuse, so it is refused, and the checks
-        # below say so by opting in.
-        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
-                       "--strike", "400", "--price-scale", "100000",
-                       "--sighash", sighash)
-        check("a bare sighash with no request is refused: it pins nothing",
-              r.returncode != 0 and "pins nothing" in r.stderr, r.stderr[-240:])
-        # From here on, `bare` says "I have checked this by hand" -- which is
-        # what an operator co-signing without a request is really claiming.
-        bare = ("--allow-unpinned-strike",)
-        # GOLD/USDX signs at 300 with these precisions, so a strike of 200 is
-        # above the price and a strike of 400 is not.
-        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
-                       "--strike", "200", "--price-scale", "100000",
-                       "--sighash", sighash)
-        check("a price at or above the strike is refused",
-              r.returncode != 0 and "not justified" in r.stderr, r.stderr[-200:])
-        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "NOPE/USDX",
-                       "--strike", "400", "--sighash", sighash)
-        check("a market this oracle does not sign is refused",
-              r.returncode != 0 and "does not sign" in r.stderr, r.stderr[-200:])
-        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
-                       "--strike", "400", "--sighash", "ab" * 20)
-        check("a sighash that is not 32 bytes is refused",
-              r.returncode != 0 and "32 bytes" in r.stderr, r.stderr[-200:])
-        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
-                       "--strike", "400", "--sighash", sighash,
-                       "--max-age", "-1")
-        check("and so is one justified by a price older than --max-age",
-              r.returncode != 0 and "signed" in r.stderr, r.stderr[-200:])
-        # By hand, the loan's own price scale has to be given: a strike is an
-        # integer scaled by it, and this oracle signs at its own. Comparing two
-        # written at different scales decides a seizure by a power of ten, so
-        # the omission is refused rather than guessed at.
-        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
-                       "--strike", "400", "--sighash", sighash)
-        check("a hand-fed seizure with no price scale is refused",
-              r.returncode != 0 and "price scale" in r.stderr,
-              r.stderr[-200:])
-        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
-                       "--strike", "400", "--price-scale", "100000",
-                       "--sighash", sighash)
-        check("a genuine seizure is co-signed", r.returncode == 0,
-              r.stderr[-300:])
-        rec = json.loads(r.stdout)
-        check("the co-signature is over the sighash it was given",
-              rec["sighash"] == sighash)
-
-        # A loan naming SOMEBODY ELSE's oracle. The Bitcoin script asks for the
-        # key the loan baked in, so this signature would authorise nothing --
-        # while the published record said this oracle had approved a seizure it
-        # has no part in.
         from pignus import btc_collateral as BC             # noqa: PLC0415
         mine = run_oracle(cfg_path, "--print-pubkey").stdout.strip()
         seize_base = dict(
@@ -707,7 +650,83 @@ def main():
             debt_asset="dd" * 32, debt=1000, repay_deadline=200000,
             recover_after=900000, market="GOLD/USDX", strike=400,
             price_scale=100000, lender_prog="ee" * 20, lender_ver=0,
-            payment_hash="ff" * 32)
+            payment_hash="ff" * 32, oracle_x=mine)
+        n_req = [0]
+
+        def request(**over):
+            """A seizure request for a loan on this oracle, with `over`
+            changed. Every field is written by `seize_request`, including the
+            sighash rebuilt from these very terms, so a refusal is for the
+            property changed and nothing else. No lender-signed offer: the
+            checks below pass --allow-unpinned-strike, which is what an
+            operator co-signing a loan arranged by hand is claiming."""
+            loan = BC.loan_from_dict({**seize_base, **over})
+            req = BC.seize_request(loan, "aa" * 32, 0,
+                                   b"\x00\x14" + b"\xee" * 20, 1000)
+            n_req[0] += 1
+            rp = os.path.join(work, f"seize-{n_req[0]}.json")
+            json.dump(req, open(rp, "w"))
+            return rp, req
+
+        def seize(rp, *extra):
+            return run_oracle(cfg_path, "--sign-seize", "--request", rp,
+                              "--allow-unpinned-strike", *extra)
+
+        # A bare sighash is 32 bytes somebody else computed. This key also
+        # signs format-2 price attestations, whose signed message is a 32-byte
+        # digest too, so a key that signs a hash it was handed can be made to
+        # sign a price it never observed. Refused, with or without the flags
+        # that once let an operator vouch for it.
+        sighash = "ab" * 32
+        r = run_oracle(cfg_path, "--sign-seize", "--market", "GOLD/USDX",
+                       "--strike", "400", "--sighash", sighash)
+        check("a bare sighash with no request is refused",
+              r.returncode != 0 and "takes --request" in r.stderr,
+              r.stderr[-240:])
+        rp, _ = request()
+        r = run_oracle(cfg_path, "--sign-seize", "--request", rp,
+                       "--allow-unpinned-strike", "--sighash", sighash)
+        check("and so is a sighash given beside a request",
+              r.returncode != 0 and "takes --request" in r.stderr,
+              r.stderr[-240:])
+        r = run_oracle(cfg_path, "--sign-seize", "--allow-unpinned-strike")
+        check("and a seizure with no request at all",
+              r.returncode != 0 and "takes --request" in r.stderr,
+              r.stderr[-240:])
+        # GOLD/USDX signs at 300 with these precisions, so a strike of 200 is
+        # above the price and a strike of 400 is not.
+        r = seize(request(strike=200)[0])
+        check("a price at or above the strike is refused",
+              r.returncode != 0 and "not justified" in r.stderr, r.stderr[-200:])
+        r = seize(request(market="NOPE/USDX")[0])
+        check("a market this oracle does not sign is refused",
+              r.returncode != 0 and "does not sign" in r.stderr, r.stderr[-200:])
+        r = seize(rp, "--strike", "500")
+        check("a --strike the request's loan does not carry is refused",
+              r.returncode != 0 and "The loan decides" in r.stderr,
+              r.stderr[-200:])
+        r = seize(rp, "--max-age", "-1")
+        check("and so is one justified by a price older than --max-age",
+              r.returncode != 0 and "signed" in r.stderr, r.stderr[-200:])
+        r = run_oracle(cfg_path, "--sign-seize", "--request", rp)
+        check("a request with no lender-signed offer needs the operator's "
+              "--allow-unpinned-strike", r.returncode != 0, r.stderr[-200:])
+        rp, req = request()
+        r = seize(rp)
+        check("a genuine seizure is co-signed", r.returncode == 0,
+              r.stderr[-300:])
+        rec = json.loads(r.stdout)
+        sighash = req["sighash"]
+        check("the co-signature is over the sighash rebuilt from the loan",
+              rec["sighash"] == sighash
+              and rec["sighash"] == BC.seize_sighash(
+                  BC.loan_from_dict(seize_base), "aa" * 32, 0,
+                  b"\x00\x14" + b"\xee" * 20, 1000).hex())
+
+        # A loan naming SOMEBODY ELSE's oracle. The Bitcoin script asks for the
+        # key the loan baked in, so this signature would authorise nothing --
+        # while the published record said this oracle had approved a seizure it
+        # has no part in.
         for who, key, refused_for_key in (("this oracle", mine, False),
                                           ("another oracle", "11" * 32, True)):
             loan = BC.loan_from_dict({**seize_base, "oracle_x": key})
@@ -732,9 +751,7 @@ def main():
         # the seizure would look justified. It is not: the two numbers are not
         # comparable at all, and nothing downstream could catch it -- the scale
         # is in no Bitcoin script, and no covenant runs in a Tier B seizure.
-        r = run_oracle(cfg_path, *bare, "--sign-seize", "--market", "GOLD/USDX",
-                       "--strike", "400000", "--price-scale", "100000000",
-                       "--sighash", sighash)
+        r = seize(request(strike=400000, price_scale=100000000)[0])
         check("a loan written at another price scale is refused",
               r.returncode != 0 and "price scale" in r.stderr,
               r.stderr[-200:])

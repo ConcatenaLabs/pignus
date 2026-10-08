@@ -316,6 +316,31 @@ The oracle is a public, replayable log: attestations are published for everyone,
 not handed to a liquidator, so any watcher can verify a liquidation was
 justified after the fact.
 
+That message is **attestation format 1**, and every vault here checks it. A
+Simplicity program cannot: its signature jet takes a 32-byte message, and the
+48 bytes above are signed raw. **Format 2**, defined in
+[`sequentia-oracle`](https://github.com/ConcatenaLabs/sequentia-oracle)'s
+`doc/format.md`, is a fixed-width message of the signer's key, the base and
+quote asset ids, the price, its precision, the time and a beacon field, signed
+over its tagged hash, which a Simplicity program and a tapscript leaf both
+rebuild. It also signs what format 1 leaves to each consumer: the precision
+(format 1's `price_scale` is not in the message) and the assets themselves
+rather than a market name. A vault checks one format, fixed when it is built,
+so each loan says which (`attestation_format`, 1 for every vault here), and
+an oracle whose key backs open format-1 loans publishes format 1 for as long
+as one is open, and format 2 for the same observations beside it.
+
+Both come from one key held by a separate signer process
+(`sequentia-oracle-signer`) that serves nothing; `pignus-oracle` publishes
+its logs, verifying each record before serving it, and never reads the key.
+The key then signs exactly three kinds of message, and none can stand for
+another: a 48-byte format-1 message, a format-2 digest under the tag
+`Sequentia/oracle/price`, and a Tier B seizure's BIP341 signature hash under
+the tag `TapSighash`, which it rebuilds itself from the loan in the request.
+It never signs a 32-byte value it was handed: that value could as well be a
+format-2 digest of a price nobody observed as a transaction hash, and every
+contract pinning the key would accept it.
+
 ## 5. Freshness, and the one honest gap
 
 The covenant can test that an attestation is NEWER than `not_before`. Nothing in

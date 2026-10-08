@@ -51,6 +51,17 @@ jobs:
           path: Sequentia
           fetch-depth: 1
 
+      # The attestation formats and the signer, from the repository that owns
+      # them: tests/test_attestation_formats.py runs its signer and compares
+      # the vendored copy in pignus/sequentia_oracle/ with it.
+      - name: check out sequentia-oracle
+        uses: actions/checkout@v4
+        with:
+          repository: ConcatenaLabs/sequentia-oracle
+          ref: main
+          path: sequentia-oracle
+          fetch-depth: 1
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -94,6 +105,10 @@ jobs:
           # README lists it in the half that runs here.
           python3 tests/test_watcher_reorgs.py
           python3 tests/test_oracle_service.py
+          # Formats 1 and 2 against the vendored reader, and the oracle
+          # publishing sequentia-oracle's own signer's logs (checked out
+          # beside this repository) without holding its key.
+          SEQUENTIA_ORACLE=${{ github.workspace }}/sequentia-oracle python3 tests/test_attestation_formats.py
           python3 tests/test_liquidator.py
           python3 tests/test_btc_relay_auth.py
           # The Python repurchase composer against the same golden vectors the

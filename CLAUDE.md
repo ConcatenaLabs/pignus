@@ -96,6 +96,11 @@ feature lands with the ways it must fail, or it does not land.
 - **Never treat a loan as originated until its funding is buried.** Sequentia
   reorgs when Bitcoin reorgs, in real time. The watcher reports a vault whose
   funding was undone as GHOST, and that is correct, not a bug to paper over.
+- **The oracle key signs only what it computed itself.** It signs format-1
+  attestations, format-2 digests (`pignus/sequentia_oracle/`, vendored from
+  sequentia-oracle: edit nothing there) and seizure sighashes it rebuilds from
+  the loan in a request. Never add a path that signs a 32-byte value it was
+  handed: that value could be a format-2 digest of a price nobody observed.
 - **Explicit amounts only.** The covenant asserts every introspected asset and
   value prefix is `0x01`. A blinded output it cannot read is refused rather than
   guessed at.

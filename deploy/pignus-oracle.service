@@ -33,6 +33,11 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=/root/sequentia/pignus-data
+# With a `signer` in its config this process publishes what a separate signer
+# (sequentia-oracle) writes and must never read that signer's key: its whole
+# directory is hidden from it. The leading "-" lets the unit start on a box
+# with no signer directory.
+InaccessiblePaths=-/root/sequentia/oracle-signer
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

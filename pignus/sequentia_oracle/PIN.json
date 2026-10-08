@@ -1,0 +1,9 @@
+{
+ "_note": "Vendored from sequentia-oracle at this commit: the reader and signer of the attestation formats, and its golden vectors. Replace the files only with newer copies from that repository and update every field; tests/test_attestation_formats.py checks the hashes.",
+ "repository": "https://github.com/ConcatenaLabs/sequentia-oracle",
+ "commit": "22165d77ea59fa703db96ad7d5360df7a0ccbfa6",
+ "files": {
+  "attestation.py": {"from": "sequentia_oracle/attestation.py", "sha256": "fa1de0a73e207884553e82f808556fcc8b2a8924c8918ecf2a1bfb5e6001a2ab"},
+  "attestations.json": {"from": "vectors/attestations.json", "sha256": "59e02007b44114786fd5150cbd0dc651e497b712c7e9e8ec9b2ffee462c900c7"}
+ }
+}

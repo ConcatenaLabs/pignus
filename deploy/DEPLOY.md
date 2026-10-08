@@ -136,6 +136,61 @@ Publish the key so borrowers and lenders can pin it:
   --config /root/sequentia/pignus-oracle.json --print-pubkey
 ```
 
+## The key in a separate signer
+
+An oracle can sign in process, as above, or leave its key to
+[`sequentia-oracle`](https://github.com/ConcatenaLabs/sequentia-oracle)'s
+signer, which publishes attestation format 1 (what every loan here checks) and
+format 2 (what Simplicity and tapscript contracts check) for the same
+observations, and serves nothing. `pignus-oracle` then only publishes the
+signer's logs, and its unit cannot reach the signer's directory
+(`InaccessiblePaths=` in `pignus-oracle.service`). The signer's own runbook
+(`doc/runbook.md` there) has its configuration in full; for the primary oracle
+on this layout:
+
+```bash
+cd /root/sequentia && git clone https://github.com/ConcatenaLabs/sequentia-oracle.git
+cp /root/sequentia/sequentia-oracle/deploy/sequentia-oracle-signer@.service /etc/systemd/system/
+install -d -m 700 /root/sequentia/oracle-signer /root/sequentia/oracle-signer/1
+cp /root/sequentia/sequentia-oracle/deploy/signer.example.json /root/sequentia/oracle-signer/1.json
+# edit 1.json: the same markets, precisions, symbols, source and guards as
+# pignus-oracle.json, `precision` 5 for a price_scale of 100000, and every
+# asset id (sequentia-oracle's tools/resolve_assets.py reads them from the
+# registry). log_v1 is this oracle's existing attestations.log.
+systemctl stop pignus-oracle
+mv /root/sequentia/pignus-data/oracle.key /root/sequentia/oracle-signer/1/oracle.key
+chmod 600 /root/sequentia/oracle-signer/1/oracle.key
+```
+
+Then in `pignus-oracle.json` remove `keyfile`, `source`, `max_jump`,
+`jump_rounds` and `flat_rounds` (the signer's now, and refused here), set
+`log_max_bytes` to 0 (the signer appends to the log, so nothing may rotate it
+underneath), and add
+
+```json
+"signer": {"key": "<python3 /root/sequentia/sequentia-oracle/bin/sequentia-oracle-signer --config /root/sequentia/oracle-signer/1.json --print-pubkey>",
+           "log_v2": "/root/sequentia/pignus-data/attestations-v2.log",
+           "status": "/root/sequentia/pignus-data/signer-status.json"}
+```
+
+and start both:
+
+```bash
+systemctl daemon-reload
+systemctl enable --now sequentia-oracle-signer@1
+systemctl restart pignus-oracle
+curl -s localhost:8740/healthz      # "signer": "external", "formats": [1, 2]
+curl -s localhost:8740/v2/attestation/GOLD_USDX
+```
+
+The key is unchanged, so every open loan still verifies against it. A
+co-signed seizure then takes the key file for that one command:
+`pignus-oracle --config /root/sequentia/pignus-oracle.json --sign-seize
+--request seizure.json --keyfile /root/sequentia/oracle-signer/1/oracle.key`.
+Back up `/root/sequentia/oracle-signer` with the rest (*Backups*): the key now
+lives there. The further oracles move the same way, each to its own instance
+(`2.json`, `2/oracle.key`, and its own log paths).
+
 ## Backups
 
 Everything Pignus keeps that is not on a chain: the oracle keys and their
@@ -148,6 +203,8 @@ the box:
 mkdir -p /var/lib/pignus-backup
 tar czf /var/lib/pignus-backup/pignus-$(date +%F).tgz \
     /root/sequentia/pignus-data \
+    $(test -d /root/sequentia/oracle-signer \
+      && echo /root/sequentia/oracle-signer) \
     $(test -d /root/sequentia/pignus-btc-keys \
       && echo /root/sequentia/pignus-btc-keys) \
     /root/sequentia/pignusd.json \
@@ -160,7 +217,8 @@ tar czf /var/lib/pignus-backup/pignus-$(date +%F).tgz \
       && echo /root/sequentia/pignus-alert.env)
 ```
 
-`pignus-btc-keys` is named as well as `pignus-data` because a lender key kept
+`oracle-signer` is named when it exists, which it does once a separate signer
+holds an oracle key (*The key in a separate signer*). `pignus-btc-keys` is named as well as `pignus-data` because a lender key kept
 there rather than in `pignus-data` would otherwise be the one file the archive
 lacks. It, the responder's config and the liquidator's environment file are
 named only if they exist: tar fails the whole archive on a missing path rather

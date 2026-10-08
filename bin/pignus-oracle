@@ -144,7 +144,13 @@ SOURCE_KEYS = {
 
 # Every top-level key of an oracle config this service reads; `main` refuses
 # any other, the way build_source refuses an unknown source key.
-CONFIG_KEYS = ("book", "compromised_keys", "flat_rounds", "interval", "jump_rounds", "keyfile", "listen", "log_max_bytes", "logfile", "markets", "max_jump", "precisions", "previous_keys", "price_scale", "seizures", "source", "symbols", "trusted_proxies")
+CONFIG_KEYS = ("book", "compromised_keys", "flat_rounds", "interval", "jump_rounds", "keyfile", "listen", "log_max_bytes", "logfile", "markets", "max_jump", "precisions", "previous_keys", "price_scale", "seizures", "signer", "source", "symbols", "trusted_proxies")
+
+# With a `signer` section, this process publishes what a separate signer
+# (sequentia-oracle) writes, and holds no key. These settings belong to the
+# signer then; set here they would go nowhere.
+SIGNER_OWNS = ("keyfile", "source", "max_jump", "jump_rounds", "flat_rounds")
+SIGNER_KEYS = ("key", "log_v2", "status")
 
 
 def build_source(cfg):
@@ -266,13 +272,29 @@ class Oracle:
                            for k, v in cfg.get("precisions", {}).items()}
         self.markets = list(cfg.get("markets", []))
         self._check_precisions()
-        self.sec = load_or_create_key(cfg["keyfile"], create=create_key)
-        self.xonly = O.xonly_pubkey(self.sec)
-        self.log = O.AttestationLog(cfg["logfile"],
-                                    max_bytes=int(cfg.get("log_max_bytes", 0)))
+        # External: a separate signer holds the key and writes the logs; this
+        # process reads them and the signer's status, and never sees the key.
+        self.signer = cfg.get("signer")
+        self.log_v2 = None
+        self.latest_v2 = {}
+        self.formats = [O.FORMAT_1]
+        self.status_skew = None
+        if self.signer is not None:
+            self._check_signer(cfg)
+            self.sec = None
+            self.xonly = bytes.fromhex(self.signer["key"])
+            self.log = O.AttestationLog(cfg["logfile"])
+            self.log_v2 = O.AttestationLogV2(self.signer["log_v2"])
+            self.source = None
+            self._verified = set()
+        else:
+            self.sec = load_or_create_key(cfg["keyfile"], create=create_key)
+            self.xonly = O.xonly_pubkey(self.sec)
+            self.log = O.AttestationLog(cfg["logfile"],
+                                        max_bytes=int(cfg.get("log_max_bytes", 0)))
+            self.source = build_source(cfg)
         self.seizures = SeizureLog(cfg.get("seizures")
                                    or cfg["logfile"] + ".seizures")
-        self.source = build_source(cfg)
         # The peers whose `X-Forwarded-For` this oracle believes. Behind a
         # reverse proxy every request arrives from loopback, and keying a rate
         # limit on that gives the whole internet one bucket -- so one flooder
@@ -355,6 +377,37 @@ class Oracle:
         self.round_error = None
         self._lock = threading.Lock()
 
+    def _check_signer(self, cfg):
+        sig = self.signer
+        if not isinstance(sig, dict):
+            raise SystemExit("`signer` is an object: key, log_v2, status")
+        odd = sorted(set(sig) - set(SIGNER_KEYS))
+        missing = [k for k in SIGNER_KEYS if not sig.get(k)]
+        if odd or missing:
+            raise SystemExit(
+                f"`signer` takes {', '.join(SIGNER_KEYS)}"
+                + (f"; it does not read {', '.join(odd)}" if odd else "")
+                + (f"; it is missing {', '.join(missing)}" if missing else ""))
+        try:
+            key = bytes.fromhex(str(sig["key"]))
+        except ValueError:
+            key = b""
+        if len(key) != 32:
+            raise SystemExit("signer.key is the signer's x-only public key, 64 "
+                             "hex characters (sequentia-oracle-signer "
+                             "--print-pubkey)")
+        here = sorted(k for k in SIGNER_OWNS if k in cfg)
+        if here:
+            raise SystemExit(
+                f"with a `signer`, {', '.join(here)} belong to the signer's own "
+                f"configuration; this process holds no key and reads no feed. "
+                f"Remove them here.")
+        if int(cfg.get("log_max_bytes", 0) or 0):
+            raise SystemExit(
+                "with a `signer`, log_max_bytes must be 0: the signer appends "
+                "to the log, and a file rotated under it by another process "
+                "loses records")
+
     def _check_precisions(self):
         """Every asset in `markets` needs an explicit decimal count.
 
@@ -391,11 +444,82 @@ class Oracle:
                 return m
         return None
 
+    def follow(self):
+        """One round in external mode: take in what the signer appended,
+        verify the newest record of each market under the configured key, and
+        read the signer's status for errors and liveness. Nothing is signed
+        here. A record that does not verify is not served: the log is the
+        signer's, but this process is the one putting it in front of people.
+        A failure raises, so the loop reports it and a run of them restarts
+        the process, as a failed signing round does."""
+        self.log.follow()
+        self.log_v2.follow()
+        with open(self.signer["status"]) as f:
+            st = json.load(f)
+        if str(st.get("key", "")).lower() != self.xonly.hex():
+            raise RuntimeError(
+                f"the signer's status names key {str(st.get('key'))[:16]}…, "
+                f"not the {self.xonly.hex()[:16]}… configured here")
+        rows = st.get("markets") or {}
+        last = float(st.get("last_round") or 0)
+        with self._lock:
+            latest = dict(self.latest)
+            latest_v2 = dict(self.latest_v2)
+        errors, seen = {}, {}
+        for m in self.markets:
+            # The signer writes markets in canonical form (upper case, one
+            # slash); this config may spell them otherwise.
+            canon = "/".join(p.strip().upper() for p in m.split("/"))
+            row = rows.get(canon)
+            if row is None:
+                errors[m] = "the signer does not sign this market"
+            elif row.get("error"):
+                errors[m] = str(row["error"])
+            # The cache of what verified is keyed by everything signed AND the
+            # signature: a line carrying a signature that verified once, over
+            # a message that says something else, is a forgery, not a repeat.
+            att = self.log.latest(canon)
+            if att is not None:
+                ident = ("v1", att.to_json())
+                if ident in self._verified or O.verify(self.xonly, att):
+                    self._verified.add(ident)
+                    latest[m] = att
+                else:
+                    errors.setdefault(
+                        m, "its newest format-1 record does not verify under "
+                           "the signer's key; the last one that did is served")
+            rec = self.log_v2.latest(canon)
+            if rec is not None:
+                ident = ("v2", rec.att.message(), rec.att.signature)
+                if ident in self._verified or rec.att.verify(self.xonly):
+                    self._verified.add(ident)
+                    latest_v2[m] = rec
+                else:
+                    errors.setdefault(
+                        m, "its newest format-2 record does not verify under "
+                           "the signer's key; the last one that did is served")
+            if m not in errors and last:
+                seen[m] = last
+        if len(self._verified) > 100_000:
+            self._verified.clear()
+        with self._lock:
+            self.latest, self.latest_v2 = latest, latest_v2
+            self.errors = errors
+            self.signed_at = {m: a.timestamp for m, a in latest.items()}
+            self.seen_at = seen
+            self.last_round = last
+            self.source_error = st.get("source_error")
+            self.status_skew = st.get("clock_skew")
+            self.formats = sorted(int(f) for f in (st.get("formats") or [1]))
+            self.interval = float(st.get("interval") or self.interval)
+
     def tick(self):
         """Sign one round of prices. A market that fails is recorded and skipped
         rather than taking the round down: an oracle that stops signing every
         feed because one price source hiccuped is an oracle whose outage reaches
         the RECOVER backstop."""
+        if self.signer is not None:
+            return self.follow()
         try:
             # One snapshot for the whole round, so two markets cannot be signed
             # against feeds that moved between them. A failure here is not fatal
@@ -715,9 +839,8 @@ class Oracle:
                 "REFUSED: this seizure does not say what price scale the loan "
                 "is written at. A strike is an integer scaled by it and this "
                 "oracle signs at its own, so comparing them without knowing "
-                "both would decide the seizure by a power of ten. Use "
-                "--request, which carries the loan and its scale, or give "
-                "--price-scale.")
+                "both would decide the seizure by a power of ten. The "
+                "request's loan carries its scale.")
         if int(loan_scale) != int(self.price_scale):
             raise SystemExit(
                 f"REFUSED: this loan is written at price scale {loan_scale} "
@@ -885,7 +1008,8 @@ class Handler(BaseHTTPRequestHandler):
         age = None if not last_round else round(now - last_round, 1)
         ok = (not errs and not stale and round_error is None
               and last_round > 0 and now - last_round <= window)
-        skew = getattr(o.source, "clock_skew", None)
+        skew = (o.status_skew if o.signer is not None
+                else getattr(o.source, "clock_skew", None))
         signed = sum(1 for m in o.markets if m not in errs and m not in stale)
         with o._lock:
             last_signed = max(o.signed_at.values(), default=None)
@@ -894,7 +1018,9 @@ class Handler(BaseHTTPRequestHandler):
                     "errors": errs, "stale": stale, "round_error": round_error,
                     "source_error": source_error,
                     "clock_skew": None if skew is None else round(skew, 1),
-                    "last_round": int(last_round) or None, "age": age}
+                    "last_round": int(last_round) or None, "age": age,
+                    "signer": "external" if o.signer is not None else "in-process",
+                    "formats": list(o.formats)}
 
     def do_GET(self):
         o = self.oracle
@@ -907,6 +1033,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200 if ok else 503, body)
             if path == "/v1/pubkey":
                 return self._send(200, {"oracle_x": o.xonly.hex(),
+                                        "formats": list(o.formats),
                                         "price_scale": o.price_scale,
                                         "previous": list(o.previous_keys),
                                         "compromised": list(o.compromised_keys)})
@@ -956,6 +1083,8 @@ class Handler(BaseHTTPRequestHandler):
                                        os.path.basename(o.log.path))
             if path == "/v1/log":
                 return self._log(o, q)
+            if path.startswith("/v2/"):
+                return self._v2(o, path, q)
             return self._send(404, {"error": "no such endpoint", "path": path})
         except Exception as e:                    # noqa: BLE001
             return self._send(500, {"error": f"{type(e).__name__}: {e}"})
@@ -1021,6 +1150,54 @@ class Handler(BaseHTTPRequestHandler):
                                     age=int(time.time()) - att.timestamp,
                                     stale=bool(error), error=error))
 
+    def _v2(self, o, path, q):
+        """Format 2, published from the signer's log. An oracle signing in
+        process signs format 1 only; format 2 comes from a separate signer."""
+        if o.log_v2 is None:
+            return self._send(404, {
+                "error": "this oracle publishes format 1 only. Format 2 is "
+                         "signed by a separate signer (sequentia-oracle) and "
+                         "published by an oracle configured with `signer`"})
+        if path.startswith("/v2/attestation/"):
+            asked = path[len("/v2/attestation/"):].replace("_", "/")
+            market = o.canonical_market(asked)
+            if market is None:
+                return self._send(404, {
+                    "error": f"this oracle does not sign {asked.upper()}",
+                    "markets": o.markets})
+            with o._lock:
+                rec = o.latest_v2.get(market)
+                error = o.errors.get(market)
+            if rec is None:
+                return self._send(404, {"error": f"no format-2 attestation "
+                                                 f"for {market}",
+                                        "detail": error})
+            return self._send(200, dict(rec.to_dict(),
+                                        age=int(time.time()) - rec.timestamp,
+                                        stale=bool(error), error=error))
+        if path == "/v2/log":
+            market = (q.get("market", [None])[0] or None)
+            if market:
+                asked = market.replace("_", "/")
+                market = "/".join(p.strip().upper() for p in asked.split("/"))
+            try:
+                n = min(int(q.get("n", ["50"])[0]), 1000)
+            except ValueError:
+                return self._send(400, {"error": "n is an integer"})
+            if n < 1:
+                return self._send(400, {"error": "n must be at least 1"})
+            return self._send(200, {"attestations": [
+                r.to_dict() for r in o.log_v2.tail(n, market)]})
+        if path == "/v2/digest":
+            return self._send(200, {"digest": o.log_v2.digest(),
+                                    "file": os.path.basename(o.log_v2.path)})
+        if path == "/v2/log/raw":
+            if not self._archive_ok():
+                return None
+            fh, size = o.log_v2.open_file(None)
+            return self._send_file(fh, size, os.path.basename(o.log_v2.path))
+        return self._send(404, {"error": "no such endpoint", "path": path})
+
     def _log(self, o, q):
         market = (q.get("market", [None])[0] or None)
         if market:
@@ -1064,18 +1241,16 @@ def main():
                     help="print the oracle x-only key and exit")
     ap.add_argument("--sign-seize", action="store_true",
                     help="co-sign a native-BTC seizure and publish the "
-                         "attestation that justifies it. Takes --request "
-                         "(preferred), or --sighash with --market, --strike "
-                         "and --price-scale plus --allow-unpinned-strike")
-    ap.add_argument("--sighash", help="with --sign-seize: the 32-byte sighash "
-                                      "from `pignus-cli btc-seize-sighash`")
+                         "attestation that justifies it. Takes --request")
+    ap.add_argument("--sighash", help="refused: a seizure is co-signed only "
+                                      "from --request, whose loan the sighash "
+                                      "is rebuilt from")
     ap.add_argument("--request", help="with --sign-seize: the seizure request "
                                       "file `pignus-cli btc-seize-sighash "
-                                      "--out` writes. Preferred over --sighash: "
-                                      "it carries the loan, so this oracle "
-                                      "rebuilds the sighash from the terms "
-                                      "rather than signing a number somebody "
-                                      "else computed")
+                                      "--out` writes. It carries the loan, so "
+                                      "this oracle rebuilds the sighash from "
+                                      "the terms rather than signing a number "
+                                      "somebody else computed")
     ap.add_argument("--allow-unpinned-strike", action="store_true",
                     help="with --sign-seize --request: co-sign a request that "
                          "carries no lender-signed offer. The strike is in no "
@@ -1084,17 +1259,12 @@ def main():
                          "having a healthy loan judged against it. Only for a "
                          "loan arranged entirely by hand, where the operator "
                          "is the one vouching for the terms")
-    ap.add_argument("--market", help="with --sign-seize: the market the loan "
-                                     "is priced in")
+    ap.add_argument("--market", help="with --sign-seize: the market the "
+                                     "request's loan must name; one that "
+                                     "names another is refused")
     ap.add_argument("--strike", type=int,
-                    help="with --sign-seize: the loan's strike; the seizure is "
-                         "refused unless the published price is under it")
-    ap.add_argument("--price-scale", type=int, default=None,
-                    help="with --sign-seize and --strike: the LOAN's price "
-                         "scale. A strike is an integer scaled by it, and this "
-                         "oracle signs at its own -- comparing two numbers "
-                         "written at different scales decides the seizure by a "
-                         "power of ten. --request carries it and is preferred")
+                    help="with --sign-seize: the strike the request's loan "
+                         "must carry; one that carries another is refused")
     ap.add_argument("--max-age", type=int, default=600, metavar="S",
                     help="with --sign-seize: refuse to co-sign against a price "
                          "signed longer ago than this (default 600 s)")
@@ -1105,6 +1275,9 @@ def main():
     ap.add_argument("--allow-unlisted", action="store_true",
                     help="with --sign-seize: co-sign without asking the "
                          "configured book whether the loan is still open")
+    ap.add_argument("--keyfile",
+                    help="with --sign-seize and a `signer` configuration: the "
+                         "signer's key file, read for this command only")
     ap.add_argument("--allow-stale", action="store_true",
                     help="with --sign-seize: co-sign against a price older "
                          "than --max-age anyway")
@@ -1131,9 +1304,16 @@ def main():
     # key: that is a lost key, and a fresh one would sign for nothing the live
     # loans accept while every check downstream stayed green.
     fresh = not os.path.exists(cfg["logfile"])
+    external = cfg.get("signer") is not None
+    if args.keyfile and not (external and args.sign_seize):
+        raise SystemExit("--keyfile is for --sign-seize with a `signer` "
+                         "configuration, which holds no key of its own")
+    if external and args.create_key:
+        raise SystemExit("with a `signer`, the key is the signer's: make it "
+                         "with sequentia-oracle-signer --create-key")
     create = args.create_key or (
         not (args.print_pubkey or args.sign_seize or args.once) and fresh)
-    if os.path.exists(cfg["keyfile"]) and fresh \
+    if not external and os.path.exists(cfg["keyfile"]) and fresh \
             and not (args.print_pubkey or args.sign_seize):
         print(f"pignus-oracle: the key at {cfg['keyfile']} exists but no "
               f"attestation log does at {cfg['logfile']}: the log was lost, or "
@@ -1142,93 +1322,68 @@ def main():
               f"co-signed. Restore the log, its .chain and .seizures from the "
               f"same backup as the key, or publish the gap.", file=sys.stderr)
     o = Oracle(cfg, create_key=create)
+    if external and args.sign_seize:
+        # The one act of this process that needs the key, run by an operator
+        # as a command, never by the web service. The key must be the one the
+        # signer signs with, or the seizure would be co-signed by a stranger.
+        if not args.keyfile:
+            raise SystemExit("with a `signer`, --sign-seize needs --keyfile: "
+                             "the signer's key file, read only for this "
+                             "command")
+        o.sec = load_or_create_key(args.keyfile, create=False)
+        if O.xonly_pubkey(o.sec) != o.xonly:
+            raise SystemExit(f"{args.keyfile} is not the key in signer.key")
 
     if args.print_pubkey:
         print(o.xonly.hex())
         return
     if args.sign_seize:
-        if args.request:
-            # Rebuild the sighash from the loan in the request. An oracle that
-            # signs a number it was handed has read nothing: the number could
-            # seize a healthy loan, or somebody else's.
-            import json as _json
-            from pignus import btc_collateral as _BC
-            with open(args.request) as fh:
-                req = _json.load(fh)
-            loan, want = _BC.check_seize_request(
-                req, require_offer=not args.allow_unpinned_strike)
-            args.sighash = want
-            # The LOAN's own market and strike, always. These are what the
-            # signature is logged against and what a borrower later holds the
-            # oracle to; letting a command line override them would let the
-            # party asking for a seizure choose the terms it is judged by.
-            for name, mine, theirs in (("--market", args.market, loan.market),
-                                       ("--strike", args.strike,
-                                        int(loan.strike))):
-                if mine and str(mine) != str(theirs):
-                    raise SystemExit(
-                        f"{name} says {mine} and the loan in that request says "
-                        f"{theirs}. The loan decides: remove {name}.")
-            args.market = loan.market
-            args.strike = int(loan.strike)
-            # The loan's OWN price scale. A price and a strike are integers
-            # scaled by it, and comparing two written at different scales
-            # decides a seizure by a factor of ten to some power.
-            seize_scale = int(loan.price_scale)
-            # Kept for the published record, so a third party can re-check the
-            # judgement rather than only the price.
-            # The loan this oracle actually JUDGED, not the requester's raw
-            # object. Every key it does not use is dropped before the sighash
-            # is rebuilt, so keeping them would put an unbounded amount of
-            # somebody else's filler into a log every reader of this tier's
-            # accountability has to page through.
-            seize_loan = _BC.loan_to_dict(loan)
-            seize_offer_sig = str(req.get("offer_sig") or "")
-            seize_offer_lots = int(req.get("offer_lots", 1) or 1)
-        else:
-            # NOTHING is pinned on this path. Without a request there is no
-            # loan, so the sighash is 32 bytes somebody else computed and this
-            # oracle cannot rebuild; and no lender-signed offer, so the strike
-            # it is judged against is one the seizing party typed. The strike
-            # is in no Bitcoin script, so a lender naming any figure above
-            # today's price passes the price check below and takes the
-            # collateral of a loan that was never liquidatable -- which is the
-            # exact act this oracle's own documentation says it refuses.
-            #
-            # The same explicit opt-in as a request that carries no offer
-            # signature, and for the same reason.
-            if not args.allow_unpinned_strike:
+        if args.sighash or not args.request:
+            # Refused, always. A bare sighash is 32 bytes somebody else
+            # computed, and this key cannot tell a transaction hash from a
+            # format-2 price attestation digest (sequentia-oracle's
+            # doc/format.md): signing one it was handed could be signing a
+            # price it never observed, which every contract pinning this key
+            # would accept. The request carries the loan, and the sighash is
+            # rebuilt from it here.
+            raise SystemExit(
+                "--sign-seize takes --request and nothing else: this key signs "
+                "only what it computed itself. A 32-byte value handed to it "
+                "could as well be a price attestation as a transaction hash. "
+                "Use --request <file> (pignus-cli btc-seize-sighash --out), "
+                "which carries the loan; the sighash is rebuilt from it.")
+        # Rebuild the sighash from the loan in the request. An oracle that
+        # signs a number it was handed has read nothing: the number could
+        # seize a healthy loan, or somebody else's.
+        from pignus import btc_collateral as _BC
+        with open(args.request) as fh:
+            req = json.load(fh)
+        loan, want = _BC.check_seize_request(
+            req, require_offer=not args.allow_unpinned_strike)
+        # The LOAN's own market and strike, always. These are what the
+        # signature is logged against and what a borrower later holds the
+        # oracle to; letting a command line override them would let the
+        # party asking for a seizure choose the terms it is judged by.
+        for name, mine, theirs in (("--market", args.market, loan.market),
+                                   ("--strike", args.strike,
+                                    int(loan.strike))):
+            if mine and str(mine) != str(theirs):
                 raise SystemExit(
-                    "--sign-seize with a bare --sighash pins nothing: there is "
-                    "no loan for this oracle to rebuild the sighash from, and "
-                    "no lender-signed offer pinning the strike, so the number "
-                    "it would be judged against is one the party asking for "
-                    "the seizure chose. A strike above today's price passes "
-                    "every check here and takes collateral from a healthy "
-                    "loan.\n\nUse --request <file>, which carries the loan and "
-                    "the lender's own signature over its terms. "
-                    "--allow-unpinned-strike says you have checked this "
-                    "seizure by hand and accept that the published record "
-                    "cannot show anyone else why it was justified.")
-        missing = [f for f, v in (("--sighash", args.sighash),
-                                  ("--market", args.market),
-                                  ("--strike", args.strike)) if not v]
-        if "seize_scale" not in locals():
-            # Not stated: `sign_seizure` refuses at the point the scale
-            # matters, after the simpler faults it can name first.
-            seize_scale = (int(args.price_scale)
-                           if args.price_scale is not None else None)
-        if missing:
-            raise SystemExit("--sign-seize needs " + ", ".join(missing))
-        try:
-            sighash = bytes.fromhex(args.sighash)
-        except ValueError:
-            raise SystemExit("--sighash is hex") from None
-        rec = o.sign_seizure(sighash, args.market, args.strike,
-                             loan=locals().get("seize_loan"),
-                             offer_sig=locals().get("seize_offer_sig", ""),
-                             offer_lots=locals().get("seize_offer_lots", 1),
-                             loan_scale=locals().get("seize_scale"),
+                    f"{name} says {mine} and the loan in that request says "
+                    f"{theirs}. The loan decides: remove {name}.")
+        sighash = bytes.fromhex(want)
+        # The loan this oracle actually JUDGED, not the requester's raw
+        # object: every key it does not use is dropped before the sighash is
+        # rebuilt, so keeping them would put an unbounded amount of somebody
+        # else's filler into a log every reader of this tier's accountability
+        # has to page through. The lender's offer signature says the strike is
+        # the one they published, and the loan's OWN price scale is what the
+        # price and the strike are both written at.
+        rec = o.sign_seizure(sighash, loan.market, int(loan.strike),
+                             loan=_BC.loan_to_dict(loan),
+                             offer_sig=str(req.get("offer_sig") or ""),
+                             offer_lots=int(req.get("offer_lots", 1) or 1),
+                             loan_scale=int(loan.price_scale),
                              max_age=args.max_age,
                              allow_stale=args.allow_stale,
                              allow_unlisted=args.allow_unlisted)
@@ -1242,6 +1397,17 @@ def main():
               "for " + ", ".join(o.assumed) + ". Set them: an asset with other "
               "decimals would be signed wrong by a power of ten.",
               file=sys.stderr)
+    if args.once and external:
+        try:
+            o.follow()
+        except Exception as e:                    # noqa: BLE001 - reported
+            print(f"pignus-oracle: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+        for m in o.markets:
+            att, rec = o.latest.get(m), o.latest_v2.get(m)
+            print(f"{m:16s} {att.price if att else '-':>14} "
+                  f"{rec.price if rec else '-':>14}  {o.errors.get(m, 'ok')}")
+        return 1 if o.errors else 0
     if args.once:
         o.tick()
         signed = 0
@@ -1278,8 +1444,13 @@ def main():
     srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
     srv.daemon_threads = True
     print(f"pignus-oracle: key {o.xonly.hex()}", file=sys.stderr)
-    print(f"pignus-oracle: signing {len(o.markets)} market(s) every "
-          f"{o.interval:g}s, serving on {host}:{port}", file=sys.stderr)
+    if external:
+        print(f"pignus-oracle: publishing the signer's {len(o.markets)} "
+              f"market(s), read every {o.interval:g}s, serving on "
+              f"{host}:{port}; this process holds no key", file=sys.stderr)
+    else:
+        print(f"pignus-oracle: signing {len(o.markets)} market(s) every "
+              f"{o.interval:g}s, serving on {host}:{port}", file=sys.stderr)
     srv.serve_forever()
 
 

@@ -30,19 +30,23 @@ SuccessExitStatus=1
 # first and fails on the missing path, and the failure names a directory rather
 # than a problem.
 StateDirectory=pignus-backup
-# EVERY key, not just the oracles': a lender key kept in pignus-btc-keys rather
+# EVERY key, not just the oracles' (in pignus-data, or in oracle-signer when a
+# separate signer holds them): a lender key kept in pignus-btc-keys rather
 # than in pignus-data would otherwise be the one file the archive lacks, and a
 # lender restored without it can answer none of their own live loans. The
 # responder's config and the liquidator's environment file hold credentials
 # and are archived too.
 #
-# Each of those three is named CONDITIONALLY, because each legitimately may not
-# exist: lender.key normally lives inside pignus-data, and a box may run no
+# Each of those is named CONDITIONALLY, because each legitimately may not
+# exist: lender.key normally lives inside pignus-data, an oracle's key is in
+# oracle-signer only when a separate signer holds it, and a box may run no
 # responder or no liquidator. Naming a missing path outright would not make the
 # backup wider; it would make tar exit 2 and the unit fail, so the nights it was
 # most needed would be the nights there is no archive at all.
 ExecStart=/bin/sh -c 'exec tar czf /var/lib/pignus-backup/pignus-$(date +%%F).tgz \
     /root/sequentia/pignus-data \
+    $(test -d /root/sequentia/oracle-signer \
+      && echo /root/sequentia/oracle-signer) \
     $(test -d /root/sequentia/pignus-btc-keys \
       && echo /root/sequentia/pignus-btc-keys) \
     /root/sequentia/pignusd.json \

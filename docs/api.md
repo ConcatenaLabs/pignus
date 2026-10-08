@@ -310,6 +310,21 @@ signed by along with its `age` and `stale`. This is what a threshold loan's
 witness is assembled from, and what a liquidator uses to find the attestation
 signed by the key a particular loan bakes in.
 
+### `GET /v2/attestation/{market}`, `GET /v2/attestations/{market}`
+
+The same, in attestation format 2 (`sequentia-oracle`'s `doc/format.md`), from
+every oracle whose `/v1/pubkey` lists format 2. The book keeps a record only
+when it verifies under that oracle's key for this market's two assets as the
+registry names them (native bitcoin as the unit `BTC`), at the precision the
+market's format-1 `price_scale` implies (`100000` is precision 5), with no
+beacon; a record that does not is an `oracle_errors` entry. Each record carries
+`version`, `message` and `signature`, which are what a reader checks, the
+decoded `key`, `base`, `quote`, `price`, `precision`, `time` and `beacon`,
+which must agree with the message, the unsigned `market` label, and `oracle_x`,
+`age` and `stale` as above. `?oracle=<x-only hex>` on the first picks one
+signer. No loan this book holds is closed by a format-2 attestation: each
+loan's `attestation_format` says which format its covenant checks.
+
 ### `GET /v1/stats`
 
 ```json
@@ -678,7 +693,7 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
   "borrower_prog": "…", "borrower_ver": 0,
   "oracle": "2-of-3", "oracle_x": "…",
   "oracle_keys": ["…", "…", "…"],
-  "oracle_compromised": false,
+  "oracle_compromised": false, "attestation_format": 1,
   "height": 118432, "past_maturity": false, "recover_open": false,
   "price": 300000000, "health": 1.6667, "ltv": 0.525,
   "liquidatable": false,
@@ -688,6 +703,12 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
  "funding_height": 118289, "funding_block": "…"
 }
 ```
+
+`attestation_format` is the attestation format the loan's covenant checks:
+1 for every vault this repository builds, the 48-byte message signed raw. An
+attestation in another format of the same observation cannot close it, so an
+oracle whose key a loan bakes in publishes format 1 for as long as the loan is
+open. Offers carry it too.
 
 `liquidatable_since` is the Unix time at which a LIVE loan's price last crossed
 under its strike, present only while it is under; the book stamps the crossing
@@ -1202,8 +1223,10 @@ Everything else comes out of memory and is not limited.
 
 ### `GET /v1/pubkey`
 
-`{"oracle_x": "…64 hex…", "price_scale": 100000, "previous": ["…"],
-"compromised": ["…"]}` — the key vaults bake in. `previous` lists keys this
+`{"oracle_x": "…64 hex…", "formats": [1, 2], "price_scale": 100000,
+"previous": ["…"], "compromised": ["…"]}` — the key vaults bake in, and the
+attestation formats this oracle publishes: `[1]` when it signs in process,
+the signer's own list when it publishes a separate signer's logs. `previous` lists keys this
 oracle used to sign with, so a borrower's page can tell a rotation from a
 stranger; live vaults bake the key they were originated against, so a
 rotation is never a swap. `compromised` lists keys this operator has declared
@@ -1282,6 +1305,27 @@ seeded with the digest the previous file closed at. So the chain of `.sha256`
 files pins every attestation this key has ever signed: publish `digest`
 somewhere durable and a rewritten or truncated log stops matching it.
 
+### `GET /v2/attestation/{market}`, `/v2/log`, `/v2/log/raw`, `/v2/digest`
+
+Served only by an oracle configured with a `signer` (README, *Attestation
+formats, and the key in a separate signer*); without one each is a 404 that
+says so. They are the format-2 counterparts of the `/v1` endpoints of the same
+names, read from the signer's format-2 log. `/v2/attestation/{market}` is the
+newest record of the market that verifies under the signer's key, with `age`,
+`stale` and `error` beside it as in `/v1`:
+
+```json
+{"version": 2, "message": "02…", "signature": "…",
+ "key": "…", "base": "…", "quote": "…", "price": 300000000, "precision": 5,
+ "time": 1799999940, "beacon": "00…00", "market": "GOLD/USDX",
+ "age": 12, "stale": false, "error": null}
+```
+
+`base` and `quote` are asset ids in internal byte order, the reverse of the
+hex an RPC prints. `/v2/log` takes `market` and `n` (50, capped at 1000) and
+returns the newest records as the file holds them; verify each one you take.
+`/v2/log/raw` streams the file and `/v2/digest` is its running SHA-256.
+
 ### `GET /v1/seizures`, `GET /v1/seizure/{sighash}`
 
 Every native-BTC seizure this oracle has co-signed, each with the attestation
@@ -1308,8 +1352,15 @@ oracle co-signed no such seizure.
 ```json
 {"ok": true, "markets": 6, "signed": 6, "errors": {}, "stale": [],
  "round_error": null, "source_error": null, "clock_skew": 0.3,
- "last_round": 1799999940, "last_signed": 1799999940, "age": 12.4}
+ "last_round": 1799999940, "last_signed": 1799999940, "age": 12.4,
+ "signer": "in-process", "formats": [1]}
 ```
+
+`signer` is `in-process` when this process holds the key and signs, and
+`external` when it publishes a separate signer's logs; then `last_round` is
+the signer's, `round_error` names a signer status file this process cannot
+read or one naming another key, and `errors` names a market whose newest
+record does not verify.
 
 `ok` means *this oracle is signing*, not *this process is running*: a dead
 signing thread, an unwritable log or a feed that stopped answering all leave the

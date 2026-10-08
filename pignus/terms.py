@@ -148,6 +148,16 @@ class LoanTerms:
         return list(self.oracles) if self.oracles else [self.oracle_x]
 
     @property
+    def attestation_format(self):
+        """The attestation format this loan's covenant checks. Every vault
+        this repository builds checks format 1, the 48-byte message signed
+        raw (pignus_covenant.py, attestation_message), so a format-2
+        attestation of the same observation cannot close it. Derived from the
+        covenant, not stored: a loan's terms are signed and hashed as they are,
+        and a vault that checked another format would be another covenant."""
+        return 1
+
+    @property
     def threshold(self):
         if not self.oracles:
             return 1

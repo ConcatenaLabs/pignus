@@ -95,6 +95,10 @@ Endpoints:
     GET  /v1/attestation/{market}     the primary oracle's latest attestation
                                (?oracle=<x> for one other oracle's)
     GET  /v1/attestations/{market}    one verified attestation per oracle
+    GET  /v2/attestation/{market}     the same in format 2, from an oracle
+                               that publishes it (?oracle=<x>)
+    GET  /v2/attestations/{market}    one verified format-2 attestation per
+                               oracle
     GET  /v1/stats             counts, live debt, positions near their strike
     GET  /v1/unrenderable      records this book holds and cannot show, and why
     GET  /v1/oracle            the primary oracle key this book quotes against
@@ -394,6 +398,16 @@ def _limit(rows, q):
     return rows[:n] if n else rows
 
 
+def _attested_v2(rec, max_age):
+    """One format-2 attestation as it is served: the signed message and
+    signature with their decoded fields, the market label, and its age."""
+    d = rec.to_dict()
+    d["oracle_x"] = rec.att.key.hex()
+    d["age"] = O.age_of(rec)
+    d["stale"] = not O.current(rec, max_age)
+    return d
+
+
 def _attested(att, oracle_x, max_age):
     """One attestation as it is served: the signed fields untouched, with who
     signed it and how old it is beside them.
@@ -489,6 +503,15 @@ class Service:
         self.oracle_keys = []                       # x-only hex, in url order
         self.oracle_key_by_url = {}
         self.att_by_oracle = {}                     # (oracle_x, market) -> att
+        # Format 2 (sequentia-oracle's doc/format.md), from every oracle that
+        # publishes it: the same observations, in the fixed-width message a
+        # Simplicity program or a tapscript leaf rebuilds. No covenant this
+        # book watches checks it (each loan's `attestation_format` says which
+        # one its covenant checks); it is read and verified here so that the
+        # format contracts build on is served beside the one open loans need.
+        self.att_v2_by_oracle = {}                  # (oracle_x, market) -> rec
+        self.attestations_v2 = {}                   # market -> primary's rec
+        self.oracle_formats = {}                    # url -> formats it signs
         # What each oracle says the two assets of a market are denominated in.
         # The price is an integer scaled by those precisions, so an oracle
         # working from one set and a registry publishing another do not disagree
@@ -649,7 +672,7 @@ class Service:
         if not self.oracle_urls:
             return
         primary = self.oracle_urls[0]
-        key_by_url, errors = {}, []
+        key_by_url, errors, formats = {}, [], {}
         compromised, previous = set(), {}
         primary_err = None              # why the PRIMARY is out, when it is
         for url in self.oracle_urls:
@@ -689,6 +712,10 @@ class Service:
                                   f"previous one; ignored")
             previous[url] = prev
             key_by_url[url] = served
+            try:
+                formats[url] = sorted({int(f) for f in pub.get("formats") or [1]})
+            except (TypeError, ValueError):
+                formats[url] = [1]
         for url, ox in list(key_by_url.items()):
             if ox in compromised:
                 errors.append(f"{url}: its key {ox[:16]}… is declared "
@@ -701,6 +728,7 @@ class Service:
             self.oracle_keys = [key_by_url[u] for u in self.oracle_urls
                                 if u in key_by_url]
             self.oracle_key_by_url = key_by_url
+            self.oracle_formats = formats
             self.compromised_keys = compromised
             self.previous_keys = previous
             # The FIRST oracle is the "primary": its price is what the page
@@ -775,6 +803,8 @@ class Service:
                     if url == primary:
                         fresh_primary += 1
                         self.attestations[m] = att
+                if 2 in formats.get(url, ()):
+                    self._refresh_v2(url, ox, m, url == primary, errors)
         if primary_err is None and self.markets and not fresh_primary:
             self.oracle_error = (f"primary oracle {primary} published no "
                                  "attestation this book could verify")
@@ -784,6 +814,49 @@ class Service:
             self.book.stamp_at_risk(self.price_for)
         except Exception as e:                          # noqa: BLE001
             print(f"at-risk stamp: {type(e).__name__}: {e}", file=sys.stderr)
+
+    def _v2_ids(self, symbol):
+        """A market symbol as a format-2 message names it: native bitcoin as
+        the unit BTC, anything else by its registry asset id, or None."""
+        if symbol.strip().upper() in NATIVE:
+            return "unit:BTC"
+        return self.resolve(symbol)[0]
+
+    def _refresh_v2(self, url, ox, market, primary, errors):
+        """Read one oracle's format-2 attestation of one market, and keep it
+        only when it is that oracle's, of that market's two assets as the
+        registry names them, at the precision its format-1 scale implies, with
+        no beacon. A record failing any of those is said, not stored: a
+        format-2 signature over another pair or precision is a good signature
+        over something else."""
+        try:
+            with urllib.request.urlopen(
+                    f"{url}/v2/attestation/{market.replace('/', '_')}",
+                    timeout=8) as r:
+                rec = O.parse_v2(json.loads(r.read().decode()))
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                errors.append(f"{url}: {market} (format 2): HTTP {e.code}")
+            return
+        except Exception as e:                      # noqa: BLE001
+            errors.append(f"{url}: {market} (format 2): "
+                          f"{type(e).__name__}: {e}")
+            return
+        try:
+            base, quote = O.market_ids(market, self._v2_ids)
+        except ValueError as e:
+            errors.append(f"{url}: {market} (format 2): {e}; not verified")
+            return
+        precision = O.precision_of(self.price_scales.get(market) or 0)
+        if not O.verify_v2(ox, rec, base, quote, precision):
+            errors.append(f"{url}: {market} (format 2): the record does not "
+                          f"verify as this oracle's attestation of this pair "
+                          f"at precision {precision}; dropped")
+            return
+        with self._lock:
+            self.att_v2_by_oracle[self._att_key(ox, market)] = rec
+            if primary:
+                self.attestations_v2[market] = rec
 
     def _oracle_compromised(self, t):
         """Does this loan bake a key some quoted oracle has declared
@@ -1589,6 +1662,7 @@ class Service:
         out["lender_ver"] = t.lender_ver
         out["oracle_x"] = t.oracle_x
         out["oracle_compromised"] = self._oracle_compromised(t)
+        out["attestation_format"] = t.attestation_format
         price = self.price_for(t)
         if rec.get("liquidatable_since"):
             out["liquidatable_since"] = int(rec["liquidatable_since"])
@@ -1638,6 +1712,10 @@ class Service:
         out["oracle_x"] = t.oracle_x
         out["oracle_keys"] = list(t.oracle_keys)
         out["oracle_compromised"] = self._oracle_compromised(t)
+        # Which attestation format this loan's covenant checks. A loan is
+        # closed by an attestation in that format only, so the format-1
+        # publication stays on for as long as any loan saying 1 is open.
+        out["attestation_format"] = t.attestation_format
         # A loan originated through a funded offer lives in the SINGLE-LEAF
         # vault; the browser needs to know which, because the two have
         # different addresses and different witnesses.
@@ -2967,6 +3045,25 @@ class Handler(BaseHTTPRequestHandler):
                                         "anchor_confirmations")},
                         "spend_height": height, "spend_block": block_hash}
             return self._send(200, out)
+        if path.startswith("/v2/attestations/"):
+            market = path[len("/v2/attestations/"):].replace("_", "/").upper()
+            out = []
+            for ox in s.oracle_keys:
+                rec = s.att_v2_by_oracle.get(s._att_key(ox, market))
+                if rec is not None:
+                    out.append(_attested_v2(rec, s.max_price_age))
+            return self._send(200, {"market": market, "attestations": out})
+        if path.startswith("/v2/attestation/"):
+            market = path[len("/v2/attestation/"):].replace("_", "/").upper()
+            ox = (q.get("oracle", [None])[0] or "").lower()
+            rec = (s.att_v2_by_oracle.get(s._att_key(ox, market)) if ox
+                   else s.attestations_v2.get(market))
+            if rec is None:
+                return self._send(404, {"error": f"no format-2 attestation "
+                                                 f"for {market}"
+                                        + (f" from oracle {ox[:16]}…" if ox
+                                           else "")})
+            return self._send(200, _attested_v2(rec, s.max_price_age))
         if path.startswith("/v1/attestations/"):
             market = path[len("/v1/attestations/"):].replace("_", "/").upper()
             out = []
