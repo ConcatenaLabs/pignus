@@ -398,13 +398,17 @@ def _limit(rows, q):
     return rows[:n] if n else rows
 
 
-def _attested_v2(rec, max_age):
+def _attested_v2(rec, max_age, beacon_state=None):
     """One format-2 attestation as it is served: the signed message and
-    signature with their decoded fields, the market label, and its age."""
+    signature with their decoded fields, the market label, its age, and
+    whether its beacon is live on this book's node ("none" for a record that
+    names no beacon)."""
     d = rec.to_dict()
     d["oracle_x"] = rec.att.key.hex()
     d["age"] = O.age_of(rec)
     d["stale"] = not O.current(rec, max_age)
+    if beacon_state is not None:
+        d["beacon_state"] = beacon_state
     return d
 
 
@@ -465,7 +469,7 @@ def _views(render, rows):
 # Every top-level key of pignusd.json this daemon reads; `main` refuses any
 # other, so a misspelt setting is a start-up error rather than a default
 # silently in force.
-CONFIG_KEYS = ("back_scan_cap", "block_seconds", "book", "btc_explorer_tx_url", "btc_rpc", "explorer_tx_url", "explorer_url", "listen", "markets", "max_price_age", "min_depth", "oracle", "oracle_keys", "oracle_public_url", "oracle_public_urls", "oracles", "poll", "prune_after", "reference_ticker", "registry", "rescan_depth", "rpc", "trusted_proxies")
+CONFIG_KEYS = ("back_scan_cap", "block_seconds", "book", "btc_explorer_tx_url", "btc_rpc", "explorer_tx_url", "explorer_url", "listen", "markets", "max_price_age", "min_depth", "oracle", "oracle_beacon_assets", "oracle_keys", "oracle_public_url", "oracle_public_urls", "oracles", "poll", "prune_after", "reference_ticker", "registry", "rescan_depth", "rpc", "trusted_proxies")
 
 
 class Service:
@@ -498,6 +502,14 @@ class Service:
         keys = [str(k).lower() for k in cfg.get("oracle_keys", [])]
         self.oracle_expected = {u: keys[i] for i, u in enumerate(urls)
                                 if i < len(keys) and keys[i]}
+        # The beacon asset each oracle's fresh attestations are checked
+        # against, in the same order; an empty entry takes the one the oracle
+        # publishes at /v2/beacon. Pinned, an oracle that starts naming another
+        # asset is refused: a beacon of an asset somebody else holds is a
+        # freshness claim anybody can fake.
+        bas = [str(a).lower() for a in cfg.get("oracle_beacon_assets", [])]
+        self.beacon_asset_pins = {u: bas[i] for i, u in enumerate(urls)
+                                  if i < len(bas) and bas[i]}
         self.compromised_keys = set()       # declared by any quoted oracle
         self.previous_keys = {}             # url -> keys it used to sign with
         self.oracle_keys = []                       # x-only hex, in url order
@@ -511,6 +523,10 @@ class Service:
         # format contracts build on is served beside the one open loans need.
         self.att_v2_by_oracle = {}                  # (oracle_x, market) -> rec
         self.attestations_v2 = {}                   # market -> primary's rec
+        # Each oracle's beacon as it publishes it (/v2/beacon), and which
+        # beacons this book's own node shows live this round.
+        self.oracle_beacons = {}                    # url -> /v2/beacon view
+        self._beacon_live_cache = {}                # (url, program) -> bool
         self.oracle_formats = {}                    # url -> formats it signs
         # What each oracle says the two assets of a market are denominated in.
         # The price is an integer scaled by those precisions, so an oracle
@@ -804,6 +820,8 @@ class Service:
                         fresh_primary += 1
                         self.attestations[m] = att
                 if 2 in formats.get(url, ()):
+                    if m == self.markets[0]:
+                        self._refresh_beacon(url, errors)
                     self._refresh_v2(url, ox, m, url == primary, errors)
         if primary_err is None and self.markets and not fresh_primary:
             self.oracle_error = (f"primary oracle {primary} published no "
@@ -848,15 +866,122 @@ class Service:
             errors.append(f"{url}: {market} (format 2): {e}; not verified")
             return
         precision = O.precision_of(self.price_scales.get(market) or 0)
-        if not O.verify_v2(ox, rec, base, quote, precision):
-            errors.append(f"{url}: {market} (format 2): the record does not "
-                          f"verify as this oracle's attestation of this pair "
-                          f"at precision {precision}; dropped")
+        live = lambda b: self._beacon_live(url, b)          # noqa: E731
+        if not O.verify_v2(ox, rec, base, quote, precision, beacon_live=live):
+            if O.verify_v2(ox, rec, base, quote, precision, beacon_live=lambda b: True):
+                errors.append(
+                    f"{url}: {market} (format 2): the record names beacon "
+                    f"{rec.att.beacon.hex()[:16]}…, which holds no coin of the "
+                    f"oracle's beacon asset on this book's node: the oracle has "
+                    f"rotated past it, or the rotation is not on chain yet; dropped")
+            else:
+                errors.append(f"{url}: {market} (format 2): the record does not "
+                              f"verify as this oracle's attestation of this pair "
+                              f"at precision {precision}; dropped")
+            # What was kept before is dropped too once its beacon is not live:
+            # a contract that checks freshness refuses it now.
+            k = self._att_key(ox, market)
+            old = self.att_v2_by_oracle.get(k)
+            if old is not None and old.att.beacon != O.AF.NO_BEACON \
+                    and not self._beacon_live(url, old.att.beacon):
+                with self._lock:
+                    if self.att_v2_by_oracle.get(k) is old:
+                        del self.att_v2_by_oracle[k]
+                    if primary and self.attestations_v2.get(market) is old:
+                        del self.attestations_v2[market]
             return
         with self._lock:
             self.att_v2_by_oracle[self._att_key(ox, market)] = rec
             if primary:
                 self.attestations_v2[market] = rec
+
+    def _refresh_beacon(self, url, errors):
+        """One oracle's beacon as it publishes it. The coins it lists are
+        checked on this book's node before any of them counts (_beacon_live);
+        the oracle is believed for nothing but where to look."""
+        with self._lock:
+            self._beacon_live_cache = {k: v for k, v in self._beacon_live_cache.items()
+                                       if k[0] != url}
+        try:
+            with urllib.request.urlopen(f"{url}/v2/beacon", timeout=8) as r:
+                view = json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                errors.append(f"{url}/v2/beacon: HTTP {e.code}")
+            view = None
+        except Exception as e:                      # noqa: BLE001
+            errors.append(f"{url}/v2/beacon: {type(e).__name__}: {e}")
+            view = None
+        pin = self.beacon_asset_pins.get(url)
+        if view is not None and pin and str(view.get("asset") or "").lower() != pin:
+            errors.append(f"{url}: publishes beacon asset "
+                          f"{str(view.get('asset'))[:16]}…, not the {pin[:16]}… "
+                          f"this book pins; its beacons are not believed")
+            view = dict(view, coins=[])
+        with self._lock:
+            if view is None:
+                self.oracle_beacons.pop(url, None)
+            else:
+                self.oracle_beacons[url] = view
+
+    def _beacon_asset(self, url):
+        view = self.oracle_beacons.get(url) or {}
+        return (self.beacon_asset_pins.get(url) or str(view.get("asset") or "")).lower() or None
+
+    def _beacon_live(self, url, beacon):
+        """Is `beacon` live on THIS book's node: an unspent coin, confirmed or
+        in the mempool, of the oracle's beacon asset at `OP_1 <beacon>`? That
+        is what a contract that checks freshness requires, asked of a node this
+        book trusts rather than of the oracle."""
+        prog = beacon.hex() if isinstance(beacon, (bytes, bytearray)) else str(beacon).lower()
+        key = (url, prog)
+        with self._lock:
+            if key in self._beacon_live_cache:
+                return self._beacon_live_cache[key]
+        asset = self._beacon_asset(url)
+        coins = [c for c in (self.oracle_beacons.get(url) or {}).get("coins") or []
+                 if str(c.get("program") or "").lower() == prog]
+        live = False
+        if self.node is not None and asset:
+            for c in coins[:8]:
+                try:
+                    o = self.node.gettxout(str(c["txid"]), int(c["vout"]), True)
+                except Exception:                   # noqa: BLE001
+                    o = None
+                if o and str((o.get("scriptPubKey") or {}).get("hex") or "") == "5120" + prog \
+                        and str(o.get("asset") or "").lower() == asset:
+                    live = True
+                    break
+        with self._lock:
+            self._beacon_live_cache[key] = live
+        return live
+
+    def beacon_state(self, url, beacon):
+        """"none", "live" or "spent", for showing beside an attestation."""
+        if beacon == O.AF.NO_BEACON:
+            return "none"
+        return "live" if self._beacon_live(url, beacon) else "spent"
+
+    def _url_of_key(self, ox):
+        ox = str(ox or "").lower()
+        for u, k in self.oracle_key_by_url.items():
+            if k == ox:
+                return u
+        return None
+
+    def loan_beacon(self, t):
+        """The beacon an attestation for this loan names now: the asset and
+        current program of the loan's own primary oracle, and whether it is
+        live on this node. A format-1 covenant checks no beacon; the field
+        says so rather than leaving the reader to guess."""
+        url = self._url_of_key(t.oracle_x)
+        view = (self.oracle_beacons.get(url) or {}) if url else {}
+        prog = view.get("program")
+        return {"asset": self._beacon_asset(url) if url else None,
+                "program": prog,
+                "epoch": view.get("epoch"),
+                "live": bool(prog and self._beacon_live(url, bytes.fromhex(prog))),
+                "checked_by_covenant": False}
 
     def _oracle_compromised(self, t):
         """Does this loan bake a key some quoted oracle has declared
@@ -1663,6 +1788,7 @@ class Service:
         out["oracle_x"] = t.oracle_x
         out["oracle_compromised"] = self._oracle_compromised(t)
         out["attestation_format"] = t.attestation_format
+        out["beacon"] = self.loan_beacon(t)
         price = self.price_for(t)
         if rec.get("liquidatable_since"):
             out["liquidatable_since"] = int(rec["liquidatable_since"])
@@ -1716,6 +1842,7 @@ class Service:
         # closed by an attestation in that format only, so the format-1
         # publication stays on for as long as any loan saying 1 is open.
         out["attestation_format"] = t.attestation_format
+        out["beacon"] = self.loan_beacon(t)
         # A loan originated through a funded offer lives in the SINGLE-LEAF
         # vault; the browser needs to know which, because the two have
         # different addresses and different witnesses.
@@ -3051,7 +3178,8 @@ class Handler(BaseHTTPRequestHandler):
             for ox in s.oracle_keys:
                 rec = s.att_v2_by_oracle.get(s._att_key(ox, market))
                 if rec is not None:
-                    out.append(_attested_v2(rec, s.max_price_age))
+                    out.append(_attested_v2(rec, s.max_price_age, s.beacon_state(
+                        s._url_of_key(ox), rec.att.beacon)))
             return self._send(200, {"market": market, "attestations": out})
         if path.startswith("/v2/attestation/"):
             market = path[len("/v2/attestation/"):].replace("_", "/").upper()
@@ -3063,7 +3191,8 @@ class Handler(BaseHTTPRequestHandler):
                                                  f"for {market}"
                                         + (f" from oracle {ox[:16]}…" if ox
                                            else "")})
-            return self._send(200, _attested_v2(rec, s.max_price_age))
+            return self._send(200, _attested_v2(rec, s.max_price_age, s.beacon_state(
+                s._url_of_key(rec.att.key.hex()), rec.att.beacon)))
         if path.startswith("/v1/attestations/"):
             market = path[len("/v1/attestations/"):].replace("_", "/").upper()
             out = []

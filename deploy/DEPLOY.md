@@ -191,6 +191,47 @@ Back up `/root/sequentia/oracle-signer` with the rest (*Backups*): the key now
 lives there. The further oracles move the same way, each to its own instance
 (`2.json`, `2/oracle.key`, and its own log paths).
 
+### The beacon
+
+With a beacon, every format-2 attestation names the signer's current beacon
+coins, and a contract that checks freshness accepts it only while those coins
+are where it says (sequentia-oracle `doc/format.md`, "The beacon"). The signer
+signs each rotation; `pignus-oracle` puts it on chain from the signer's beacon
+log, paying the fee from its node wallet, and serves a format-2 record only
+while its beacon is live on its node.
+
+1. In the signer's `1.json`, add `"beacon": {"rotate_every": 3600}` and
+   restart it. Its next round starts epoch 0 (the journal and
+   `signer-status.json` give the program).
+2. In `pignus-oracle.json`, give the oracle a node and a beacon:
+
+   ```json
+   "rpc": {"url": "http://127.0.0.1:18200", "cookie": "<the node's .cookie path>", "wallet": "<a wallet holding an explicit coin of the fee asset>"},
+   "beacon": {"asset": "", "fee_asset": "<the fee asset's id or label>"}
+   ```
+
+   and add `"beacon_log": "/root/sequentia/pignus-data/beacon.log"` to its
+   `signer` section. `fee_asset` is required: there is no default fee asset.
+3. Fund the beacon once:
+   `pignus-oracle --config /root/sequentia/pignus-oracle.json --fund-beacon 2`
+   issues the beacon asset with no reissuance token, as two one-atom coins at
+   the current beacon script, in one transaction. Put the `asset` it prints
+   into `beacon.asset`, restart `pignus-oracle`, and publish the asset beside
+   the oracle's key: contracts that check freshness pin both.
+4. Check: `curl -s localhost:8740/v2/beacon` shows `"live": true` and the
+   coins; `/v2/attestation/GOLD_USDX` names that `program` as its `beacon`.
+
+The signer rotates every `rotate_every` seconds. **To rotate now** (a price
+that just moved hard, a suspicion that an old attestation is being replayed):
+`pignus-oracle --config /root/sequentia/pignus-oracle.json --rotate-beacon`.
+The signer signs the rotation at its next round and `pignus-oracle` broadcasts
+it at its own; `/v2/beacon` then shows the new program with every coin at it.
+A rotation that cannot be paid for (no explicit fee coin in the wallet) is
+said in `/healthz` (`beacon.error`, and `ok` false) until it goes out, because
+until then the old attestations still verify. `pignusd` checks each oracle's
+beacon on its own node; pin each oracle's beacon asset in its
+`oracle_beacon_assets`, in the order of `oracle_keys`.
+
 ## Backups
 
 Everything Pignus keeps that is not on a chain: the oracle keys and their

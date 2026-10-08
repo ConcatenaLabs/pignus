@@ -17,8 +17,9 @@ without ever holding the key. This file checks:
 - Pignus's own format 1, the covenant builder's message and the vendored
   format 1 are the same bytes, so a signer's format-1 record closes the loans
   Pignus built;
-- what `verify_v2` refuses: another pair, precision, beacon or key, and a
-  symbol nobody can name; and which format each loan's covenant checks;
+- what `verify_v2` refuses: another pair, precision or key, a beacon its
+  caller's node does not show live, and a symbol nobody can name; and which
+  format each loan's covenant checks;
 - `pignus-oracle` in signer mode: it serves both formats from the signer's
   logs, verifies each before serving it, refuses a tampered record and a
   status naming another key, refuses the settings that belong to the signer,
@@ -215,8 +216,19 @@ def test_verify_v2():
           not O.verify_v2(AF.xonly_pubkey(OTHER), rec, base, quote, 5))
     beacon = AF.AttestationV2(key, base, quote, 300_000_000, 5, 1_790_000_000,
                               beacon=b"\x01" * 32).sign(SECRET)
-    check("a beacon this reader does not know of does not",
-          not O.verify_v2(key, O.parse_v2(beacon.to_dict()), base, quote, 5))
+    brec = O.parse_v2(beacon.to_dict())
+    check("a beacon with nobody to check it against does not",
+          not O.verify_v2(key, brec, base, quote, 5))
+    check("nor one the caller's node shows no coin at",
+          not O.verify_v2(key, brec, base, quote, 5, beacon_live=lambda b: False))
+    check("one the caller's node shows live does",
+          O.verify_v2(key, brec, base, quote, 5,
+                      beacon_live=lambda b: b == b"\x01" * 32))
+    check("and a live beacon does not rescue a bad signature",
+          not O.verify_v2(AF.xonly_pubkey(OTHER), brec, base, quote, 5,
+                          beacon_live=lambda b: True))
+    check("a zero beacon claims no freshness and needs no check",
+          O.verify_v2(key, rec, base, quote, 5, beacon_live=lambda b: False))
     forged = dict(att.to_dict(), price=1)
     try:
         O.parse_v2(forged)
