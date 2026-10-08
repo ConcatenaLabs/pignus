@@ -1103,11 +1103,14 @@ def market_ids(market, resolve):
     return tuple(out)
 
 
-def verify_v2(oracle_x, rec, base, quote, precision=None):
+def verify_v2(oracle_x, rec, base, quote, precision=None, beacon_live=None):
     """Check a format-2 record as a contract would, plus what only a reader
     can: it is THIS key's, of THIS pair, at the precision the caller computes
-    with, with no beacon (none is specified yet, and a contract pinning a zero
-    beacon accepts nothing else)."""
+    with, and its beacon is live. A zero beacon claims no freshness and
+    passes; a non-zero one passes only when `beacon_live(beacon)` says its
+    coins are where it says on the caller's node (sequentia-oracle
+    `doc/format.md`, "Checking a beacon off chain"). Without `beacon_live`
+    nothing can say so, and a non-zero beacon is refused."""
     if isinstance(oracle_x, str):
         oracle_x = bytes.fromhex(oracle_x)
     a = rec.att if isinstance(rec, AttestationV2Record) else rec
@@ -1115,9 +1118,11 @@ def verify_v2(oracle_x, rec, base, quote, precision=None):
         return False
     if precision is not None and a.precision != int(precision):
         return False
-    if a.beacon != AF.NO_BEACON:
+    if not a.verify(oracle_x):
         return False
-    return a.verify(oracle_x)
+    if a.beacon != AF.NO_BEACON:
+        return bool(beacon_live is not None and beacon_live(a.beacon))
+    return True
 
 
 def precision_of(price_scale):

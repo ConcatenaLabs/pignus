@@ -6,6 +6,8 @@
   "oracles": [],
   "_oracle_keys_note": "Pin each oracle's x-only key, in the order oracle then oracles (an empty entry pins nothing). Pinned, an oracle that starts serving a different key is refused rather than adopted; unpinned, the book takes whatever /v1/pubkey says, which is what a swapped key looks like.",
   "oracle_keys": [],
+  "_oracle_beacon_assets_note": "Pin each oracle's beacon asset, in the same order as oracle_keys (an empty entry takes the one the oracle publishes at /v2/beacon). A format-2 attestation that names a beacon is kept only while this book's own node shows a coin of that asset at the beacon it names.",
+  "oracle_beacon_assets": [],
   "markets": [
     "GOLD/USDX",
     "SILVR/USDX",

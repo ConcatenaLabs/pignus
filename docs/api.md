@@ -316,12 +316,17 @@ The same, in attestation format 2 (`sequentia-oracle`'s `doc/format.md`), from
 every oracle whose `/v1/pubkey` lists format 2. The book keeps a record only
 when it verifies under that oracle's key for this market's two assets as the
 registry names them (native bitcoin as the unit `BTC`), at the precision the
-market's format-1 `price_scale` implies (`100000` is precision 5), with no
-beacon; a record that does not is an `oracle_errors` entry. Each record carries
+market's format-1 `price_scale` implies (`100000` is precision 5), and whose
+beacon is live: a record naming a beacon is kept only while this book's own
+node shows an unspent coin of the oracle's beacon asset at that beacon
+(`oracle_beacon_assets` pins the asset; otherwise the one the oracle publishes
+at `/v2/beacon` is taken). A record that does not is an `oracle_errors` entry,
+and a record kept earlier is dropped once its beacon's coins move. Each record carries
 `version`, `message` and `signature`, which are what a reader checks, the
 decoded `key`, `base`, `quote`, `price`, `precision`, `time` and `beacon`,
-which must agree with the message, the unsigned `market` label, and `oracle_x`,
-`age` and `stale` as above. `?oracle=<x-only hex>` on the first picks one
+which must agree with the message, the unsigned `market` label, `oracle_x`,
+`age` and `stale` as above, and `beacon_state`: `"live"`, or `"none"` for a
+record whose beacon is all zero (it makes no claim of freshness). `?oracle=<x-only hex>` on the first picks one
 signer. No loan this book holds is closed by a format-2 attestation: each
 loan's `attestation_format` says which format its covenant checks.
 
@@ -694,6 +699,8 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
   "oracle": "2-of-3", "oracle_x": "…",
   "oracle_keys": ["…", "…", "…"],
   "oracle_compromised": false, "attestation_format": 1,
+  "beacon": {"asset": "…", "program": "…", "epoch": 7, "live": true,
+             "checked_by_covenant": false},
   "height": 118432, "past_maturity": false, "recover_open": false,
   "price": 300000000, "health": 1.6667, "ltv": 0.525,
   "liquidatable": false,
@@ -709,6 +716,14 @@ One loan, with its health at the current price. `/v1/loan/{id}` is an alias.
 attestation in another format of the same observation cannot close it, so an
 oracle whose key a loan bakes in publishes format 1 for as long as the loan is
 open. Offers carry it too.
+
+`beacon` is the beacon a fresh attestation for this loan names now: the beacon
+asset and current `program` (and `epoch`) of the loan's own primary oracle, as
+that oracle publishes them, and whether this book's node shows that beacon
+`live`. Each is null when the oracle publishes no beacon. `checked_by_covenant`
+says whether the loan's covenant itself requires a live beacon; a format-1
+vault checks none, so for every loan here it is false and the beacon is
+information for the reader. Offers carry it too.
 
 `liquidatable_since` is the Unix time at which a LIVE loan's price last crossed
 under its strike, present only while it is under; the book stamps the crossing
@@ -1325,6 +1340,33 @@ newest record of the market that verifies under the signer's key, with `age`,
 hex an RPC prints. `/v2/log` takes `market` and `n` (50, capped at 1000) and
 returns the newest records as the file holds them; verify each one you take.
 `/v2/log/raw` streams the file and `/v2/digest` is its running SHA-256.
+
+A record whose `beacon` is not all zero is served at `/v2/attestation` only
+while that beacon is live on this oracle's node (an unspent coin of the beacon
+asset at `OP_1 <beacon>`, in a block or the mempool), which needs a `beacon`
+section; a newer record whose beacon is not live yet is an `error`, and a
+record served earlier stops being served once its beacon's coins move.
+
+### `GET /v2/beacon`, `GET /v2/beacon/log`
+
+Served by an oracle with a `beacon` section (README, *The beacon*):
+
+```json
+{"key": "…", "asset": "…", "epoch": 7, "program": "…", "since": 1799996400,
+ "live": true,
+ "coins": [{"txid": "…", "vout": 0, "atoms": 1, "program": "…", "epoch": 7,
+            "address": "…", "confirmations": 3}],
+ "rotations_broadcast": ["…"], "checked_at": 1799999950, "error": null}
+```
+
+`program` is what every new format-2 record names as its `beacon`; `coins` are
+the beacon coins this oracle's node shows, each re-read from the node every
+round. `error` says why the beacon is not live or a rotation has not gone out
+(and makes `/healthz` unhealthy). A reader with its own node checks a coin
+with `gettxout` rather than believing the list. `/v2/beacon/log` is the
+signer's beacon log, `{"key": "…", "log": [ … ]}`, one record per epoch with
+its nonce, program and the rotation signature that moved the beacon there;
+sequentia-oracle's `beacon_epochs` checks it.
 
 ### `GET /v1/seizures`, `GET /v1/seizure/{sighash}`
 

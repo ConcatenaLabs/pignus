@@ -52,6 +52,20 @@ Endpoints:
     GET /v1/seizure/{sighash}      one of them, with the attestation behind it
     GET /healthz
 
+With a `signer` (a separate sequentia-oracle signer holds the key):
+
+    GET /v2/attestation/{market}   the latest format-2 record, served only when
+                                   its beacon is live (or it names none)
+    GET /v2/log, /v2/log/raw, /v2/digest   the format-2 log
+    GET /v2/beacon                 with a `beacon`: the beacon asset, the current
+                                   epoch and program, and the coins on chain
+    GET /v2/beacon/log             the signer's beacon log, every rotation signed
+
+With a `beacon`, this process also puts the signer's rotations on chain:
+
+    pignus-oracle --config oracle.json --fund-beacon 2   issue the beacon asset once
+    pignus-oracle --config oracle.json --rotate-beacon   ask the signer to rotate now
+
 Co-signing a Tier B (native BTC) seizure is deliberately not an endpoint: it
 moves someone's bitcoin, so it is an operator's command, run against the same
 config, and it refuses unless this oracle's own published price is under the
@@ -144,13 +158,19 @@ SOURCE_KEYS = {
 
 # Every top-level key of an oracle config this service reads; `main` refuses
 # any other, the way build_source refuses an unknown source key.
-CONFIG_KEYS = ("book", "compromised_keys", "flat_rounds", "interval", "jump_rounds", "keyfile", "listen", "log_max_bytes", "logfile", "markets", "max_jump", "precisions", "previous_keys", "price_scale", "seizures", "signer", "source", "symbols", "trusted_proxies")
+CONFIG_KEYS = ("beacon", "book", "compromised_keys", "flat_rounds", "interval", "jump_rounds", "keyfile", "listen", "log_max_bytes", "logfile", "markets", "max_jump", "precisions", "previous_keys", "price_scale", "rpc", "seizures", "signer", "source", "symbols", "trusted_proxies")
 
 # With a `signer` section, this process publishes what a separate signer
 # (sequentia-oracle) writes, and holds no key. These settings belong to the
 # signer then; set here they would go nowhere.
 SIGNER_OWNS = ("keyfile", "source", "max_jump", "jump_rounds", "flat_rounds")
 SIGNER_KEYS = ("key", "log_v2", "status")
+# Optional in `signer`: the signer's beacon log, which a `beacon` section needs.
+SIGNER_OPTIONAL = ("beacon_log",)
+# What a `beacon` section takes: the beacon asset (empty until funded), the
+# asset this process pays rotation fees in (required: no fee asset is the
+# default), and the request file the signer rotates on.
+BEACON_KEYS = ("asset", "fee_asset", "request", "drive")
 
 
 def build_source(cfg):
@@ -293,6 +313,7 @@ class Oracle:
             self.log = O.AttestationLog(cfg["logfile"],
                                         max_bytes=int(cfg.get("log_max_bytes", 0)))
             self.source = build_source(cfg)
+        self._setup_beacon(cfg)
         self.seizures = SeizureLog(cfg.get("seizures")
                                    or cfg["logfile"] + ".seizures")
         # The peers whose `X-Forwarded-For` this oracle believes. Behind a
@@ -381,7 +402,7 @@ class Oracle:
         sig = self.signer
         if not isinstance(sig, dict):
             raise SystemExit("`signer` is an object: key, log_v2, status")
-        odd = sorted(set(sig) - set(SIGNER_KEYS))
+        odd = sorted(set(sig) - set(SIGNER_KEYS) - set(SIGNER_OPTIONAL))
         missing = [k for k in SIGNER_KEYS if not sig.get(k)]
         if odd or missing:
             raise SystemExit(
@@ -407,6 +428,108 @@ class Oracle:
                 "with a `signer`, log_max_bytes must be 0: the signer appends "
                 "to the log, and a file rotated under it by another process "
                 "loses records")
+
+    def _setup_beacon(self, cfg):
+        """The beacon: with a `beacon` section this process reads the signer's
+        beacon log, checks which beacon holds coins on its node, serves only
+        format-2 records whose beacon is live, and replays the signer's
+        rotations on chain, paying the fee from its node wallet."""
+        self.beacon_cfg = cfg.get("beacon")
+        self.chain = None
+        self.node = None
+        self.beacon_error = None
+        self.fee_asset = None
+        rpc = cfg.get("rpc")
+        if rpc and rpc.get("url"):
+            from pignus.node import Node
+            self.node = Node(url=rpc["url"], user=rpc.get("user") or None,
+                             password=rpc.get("password"),
+                             wallet=rpc.get("wallet") or None,
+                             cookie_path=rpc.get("cookie") or None)
+        if self.beacon_cfg is None:
+            return
+        b = self.beacon_cfg
+        if not isinstance(b, dict):
+            raise SystemExit("`beacon` is an object: " + ", ".join(BEACON_KEYS))
+        odd = sorted(k for k in b if k not in BEACON_KEYS and not k.startswith("_"))
+        if odd:
+            raise SystemExit(f"`beacon` does not read {', '.join(odd)}; it "
+                             f"takes {', '.join(BEACON_KEYS)}")
+        if self.signer is None or not self.signer.get("beacon_log"):
+            raise SystemExit("a `beacon` needs a `signer` with `beacon_log`: the "
+                             "beacon is the signer's, and its rotations are "
+                             "replayed from that log")
+        if self.node is None:
+            raise SystemExit("a `beacon` needs `rpc`: whether a beacon is live "
+                             "is a question for a node, and so is a rotation")
+        if not b.get("fee_asset"):
+            raise SystemExit("beacon.fee_asset is required: the asset rotation "
+                             "fees are paid in. There is no default fee asset")
+        asset = str(b.get("asset") or "").lower()
+        if asset and (len(asset) != 64 or any(c not in "0123456789abcdef" for c in asset)):
+            raise SystemExit("beacon.asset is the beacon asset id as the node "
+                             "prints it, or empty until --fund-beacon")
+        from pignus.beacon import BeaconChain
+        self.chain = BeaconChain(self.node, self.xonly, asset or None)
+
+    @property
+    def beacon_request(self):
+        b = self.beacon_cfg or {}
+        log = (self.signer or {}).get("beacon_log") or ""
+        return b.get("request") or os.path.join(os.path.dirname(os.path.abspath(log)),
+                                                "beacon-rotate.request")
+
+    def _resolve_fee_asset(self):
+        if self.fee_asset is None:
+            want = str(self.beacon_cfg["fee_asset"])
+            labels = self.node.dumpassetlabels() or {}
+            self.fee_asset = labels.get(want, want).lower()
+            if len(self.fee_asset) != 64:
+                raise RuntimeError(f"beacon.fee_asset {want!r} is neither an "
+                                   f"asset id nor a label this node knows")
+        return self.fee_asset
+
+    def read_beacon_log(self):
+        path = self.signer["beacon_log"]
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def beacon_round(self):
+        """Take in the signer's beacon log, find the coins, and move them to
+        the newest epoch. A failure is kept and reported, and the rest of the
+        round goes on: a rotation that cannot be paid for must not also stop
+        the prices being published, but nothing is served under a beacon that
+        is not live."""
+        if self.chain is None:
+            return
+        try:
+            self.chain.load(self.read_beacon_log())
+            self.chain.refresh()
+            if self.chain.asset and self.beacon_cfg.get("drive", True):
+                sent = self.chain.drive(self._resolve_fee_asset())
+                for txid in sent:
+                    print(f"pignus-oracle: beacon rotated on chain to epoch "
+                          f"{self.chain.current['epoch']} in {txid}", file=sys.stderr)
+            err = None
+            if not self.chain.asset:
+                err = ("the beacon is not funded: run pignus-oracle --fund-beacon "
+                       "and put the asset it prints into beacon.asset")
+            elif self.chain.current and not self.chain.live(self.chain.current["program"]):
+                err = (f"no beacon coin at the current program "
+                       f"{self.chain.current['program'].hex()[:16]}… yet")
+            self.beacon_error = err
+        except Exception as e:                    # noqa: BLE001 - reported
+            self.beacon_error = f"{type(e).__name__}: {e}"
+
+    def beacon_ok(self, att):
+        """May a format-2 record be served for its beacon? A zero beacon makes
+        no claim and is served as before; a non-zero one only when it is live
+        on this node."""
+        if att.beacon == O.AF.NO_BEACON:
+            return True
+        return self.chain is not None and self.chain.live(att.beacon)
 
     def _check_precisions(self):
         """Every asset in `markets` needs an explicit decimal count.
@@ -454,6 +577,7 @@ class Oracle:
         the process, as a failed signing round does."""
         self.log.follow()
         self.log_v2.follow()
+        self.beacon_round()
         with open(self.signer["status"]) as f:
             st = json.load(f)
         if str(st.get("key", "")).lower() != self.xonly.hex():
@@ -491,13 +615,26 @@ class Oracle:
             rec = self.log_v2.latest(canon)
             if rec is not None:
                 ident = ("v2", rec.att.message(), rec.att.signature)
-                if ident in self._verified or rec.att.verify(self.xonly):
-                    self._verified.add(ident)
-                    latest_v2[m] = rec
-                else:
+                if not (ident in self._verified or rec.att.verify(self.xonly)):
                     errors.setdefault(
                         m, "its newest format-2 record does not verify under "
                            "the signer's key; the last one that did is served")
+                elif not self.beacon_ok(rec.att):
+                    errors.setdefault(
+                        m, f"its newest format-2 record names beacon "
+                           f"{rec.att.beacon.hex()[:16]}…, which holds no coin "
+                           f"of the beacon asset on this node"
+                           + ("" if self.chain is not None else
+                              " (this oracle has no `beacon` section to check it)"))
+                else:
+                    self._verified.add(ident)
+                    latest_v2[m] = rec
+            # A record served earlier stops being served the moment its beacon
+            # is not live: an attestation the signer has rotated away from is
+            # one a contract that checks freshness refuses.
+            prev = latest_v2.get(m)
+            if prev is not None and not self.beacon_ok(prev.att):
+                del latest_v2[m]
             if m not in errors and last:
                 seen[m] = last
         if len(self._verified) > 100_000:
@@ -1007,7 +1144,8 @@ class Handler(BaseHTTPRequestHandler):
                        if now - signed_at.get(m, 0) > window)
         age = None if not last_round else round(now - last_round, 1)
         ok = (not errs and not stale and round_error is None
-              and last_round > 0 and now - last_round <= window)
+              and last_round > 0 and now - last_round <= window
+              and not (o.chain is not None and o.beacon_error))
         skew = (o.status_skew if o.signer is not None
                 else getattr(o.source, "clock_skew", None))
         signed = sum(1 for m in o.markets if m not in errs and m not in stale)
@@ -1020,7 +1158,12 @@ class Handler(BaseHTTPRequestHandler):
                     "clock_skew": None if skew is None else round(skew, 1),
                     "last_round": int(last_round) or None, "age": age,
                     "signer": "external" if o.signer is not None else "in-process",
-                    "formats": list(o.formats)}
+                    "formats": list(o.formats),
+                    "beacon": None if o.chain is None else {
+                        "program": (o.chain.current["program"].hex()
+                                    if o.chain.current else None),
+                        "live": bool(o.chain.current and o.chain.live(o.chain.current["program"])),
+                        "error": o.beacon_error}}
 
     def do_GET(self):
         o = self.oracle
@@ -1188,6 +1331,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "n must be at least 1"})
             return self._send(200, {"attestations": [
                 r.to_dict() for r in o.log_v2.tail(n, market)]})
+        if path == "/v2/beacon":
+            if o.chain is None:
+                return self._send(404, {"error": "this oracle publishes no beacon: "
+                                                 "its format-2 records carry a zero "
+                                                 "beacon, which claims no freshness"})
+            with o._lock:
+                view = o.chain.view()
+                err = o.beacon_error
+            return self._send(200, dict(view, error=err))
+        if path == "/v2/beacon/log":
+            if o.chain is None:
+                return self._send(404, {"error": "this oracle publishes no beacon"})
+            return self._send(200, {"key": o.xonly.hex(), "log": o.read_beacon_log()})
         if path == "/v2/digest":
             return self._send(200, {"digest": o.log_v2.digest(),
                                     "file": os.path.basename(o.log_v2.path)})
@@ -1278,6 +1434,16 @@ def main():
     ap.add_argument("--keyfile",
                     help="with --sign-seize and a `signer` configuration: the "
                          "signer's key file, read for this command only")
+    ap.add_argument("--rotate-beacon", action="store_true",
+                    help="with a `beacon`: ask the signer to rotate the beacon "
+                         "at its next round (writes the request file), and exit. "
+                         "This process replays the rotation on chain at its own "
+                         "next round")
+    ap.add_argument("--fund-beacon", type=int, metavar="COINS",
+                    help="with a `beacon` whose asset is empty: issue the beacon "
+                         "asset, with no reissuance token, as COINS one-atom coins "
+                         "at the signer's current beacon script, from this "
+                         "node's wallet; print the asset id for beacon.asset")
     ap.add_argument("--allow-stale", action="store_true",
                     help="with --sign-seize: co-sign against a price older "
                          "than --max-age anyway")
@@ -1336,6 +1502,31 @@ def main():
 
     if args.print_pubkey:
         print(o.xonly.hex())
+        return
+    if args.rotate_beacon or args.fund_beacon is not None:
+        if o.chain is None:
+            raise SystemExit("--rotate-beacon and --fund-beacon need a `beacon` "
+                             "section (and a `signer` with `beacon_log`)")
+        if args.rotate_beacon:
+            path = o.beacon_request
+            with open(path, "w") as fh:
+                fh.write(f"{int(time.time())}\n")
+            print(f"pignus-oracle: asked the signer for a rotation ({path}); it "
+                  f"signs one at its next round, and this oracle puts it on "
+                  f"chain at its own", file=sys.stderr)
+            return
+        o.chain.load(o.read_beacon_log())
+        tx, asset = o.chain.fund_tx(args.fund_beacon, o._resolve_fee_asset())
+        res = o.node.testmempoolaccept([tx.serialize().hex()])[0]
+        if not res.get("allowed"):
+            raise SystemExit(f"the funding is refused: {res.get('reject-reason')}")
+        txid = o.node.sendrawtransaction(tx.serialize().hex())
+        print(json.dumps({"asset": asset, "txid": txid, "coins": args.fund_beacon,
+                          "program": o.chain.current["program"].hex(),
+                          "epoch": o.chain.current["epoch"]}, indent=2))
+        print(f"pignus-oracle: beacon funded. Set beacon.asset to {asset} in "
+              f"{args.config} and restart; contracts that check freshness pin "
+              f"this asset beside the key", file=sys.stderr)
         return
     if args.sign_seize:
         if args.sighash or not args.request:

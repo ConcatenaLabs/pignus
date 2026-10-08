@@ -390,3 +390,195 @@ def format_of(d: dict) -> int:
     if {"feed_id", "timestamp", "price", "signature"} <= set(d):
         return 1
     raise ValueError("not an attestation of a known format")
+
+
+# --------------------------------------------------------------------- beacon
+#
+# An attestation's `beacon` names the place where the signer's beacon coins
+# sit now: the 32-byte witness program of a taproot output, `OP_1 <beacon>`.
+# A contract that checks freshness requires one of its transaction's inputs
+# to spend a coin of the oracle's beacon asset from exactly that output
+# script. The signer moves every beacon coin to a new script when it rotates,
+# and nothing else can put the beacon asset back at an old one, so an
+# attestation stops being usable the moment its beacon's coins are moved.
+#
+# The beacon script of one epoch is P2TR(NUMS, {recreate, rotate}):
+#
+#   recreate  anyone may spend a beacon coin at input k if output 2k is the
+#             same script, the same asset and the same amount: using the
+#             beacon leaves it where it was.
+#   rotate    the oracle key may move it: output 2k holds the same asset and
+#             amount at `OP_1 <to>`, and the witness carries the oracle's
+#             BIP340 signature over
+#                 SHA256(SHA256(BEACON_TAG) || SHA256(BEACON_TAG) || from || to)
+#             where `from` is the coin's own program. The leaf starts with the
+#             epoch's 32-byte nonce, which is what makes each epoch's program
+#             new; nothing reads it.
+
+BEACON_TAG = "Sequentia/oracle/beacon"
+NUMS = bytes.fromhex("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+TAPSCRIPT_LEAF = 0xc4
+
+_OP = {"1": 0x51, "DROP": 0x75, "DUP": 0x76, "OVER": 0x78, "ROT": 0x7b,
+       "SWAP": 0x7c, "CAT": 0x7e, "EQUAL": 0x87, "EQUALVERIFY": 0x88,
+       "ADD": 0x93, "SHA256": 0xa8, "CHECKSIGFROMSTACK": 0xc1,
+       "INSPECTINPUTASSET": 0xc8, "INSPECTINPUTVALUE": 0xc9,
+       "INSPECTINPUTSCRIPTPUBKEY": 0xca, "PUSHCURRENTINPUTINDEX": 0xcd,
+       "INSPECTOUTPUTASSET": 0xce, "INSPECTOUTPUTVALUE": 0xcf,
+       "INSPECTOUTPUTSCRIPTPUBKEY": 0xd1}
+
+
+def _ops(*names):
+    return bytes(_OP[n] for n in names)
+
+
+def _push(b):
+    assert 1 < len(b) < 76
+    return bytes([len(b)]) + b
+
+
+def _same(inspect_in, inspect_out):
+    """Input k's field equals output 2k's (both pushes of the inspection)."""
+    return _ops("PUSHCURRENTINPUTINDEX", inspect_in,
+                "PUSHCURRENTINPUTINDEX", "DUP", "ADD", inspect_out,
+                "ROT", "EQUALVERIFY", "EQUALVERIFY")
+
+
+_KEEP_ASSET_AND_AMOUNT = (_same("INSPECTINPUTASSET", "INSPECTOUTPUTASSET")
+                          + _same("INSPECTINPUTVALUE", "INSPECTOUTPUTVALUE"))
+
+
+def beacon_recreate_leaf() -> bytes:
+    """The same in every epoch: it reads its own script from the coin."""
+    return (_same("INSPECTINPUTSCRIPTPUBKEY", "INSPECTOUTPUTSCRIPTPUBKEY")
+            + _KEEP_ASSET_AND_AMOUNT + _ops("1"))
+
+
+def beacon_rotate_leaf(key: bytes, nonce: bytes) -> bytes:
+    """Witness, bottom to top: the oracle's rotation signature, `to` (32)."""
+    if len(key) != 32 or len(nonce) != 32:
+        raise ValueError("a beacon script takes a 32-byte key and nonce")
+    t = hashlib.sha256(BEACON_TAG.encode()).digest()
+    return (_push(nonce) + _ops("DROP")
+            # output 2k is `OP_1 <to>`
+            + _ops("PUSHCURRENTINPUTINDEX", "DUP", "ADD", "INSPECTOUTPUTSCRIPTPUBKEY",
+                   "1", "EQUALVERIFY", "OVER", "EQUALVERIFY")
+            + _KEEP_ASSET_AND_AMOUNT
+            # from = this coin's own program; digest = tagged(from || to)
+            + _ops("PUSHCURRENTINPUTINDEX", "INSPECTINPUTSCRIPTPUBKEY", "DROP",
+                   "SWAP", "CAT")
+            + _push(t + t) + _ops("SWAP", "CAT", "SHA256")
+            + _push(key) + _ops("CHECKSIGFROMSTACK"))
+
+
+def _ser_string(b):
+    assert len(b) < 253
+    return bytes([len(b)]) + b
+
+
+def _tapleaf(script):
+    return tagged_hash("TapLeaf/elements", bytes([TAPSCRIPT_LEAF]) + _ser_string(script))
+
+
+class BeaconScript:
+    """One epoch's beacon script: its program (what an attestation names),
+    its two leaves, and the control block that spends each."""
+
+    def __init__(self, key: bytes, nonce: bytes):
+        self.key, self.nonce = bytes(key), bytes(nonce)
+        self.recreate = beacon_recreate_leaf()
+        self.rotate = beacon_rotate_leaf(self.key, self.nonce)
+        hr, ht = _tapleaf(self.recreate), _tapleaf(self.rotate)
+        self.merkle_root = tagged_hash("TapBranch/elements", min(hr, ht) + max(hr, ht))
+        tweak = tagged_hash("TapTweak/elements", NUMS + self.merkle_root)
+        t = int.from_bytes(tweak, "big")
+        if t >= N:
+            raise ValueError("tweak out of range")
+        q = _add(_lift_x(int.from_bytes(NUMS, "big")), _mul(G, t))
+        self.program = q[0].to_bytes(32, "big")
+        parity = q[1] & 1
+        self._sibling = {"recreate": ht, "rotate": hr}
+        self._version = TAPSCRIPT_LEAF | parity
+
+    @property
+    def script_pubkey(self) -> bytes:
+        return b"\x51\x20" + self.program
+
+    def control_block(self, leaf: str) -> bytes:
+        return bytes([self._version]) + NUMS + self._sibling[leaf]
+
+    def leaf(self, name: str) -> bytes:
+        return {"recreate": self.recreate, "rotate": self.rotate}[name]
+
+
+def beacon_program(key: bytes, nonce: bytes) -> bytes:
+    return BeaconScript(key, nonce).program
+
+
+def rotation_digest(frm: bytes, to: bytes) -> bytes:
+    if len(frm) != 32 or len(to) != 32:
+        raise ValueError("a beacon program is 32 bytes")
+    if frm == to:
+        raise ValueError("a rotation moves the beacon to a new program")
+    return tagged_hash(BEACON_TAG, bytes(frm) + bytes(to))
+
+
+def rotation_sign(secret: bytes, frm: bytes, to: bytes, aux: bytes = bytes(32)) -> bytes:
+    return schnorr_sign(secret, rotation_digest(frm, to), aux)
+
+
+def rotation_verify(key: bytes, frm: bytes, to: bytes, sig: bytes) -> bool:
+    try:
+        return schnorr_verify(bytes(key), rotation_digest(frm, to), bytes(sig))
+    except ValueError:
+        return False
+
+
+def beacon_epochs(key: bytes, records) -> list:
+    """Check a signer's beacon log and return its epochs, oldest first, each
+    a dict with `epoch`, `nonce`, `program`, `from`, `signature` and `time`
+    (bytes where binary). Epoch 0 has no `from` and no signature; every later
+    one is the previous program rotated by `key`, and its program is the one
+    its nonce derives under `key`. Any record that breaks that chain is a
+    ValueError: a beacon log is what a publisher replays rotations from, and
+    one forged step would move the coins somewhere nobody chose."""
+    key = bytes(key)
+    out = []
+    for d in records:
+        if str(d.get("key", "")).lower() != key.hex():
+            raise ValueError("a beacon record names another key")
+        n = int(d["epoch"])
+        nonce = bytes.fromhex(d["nonce"])
+        prog = bytes.fromhex(d["program"])
+        if n != len(out):
+            raise ValueError(f"beacon epoch {n} where {len(out)} was expected")
+        if beacon_program(key, nonce) != prog:
+            raise ValueError(f"beacon epoch {n}: its program is not its nonce's")
+        if n == 0:
+            frm, sig = None, None
+            if d.get("from") or d.get("signature"):
+                raise ValueError("beacon epoch 0 is not a rotation")
+        else:
+            frm = bytes.fromhex(d["from"])
+            sig = bytes.fromhex(d["signature"])
+            if frm != out[-1]["program"]:
+                raise ValueError(f"beacon epoch {n} rotates from a program that "
+                                 f"is not epoch {n - 1}'s")
+            if any(e["program"] == prog for e in out):
+                raise ValueError(f"beacon epoch {n} returns to an old program")
+            if not rotation_verify(key, frm, prog, sig):
+                raise ValueError(f"beacon epoch {n}: the rotation signature "
+                                 f"does not verify")
+        out.append({"epoch": n, "nonce": nonce, "program": prog, "from": frm,
+                    "signature": sig, "time": int(d.get("time", 0))})
+    return out
+
+
+def beacon_record(key: bytes, epoch: int, nonce: bytes, frm=None, signature=None,
+                  time=0) -> str:
+    """One beacon log line."""
+    d = {"key": bytes(key).hex(), "epoch": int(epoch), "nonce": bytes(nonce).hex(),
+         "program": beacon_program(key, nonce).hex(),
+         "from": frm.hex() if frm else None,
+         "signature": signature.hex() if signature else None, "time": int(time)}
+    return json.dumps(d, sort_keys=True, separators=(",", ":"))

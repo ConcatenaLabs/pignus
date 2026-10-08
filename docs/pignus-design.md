@@ -380,6 +380,19 @@ reach, and only while `min_epoch` advances, which requires re-covenanting. It
 would help mainly short-term loans, where `not_before` can be set close to
 origination, and that is why this design leaves it out.
 
+### 5.3 A beacon coin (format 2)
+
+Attestation format 2 names a beacon: the script where the oracle's beacon coins
+sit (sequentia-oracle `doc/format.md`, "The beacon"). A covenant that checks
+format 2 can require its spending transaction to spend one of those coins, and
+the oracle rotates them to a new script on a schedule and on demand; from then
+on an attestation saved from a dip has no coin to point at. That narrows the
+window to one rotation interval, with no re-covenanting, because a covenant
+pins the beacon asset rather than one beacon. The sequentia-contracts harness
+test `o2` proves it on a regtest chain. Every vault here checks format 1, which
+carries no beacon, so for them the gap above stands; `pignus-oracle` and
+`pignusd` already refuse a format-2 attestation whose beacon has moved.
+
 This gap is inherent to putting an external fact into a script, and every
 oracle-driven on-chain lending design has some version of it. It is written down
 here rather than left for someone to find.

@@ -153,6 +153,7 @@ were.
 pignus/compat.py         imports the PROVEN covenant and refuses a drifted one
 pignus/terms.py          LoanTerms: the agreement, the address, and verify_funding()
 pignus/oracle.py         attestation format, signing, verification, price quoting
+pignus/beacon.py         an oracle's beacon on chain: live or not, funding, rotations
 pignus/sequentia_oracle/ the attestation formats' reader and golden vectors,
                          vendored from sequentia-oracle (PIN.json)
 pignus/vault.py          every transaction: fund/take/withdraw an offer, the four
@@ -1001,6 +1002,27 @@ assets as the registry names them (native bitcoin is the unit `BTC`) at the
 precision its format-1 scale implies, and serves it at
 `/v2/attestation/{market}` and `/v2/attestations/{market}`.
 
+### The beacon
+
+Format 2 names the signer's beacon: the script where its beacon coins sit. A
+contract that checks freshness accepts an attestation only while those coins
+are at the script it names, and the signer rotates them to a new one on a
+schedule and on request (sequentia-oracle `doc/format.md`, "The beacon").
+The signer has no node; `pignus-oracle` with a `beacon` section and an `rpc`
+section does the chain's part. It funds the beacon once (`--fund-beacon`
+issues the beacon asset with no reissuance token straight to the beacon
+script), puts each rotation the signer signs on chain from the signer's
+beacon log, paying the fee from its node wallet in `beacon.fee_asset`, and
+serves a format-2 record only while its beacon is live on its node. `pignus-oracle
+--rotate-beacon` asks the signer for a rotation now. `/v2/beacon` shows the
+asset, the current program and the coins; `deploy/DEPLOY.md`, *The beacon*,
+has the steps.
+
+`pignusd` checks every format-2 record's beacon on its own node, keeps one
+only while its beacon is live, says why it dropped one in `oracle_errors`,
+and shows each record's `beacon_state` and each loan's `beacon` (the beacon
+its oracle names now; no vault here checks it, since they check format 1).
+
 `--sign-seize` is the one act that needs the key. With a `signer` config it
 takes `--keyfile`, the signer's own key file, read for that command only and
 refused unless it is the key in `signer.key`.
@@ -1124,6 +1146,9 @@ tests/test_lifecycle.py            the CLI through fund, take, repay,
                                    liquidate, withdraw, default, with the
                                    daemon discovering every step
 tests/test_threshold.py            a 2-of-3 oracle loan, end to end
+tests/test_beacon.py               the beacon on a chain: funded, rotated by
+                                   the signer, put on chain by the oracle, an
+                                   old attestation refused by pignusd
 tests/test_btc_collateral.py       Tier B's covenant and crypto
 tests/test_btc_cli.py              the BTC-collateral library legs
 tests/test_btc_cli_flow.py         the BTC-collateral CLI handshake

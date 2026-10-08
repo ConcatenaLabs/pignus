@@ -104,6 +104,7 @@ run "tiers C and D on a chain"         python3 tests/test_tiers.py
 run "tier D settled against OpenDAMP"  python3 tests/test_repo_opendamp.py
 run "CLI lifecycle + book discovery"   python3 tests/test_lifecycle.py
 run "threshold oracles end to end"     python3 tests/test_threshold.py
+run "fresh attestations through a beacon" python3 tests/test_beacon.py
 run "BTC collateral: the covenant + crypto" python3 tests/test_btc_collateral.py
 run "BTC collateral: the library legs"  python3 tests/test_btc_cli.py
 run "BTC collateral: the CLI handshake" python3 tests/test_btc_cli_flow.py
