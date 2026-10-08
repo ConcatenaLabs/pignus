@@ -153,6 +153,8 @@ were.
 pignus/compat.py         imports the PROVEN covenant and refuses a drifted one
 pignus/terms.py          LoanTerms: the agreement, the address, and verify_funding()
 pignus/oracle.py         attestation format, signing, verification, price quoting
+pignus/sequentia_oracle/ the attestation formats' reader and golden vectors,
+                         vendored from sequentia-oracle (PIN.json)
 pignus/vault.py          every transaction: fund/take/withdraw an offer, the four
                          exits, explicit-coin preparation for node wallets
 pignus/fees.py           a fee in any asset, from the node's exchange rates
@@ -874,6 +876,7 @@ pignus-oracle --config oracle.json
 | `source.timeout`, `.max_age` | seconds to wait, and how long a fetched snapshot may be reused. Every attestation is stamped with the time the price was OBSERVED -- the feed's own `_meta.updated` when it publishes one, else the fetch -- so a snapshot re-used after the feed stopped answering ages honestly, and nothing new observed signs nothing new |
 | `source.insecure` | allow a plain-`http` feed on another machine. Refused otherwise: a path in between can rewrite it, and this oracle would sign the rewrite |
 | `source.feed_max_age` | how old the feed's own `_meta.updated` may be before this oracle refuses to re-sign its numbers. **Off unless you set it**, and set it only against a feed that publishes that field: an oracle asked for a check it cannot perform refuses to sign at all rather than read "cannot tell" as "fresh", and a key that signs nothing is one no loan under it can ever be liquidated |
+| `signer` | `{"key": …, "log_v2": …, "status": …}`: publish what a separate signer writes instead of signing here (*The key in a separate signer* below). With it, `keyfile`, `source`, `max_jump`, `jump_rounds` and `flat_rounds` are refused, because they are the signer's, and `log_max_bytes` must be 0 |
 
 8730 is the oracle's built-in listen default and 8741 is `pignusd`'s.
 `deploy/oracle.example.json` listens on 8740 and `deploy/pignusd.example.json`
@@ -915,8 +918,9 @@ feed frozen, and how many markets were signed when that changes -- so
 
 Endpoints: `/v1/pubkey`, `/v1/markets`, `/v1/attestation/{market}` (use `_` for
 the slash) and `/v1/attestation/{market}/at/{ts}`, `/v1/log`, `/v1/log/raw`,
-`/v1/digest`, `/v1/seizures`, `/v1/seizure/{sighash}`, `/healthz`. All of them
-are in [`docs/api.md`](docs/api.md).
+`/v1/digest`, `/v1/seizures`, `/v1/seizure/{sighash}`, `/healthz`, and with a
+`signer`, `/v2/attestation/{market}`, `/v2/log`, `/v2/log/raw` and
+`/v2/digest`. All of them are in [`docs/api.md`](docs/api.md).
 
 `/healthz` answers 503, not 200, when the oracle has not completed a signing
 round within two intervals, or thirty seconds where that is longer: the process
@@ -934,9 +938,11 @@ pignus-oracle --config oracle.json --sign-seize --request seizure.json
 
 `seizure.json` is what `pignus-cli btc-seize-sighash --out` writes: it carries
 the loan, so the oracle rebuilds the sighash from the terms rather than signing
-a number somebody else computed. `--sighash`, `--market`, `--strike` and
-`--price-scale` are the hand-fed alternative. A bare sighash pins nothing, and
-neither does a request without a lender-signed offer; the oracle refuses both
+a number somebody else computed. There is no hand-fed alternative: the oracle
+key also signs format-2 price attestations, whose signed message is a 32-byte
+digest as well, so a key that signed a hash it was handed could be made to
+sign a price it never observed. `--market` and `--strike` only pin what the
+request's loan must say. A request without a lender-signed offer is refused
 unless `--allow-unpinned-strike` says the operator has checked the terms by
 hand, and nothing then holds the lender to any strike. `--max-age`
 (600 seconds by default) is how recent the justifying price must be, and
@@ -947,6 +953,57 @@ acceptance of it, which pin the strike (*Native BTC collateral* above says
 why a sighash alone cannot). The published record carries the loan and that
 signature too, so a borrower disputing a seizure can re-check the judgement and
 not only the price.
+
+### Attestation formats, and the key in a separate signer
+
+Every covenant this repository builds checks **format 1**: a 48-byte message
+(feed id, timestamp, price) signed raw, which only `OP_CHECKSIGFROMSTACK` can
+take. Contracts written since check **format 2**, the fixed-width message of
+[`sequentia-oracle`](https://github.com/ConcatenaLabs/sequentia-oracle) (its
+`doc/format.md`): signer key, base and quote asset ids, price, precision,
+time and a beacon field, signed over a tagged hash that a Simplicity program
+and a tapscript leaf both rebuild. `pignus/sequentia_oracle/` is a vendored
+copy of that repository's reader and golden vectors, pinned by `PIN.json`.
+
+Every loan in the book says which one its covenant checks
+(`attestation_format` in `/v1/loans`); it is 1 for every vault built here, and
+a format-2 attestation of the same observation cannot close it. So an oracle
+whose key backs open loans keeps publishing format 1 for as long as any of
+them is open, and publishes format 2 beside it.
+
+That is what sequentia-oracle's signer does: a separate process that holds
+the key, reads the price feed, and writes both formats for each observation
+(the same time, the same integer price; format 2's precision is the power of
+ten of format 1's `price_scale`) to append-only logs and a status file. It
+listens on nothing. `pignus-oracle` with a `signer` section in its config
+publishes those logs and never holds the key:
+
+```json
+{"logfile": "/root/sequentia/pignus-data/attestations.log",
+ "listen": "127.0.0.1:8740", "interval": 60, "price_scale": 100000,
+ "markets": ["GOLD/USDX"], "precisions": {"GOLD": 8, "USDX": 8},
+ "signer": {"key": "<the signer's x-only key, --print-pubkey>",
+            "log_v2": "/root/sequentia/pignus-data/attestations-v2.log",
+            "status": "/root/sequentia/pignus-data/signer-status.json"}}
+```
+
+Each round it reads what the signer appended, verifies the newest record of
+each market in each format under the configured key, and serves as a market's
+attestation only a record that verifies: the log is the signer's, but this
+process is the one putting it in front of people. `/v1/log` and `/v2/log` are
+the files as written, and a reader verifies each record it takes from them. A newer record that does not verify, or a status file
+naming another key, is reported in `/healthz` and the last verified record is
+served, marked `stale`. Format 2 is served at `/v2/attestation/{market}`,
+`/v2/log`, `/v2/log/raw` and `/v2/digest`; `/v1/pubkey` and `/healthz` list
+the formats the signer publishes. `pignusd` reads format 2 from every oracle
+that publishes it, keeps a record only when it verifies for that market's two
+assets as the registry names them (native bitcoin is the unit `BTC`) at the
+precision its format-1 scale implies, and serves it at
+`/v2/attestation/{market}` and `/v2/attestations/{market}`.
+
+`--sign-seize` is the one act that needs the key. With a `signer` config it
+takes `--keyfile`, the signer's own key file, read for that command only and
+refused unless it is the key in `signer.key`.
 
 ### Verifying a liquidation
 
@@ -1024,6 +1081,9 @@ tests/test_watcher.py              reorgs, and reading an exit back
 tests/test_watcher_reorgs.py       a close undone below the restart tip, a dropped
                                    or replaced mempool take, a mid-poll block
 tests/test_oracle_service.py       what the oracle will not sign
+tests/test_attestation_formats.py  formats 1 and 2, the vendored reader, and
+                                   the oracle publishing a separate signer's
+                                   logs without its key
 tests/test_liquidator.py           what the liquidation bot refuses
 tests/test_btc_relay.py            the relay and the lender's responder
 tests/test_btc_relay_auth.py       what the relay may be believed about
