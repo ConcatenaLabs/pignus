@@ -126,8 +126,8 @@ source on the box, never copy binaries onto it.
   request and response shapes. A route added or changed in `bin/pignusd` or
   `bin/pignus-oracle` is not finished until it is right there too -- the page,
   the CLI, the responder and the liquidator are all clients of it.
-- `openamp-design.md` and `opendamp-design.md` (restricted assets, Tiers C and
-  D) in the node repository's `doc/sequentia/`, and
+- `DESIGN.md` in the `openamp` and `opendamp` repositories (restricted assets,
+  Tiers C and D), and
   `simplicity-dex-covenant-offers-design.md` (where the output-map and
   self-replication techniques came from) in the `seqdex` repository's `docs/`.
 
