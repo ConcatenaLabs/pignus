@@ -19,7 +19,7 @@ this repository does not. This test runs the whole thing on one node:
      at the lender's address, the verifier back where it came from.
 
 It needs the `opendamp` binary: $OPENDAMP_BIN, or a build beside this
-checkout at ../openamp/opendamp/target/{release,debug}/opendamp. Without one
+checkout at ../opendamp/target/{release,debug}/opendamp. Without one
 it FAILS rather than skips, because a settlement nobody has run is the one
 claim in this platform that would otherwise rest on a diagram.
 """
@@ -55,8 +55,8 @@ def find_opendamp():
     cands = [os.environ.get("OPENDAMP_BIN") or ""]
     for root in (os.path.join(HERE, "..", ".."), os.path.expanduser("~")):
         for kind in ("release", "debug"):
-            cands.append(os.path.join(root, "openamp", "opendamp", "target",
-                                      kind, "opendamp"))
+            cands.append(os.path.join(root, "opendamp", "target", kind,
+                                      "opendamp"))
     for c in cands:
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
             return os.path.abspath(c)
@@ -66,9 +66,8 @@ def find_opendamp():
 def main():
     od = find_opendamp()
     if not od:
-        print("FAIL: no opendamp binary. Build it from the openamp repository "
-              "(cd openamp/opendamp && cargo build --release) or set "
-              "OPENDAMP_BIN.")
+        print("FAIL: no opendamp binary. Build it from the opendamp repository "
+              "(cd opendamp && cargo build --release) or set OPENDAMP_BIN.")
         return 1
     print(f"\nTier D: a repurchase settled against OpenDAMP ({od})")
 

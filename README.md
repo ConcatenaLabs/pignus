@@ -798,8 +798,8 @@ the terms say. That look is what the design rests on, because the borrower's
 payment of the debt is the one output no covenant checks; the tool that signs
 signs what it is handed. The lender then signs
 the two OpenDAMP inputs with `opendamp transfer-cosign` from the
-[openamp](https://github.com/ConcatenaLabs/openamp) repository (`cargo build
---release` in its `opendamp/` directory), which leaves every other witness as
+[opendamp](https://github.com/ConcatenaLabs/opendamp) repository (`cargo build
+--release` there), which leaves every other witness as
 it found it. `--attach` puts the covenant's `RETURN` witness on last, which is
 the only order that works, and refuses a transaction on which any of the three
 signatures is missing, naming the input and who signs it. `repo-settle`,
@@ -1141,7 +1141,7 @@ tests/test_watcher_reorg.py        the watcher against a real reorg
 tests/test_tiers.py                Tiers C and D
 tests/test_repo_opendamp.py        Tier D settled against a real OpenDAMP asset; needs the
                                    `opendamp` binary ($OPENDAMP_BIN, or a build beside this
-                                   checkout at ../openamp/opendamp/target/{release,debug}/opendamp)
+                                   checkout at ../opendamp/target/{release,debug}/opendamp)
 tests/test_lifecycle.py            the CLI through fund, take, repay,
                                    liquidate, withdraw, default, with the
                                    daemon discovering every step
