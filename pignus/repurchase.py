@@ -527,7 +527,7 @@ def settlement_shape(consolidated_debt_input: bool) -> dict:
 
     Two rules fix every position, and between them they leave one arrangement.
     OpenDAMP wants its verifier output at input 0 and returned whole to output 0
-    (opendamp-design.md 2.1 check 3, 2.2 checks 1 and 2). The covenant maps a
+    (opendamp's DESIGN.md 2.1 check 3, 2.2 checks 1 and 2). The covenant maps a
     vault at input k to output 2k for the credit and 2k+1 for the return. So the
     bond vault takes input 1 and pays the asset to C_U(borrower) at output 2 and
     the bond to the lender at output 3; anywhere lower is the verifier's and

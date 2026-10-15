@@ -21,8 +21,8 @@ creditor holds the pledge, the debt is owed separately, and redeeming the debt
 redeems the pledge. That is exactly the shape of the thing.
 
 Companion documents, all in other repositories:
-[`openamp-design.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/openamp-design.md) and
-[`opendamp-design.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/opendamp-design.md) in the node
+the [OpenAMP design](https://github.com/ConcatenaLabs/openamp/blob/main/DESIGN.md) and the
+[OpenDAMP design](https://github.com/ConcatenaLabs/opendamp/blob/main/DESIGN.md), each in its own
 repository (the two restricted-asset models this coexists with, section 8),
 [`simplicity-dex-covenant-offers-design.md`](https://github.com/ConcatenaLabs/seqdex/blob/main/docs/simplicity-dex-covenant-offers-design.md)
 in the `seqdex` repository (the covenant-offer design this borrows its
@@ -979,7 +979,7 @@ sufficient:
 
 1. **The collateral cannot enter a vault.** The verifier covenant requires that
    every output carrying the restricted asset pays `C_U(Y)` for a witness-supplied
-   recipient key Y (opendamp-design.md 2.2, check 4). A Pignus vault script is
+   recipient key Y (opendamp's DESIGN.md 2.2, check 4). A Pignus vault script is
    not of that form and cannot be made to be. This is network-enforced, so it is
    not something an issuer could waive even if it wanted to.
 2. **Exits cannot be pre-signed.** The DLC-style escape -- both parties sign the
@@ -1048,7 +1048,7 @@ where any of them is false cannot be settled by the transaction below:
   are unspendable under the one-to-one rule; on the live testnet the wider
   budget starts at a stated height, and every fresh chain has it from genesis.
 
-`doc/sequentia/opendamp-design.md` in the node repository is authoritative for
+The [OpenDAMP design](https://github.com/ConcatenaLabs/opendamp/blob/main/DESIGN.md) is authoritative for
 all of these.
 
 **Leg one, off the covenant.** The borrower transfers `q` units of the OpenDAMP
@@ -1145,7 +1145,7 @@ Two consequences the platform must enforce, because nothing else will:
   compose a settlement otherwise; consolidate first, in its own transaction.
 - The **fee is paid in the debt asset**, out of that same input. A separate fee
   input would not fit. Sequentia's any-asset fees make this ordinary rather than
-  a workaround, and OpenDAMP's fee delta (opendamp-design.md 2.3) is what lets
+  a workaround, and OpenDAMP's fee delta (opendamp's DESIGN.md 2.3) is what lets
   the verifier tolerate the fee output at all.
 
 **What each outcome pays.** Write `V` for the collateral's value at origination,
