@@ -1470,16 +1470,14 @@ liquidation with the rule written out in the browser, pinned to the same
 vectors as every other implementation, and shows the five points. For a take,
 a repayment and a top-up it composes the spend as a contract spend request
 and asks the wallet to sign it (`signContractSpend`, with the wallet funding
-it). The wallet's contract engine, SWK's `lwk_contracts`, carries both
-templates: it adds the wallet's own coins for the collateral, the repayment
+it). The wallet's contract engine, SWK's `lwk_contracts`, carries the vault
+and the offer, of one oracle and of several: it adds the wallet's own coins for the collateral, the repayment
 and the fee, recomputes the offer's or the vault's script and every vault the
 spend opens or returns to, runs the program against the final transaction,
 shows its own five points with the wallet's balance change in every asset,
 and signs only the digest of what it showed, with the wallet's funding keys
 on the wallet's own inputs. A liquidation, a recovery and a refund are given
-as the `pignus-cli` command that makes them, and so is every spend of a loan
-of several oracles, whose templates the wallet's engine does not carry: the
-page recomputes and shows those loans and offers, and the CLI signs for them.
+as the `pignus-cli` command that makes them.
 
 ### 10.8 Native BTC collateral
 

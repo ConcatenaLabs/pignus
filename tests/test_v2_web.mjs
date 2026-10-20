@@ -152,12 +152,32 @@ ok("the panel lists the oracles with each one's bond: asset, amount and status i
    panel.includes("Oracles and their bonds") && panel.includes("bonded: 500 USDX bonded")
    && panel.includes("300 USDX in notice, leaving") && panel.includes("no bond published")
    && panel.includes("a single consistent false price is no conflict"), panel.slice(0, 600));
-ok("a 2-of-3 offer is shown 2-of-3 with its oracles' bonds, its script recomputed, taken with the CLI",
+ok("a 2-of-3 offer is shown 2-of-3 with its oracles' bonds, its script recomputed, taken with the wallet or the CLI",
    panel.includes("Priced by 2-of-3 oracles") && panel.includes("Script recomputed here")
-   && !panel.includes(`data-v2-take="${toffer.offer_id}"`) && panel.includes("v2-take --offer " + toffer.offer_id));
-ok("a 2-of-3 loan is shown with the record two of them signed alike, and its five points",
+   && panel.includes(`data-v2-take="${toffer.offer_id}"`) && panel.includes("v2-take --offer " + toffer.offer_id));
+ok("a 2-of-3 loan is shown with the record two of them signed alike, its five points, and the wallet's buttons",
    panel.includes("now by the record 2 of them signed alike") && panel.includes("pignus/vault-threshold v1, known")
-   && !panel.includes(`data-v2-repay="${tloan.loan_id}"`), panel.slice(-900));
+   && panel.includes(`data-v2-repay="${tloan.loan_id}"`) && panel.includes(`data-v2-topup="${tloan.loan_id}"`), panel.slice(-900));
+
+// The spends of a loan of several oracles name the threshold templates: the
+// wallet's engine checks the request's template against the instance's.
+const ttk = v2.takeSpend({ ...toffer, coin: { ...toffer.coin, amount: String(toc.offer.lot) } },
+                         { borrowerSpk: borrower, lockTime: 1790000000, ratePerKvb: 2000, genesis: G });
+ok("a 2-of-3 take names the threshold offer and opens a threshold vault",
+   ttk.templateHash === vectors.offer_threshold.hash && ttk.instance.template_hash === vectors.offer_threshold.hash
+   && ttk.request.outputs[0].open.template_hash === vectors.vault_threshold.hash
+   && ttk.request.outputs[0].script === v2.vaultSpk({ ...toc.offer.terms, borrower_spk: borrower }, toc.offer.debt, 1790000000),
+   ttk.templateHash);
+const tlive = { ...structuredClone(tloan), terms: { ...tc.terms, borrower_spk: borrower } };
+tlive.line[0].vout = 0;
+const ttu = v2.topUpSpend(tlive, { add: "5000", ratePerKvb: 2000, genesis: G });
+const trp = v2.repaySpend(tlive, { amount: "1000", ratePerKvb: 2000, genesis: G });
+ok("a 2-of-3 top-up and repayment name the threshold vault, as their instances do",
+   [ttu, trp].every((x) => x.templateHash === vectors.vault_threshold.hash
+                           && x.instance.template_hash === vectors.vault_threshold.hash)
+   && trp.request.outputs[0].script === v2.vaultSpk(tlive.terms, BigInt(tc.debt) - 1000n, tc.last_time));
+ok("and the single-oracle spends still name the single-oracle templates",
+   tk.templateHash === vectors.offer.hash && part.templateHash === vectors.vault.hash && tu.templateHash === vectors.vault.hash);
 ok("its script is recomputed from the threshold layout",
    v2.vaultSpk(tc.terms, tc.debt, tc.last_time) === tc.script_pubkey && v2.offerSpk(toc.offer) === toc.script_pubkey);
 
