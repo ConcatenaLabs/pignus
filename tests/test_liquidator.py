@@ -18,7 +18,6 @@ every RPC is counted than when a regtest is answering.
 
 import json
 import os
-import socket
 import subprocess
 import sys
 import tempfile
@@ -29,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
+import ports                                                # noqa: E402  (tests/)
 from pignus import oracle as O                # noqa: E402
 from pignus.terms import LoanTerms            # noqa: E402
 
@@ -101,9 +101,7 @@ class StubNode(BaseHTTPRequestHandler):
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return ports.free_port()
 
 
 def main():

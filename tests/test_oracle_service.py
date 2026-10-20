@@ -19,7 +19,6 @@ prices below can be asserted rather than sampled.
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -33,6 +32,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 BIN = os.path.join(ROOT, "bin")
 sys.path.insert(0, ROOT)
 
+import ports                                                # noqa: E402  (tests/)
 from pignus import oracle as O            # noqa: E402
 from pignus.terms import feed_id          # noqa: E402
 
@@ -96,9 +96,7 @@ class Feed(BaseHTTPRequestHandler):
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return ports.free_port()
 
 
 def get(url, want_status=200):

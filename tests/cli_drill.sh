@@ -22,6 +22,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HERE/../bin"
 PKG="$HERE/.."
 WORK="$(mktemp -d)"
+# Ports below the kernel's ephemeral range, distinct (tests/ports.py says why).
+read -r OPORT DPORT2 <<<"$(python3 "$HERE/ports.py" 2)"
 PIDS=()
 # Nothing a drill runs may page a person or touch the box's own verdict: the
 # check script it exercises alerts through this file and records through
@@ -189,7 +191,7 @@ cat > "$WORK/oracle.json" <<EOF
 {
   "keyfile": "$WORK/oracle.key",
   "logfile": "$WORK/attestations.log",
-  "listen": "127.0.0.1:8731",
+  "listen": "127.0.0.1:$OPORT",
   "interval": 60,
   "price_scale": 100000,
   "markets": ["GOLD/USDX", "SILVR/USDX"],
@@ -748,7 +750,6 @@ PYSTATUS
 # covers. Both need a person.
 echo
 echo "-- an offer that stops verifying under its own key"
-DPORT2=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
 LKEY2="$WORK/disowned.key"
 "$BIN/pignus-cli" btc-keygen --out "$LKEY2" >/dev/null
 # Under its REAL id -- the hash of the terms, which is the only id a relay ever

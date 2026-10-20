@@ -64,9 +64,8 @@ def post(url, body):
 
 
 def free_port():
-    import socket
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0)); return s.getsockname()[1]
+    import ports
+    return ports.free_port()
 
 
 def main():
