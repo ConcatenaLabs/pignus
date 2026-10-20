@@ -1,0 +1,308 @@
+/* The oracle bond: coins an oracle puts behind its format-2 attestations.
+ *
+ * The output is
+ *
+ *     P2TR(NUMS, TapBranch(TapLeaf_0xbe(CMR), H_TapData(ORACLE || BOND_ASSET || NOTICE || STATE)))
+ *
+ * params ORACLE (the key whose attestations the bond stands behind),
+ *        BOND_ASSET (the asset the bond is held in, internal byte order) and
+ *        NOTICE (a BIP68 relative lock in units of 512 seconds, written as its
+ *        nSequence value: the time between giving notice and withdrawing);
+ * slot   STATE: 0 while bonded, 1 once notice is given.
+ *
+ * Every coin at the address is a bond on its own, so topping up is paying
+ * another coin there. The coin at input k owns output 2k.
+ *
+ *   NOTICE    the oracle key, while bonded. Output 2k is this bond with STATE 1,
+ *             the same asset, at least the whole coin. The key signs
+ *             tagged(TAG, 0x01 || genesis || txid || vout), the coin's outpoint.
+ *   WITHDRAW  the oracle key, once notice is given and the coin has waited
+ *             NOTICE by its own sequence. Output 2k pays the script whose hash
+ *             DEST the key signs, the same asset, at least the whole coin. The
+ *             key signs tagged(TAG, 0x02 || genesis || txid || vout || DEST).
+ *   SLASH     anyone, in either state, with two format-2 attestations by ORACLE
+ *             of one pair at one precision and one time, at different prices.
+ *             Output 2k burns at least half the coin (rounded up) in the bond's
+ *             asset to the script OP_RETURN; the rest is the presenter's.
+ *
+ * TAG is "Sequentia/oracle/bond". Neither a notice nor a withdrawal digest can
+ * be a price digest ("Sequentia/oracle/price") or a beacon rotation
+ * ("Sequentia/oracle/beacon"), and each names one coin on one chain, so a
+ * signature moves exactly the coin it names, to exactly where it says.
+ *
+ * Half is burned because the oracle can present its own conflict: whatever a
+ * slash pays out it could take back itself, so the burned half is the least a
+ * conflict costs it, and the other half pays whoever else finds it first.
+ */
+/* Output reader.
+ *
+ * The asset, amount and script of an output, refusing an output that does not
+ * exist or whose asset or amount is confidential: a covenant can only police
+ * what it can read. Asset ids are in internal byte order, the reverse of the
+ * hex an RPC prints. Include with `// include output_reader`.
+ */
+
+/* (asset id, amount, SHA256 of the scriptPubKey) of output i. */
+fn out_explicit(i: u32) -> (u256, u64, u256) {
+    let (asset, amount): (Asset1, Amount1) = unwrap(jet::output_amount(i));
+    let id: u256 = match asset {
+        Left(blinded: (u1, u256)) => panic!(),
+        Right(explicit: u256) => explicit,
+    };
+    let value: u64 = match amount {
+        Left(blinded: (u1, u256)) => panic!(),
+        Right(explicit: u64) => explicit,
+    };
+    (id, value, unwrap(jet::output_script_hash(i)))
+}
+
+/* Output i carries no nonce. An explicit output's nonce field is empty unless
+ * someone put data there, such as a blinding key; a covenant that pins an
+ * output pins this field too. */
+fn out_no_nonce(i: u32) {
+    assert!(is_none::<Nonce>(unwrap(jet::output_nonce(i))));
+}
+
+/* Output i pays exactly `amount` of `asset` to the script whose hash is
+ * `script_hash`, explicitly and with no nonce. */
+fn out_require(i: u32, asset: u256, amount: u64, script_hash: u256) {
+    let (id, value, script): (u256, u64, u256) = out_explicit(i);
+    assert!(jet::eq_256(id, asset));
+    assert!(jet::eq_64(value, amount));
+    assert!(jet::eq_256(script, script_hash));
+    out_no_nonce(i);
+}
+
+/* (asset id, amount) of the input being spent, refusing a confidential one. */
+fn in_explicit_current() -> (u256, u64) {
+    let (asset, amount): (Asset1, Amount1) = jet::current_amount();
+    let id: u256 = match asset {
+        Left(blinded: (u1, u256)) => panic!(),
+        Right(explicit: u256) => explicit,
+    };
+    let value: u64 = match amount {
+        Left(blinded: (u1, u256)) => panic!(),
+        Right(explicit: u64) => explicit,
+    };
+    (id, value)
+}
+/* Relative lock, in the safe form.
+ *
+ * Reads the sequence of the input being spent. The four relative-timelock jets
+ * read the largest lock over every input instead, so a spender defeats them by
+ * adding an old coin of their own; the lints refuse them. BIP68 makes
+ * consensus enforce an input's own sequence only when the transaction version
+ * is at least 2 and the sequence's disable bit is clear, so these check
+ * exactly that, then compare the lock with the minimum.
+ * Include with `// include relative_lock`.
+ */
+
+/* This input has waited at least `blocks` blocks since its coin confirmed. */
+fn rel_lock_blocks(blocks: u16) {
+    assert!(jet::le_32(2, jet::version()));
+    let d: u16 = match unwrap(jet::parse_sequence(jet::current_sequence())) {
+        Left(distance: u16) => distance,
+        Right(duration: u16) => panic!(),
+    };
+    assert!(jet::le_16(blocks, d));
+}
+
+/* This input has waited at least `units` units of 512 seconds of median time. */
+fn rel_lock_time(units: u16) {
+    assert!(jet::le_32(2, jet::version()));
+    let d: u16 = match unwrap(jet::parse_sequence(jet::current_sequence())) {
+        Left(distance: u16) => panic!(),
+        Right(duration: u16) => duration,
+    };
+    assert!(jet::le_16(units, d));
+}
+/* Price attestation, format 2: the digest a signer signs, rebuilt from the
+ * fields a contract uses, and the signature checked over it.
+ *
+ *   message = version (1) || key (32) || base (32) || quote (32)
+ *             || price (8, LE) || precision (1) || time (4, LE) || beacon (32)
+ *   digest  = SHA256(SHA256(TAG) || SHA256(TAG) || message),
+ *             TAG = "Sequentia/oracle/price"
+ *
+ * The format is owned by sequentia-oracle (doc/format.md there). Integers are
+ * little-endian in the message, the order tapscript's 64-bit opcodes use; a
+ * SimplicityHL integer is big-endian, so the helper reverses the bytes of
+ * `price` and `time` before hashing them, which costs combinators only.
+ * Asset ids are in internal byte order, as jet::current_asset gives them.
+ * Include with `// include attestation`.
+ */
+
+fn att_le16(x: u16) -> u16 {
+    let (a, b): (u8, u8) = <u16>::into(x);
+    <(u8, u8)>::into((b, a))
+}
+
+fn att_le32(x: u32) -> u32 {
+    let (a, b): (u16, u16) = <u32>::into(x);
+    <(u16, u16)>::into((att_le16(b), att_le16(a)))
+}
+
+fn att_le64(x: u64) -> u64 {
+    let (a, b): (u32, u32) = <u64>::into(x);
+    <(u32, u32)>::into((att_le32(b), att_le32(a)))
+}
+
+/* The 32 bytes a format-2 attestation's BIP340 signature is over. */
+fn att_digest(key: u256, base: u256, quote: u256, price: u64, precision: u8, time: u32, beacon: u256) -> u256 {
+    let tag: u256 = 0xc04934780078514d7ab2e52cded2406ac154a043874d7121dadd61942b2ca91c;
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, tag);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, tag);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_1(ctx, 2);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, key);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, base);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, quote);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_8(ctx, att_le64(price));
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_1(ctx, precision);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, att_le32(time));
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, beacon);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* `sig` is `key`'s format-2 attestation of exactly these fields. The key
+ * signs its own name into the message, so a contract passes the one key it
+ * pins for both. */
+fn att_verify(key: Pubkey, base: u256, quote: u256, price: u64, precision: u8, time: u32, beacon: u256, sig: Signature) {
+    jet::bip_0340_verify((key, att_digest(key, base, quote, price, precision, time, beacon)), sig);
+}
+
+/* SHA256 of `OP_1 <beacon>`: the output script an attestation's beacon names,
+ * in the form jet::input_script_hash returns. */
+fn att_beacon_script_hash(beacon: u256) -> u256 {
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_2(ctx, 0x5120);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, beacon);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* The attestation's beacon is live: input `at` of this transaction spends an
+ * explicit coin of `beacon_asset` (the oracle's beacon asset, internal byte
+ * order) from the output script `beacon` names. The oracle moves every coin of
+ * that asset to a new script when it rotates, and only its key can, so an
+ * attestation naming an old beacon has no coin to point at. A zero beacon
+ * names no script that can hold one. */
+fn att_beacon_check(beacon: u256, beacon_asset: u256, at: u32) {
+    assert!(jet::eq_256(att_beacon_script_hash(beacon), unwrap(jet::input_script_hash(at))));
+    let asset: u256 = unwrap_right::<(u1, u256)>(unwrap(jet::input_asset(at)));
+    assert!(jet::eq_256(asset, beacon_asset));
+}
+
+/* att_verify, and the beacon it names is live at input `at`. */
+fn att_verify_fresh(key: Pubkey, base: u256, quote: u256, price: u64, precision: u8, time: u32, beacon: u256, sig: Signature, beacon_asset: u256, at: u32) {
+    att_verify(key, base, quote, price, precision, time, beacon, sig);
+    att_beacon_check(beacon, beacon_asset, at);
+}
+
+fn bond_data(oracle: Pubkey, asset: u256, notice: u32, state: u8) -> u256 {
+    let ctx: Ctx8 = jet::tapdata_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, oracle);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, asset);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_4(ctx, notice);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_1(ctx, state);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* SHA256 of the scriptPubKey of this program beside this data leaf. */
+fn bond_script_hash(data: u256) -> u256 {
+    let root: u256 = jet::build_tapbranch(jet::tapleaf_hash(), data);
+    let key: u256 = jet::build_taptweak(jet::internal_key(), root);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_2(ctx, 0x5120);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, key);
+    jet::sha_256_ctx_8_finalize(ctx)
+}
+
+/* The tagged hash over a kind, the chain and this coin's outpoint, the start
+ * of every digest the oracle key signs for a bond. */
+fn bond_ctx(kind: u8) -> Ctx8 {
+    let tag: u256 = 0xa564e4ae4e11e467ff558ad7e43e627aedf5562e43b9c1acce595824b954784f;
+    let (txid, vout): (u256, u32) = jet::current_prev_outpoint();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_init();
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, tag);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, tag);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_1(ctx, kind);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, jet::genesis_block_hash());
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(ctx, txid);
+    jet::sha_256_ctx_8_add_4(ctx, vout)
+}
+
+/* Output i pays `script` at least `c` of `asset`, explicitly and with no nonce. */
+fn pays_at_least(i: u32, asset: u256, c: u64, script: u256) {
+    let (id, value, s): (u256, u64, u256) = out_explicit(i);
+    assert!(jet::eq_256(id, asset));
+    assert!(jet::eq_256(s, script));
+    assert!(jet::le_64(c, value));
+    out_no_nonce(i);
+}
+
+fn notice(oracle: Pubkey, asset: u256, delay: u32, state: u8, c: u64, main: u32, sig: Signature) {
+    assert!(jet::eq_8(state, 0));
+    jet::bip_0340_verify((oracle, jet::sha_256_ctx_8_finalize(bond_ctx(1))), sig);
+    pays_at_least(main, asset, c, bond_script_hash(bond_data(oracle, asset, delay, 1)));
+}
+
+fn withdraw(oracle: Pubkey, asset: u256, delay: u32, state: u8, c: u64, main: u32, dest: u256, sig: Signature) {
+    assert!(jet::eq_8(state, 1));
+    let units: u16 = match unwrap(jet::parse_sequence(delay)) {
+        Left(blocks: u16) => panic!(),
+        Right(duration: u16) => duration,
+    };
+    rel_lock_time(units);
+    let ctx: Ctx8 = jet::sha_256_ctx_8_add_32(bond_ctx(2), dest);
+    jet::bip_0340_verify((oracle, jet::sha_256_ctx_8_finalize(ctx)), sig);
+    pays_at_least(main, asset, c, dest);
+}
+
+/* Two attestations by `oracle` of one pair, precision and time, at two
+ * prices; each brings its own beacon, which a conflict does not compare. */
+fn slash(oracle: Pubkey, asset: u256, c: u64, main: u32, ev: (u256, u256, u8, u32, (u64, u256, Signature), (u64, u256, Signature))) {
+    let (base, quote, precision, time, one, two): (u256, u256, u8, u32, (u64, u256, Signature), (u64, u256, Signature)) = ev;
+    let (p1, beacon1, sig1): (u64, u256, Signature) = one;
+    let (p2, beacon2, sig2): (u64, u256, Signature) = two;
+    att_verify(oracle, base, quote, p1, precision, time, beacon1, sig1);
+    att_verify(oracle, base, quote, p2, precision, time, beacon2, sig2);
+    assert!(jet::eq_1(<bool>::into(jet::eq_64(p1, p2)), 0));
+    // Output 2k burns at least half the coin, rounded up: 2 * burned >= c.
+    let op_return: u256 = 0x189f40034be7a199f1fa9891668ee3ab6049f82d38c68be70f596eab2e1857b7;
+    let (id, burned, s): (u256, u64, u256) = out_explicit(main);
+    assert!(jet::eq_256(id, asset));
+    assert!(jet::eq_256(s, op_return));
+    out_no_nonce(main);
+    let (carry, twice): (bool, u64) = jet::add_64(burned, burned);
+    assert!(jet::eq_1(jet::or_1(<bool>::into(carry), <bool>::into(jet::le_64(c, twice))), 1));
+}
+
+fn main() {
+    let oracle: Pubkey = witness::ORACLE;
+    let asset: u256 = witness::BOND_ASSET;
+    let delay: u32 = witness::NOTICE;
+    let state: u8 = witness::STATE;
+
+    // The parameters and the state are the data leaf's.
+    assert!(jet::eq_256(bond_data(oracle, asset, delay, state), unwrap(jet::tappath(0))));
+
+    // The coin holds the bond's asset, explicitly.
+    let (held, c): (u256, u64) = in_explicit_current();
+    assert!(jet::eq_256(held, asset));
+
+    // Input k owns output 2k.
+    let k: u32 = jet::current_index();
+    let (carry, main): (bool, u32) = jet::add_32(k, k);
+    assert!(jet::eq_1(<bool>::into(carry), 0));
+
+    match witness::PATH {
+        Left(a: Either<Signature, (u256, Signature)>) => match a {
+            Left(sig: Signature) => notice(oracle, asset, delay, state, c, main, sig),
+            Right(w: (u256, Signature)) => {
+                let (dest, sig): (u256, Signature) = w;
+                withdraw(oracle, asset, delay, state, c, main, dest, sig)
+            },
+        },
+        Right(ev: (u256, u256, u8, u32, (u64, u256, Signature), (u64, u256, Signature))) => slash(oracle, asset, c, main, ev),
+    };
+}

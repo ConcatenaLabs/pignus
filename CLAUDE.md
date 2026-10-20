@@ -34,8 +34,11 @@ may differ.
 
 The version 2 vault and offer are Simplicity programs, and they live in
 `ConcatenaLabs/sequentia-contracts` (`templates/pignus_vault`,
-`templates/pignus_offer`), proven there by harness test `l1`, not in the node
-repository. They are vendored in `pignus/sequentia_contracts/` with the
+`templates/pignus_offer`, and for several oracles
+`templates/pignus_vault_threshold` and `templates/pignus_offer_threshold`),
+proven there by harness tests `l1` and `l2`, not in the node repository. The
+oracle bond the book shows (`pignus/bonds.py`) is that repository's
+`templates/oracle_bond`, vendored the same way. They are vendored in `pignus/sequentia_contracts/` with the
 contracts' Python address mirror, each program's source as compiled, and
 pinned by its `PIN.json`; CI compares the files with that repository at the
 pinned commit. Do not edit them here, and do not write a second Python

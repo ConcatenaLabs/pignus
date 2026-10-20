@@ -23,8 +23,12 @@ const vectors = JSON.parse(readFileSync(here + "../web/v2_vectors.json", "utf8")
 
 const n = v2.selfTest(vectors);
 ok(`the page reproduces all ${n} version 2 vectors (addresses, terms cases, rules)`,
-   n === vectors.vault.vectors.length + vectors.offer.vectors.length + vectors.terms_cases.length
+   n === vectors.vault.vectors.length + vectors.offer.vectors.length + vectors.vault_threshold.vectors.length
+         + vectors.offer_threshold.vectors.length + vectors.terms_cases.length
          + vectors.rules.liquidation.length + vectors.rules.max_repay.length, String(n));
+ok("among them the threshold templates' address vectors and terms of several oracles",
+   vectors.vault_threshold.vectors.length === 4 && vectors.offer_threshold.vectors.length === 4
+   && vectors.terms_cases.filter((x) => v2.isThreshold(x.terms || x.offer.terms)).length === 4);
 
 const bent = structuredClone(vectors);
 bent.vault.vectors[0].script_pubkey = bent.vault.vectors[0].script_pubkey.replace(/.$/, (c) => c === "0" ? "1" : "0");
@@ -117,6 +121,45 @@ const tu = v2.topUpSpend(live, { add: "5000", ratePerKvb: 2000, genesis: G });
 ok("a top-up keeps the vault's script, adds the collateral, and pays its fee in the collateral",
    tu.request.outputs[0].script === live.line[0].spk && tu.request.outputs[0].amount === Number(live.line[0].amount) + 5000
    && tu.request.outputs[1].asset === t.collateral_asset && tu.request.spender.PATH === "Left(Right(()))");
+
+// --- several oracles, and their bonds
+const tc = vectors.terms_cases.find((x) => x.terms && v2.isThreshold(x.terms) && x.terms.oracles.length === 3
+                                         && x.terms.oracles[2] !== "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0");
+const tc2 = vectors.terms_cases.find((x) => x.terms && v2.isThreshold(x.terms) && x !== tc);
+ok("a 2-of-3 is labelled so, and two oracles padded with the unused key a 2-of-2",
+   v2.oracleLabel(tc.terms) === "2-of-3" && v2.oracleLabel(tc2.terms) === "2-of-2", v2.oracleLabel(tc2.terms));
+const [k1, k2, k3] = tc.terms.oracles;
+const bonds = {
+  [k1]: { key: k1, status: "bonded", asset: "aa".repeat(32), bonded_atoms: 50000000000, noticed_atoms: 0,
+          notice_seconds: 2592000, bonds: [{}] },
+  [k2]: { key: k2, status: "notice given: leaving", asset: "aa".repeat(32), bonded_atoms: 0,
+          noticed_atoms: 30000000000, notice_seconds: 2592000, bonds: [{}] },
+  [k3]: { key: k3, status: "no bond published", bonds: [] },
+};
+const tloan = {
+  loan_id: "ef".repeat(32), state: "LIVE", terms: tc.terms, debt: tc.debt, collateral: "100000000000",
+  template: { hash: vectors.vault_threshold.hash }, bonds,
+  attestation: { price: "170000000000", time: 1790000200, signers: [k1, k2] },
+  line: [{ event: "open", txid: "cd".repeat(32), debt: tc.debt, last_time: tc.last_time, amount: "100000000000",
+           spk: tc.script_pubkey, where: { in: "block" } }],
+};
+const toc = vectors.terms_cases[vectors.terms_cases.indexOf(tc) + 1];
+const toffer = { offer_id: "12".repeat(16), status: "open", offer: toc.offer, spk: toc.script_pubkey,
+                 lots_left: 1, bonds, coin: { txid: "34".repeat(32), vout: 0, amount: toc.offer.lot } };
+const panel = v2.render([toffer], [tloan], (a) => "USDX",
+                        { oracles: [k1, k2, k3], bonds: Object.values(bonds) });
+ok("the panel lists the oracles with each one's bond: asset, amount and status in words",
+   panel.includes("Oracles and their bonds") && panel.includes("bonded: 500 USDX bonded")
+   && panel.includes("300 USDX in notice, leaving") && panel.includes("no bond published")
+   && panel.includes("a single consistent false price is no conflict"), panel.slice(0, 600));
+ok("a 2-of-3 offer is shown 2-of-3 with its oracles' bonds, its script recomputed, taken with the CLI",
+   panel.includes("Priced by 2-of-3 oracles") && panel.includes("Script recomputed here")
+   && !panel.includes(`data-v2-take="${toffer.offer_id}"`) && panel.includes("v2-take --offer " + toffer.offer_id));
+ok("a 2-of-3 loan is shown with the record two of them signed alike, and its five points",
+   panel.includes("now by the record 2 of them signed alike") && panel.includes("pignus/vault-threshold v1, known")
+   && !panel.includes(`data-v2-repay="${tloan.loan_id}"`), panel.slice(-900));
+ok("its script is recomputed from the threshold layout",
+   v2.vaultSpk(tc.terms, tc.debt, tc.last_time) === tc.script_pubkey && v2.offerSpk(toc.offer) === toc.script_pubkey);
 
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

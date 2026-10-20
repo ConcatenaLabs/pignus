@@ -1,0 +1,126 @@
+{
+  "addresses": [
+    {
+      "address": {
+        "elementsregtest": "ert1pxj2q6fvfet7jpdqxk32s23ev7mumu8qvqzgvspzt9ny92u3s9csqr6m34h",
+        "sequentia-testnet": "tb1pxj2q6fvfet7jpdqxk32s23ev7mumu8qvqzgvspzt9ny92u3s9csqlsefff"
+      },
+      "leaves": {
+        "bond": {
+          "control_block": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac053cee157fa6f7c650bdc045870929c5eaf4f4a62a560a179ca92e32b3ac58e91",
+          "hash": "52bd87a3861e7963aeb090b502e5628f59782bb02e8189bcaa5cafe3f9c5e12c"
+        },
+        "terms": {
+          "data": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ecfaf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f110040ffff00",
+          "hash": "53cee157fa6f7c650bdc045870929c5eaf4f4a62a560a179ca92e32b3ac58e91"
+        }
+      },
+      "merkle_root": "6a72ccaf3c8731d28481edc5e511a28a16beb0aaf1c56ddfa7ee86cc9c76e77c",
+      "name": "instance 0: program first, output key parity 0, bonded",
+      "output_key": "34940d2589cafd20b406b45505472cf6f9be1c0c0090c8044b2cc85572302e20",
+      "output_key_parity": 0,
+      "params": {
+        "BOND_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+        "NOTICE": "0040ffff",
+        "ORACLE": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec"
+      },
+      "script_pubkey": "512034940d2589cafd20b406b45505472cf6f9be1c0c0090c8044b2cc85572302e20",
+      "slots": {
+        "STATE": "00"
+      },
+      "tweak": "1af83365616daaf91ac2917f986684dc5b401a18f56edfb8a712dd0b0f2a80ff"
+    },
+    {
+      "address": {
+        "elementsregtest": "ert1p54spd46jetcucpwgt99etzmvy7uz4p2h4lpph2tnk5ky988zkrnspmx5t7",
+        "sequentia-testnet": "tb1p54spd46jetcucpwgt99etzmvy7uz4p2h4lpph2tnk5ky988zkrnsa3yvhq"
+      },
+      "leaves": {
+        "bond": {
+          "control_block": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0dad45e5083b78d71600bb1f68f68b164a2272582ddbcc05edd3dd927c64004a5",
+          "hash": "52bd87a3861e7963aeb090b502e5628f59782bb02e8189bcaa5cafe3f9c5e12c"
+        },
+        "terms": {
+          "data": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ecfaf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f110040100001",
+          "hash": "dad45e5083b78d71600bb1f68f68b164a2272582ddbcc05edd3dd927c64004a5"
+        }
+      },
+      "merkle_root": "686dc7c1420355efdab6e1ed3032edbf2e4da6635feb74e159a740665d4583c6",
+      "name": "instance 1: program first, output key parity 1, notice given",
+      "output_key": "a56016d752caf1cc05c8594b958b6c27b82a8557afc21ba973b52c429ce2b0e7",
+      "output_key_parity": 1,
+      "params": {
+        "BOND_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+        "NOTICE": "00401000",
+        "ORACLE": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec"
+      },
+      "script_pubkey": "5120a56016d752caf1cc05c8594b958b6c27b82a8557afc21ba973b52c429ce2b0e7",
+      "slots": {
+        "STATE": "01"
+      },
+      "tweak": "22a636149568cbfe7f99d999cf6b37d29385eeb75c8ea9579efcb3597ebf9c5b"
+    },
+    {
+      "address": {
+        "elementsregtest": "ert1phdntczwkxmnuevral6afxrg2hjt0ne3795ptr6hanw8vjc4tlt2q7x6dmx",
+        "sequentia-testnet": "tb1phdntczwkxmnuevral6afxrg2hjt0ne3795ptr6hanw8vjc4tlt2qzvc48c"
+      },
+      "leaves": {
+        "bond": {
+          "control_block": "be50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac040a0ff9e7c7a30c9ce09dbe9774460084ea649dd4204b9ed50e65efee97d95f8",
+          "hash": "52bd87a3861e7963aeb090b502e5628f59782bb02e8189bcaa5cafe3f9c5e12c"
+        },
+        "terms": {
+          "data": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ecfaf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11004013c701",
+          "hash": "40a0ff9e7c7a30c9ce09dbe9774460084ea649dd4204b9ed50e65efee97d95f8"
+        }
+      },
+      "merkle_root": "fcf44436a1ed56e01305070bb95029971bcdde8ca73b150876a4858690b215bb",
+      "name": "instance 2: data leaf first, output key parity 0, notice given",
+      "output_key": "bb66bc09d636e7ccb07dfeba930d0abc96f9e63e2d02b1eafd9b8ec962abfad4",
+      "output_key_parity": 0,
+      "params": {
+        "BOND_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+        "NOTICE": "004013c7",
+        "ORACLE": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec"
+      },
+      "script_pubkey": "5120bb66bc09d636e7ccb07dfeba930d0abc96f9e63e2d02b1eafd9b8ec962abfad4",
+      "slots": {
+        "STATE": "01"
+      },
+      "tweak": "0c94ae69eb748e94b4315d10125fe082eed06dfdd635c5cae00cc65b8f0b1804"
+    },
+    {
+      "address": {
+        "elementsregtest": "ert1p7mawvuqq0yreuj5ptjwefufz6tfg38p9j6xjjrq08h9tnc404hussdgsy2",
+        "sequentia-testnet": "tb1p7mawvuqq0yreuj5ptjwefufz6tfg38p9j6xjjrq08h9tnc404husv82gc5"
+      },
+      "leaves": {
+        "bond": {
+          "control_block": "bf50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac04e5f24d17a4d84bf81e65f5c1cdefb95b4006f4b1fc06ff62d0d942b8277dc80",
+          "hash": "52bd87a3861e7963aeb090b502e5628f59782bb02e8189bcaa5cafe3f9c5e12c"
+        },
+        "terms": {
+          "data": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ecfaf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f110040100000",
+          "hash": "4e5f24d17a4d84bf81e65f5c1cdefb95b4006f4b1fc06ff62d0d942b8277dc80"
+        }
+      },
+      "merkle_root": "2abff530bbe035270f964cb7d911e45d2c7e4211f9a9b5c3aa32033175320ada",
+      "name": "instance 3: data leaf first, output key parity 1, bonded",
+      "output_key": "f6fae6700079079e4a815c9d94f122d2d2889c25968d290c0f3dcab9e2afadf9",
+      "output_key_parity": 1,
+      "params": {
+        "BOND_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+        "NOTICE": "00401000",
+        "ORACLE": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec"
+      },
+      "script_pubkey": "5120f6fae6700079079e4a815c9d94f122d2d2889c25968d290c0f3dcab9e2afadf9",
+      "slots": {
+        "STATE": "00"
+      },
+      "tweak": "76fd96e9b027d135bb1d11de92678f1b4e9053390d1f2ab72e0ace5f87065be4"
+    }
+  ],
+  "template_hash": "36e09201b19cdd4ad589ce35c6f04fc25010c9ccc2a684355d37ee361aed9b96",
+  "vectors": 2
+}

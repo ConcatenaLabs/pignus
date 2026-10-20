@@ -3172,8 +3172,9 @@ async function renderV2() {
     el.innerHTML = `<div class="empty">Version 2 is not pinned here${state.v2Why ? ": " + esc(state.v2Why) : ""}, so nothing is shown.</div>`;
     return;
   }
-  const [o, l] = await Promise.all([api("v2/offers?status=all"), api("v2/loans")]);
-  el.innerHTML = v2.render(o.offers || [], l.loans || [], (a) => esc(meta(a).ticker));
+  const [o, l, ors] = await Promise.all([api("v2/offers?status=all"), api("v2/loans"),
+                                          api("v1/oracles").catch(() => null)]);
+  el.innerHTML = v2.render(o.offers || [], l.loans || [], (a) => esc(meta(a).ticker), ors);
   const offers = new Map((o.offers || []).map(x => [x.offer_id, x]));
   const loans = new Map((l.loans || []).map(x => [x.loan_id, x]));
   for (const b of el.querySelectorAll("[data-v2-take]"))

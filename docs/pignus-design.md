@@ -1389,6 +1389,40 @@ can be made healthy only by repaying nearly all of the debt, and a close
 repays all of it. The lender is paid in full in every case, as in version 1;
 the borrower's loss is bounded as section 6.1 says.
 
+### 10.4.1 Several oracles
+
+A version 2 loan can name three oracles and a threshold instead of one
+oracle: sequentia-contracts' `templates/pignus_vault_threshold` and
+`templates/pignus_offer_threshold` (its `docs/pignus-vault.md`, "Several
+oracles"), the same vault and offer with one change. A liquidation takes a
+price record, one price at one time, that at least the threshold of the three
+keys attest, each signer under its own live beacon; every other rule is the
+single vault's. The three keys must be distinct and the threshold at least 1,
+which the program checks; a loan of two oracles fills the third slot with a
+key nobody holds.
+
+The oracles must sign the same record. Each signs its own message (its key and
+its beacon are in it), so the book matches them by pair, precision, price and
+time; oracles that read one price server and stamp its observation time
+produce the same record, and the book keeps each one's last records so that
+the liquidator can settle on the newest one enough of them share. A threshold
+moves the oracle's power of 10.4 from one key to any `threshold` of three: a
+false low price needs that many signers to sign it alike.
+
+### 10.4.2 The oracles' bonds
+
+An oracle can stand behind its attestations with a bond (sequentia-contracts'
+`templates/oracle_bond`): coins anyone slashes with two of its attestations of
+one pair, precision and time at two prices, half burned and half to whoever
+shows them, which its key takes back only after notice and a wait. The book
+shows each oracle's bond (asset, amount, and whether it is bonded, in notice or
+absent) beside every loan and offer it prices (`pignus/bonds.py`), counted on
+its own node from the scripts it recomputes. A bond deters a conflict: an
+oracle that hands a contract one price and publishes another for the same
+time. It does not deter a single consistent false price, nor one at a time the
+oracle published nothing for, and it costs a conflicting oracle at most what
+it burns.
+
 ### 10.5 Following a vault
 
 Every repayment, top-up and liquidation spends the vault's coin and makes a
@@ -1403,7 +1437,8 @@ when a reorg removes a step, whatever its depth: a loan whose opening coin has
 gone is GHOST and watched in case it returns.
 
 A take reveals the borrower in the offer's witness: the offer's terms are
-fixed-width, so the borrower's script hash sits at a fixed bit of it, and the
+fixed-width, so the borrower's script hash sits at a fixed bit of it (one for
+each offer template), and the
 watcher takes it only when the vault it derives is the take's output. So a
 loan opened from any wallet shows up in the book; only the borrower's whole
 payout script, which a close pays and which the chain shows only as a hash,
@@ -1442,7 +1477,9 @@ spend opens or returns to, runs the program against the final transaction,
 shows its own five points with the wallet's balance change in every asset,
 and signs only the digest of what it showed, with the wallet's funding keys
 on the wallet's own inputs. A liquidation, a recovery and a refund are given
-as the `pignus-cli` command that makes them.
+as the `pignus-cli` command that makes them, and so is every spend of a loan
+of several oracles, whose templates the wallet's engine does not carry: the
+page recomputes and shows those loans and offers, and the CLI signs for them.
 
 ### 10.8 Native BTC collateral
 

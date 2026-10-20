@@ -259,11 +259,37 @@ the book itself reads from, which behind a proxy is loopback.
 
 ### `GET /v1/oracles`
 
-`{"oracles": ["…x-only hex…"], "urls": ["https://…"], "previous": ["…"],
-"compromised": ["…"]}` — every independent oracle this book quotes against, in
-configured order, primary first; an oracle the book has not heard from since
-it started is left out, so the list can be shorter than the configured set. A
-lender picks an m-of-n subset from here.
+`{"oracles": ["…x-only hex…"], "urls": ["https://…"], "bonds": [{…}],
+"previous": ["…"], "compromised": ["…"]}` — every independent oracle this book
+quotes against, in configured order, primary first; an oracle the book has not
+heard from since it started is left out, so the list can be shorter than the
+configured set. A lender picks an m-of-n subset from here.
+
+`bonds` holds each oracle's bond in the same order (null until the book has
+read it), counted on this book's node about once a minute:
+
+```json
+{"key": "…", "status": "bonded", "asset": "…", "notice_seconds": 2592256,
+ "bonded_atoms": 50000000000, "noticed_atoms": 0, "template": "…",
+ "bonds": [{"asset": "…", "notice": "004013c7", "notice_seconds": 2592256,
+            "bonded_script": "5120…", "noticed_script": "5120…",
+            "bonded_atoms": 50000000000, "noticed_atoms": 0,
+            "coins": [{"txid": "…", "vout": 0, "atoms": 50000000000, "height": 812,
+                       "state": "bonded"}]}],
+ "note": "slashed by two of this oracle's attestations of one pair and time at two prices; …"}
+```
+
+The book reads the oracle's bond log (`/v2/bond/log` on the oracle), takes
+from it only the bond's terms (key, asset, notice), recomputes both scripts
+with sequentia-contracts' `templates/oracle_bond`, refuses a declaration whose
+scripts or template differ, and counts the coins of the bond's asset its node
+shows unspent at them. `status` is `bonded`, `bonded, part in notice`,
+`notice given: leaving` (every coin is in notice; each carries
+`withdrawable_from`, the median time from which its key may take it),
+`declared, no coin`, `no bond declared`, `no bond published`, or `unreadable`.
+`bonded_atoms` and `noticed_atoms` are in the current declaration's asset.
+A bond is slashed by two of its oracle's attestations of one pair, precision
+and time at two prices; it deters that conflict and nothing else.
 `previous` lists keys those oracles used to sign with, so a loan baked to one
 reads as rotated rather than as a stranger's; `compromised` lists keys any of
 them has declared compromised, which this book accepts nothing from, and
@@ -876,6 +902,14 @@ when it cannot be read: a take's lock time, which becomes the vault's
 `spk_recomputed` is the offer's script as this book derives it from those
 terms; a reader derives it again rather than believing either field.
 
+A loan of several oracles (sequentia-contracts' `templates/pignus_vault_threshold`
+and `templates/pignus_offer_threshold`) leaves `oracle_x` and `beacon_asset`
+empty and names `oracles` (three x-only keys, the third the NUMS point when
+only two are used), `beacon_assets` (each one's beacon asset) and `threshold`
+(how many must sign one price record alike). Every offer and loan view carries
+`oracles` (`"one oracle"` or `"2-of-3"`) and `bonds`, each of its oracles'
+bond as `/v1/oracles` gives it, keyed by oracle key.
+
 ### `GET /v2/offers/{id}`
 
 One offer, as above. 404 when there is none.
@@ -883,8 +917,8 @@ One offer, as above. 404 when there is none.
 ### `POST /v2/offers`
 
 `{"offer": {…}, "txid": "…", "vout": 0}`: list a funded offer at the coin
-that funds it. Refused (400) when the terms fail the builder's checks, the
-oracle is not one this book quotes, there is no unspent coin there, the coin
+that funds it. Refused (400) when the terms fail the builder's checks, an
+oracle they name is not one this book quotes, there is no unspent coin there, the coin
 does not pay the offer's script, or it holds less than one lot of the debt
 asset; 409 when the offer is listed already at another coin.
 
@@ -919,6 +953,20 @@ oracle, of the vault's own pair at its own precision, or null;
 Both are advice: a liquidator checks the record again, and the program
 checks it last.
 
+For a loan of several oracles, `attestation` is the newest price record at
+least `threshold` of its oracles signed alike, each under a beacon live on
+this book's node, from the records the book keeps (`/v2/records`):
+
+```json
+{"price": 250000000000, "time": 1792526447,
+ "slots": [{"signature": "…", "beacon": "…"}, {"signature": "…", "beacon": "…"}, null],
+ "signers": ["…", "…"], "signed_by": ["…", "…"]}
+```
+
+`slots` are in the vault's key order, null where an oracle abstains;
+`signers` are the ones a liquidation would present, `signed_by` every oracle
+that signed that record.
+
 ### `POST /v2/loans`
 
 `{"terms": {…}, "txid": "…", "vout": 0, "debt": …, "last_time": …,
@@ -941,6 +989,20 @@ leaf.
 ```
 
 502 when the oracle's log does not check.
+
+### `GET /v2/bonds`
+
+`{"bonds": {"<oracle key>": {…}, …}, "errors": ["…"]}`: each quoted oracle's
+bond as `/v1/oracles` gives it, keyed by key, and what could not be read.
+
+### `GET /v2/records/{market}`
+
+`?oracle=<x-only key>`. The last format-2 records of that oracle and market
+this book has verified (up to 64), newest first, each with `beacon_state`
+(`live`, `spent` or `none`) on this book's node. A loan of several oracles
+settles on a record several of them signed alike, which need not be any one
+oracle's newest; a liquidator reads these and verifies every one itself.
+404 when no oracle of that key is quoted here.
 
 ## The cross-chain relay
 
@@ -1471,6 +1533,15 @@ with `gettxout` rather than believing the list. `/v2/beacon/log` is the
 signer's beacon log, `{"key": "…", "log": [ … ]}`, one record per epoch with
 its nonce, program and the rotation signature that moved the beacon there;
 sequentia-oracle's `beacon_epochs` checks it.
+
+### `GET /v2/bond/log`
+
+Served by an oracle whose `signer` section names `bond_log`: the signer's bond
+log, `{"key": "…", "log": [ … ]}`. Its `"kind":"bond"` lines declare the bond's
+terms (key, asset, notice, the template's hash and the two scripts); its
+`notice` and `withdraw` lines are every signature the key made to move a bond
+coin (sequentia-oracle `doc/format.md`, "The bond"). 404 when the signer
+declares no bond.
 
 ### `GET /v1/seizures`, `GET /v1/seizure/{sighash}`
 

@@ -1,11 +1,11 @@
 {
- "_note": "Vendored from sequentia-contracts at this commit: the Python address mirror, and the Pignus vault and offer templates with each program's source as compiled (its helper includes resolved, as `seqc expand` prints it, which is what the descriptor's source_sha256 hashes). Replace the files only with newer copies from that repository and update every field; tests/test_v2.py checks the hashes and CI compares them with that repository.",
+ "_note": "Vendored from sequentia-contracts at this commit: the Python address mirror, the Pignus vault and offer templates, single-oracle and threshold, and the oracle bond template, with each program's source as compiled (its helper includes resolved, as `seqc expand` prints it, which is what the descriptor's source_sha256 hashes). Replace the files only with newer copies from that repository and update every field; tests/test_v2.py checks the hashes and CI compares them with that repository.",
  "repository": "https://github.com/ConcatenaLabs/sequentia-contracts",
- "commit": "69456833329b8ab92ebce8830ac98f3dc90ced93",
+ "commit": "bed76cd15b6bceb75bb5589017ed84f3b096d778",
  "files": {
   "sequentia_address.py": {
    "from": "mirrors/python/sequentia_address.py",
-   "sha256": "7e484c7b6f69c7ddf9bf9376f00ca9227351f4f385b881de32b789ee78a1034b"
+   "sha256": "5a8e7a9a66fd485cb9b1d984197c9f301231e8ccb86ecdbdf5f5a25217fdda78"
   },
   "templates/pignus_vault/descriptor.json": {
    "from": "templates/pignus_vault/descriptor.json",
@@ -31,9 +31,49 @@
    "from": "seqc expand templates/pignus_offer/pignus_offer.simf",
    "sha256": "38dfaa068ae52eef02997a5b025f7bc262371da3b8feb3e775988e89a7e0df4d"
   },
+  "templates/pignus_vault_threshold/descriptor.json": {
+   "from": "templates/pignus_vault_threshold/descriptor.json",
+   "sha256": "f0e0f6c809fc845f236ccf95ee733a4b45fa7e3f0937a7210449a7bd11981e78"
+  },
+  "templates/pignus_vault_threshold/vectors.json": {
+   "from": "templates/pignus_vault_threshold/vectors.json",
+   "sha256": "da8c2cdcc7467b57653a818db70bfb61c8128d6ccd4c529713ddcc4a6f6e0d08"
+  },
+  "templates/pignus_vault_threshold/pignus_vault_threshold.simf": {
+   "from": "seqc expand templates/pignus_vault_threshold/pignus_vault_threshold.simf",
+   "sha256": "4c26a520d173a381637768b9d97244e3f3f59e99c5e76a7b73b6bc5b13dec875"
+  },
+  "templates/pignus_offer_threshold/descriptor.json": {
+   "from": "templates/pignus_offer_threshold/descriptor.json",
+   "sha256": "09a543aed8f72f2a2891f39c982b088e64bd5b2f6ae39cd027736128c0a94928"
+  },
+  "templates/pignus_offer_threshold/vectors.json": {
+   "from": "templates/pignus_offer_threshold/vectors.json",
+   "sha256": "dd10f3137754db4b0d514b55a5a0be2484a5fa210ecd09041fd9e312d224da6a"
+  },
+  "templates/pignus_offer_threshold/pignus_offer_threshold.simf": {
+   "from": "seqc expand templates/pignus_offer_threshold/pignus_offer_threshold.simf",
+   "sha256": "8eb5ca758439cadba1210e8582397ebb3f7b0148dffdcc834cd9cad77ee034ec"
+  },
+  "templates/oracle_bond/descriptor.json": {
+   "from": "templates/oracle_bond/descriptor.json",
+   "sha256": "26e55e402c2586f234452f617bed589421e4849962a5888737e9c06c6cb44695"
+  },
+  "templates/oracle_bond/vectors.json": {
+   "from": "templates/oracle_bond/vectors.json",
+   "sha256": "9b110c394b920c54a382d0718651a80306bd8b07f8d5bb6953dc92d7599643b9"
+  },
+  "templates/oracle_bond/oracle_bond.simf": {
+   "from": "seqc expand templates/oracle_bond/oracle_bond.simf",
+   "sha256": "af182e2787dfe720039825af03d2cdcc0f9749428cc6b80d9e391ab84c7882de"
+  },
   "templates/pignus_vault/rules.json": {
    "from": "templates/pignus_vault/rules.json",
    "sha256": "c1d1de264c478b0dbf0a0dc9fbc5bfee8ae2a1b492d9ab12946f4f0a091ad55a"
+  },
+  "templates/oracle_bond/rules.json": {
+   "from": "templates/oracle_bond/rules.json",
+   "sha256": "c271830f1142d881b0a65a2cbc945cd45728f9f811b4b74bafb44f3a3c32614a"
   }
  }
 }
