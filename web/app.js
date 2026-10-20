@@ -21,6 +21,7 @@ import * as btc from "./btc.js";
 import * as badaptor from "./adaptor.js";
 import * as btcborrow from "./btcborrow.js";
 import * as alerts from "./alerts.js";
+import * as v2 from "./v2.js";
 import { Wallet, payoutProgram, programFromScriptPubKey, programFromAddress,
          scriptPubKeyFor, WalletError } from "./wallet.js";
 
@@ -411,11 +412,17 @@ async function pinCovenant() {
     const av = await api("adaptor_vectors.json");
     state.adaptorPinned = badaptor.selfTest(av);
   } catch (e) { state.btcPinned = 0; state.btcWhy = e.message; }
+  // Version 2 pins SEPARATELY too: its own templates and rule, its own
+  // vectors. A deployment without them still serves the other tabs.
+  try {
+    state.v2Pinned = v2.selfTest(await api("v2_vectors.json"));
+  } catch (e) { state.v2Pinned = 0; state.v2Why = e.message; }
   $("#pinned").textContent =
     `covenant pinned to ${state.pinned} golden vectors` +
     (state.offerPinned ? `, offers to ${state.offerPinned}` : "") +
     (state.repoPinned ? `, repurchase to ${state.repoPinned}` : "") +
-    (state.btcPinned ? `, BTC + adaptor pinned` : "");
+    (state.btcPinned ? `, BTC + adaptor pinned` : "") +
+    (state.v2Pinned ? `, vault v2 to ${state.v2Pinned}` : "");
   $("#pinned").className = "tag ok";
 }
 
@@ -485,6 +492,7 @@ async function refresh() {
     state.oracleCompromised = ors.compromised || [];
   }
   try { state.btcOffers = (await api("v1/btc/offers")).offers || []; } catch { /* keep */ }
+  renderV2().catch(() => {});
   // The Bitcoin height, for the half of a cross-chain loan's deadlines that
   // this chain cannot see. A book without a Bitcoin node publishes none, and
   // the page then refuses to originate rather than check half the timelocks.
@@ -3153,6 +3161,19 @@ function repoAtoms(terms) {
   return `${r.debt} atoms sold · ${r.principal} paid now · ${r.moneyDebt} to ` +
          `buy it back · ${r.bond} bond · collateral valued at ` +
          `${r.collateralValue}`;
+}
+
+// ------------------------------------------------------- vault version 2
+
+async function renderV2() {
+  const el = $("#v2");
+  if (!el) return;
+  if (!state.v2Pinned) {
+    el.innerHTML = `<div class="empty">Version 2 is not pinned here${state.v2Why ? ": " + esc(state.v2Why) : ""}, so nothing is shown.</div>`;
+    return;
+  }
+  const [o, l] = await Promise.all([api("v2/offers?status=all"), api("v2/loans")]);
+  el.innerHTML = v2.render(o.offers || [], l.loans || [], (a) => esc(meta(a).ticker));
 }
 
 // ------------------------------------------------------------------ boot

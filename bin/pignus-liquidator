@@ -49,6 +49,7 @@ from pignus.terms import LoanTerms                   # noqa: E402
 from pignus import fees as F                         # noqa: E402
 from pignus.vault import Outpoint, VaultSpender, select_funding   # noqa: E402
 from pignus.watcher import VaultWatcher, State       # noqa: E402
+from pignus import liquidator_v2 as L2               # noqa: E402
 
 
 def canon(market):
@@ -724,8 +725,28 @@ def main():
           + (f", prices also from the book at {args.book}" if args.book else ""),
           file=sys.stderr)
 
+    warned_v2 = {}
+    change_spk = None
+
+    def round_v2():
+        """Version 2 loans from the book, beside the version 1 ones."""
+        nonlocal change_spk
+        if not args.book:
+            return
+        if change_spk is None:
+            from pignus.vault import wallet_payout
+            change_spk = wallet_payout(node)[2]
+        L2.round_v2(node, args.book, taker_spk, change_spk, warned_v2, dry_run=args.dry_run,
+                    call_due=args.call_due,
+                    max_age=None if args.allow_stale else args.max_attestation_age)
+
     while True:
         failed = False
+        try:
+            round_v2()
+        except Exception as e:                          # noqa: BLE001
+            failed = True
+            print(f"round (version 2): {type(e).__name__}: {e}", file=sys.stderr)
         try:
             round_once()
         except Exception as e:                          # noqa: BLE001

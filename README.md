@@ -34,6 +34,30 @@ that is what makes the one check below sufficient.
 `REPAY` goes further: no oracle either, and no witness data at all. A solvent
 borrower can always leave, whatever anyone else does.
 
+### Vault version 2
+
+Beside that vault, a loan can sit in a **version 2 vault**: one Simplicity
+program, `templates/pignus_vault` of
+[`sequentia-contracts`](https://github.com/ConcatenaLabs/sequentia-contracts),
+with the loan's terms and its debt outstanding in a data leaf beside it and
+the collateral read from the coin itself.
+
+| path | who | needs | does |
+|---|---|---|---|
+| repay | anyone | a payment to the lender | reduces the debt in place, or closes the vault and returns the whole collateral |
+| top-up | anyone | more collateral | the same vault, holding more |
+| liquidate | anyone | the oracle's format-2 price over its live beacon, newer than the vault's last | only while under the threshold, only back to the target; the seizure is what the bonus allows at that price and the rest stays in the vault or goes to the borrower |
+| call | anyone | the same, after maturity | at any health; the surplus is forced back |
+| recover | anyone | a long timeout after maturity | the whole collateral to the lender |
+
+Health is computed from the live collateral and the debt at 192 bits, so a
+loan of any size works: there is no ceiling like the version 1 vault's
+below. An old price cannot be replayed: a liquidation needs a beacon coin the
+oracle has not rotated away, and an attestation newer than the last one the
+vault used. A version 2 loan is taken from a version 2 offer, which opens
+the vault on its terms; `docs/pignus-design.md`, section 10, has the whole of
+it.
+
 Pignus calls its collateral types tiers. **Tier A** is any unrestricted issued
 asset in the covenant vault above, and is the design. Tiers B, C and D --
 native Bitcoin, OpenAMP and OpenDAMP restricted assets -- are weaker on
@@ -175,6 +199,18 @@ pignus/dlc.py            DLC primitives for settling BTC collateral at maturity;
 pignus/btcscript.py      the Bitcoin script and taproot primitives Tier B needs
 pignus/openamp.py        Tier C pledges at an OpenAMP policy server
 pignus/repurchase.py     Tier D: the OpenDAMP repurchase, labelled as one, never a loan
+pignus/vault2.py         version 2 loans: terms, addresses, the rule, every
+                         spend finished by seqc, the next state read off a
+                         spend, and the five points shown before signing
+pignus/watcher2.py       follow version 2 offers and vaults from coin to coin,
+                         a take's borrower off its witness, undo what a reorg
+                         removed
+pignus/service_v2.py     pignusd's /v2/offers, /v2/loans and /v2/beacon
+pignus/liquidator_v2.py  the liquidator's round over version 2 loans
+pignus/cli_v2.py         pignus-cli's v2-* commands
+pignus/sequentia_contracts/ the version 2 vault and offer templates and the
+                         address mirror, vendored from sequentia-contracts
+                         (PIN.json)
 pignus/node.py           a thin JSON-RPC client; many calls in one round trip
 pignus/ratelimit.py      the token bucket both daemons ration unauthenticated
                          requests with, in one place rather than a copy each
@@ -186,13 +222,14 @@ bin/pignus-cli           selftest, quote, propose, show, address, verify, status
                          wallet:
                          offer-fund, offer-publish, offer-take, offer-delist,
                          offer-withdraw,
-                         loan-export, repay, liquidate, default, recover; btc-*
-                         (Tier B, both chains); pledge-* (Tier C); repo-*
-                         (repurchase)
+                         loan-export, repay, liquidate, default, recover; v2-*
+                         (version 2 loans); btc-* (Tier B, both chains);
+                         pledge-* (Tier C); repo-* (repurchase)
 bin/pignus-liquidator    one liquidator among however many people run one
 web/                     the browser client pignusd serves: pignus.js, offer.js,
                          repurchase.js, pset.js, flows.js, wallet.js, alerts.js, app.js,
-                         and for Tier B btc.js, adaptor.js, btcborrow.js
+                         for Tier B btc.js, adaptor.js, btcborrow.js, and for
+                         version 2 v2.js with the v2_vectors.json it pins to
 deploy/                  systemd units (oracle, book, cross-chain responder),
                          example configs, DEPLOY.md
 docs/pignus-design.md    the design and security analysis
@@ -348,6 +385,8 @@ The seizure forms `gross * price_scale` on chain, and `OP_ADD64` aborts on
 **878,000 units** of the debt asset. Lower `price_scale` to `1e4` or `1e3` for
 ~8.8M or ~88M, trading price precision for size. The builders assert the bound
 at construction, so a loan that could not be liquidated cannot be created.
+A version 2 loan has no such limit: its program compares products of three
+64-bit numbers at 192 bits.
 
 ### Threshold oracles
 
@@ -412,6 +451,65 @@ different loan.
 The wallet must hold the **debt** asset -- a liquidator pays the lender in full
 out of its own pocket and keeps collateral worth more -- plus enough of some
 asset with a published exchange rate to pay the fee.
+
+With `--book`, each round also reads the book's live version 2 loans
+(`/v2/loans`). For each one it fetches the vault's coin from its own node and
+recomputes its script from the terms and the state; checks the oracle's
+format-2 record against the key, the pair and the precision the vault pins;
+finds a coin of the record's beacon on its own node and rebuilds that
+epoch's recreate leaf from the oracle's beacon log (`/v2/beacon`); and, when
+the vault is under its threshold, repays what brings it back to its target
+and keeps the seizure the bonus allows. The program is run against the final
+transaction by `seqc` (see *Version 2 from the command line*), and the fee is
+paid in the debt asset. A liquidation's lock time is the attestation's time,
+so it waits until the chain's median time has passed it: a price signed a
+moment ago is acted on a few blocks later. `--call-due` calls version 2 loans
+past maturity as well.
+
+### Version 2 from the command line
+
+Every version 2 spend is finished by `seqc`, the command line of
+[`sequentia-contracts`](https://github.com/ConcatenaLabs/sequentia-contracts)
+that compiles, satisfies, prunes and runs a program against the final
+transaction. Build it there (`cargo build --release --bin seqc`) and set
+`PIGNUS_SEQC` to `target/release/seqc`, or keep that checkout beside this one.
+
+```
+pignus-cli v2-offer-fund --market GOLD/USDX --collateral-asset GOLD --debt-asset USDX \
+    --precision 8 --lot 200000000000000 --debt 210000000000000 --collateral 100000000000 \
+    --lots 2 --book http://127.0.0.1:8741 --rpc-wallet lender --yes
+pignus-cli v2-offers --book http://127.0.0.1:8741
+pignus-cli v2-take --offer <id> --book http://127.0.0.1:8741 --rpc-wallet borrower
+pignus-cli v2-topup --loan <id> --amount 10000000000 --book http://127.0.0.1:8741 --rpc-wallet me
+pignus-cli v2-repay --loan <id> --amount 50000000000000 --book http://127.0.0.1:8741 --rpc-wallet me
+pignus-cli v2-repay --loan <id> --all --book http://127.0.0.1:8741 --rpc-wallet me
+pignus-cli v2-show --loan <id> --book http://127.0.0.1:8741
+pignus-cli v2-recover --loan <id> ... ; pignus-cli v2-refund --offer <id> ...
+```
+
+Before any spend is signed the command prints the five points: the template,
+known here by its hash; every script the spend spends or creates, recomputed
+here from the terms and the state; the program, run against the final
+transaction; the path, the terms by role and the wallet's own balance
+changes; and the key, which is none, because no path signs with a contract key
+and the wallet signs only its own inputs. It signs only with `--yes` or a typed
+`yes`, and refuses when a point does not hold. A fee is paid in the asset the
+spend moves: the debt asset for a take, a repayment and a liquidation, the
+collateral for a top-up and a recovery.
+
+The book finds a version 2 loan by itself when an offer is taken: the
+borrower's payout script hash is read out of the take's witness and accepted
+only when the vault it derives is the take's output. A close pays the
+borrower's whole script, which the chain does not show, so `v2-take`
+registers it with the book; a borrower who took an offer another way passes
+`--borrower-address` to `v2-repay --all`.
+
+The page shows version 2 offers and loans on its *Vault v2* tab, each script
+recomputed in the browser and each loan's health judged there, with the five
+points and the command for each action. It signs no version 2 spend: the
+witness is the program pruned against the final transaction, which takes the
+Simplicity runtime, and the wallet extension's contract engine builds a spend
+of one contract coin and nothing else.
 
 ### Native BTC collateral (Tier B, cross-chain)
 
@@ -1122,6 +1220,11 @@ tests/test_spend_depth.py          a cached spend's depth, and a reorg under it
 tests/test_offer_expiry.py         a cross-chain offer's own end
 tests/test_arith_parity.py         the same arithmetic, addresses and refusals
                                    in both languages, over a sweep
+tests/test_v2.py                   version 2: the vendored templates and their
+                                   vectors, the plan, the terms refused, the
+                                   next state read off every kind of spend, a
+                                   take's borrower, the five points
+tests/test_v2_web.mjs              web/v2.js against web/v2_vectors.json
 tests/page_check.sh                the page, in a real browser; it skips
                                    itself where there is no headless Chromium.
                                    PIGNUS_SHOTS=<dir> keeps a desktop and a
@@ -1149,6 +1252,11 @@ tests/test_threshold.py            a 2-of-3 oracle loan, end to end
 tests/test_beacon.py               the beacon on a chain: funded, rotated by
                                    the signer, put on chain by the oracle, an
                                    old attestation refused by pignusd
+tests/test_lifecycle_v2.py         a version 2 loan through the CLI, pignusd and
+                                   pignus-liquidator: offer, take, top-up,
+                                   partial repay, two partial liquidations
+                                   across a beacon rotation, full repay, and a
+                                   reorg of the close; needs seqc
 tests/test_btc_collateral.py       Tier B's covenant and crypto
 tests/test_btc_cli.py              the BTC-collateral library legs
 tests/test_btc_cli_flow.py         the BTC-collateral CLI handshake
@@ -1177,6 +1285,9 @@ test/functional/feature_pignus_attack.py     the attack suite
 `tests/test_platform.py` needs the `test/config.ini` a built checkout's
 `configure` writes, and is skipped without one; the rest of the chain tests
 start their nodes through `tests/rig.py` and need only the binaries.
+
+`tests/gen_v2_web_vectors.py` writes `web/v2_vectors.json` from the vendored
+templates; `tests/test_v2.py` fails if the file is anything else.
 
 `tests/gen_web_vectors.py` regenerates the golden vectors the browser's Bitcoin
 and adaptor code pins itself to. Run it only when the Python it mirrors changes,

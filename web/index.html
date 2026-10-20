@@ -170,6 +170,7 @@ a lender who is online.</p>
     <button data-tab="loans" id="tab-loans" aria-controls="panel-loans">Loans</button>
     <button data-tab="repo" id="tab-repo" aria-controls="panel-repo">Repurchase</button>
     <button data-tab="btc" id="tab-btc" aria-controls="panel-btc">BTC collateral</button>
+    <button data-tab="v2" id="tab-v2" aria-controls="panel-v2">Vault v2</button>
   </div>
   <span class="spacer"></span>
   <button id="refresh" class="sm">Refresh</button>
@@ -324,6 +325,22 @@ a lender who is online.</p>
       buttons in the offer and loan tables above ask your wallet to sign.</span></div>
   </form>
   <div class="card" id="btcout"><div class="empty">paste a ticket to verify it</div></div>
+</section>
+
+<section data-panel="v2" id="panel-v2" role="tabpanel" aria-labelledby="tab-v2" hidden>
+  <h2>Vault version 2</h2>
+  <p class="hint">A version 2 vault keeps its terms and its debt beside one
+  Simplicity program and reads the collateral from the coin, so any loan size
+  works. Anyone may repay part or all of a loan and anyone may add collateral
+  in place. A liquidation needs the oracle's price signed over its live beacon,
+  newer than the last one the vault used, and only while the vault is under its
+  threshold; it takes only what brings the vault back to its target and forces
+  the rest back. This page recomputes every script below from the terms and the
+  state, judges health with the rule written out here, and shows the five
+  points owed before anything is signed; the spends themselves are made by
+  <code>pignus-cli</code>, which runs the program against the final transaction
+  before its wallet signs.</p>
+  <div class="card" id="v2"><div class="empty">loading&hellip;</div></div>
 </section>
 
 <section class="safe">

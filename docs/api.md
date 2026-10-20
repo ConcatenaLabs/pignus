@@ -838,6 +838,105 @@ alongside a complete account.
   close.
 - 503 if this book has no node: a close cannot be read back without one.
 
+## Version 2 offers and loans
+
+Offers and loans of the version 2 vault (`docs/pignus-design.md`, section 10),
+kept apart from the version 1 ones. Each is a **line** of coins: the coin that
+funded the offer or opened the loan, then every successor a spend made, each
+step with its transaction, the event that made it, and where that transaction
+is (`where`: `{"in": "block" | "mempool", "height", "blockhash"}`). The book
+steps along the line as the chain does and back when a reorg removes a step.
+Amounts are integers of atoms; asset ids are in RPC display order.
+
+### `GET /v2/offers`
+
+`?status=` (`open` by default, `all`, `taken`, `refunded`, `ghost`, `gone`) and
+`?market=`.
+
+```json
+{"offers": [{"offer_id": "…", "market": "GOLD/USDX", "status": "open",
+             "offer": {"terms": {…}, "lot": "200000000000000", "debt": "210000000000000",
+                       "collateral": "100000000000", "expiry": 1800000000},
+             "spk": "5120…", "spk_recomputed": "5120…",
+             "coin": {"txid": "…", "vout": 1, "amount": 200000000000000, "confirmed": true},
+             "lots_left": 1, "taken": 1, "line": [ … ],
+             "template": {"hash": "…", "name": "pignus/offer v2"},
+             "vault_template": {"hash": "…", "name": "pignus/vault v2"},
+             "warnings": []}]}
+```
+
+`terms` are a version 2 loan's terms without the borrower: `collateral_asset`,
+`debt_asset`, `oracle_x`, `beacon_asset`, `precision`, `liq_bp`, `target_bp`,
+`bonus_bp`, `maturity`, `recover_after`, `lender_spk` and `market`.
+`spk_recomputed` is the offer's script as this book derives it from those
+terms; a reader derives it again rather than believing either field.
+
+### `GET /v2/offers/{id}`
+
+One offer, as above. 404 when there is none.
+
+### `POST /v2/offers`
+
+`{"offer": {…}, "txid": "…", "vout": 0}`: list a funded offer at the coin
+that funds it. Refused (400) when the terms fail the builder's checks, the
+oracle is not one this book quotes, there is no unspent coin there, the coin
+does not pay the offer's script, or it holds less than one lot of the debt
+asset; 409 when the offer is listed already at another coin.
+
+### `GET /v2/loans`
+
+`?state=` (`LIVE`, `UNCONFIRMED`, `REPAID`, `LIQUIDATED`, `RECOVERED`,
+`SPENT_UNKNOWN`, `GHOST`, or `all`) and `?market=`.
+
+### `GET /v2/loans/{id}`
+
+```json
+{"loan_id": "…", "kind": "v2", "state": "LIVE", "market": "GOLD/USDX",
+ "terms": {…, "borrower_spk": "5120…", "borrower_hash": "…"},
+ "offer_id": "…", "debt": 160000000000000, "collateral": 110000000000,
+ "last_time": 1792500000, "txid": "…", "vout": 0,
+ "line": [{"event": "open", …}, {"event": "top_up", …}, {"event": "repay", …}],
+ "template": {"hash": "…", "name": "pignus/vault v2"},
+ "spk_recomputed": "5120…", "spk_matches": true,
+ "attestation": {"price": 170000000000, "time": 1792500100, "beacon": "…",
+                 "signature": "…", "beacon_state": "live"},
+ "ratio_bp": 11687, "healthy": false, "liquidatable": true,
+ "liquidation": {"repaid": 77777777777778, "seized": 48039215686, "kept": 61960784314,
+                 "closes": false},
+ "matured": false, "recoverable": false}
+```
+
+`borrower_spk` is empty for a loan the book found on the chain whose
+borrower has not registered: the chain shows the borrower's script only as
+its hash. `attestation` is the newest format-2 record from the vault's own
+oracle, of the vault's own pair at its own precision, or null;
+`liquidation` is the largest liquidation the rule allows at that price.
+Both are advice: a liquidator checks the record again, and the program
+checks it last.
+
+### `POST /v2/loans`
+
+`{"terms": {…}, "txid": "…", "vout": 0, "debt": …, "last_time": …,
+"offer_id": "…"}`: register a loan's borrower payout script, at a coin that
+is the vault those terms and that state derive. A loan the book already
+follows is updated, not duplicated. 400 when the coin is not that vault.
+
+### `GET /v2/beacon`
+
+`?oracle=<x-only key>` (default the primary oracle). The oracle's beacon log
+(`/v2/beacon/log` on the oracle), checked here against its key with
+sequentia-oracle's `beacon_epochs`, and its coins, each checked on this book's
+node: what a liquidator needs to spend a beacon coin through its recreate
+leaf.
+
+```json
+{"key": "…", "asset": "…",
+ "epochs": [{"epoch": 0, "nonce": "…", "program": "…"}, …],
+ "coins": [{"txid": "…", "vout": 0, "program": "…", "amount": 1, "confirmations": 3}]}
+```
+
+502 when the oracle's log does not check.
+
 ## The cross-chain relay
 
 A Bitcoin-collateral loan needs a lender who is present: Bitcoin has no
