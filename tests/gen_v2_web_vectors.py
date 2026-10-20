@@ -29,7 +29,8 @@ def leaf(node):
 
 def build():
     out = {}
-    for key, name in (("vault", "pignus_vault"), ("offer", "pignus_offer")):
+    for key, name in (("vault", "pignus_vault"), ("offer", "pignus_offer"),
+                      ("vault_threshold", "pignus_vault_threshold"), ("offer_threshold", "pignus_offer_threshold")):
         d = json.load(open(os.path.join(BASE, name, "descriptor.json")))
         v = json.load(open(os.path.join(BASE, name, "vectors.json")))
         out[key] = {"hash": d["template_hash"], "cmr": leaf(d["template"]["tree"])["cmr"],
@@ -50,6 +51,20 @@ def build():
                        12500 + i, 15000 + i, 10500 + i, 1_800_000_000 + i, 1_802_592_000 + i, lender,
                        borrower, market="GOLD/USDX")
         debt, last = 2_100_000 * 10 ** 8 - i, 1_790_000_000 + i
+        cases.append({"terms": json.loads(t.to_json()), "debt": str(debt), "last_time": last,
+                      "script_pubkey": V2.vault_spk(t, debt, last)})
+        o = V2.V2Offer(t.with_borrower(), 2 * 10 ** 14 + i, 21 * 10 ** 13 + i, 3 * 10 ** 11 + i, 1_795_000_000 + i)
+        cases.append({"offer": json.loads(o.to_json()), "script_pubkey": o.script_pubkey()})
+    # The same for terms of several oracles: three keys, and two padded with
+    # the key that fills an unused slot.
+    keys = ["c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", key]
+    for i, (n, th) in enumerate(((3, 2), (2, 2))):
+        t = V2.V2Terms("%064x" % (0xd0 + i), "%064x" % (0xe0 + i), "", "", 8, 12500, 15000, 10500,
+                       1_800_000_000 + i, 1_802_592_000 + i, "0014" + "55" * 20, "5120" + "66" * 32,
+                       market="GOLD/USDX", oracles=keys[:n], beacon_assets=["%064x" % (0xf0 + j) for j in range(n)],
+                       threshold=th)
+        debt, last = 2_100_000 * 10 ** 8 + i, 1_790_000_000 + i
         cases.append({"terms": json.loads(t.to_json()), "debt": str(debt), "last_time": last,
                       "script_pubkey": V2.vault_spk(t, debt, last)})
         o = V2.V2Offer(t.with_borrower(), 2 * 10 ** 14 + i, 21 * 10 ** 13 + i, 3 * 10 ** 11 + i, 1_795_000_000 + i)

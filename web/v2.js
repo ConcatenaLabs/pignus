@@ -28,7 +28,14 @@
 //   * a liquidation, a recovery and a refund are left to the pignus-cli
 //     commands that compose them (a liquidation also spends the oracle's beacon
 //     coin), which run the program with seqc and show the same five points
-//     before the node wallet signs.
+//     before the node wallet signs;
+//   * a loan of several oracles (templates/pignus_vault_threshold, a price
+//     record that THRESHOLD of three oracles sign alike) is recomputed and
+//     shown here like any other, and is taken, repaid and topped up with the
+//     pignus-cli commands shown beside it: the wallet's contract engine signs
+//     only for templates on its own list;
+//   * each oracle's bond (asset, amount, status), as the book counts it on its
+//     node, is shown beside the oracles that price a loan.
 
 import * as pig from "./pignus.js";
 
@@ -41,6 +48,22 @@ const VAULT_DATA = [["COLL", 32], ["DEBT_ASSET", 32], ["ORACLE", 32], ["BEACON_A
 const OFFER_DATA = [["COLL", 32], ["DEBT_ASSET", 32], ["ORACLE", 32], ["BEACON_ASSET", 32], ["PRECISION", 1],
                     ["LIQ_BP", 4], ["TARGET_BP", 4], ["BONUS_BP", 4], ["MATURITY", 4], ["RECOVER_AFTER", 4],
                     ["LENDER", 32], ["LOT", 8], ["DEBT", 8], ["COLLATERAL", 8], ["EXPIRY", 4]];
+const SET_DATA = [["COLL", 32], ["DEBT_ASSET", 32], ["ORACLE_1", 32], ["ORACLE_2", 32], ["ORACLE_3", 32],
+                  ["BEACON_ASSET_1", 32], ["BEACON_ASSET_2", 32], ["BEACON_ASSET_3", 32], ["THRESHOLD", 1],
+                  ["PRECISION", 1], ["LIQ_BP", 4], ["TARGET_BP", 4], ["BONUS_BP", 4], ["MATURITY", 4],
+                  ["RECOVER_AFTER", 4], ["LENDER", 32]];
+const VAULT_T_DATA = [...SET_DATA, ["BORROWER", 32], ["DEBT_OUT", 8], ["LAST_TIME", 4]];
+const OFFER_T_DATA = [...SET_DATA, ["LOT", 8], ["DEBT", 8], ["COLLATERAL", 8], ["EXPIRY", 4]];
+
+/** Whether terms name several oracles (templates/pignus_vault_threshold). */
+export function isThreshold(t) { return Array.isArray(t.oracles) && t.oracles.length > 0; }
+const vaultPin = (t) => (isThreshold(t) ? PIN.vault_threshold : PIN.vault);
+const offerPin = (t) => (isThreshold(t) ? PIN.offer_threshold : PIN.offer);
+const NO_ORACLE = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+/** "2-of-3", or "one oracle". */
+export function oracleLabel(t) {
+  return isThreshold(t) ? `${t.threshold}-of-${t.oracles.filter((k) => k !== NO_ORACLE).length}` : "one oracle";
+}
 
 let PIN = null;   // the vectors this page pinned itself to
 
@@ -74,9 +97,14 @@ function spkFromValues(order, values, cmr) {
 
 /** The template's parameters from a Pignus version 2 terms record. */
 export function params(t, withBorrower = true) {
+  const oracle = isThreshold(t)
+    ? { ORACLE_1: t.oracles[0], ORACLE_2: t.oracles[1], ORACLE_3: t.oracles[2],
+        BEACON_ASSET_1: reverseHex(t.beacon_assets[0]), BEACON_ASSET_2: reverseHex(t.beacon_assets[1]),
+        BEACON_ASSET_3: reverseHex(t.beacon_assets[2]), THRESHOLD: hexOf(t.threshold, 1) }
+    : { ORACLE: t.oracle_x, BEACON_ASSET: reverseHex(t.beacon_asset) };
   const p = {
-    COLL: reverseHex(t.collateral_asset), DEBT_ASSET: reverseHex(t.debt_asset), ORACLE: t.oracle_x,
-    BEACON_ASSET: reverseHex(t.beacon_asset), PRECISION: hexOf(t.precision, 1), LIQ_BP: hexOf(t.liq_bp, 4),
+    COLL: reverseHex(t.collateral_asset), DEBT_ASSET: reverseHex(t.debt_asset), ...oracle,
+    PRECISION: hexOf(t.precision, 1), LIQ_BP: hexOf(t.liq_bp, 4),
     TARGET_BP: hexOf(t.target_bp, 4), BONUS_BP: hexOf(t.bonus_bp, 4), MATURITY: hexOf(t.maturity, 4),
     RECOVER_AFTER: hexOf(t.recover_after, 4), LENDER: bytesToHex(sha256(hexToBytes(t.lender_spk))),
   };
@@ -88,14 +116,16 @@ export function params(t, withBorrower = true) {
 }
 
 export function vaultSpk(terms, debt, last) {
-  return spkFromValues(VAULT_DATA, { ...params(terms), DEBT_OUT: hexOf(debt, 8), LAST_TIME: hexOf(last, 4) },
-                       PIN.vault.cmr);
+  return spkFromValues(isThreshold(terms) ? VAULT_T_DATA : VAULT_DATA,
+                       { ...params(terms), DEBT_OUT: hexOf(debt, 8), LAST_TIME: hexOf(last, 4) },
+                       vaultPin(terms).cmr);
 }
 
 export function offerSpk(offer) {
-  return spkFromValues(OFFER_DATA, { ...params(offer.terms, false), LOT: hexOf(offer.lot, 8),
-                                     DEBT: hexOf(offer.debt, 8), COLLATERAL: hexOf(offer.collateral, 8),
-                                     EXPIRY: hexOf(offer.expiry, 4) }, PIN.offer.cmr);
+  return spkFromValues(isThreshold(offer.terms) ? OFFER_T_DATA : OFFER_DATA,
+                       { ...params(offer.terms, false), LOT: hexOf(offer.lot, 8),
+                         DEBT: hexOf(offer.debt, 8), COLLATERAL: hexOf(offer.collateral, 8),
+                         EXPIRY: hexOf(offer.expiry, 4) }, offerPin(offer.terms).cmr);
 }
 
 // ------------------------------------------------------------------ the rule
@@ -149,7 +179,8 @@ export function liquidation(x) {
 export function selfTest(v) {
   PIN = v;
   let n = 0;
-  for (const [name, order] of [["vault", VAULT_DATA], ["offer", OFFER_DATA]]) {
+  for (const [name, order] of [["vault", VAULT_DATA], ["offer", OFFER_DATA],
+                               ["vault_threshold", VAULT_T_DATA], ["offer_threshold", OFFER_T_DATA]]) {
     for (const x of v[name].vectors) {
       const got = spkFromValues(order, { ...x.params, ...x.slots }, v[name].cmr);
       if (got !== x.script_pubkey) { PIN = null; throw new Error(`${name} vector "${x.name}" does not reproduce`); }
@@ -203,7 +234,7 @@ const hexOfHash = (spk) => bytesToHex(sha256(hexToBytes(spk)));
 
 /** An offer's instance record on the chain of `genesis`. */
 export function offerInstance(offer, genesis) {
-  return { instance: 2, template_hash: PIN.offer.hash, genesis,
+  return { instance: 2, template_hash: offerPin(offer.terms).hash, genesis,
     params: { ...params(offer.terms, false), LOT: hexOf(offer.lot, 8), DEBT: hexOf(offer.debt, 8),
               COLLATERAL: hexOf(offer.collateral, 8), EXPIRY: hexOf(offer.expiry, 4) },
     slots: {} };
@@ -211,7 +242,7 @@ export function offerInstance(offer, genesis) {
 
 /** A vault's instance record in the state (`debt`, `last`) on the chain of `genesis`. */
 export function vaultInstance(terms, debt, last, genesis) {
-  return { instance: 2, template_hash: PIN.vault.hash, genesis, params: params(terms),
+  return { instance: 2, template_hash: vaultPin(terms).hash, genesis, params: params(terms),
            slots: { DEBT_OUT: hexOf(debt, 8), LAST_TIME: hexOf(last, 4) } };
 }
 
@@ -290,7 +321,10 @@ export function repaySpend(l, { amount, ratePerKvb, genesis }) {
       spender: { PATH: "Left(Left(()))" },
       ...(full ? {} : { next_slots: slotsOf(debt - a, cur.last_time) }) } };
 }
-export function templates() { return PIN ? { vault: PIN.vault, offer: PIN.offer } : null; }
+export function templates() {
+  return PIN ? { vault: PIN.vault, offer: PIN.offer, vault_threshold: PIN.vault_threshold,
+                 offer_threshold: PIN.offer_threshold } : null;
+}
 
 // ----------------------------------------------------------------- the panel
 
@@ -301,10 +335,11 @@ const short = (h) => esc(String(h).slice(0, 12)) + "…";
 /** The five points for a live loan, judged here; `action` names what the CLI would do. */
 export function fivePoints(rec, action) {
   const t = rec.terms, cur = rec.line[rec.line.length - 1];
-  const known = rec.template && PIN && rec.template.hash === PIN.vault.hash;
+  const pin = vaultPin(t);
+  const known = rec.template && PIN && rec.template.hash === pin.hash;
   const spk = vaultSpk(t, cur.debt, cur.last_time);
   return [
-    ["1. template", known ? `${esc(PIN.vault.name)}, known to this page by its hash ${short(PIN.vault.hash)}`
+    ["1. template", known ? `${esc(pin.name)}, known to this page by its hash ${short(pin.hash)}`
                           : "NOT a template this page knows"],
     ["2. script", spk === cur.spk ? `recomputed here from the terms and the state: ${short(spk)}, the vault's coin`
                                   : "the coin is NOT the vault these terms and this state derive"],
@@ -317,22 +352,57 @@ export function fivePoints(rec, action) {
 
 function cmd(parts) { return "<code>" + esc(parts.join(" ")) + "</code>"; }
 
-/** The version 2 panel: offers and loans from the book, every script recomputed here. */
-export function render(offers, loans, label = (a) => short(a)) {
+const atomsOf = (n) => (Number(n) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 });
+
+/** One oracle's bond, as the book counts it: asset, amount, status, in words. */
+export function bondLine(b, label = (a) => short(a)) {
+  if (!b) return "bond not read yet";
+  if (!b.bonds || !b.bonds.length) return esc(b.status || "no bond");
+  const amt = b.bonded_atoms ? `${atomsOf(b.bonded_atoms)} ${label(b.asset)} bonded` : "";
+  const out = b.noticed_atoms ? `${atomsOf(b.noticed_atoms)} ${label(b.asset)} in notice, leaving` : "";
+  const notice = `notice ${Math.round(Number(b.notice_seconds) / 86400 * 10) / 10} day(s)`;
+  return `${esc(b.status)}${amt || out ? ": " + [amt, out].filter(Boolean).join(", ") : ""}; ${notice}`;
+}
+
+function oracleList(keys, bonds, label) {
+  return "<ul>" + keys.map((k) => `<li><code>${short(k)}</code>: ${bondLine((bonds || {})[k], label)}</li>`)
+    .join("") + "</ul>";
+}
+
+const BOND_NOTE = "A bond is burned half and paid half to whoever shows two of its oracle's attestations of " +
+  "one pair and time at two prices. It deters that conflict and nothing else: a single consistent false " +
+  "price is no conflict.";
+
+/**
+ * The version 2 panel: the oracles and their bonds, offers and loans from the
+ * book, every script recomputed here. `oracles` is the book's /v1/oracles.
+ */
+export function render(offers, loans, label = (a) => short(a), oracles = null) {
   if (!PIN) return '<div class="empty">The version 2 derivation is not pinned, so nothing is shown.</div>';
   const out = [];
+  if (oracles && (oracles.oracles || []).length) {
+    const byKey = Object.fromEntries((oracles.bonds || []).filter(Boolean).map((b) => [b.key, b]));
+    out.push(`<h3>Oracles and their bonds</h3>${oracleList(oracles.oracles, byKey, label)}` +
+             `<div class="sub2">${esc(BOND_NOTE)}</div>`);
+  }
   out.push("<h3>Offers</h3>");
   const open = offers.filter((o) => o.status === "open");
   if (!open.length) out.push('<div class="empty">no open version 2 offers</div>');
   for (const o of open) {
     const ok = offerSpk({ ...o.offer, terms: o.offer.terms }) === o.spk;
     const t = o.offer.terms;
+    const set = isThreshold(t);
+    const oracleNote = set
+      ? `<br>Priced by ${esc(oracleLabel(t))} oracles: a price at least ${esc(t.threshold)} of them sign alike.` +
+        oracleList(t.oracles.filter((k) => k !== NO_ORACLE), o.bonds, label)
+      : (o.bonds ? `<br>Oracle bond: ${bondLine(o.bonds[t.oracle_x], label)}.` : "");
     out.push(`<div class="card"><b>${esc(t.market)}</b> lot ${esc(o.offer.lot)} of ${label(t.debt_asset)}, owes ` +
       `${esc(o.offer.debt)}, collateral at least ${esc(o.offer.collateral)} of ${label(t.collateral_asset)}; ` +
       `liquidation below ${(t.liq_bp / 100).toFixed(2)}%, back to ${(t.target_bp / 100).toFixed(2)}%, bonus ` +
       `${(t.bonus_bp / 100 - 100).toFixed(2)}%. ${o.lots_left} lot(s) left. ` +
       (ok ? `Script recomputed here: ${short(o.spk)}.` : "<b>Its script does NOT match its terms: do not take it.</b>") +
-      (ok ? `<br><button type="button" data-v2-take="${esc(o.offer_id)}">Take one lot with your wallet</button>` : "") +
+      oracleNote +
+      (ok && !set ? `<br><button type="button" data-v2-take="${esc(o.offer_id)}">Take one lot with your wallet</button>` : "") +
       `<br>Or: ${cmd(["pignus-cli", "v2-take", "--offer", o.offer_id, "--book", "<this book>"])}</div>`);
   }
   out.push("<h3>Loans</h3>");
@@ -348,12 +418,19 @@ export function render(offers, loans, label = (a) => short(a)) {
                `price, ${h ? "healthy" : "<b>unhealthy: anyone may liquidate it back to its target</b>"}.`;
     }
     const points = live ? fivePoints(l, "repay or top-up").map(([k, v]) => `<li>${esc(k)}: ${v}</li>`).join("") : "";
+    const set = isThreshold(t);
+    const oracleNote = set
+      ? ` Priced by ${esc(oracleLabel(t))} oracles` +
+        (l.attestation && l.attestation.signers ? `, now by the record ${l.attestation.signers.length} of them signed alike` : "") +
+        `.` + oracleList(t.oracles.filter((k) => k !== NO_ORACLE), l.bonds, label)
+      : (l.bonds ? ` Oracle bond: ${bondLine(l.bonds[t.oracle_x], label)}.` : "");
     out.push(`<div class="card"><b>${esc(t.market)}</b> ${esc(l.state)}: owes ${esc(l.debt)} of ` +
-      `${label(t.debt_asset)}, holds ${esc(l.collateral)} of ${label(t.collateral_asset)}.${health}` +
+      `${label(t.debt_asset)}, holds ${esc(l.collateral)} of ${label(t.collateral_asset)}.${health}${oracleNote}` +
       (live ? `<details open><summary>Before anything is signed</summary><ul>${points}</ul>` +
+              (set ? "" :
               `<label>Amount, in atoms <input data-v2-amount="${esc(l.loan_id)}" inputmode="numeric"></label> ` +
               `<button type="button" data-v2-repay="${esc(l.loan_id)}">Repay with your wallet</button> ` +
-              `<button type="button" data-v2-topup="${esc(l.loan_id)}">Top up with your wallet</button>` +
+              `<button type="button" data-v2-topup="${esc(l.loan_id)}">Top up with your wallet</button>`) +
               `<br>Or repay: ${cmd(["pignus-cli", "v2-repay", "--loan", l.loan_id, "--amount", "<atoms>", "--book", "<this book>"])}` +
               `<br>Top up: ${cmd(["pignus-cli", "v2-topup", "--loan", l.loan_id, "--amount", "<atoms>", "--book", "<this book>"])}` +
               `</details>` : "") +

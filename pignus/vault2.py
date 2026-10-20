@@ -48,7 +48,13 @@ LOCKTIME_THRESHOLD = 500_000_000
 MAX_PRECISION = SA.PIGNUS_MAX_PRECISION
 
 VAULT_PATH_T = "Either<Either<(), ()>, Either<(u64, u32, u256, Signature, u32, bool), ()>>"
+SLOT_T = "Option<(Signature, u256, u32)>"
+VAULT_T_PATH_T = "Either<Either<(), ()>, Either<(u64, u32, [%s; 3], bool), ()>>" % SLOT_T
 OFFER_PATH_T = "Either<u256, ()>"
+# A threshold vault names three keys; a loan of two oracles fills the third
+# slot with this key, which nobody holds, and an all-zero beacon asset.
+NO_ORACLE = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+NO_BEACON_ASSET = "00" * 32
 PATH_REPAY = "Left(Left(()))"
 PATH_TOP_UP = "Left(Right(()))"
 PATH_RECOVER = "Right(Right(()))"
@@ -87,10 +93,15 @@ def _simplicity_leaf(node):
 
 VAULT_DESC, VAULT_SOURCE, VAULT_LEAF = _load("pignus_vault")
 OFFER_DESC, OFFER_SOURCE, OFFER_LEAF = _load("pignus_offer")
+VAULT_T_DESC, VAULT_T_SOURCE, VAULT_T_LEAF = _load("pignus_vault_threshold")
+OFFER_T_DESC, OFFER_T_SOURCE, OFFER_T_LEAF = _load("pignus_offer_threshold")
 VAULT_TEMPLATE = VAULT_DESC["template_hash"]
 OFFER_TEMPLATE = OFFER_DESC["template_hash"]
+VAULT_T_TEMPLATE = VAULT_T_DESC["template_hash"]
+OFFER_T_TEMPLATE = OFFER_T_DESC["template_hash"]
 # The templates a Pignus party signs for: point one of the five.
-KNOWN_TEMPLATES = {VAULT_TEMPLATE: "pignus/vault v2", OFFER_TEMPLATE: "pignus/offer v2"}
+KNOWN_TEMPLATES = {VAULT_TEMPLATE: "pignus/vault v2", OFFER_TEMPLATE: "pignus/offer v2",
+                   VAULT_T_TEMPLATE: "pignus/vault-threshold v1", OFFER_T_TEMPLATE: "pignus/offer-threshold v1"}
 
 
 def _internal(display_hex):
@@ -132,14 +143,43 @@ class V2Terms:
     # read off the chain: a take reveals the hash, not the script. A close
     # pays the borrower and so needs the script itself.
     borrower_hash: str = ""
+    # Several oracles (templates/pignus_vault_threshold): three keys, each
+    # oracle's beacon asset, and how many must attest one price record. Empty
+    # for a loan of one oracle, which names it in `oracle_x` and
+    # `beacon_asset`; a threshold loan leaves those two empty.
+    oracles: list = field(default_factory=list)
+    beacon_assets: list = field(default_factory=list)
+    threshold: int = 0
 
     def __post_init__(self):
         for k in ("collateral_asset", "debt_asset", "oracle_x", "beacon_asset",
                   "lender_spk", "borrower_spk", "borrower_hash"):
             setattr(self, k, str(getattr(self, k) or "").lower())
-        for k in ("precision", "liq_bp", "target_bp", "bonus_bp", "maturity", "recover_after"):
+        for k in ("precision", "liq_bp", "target_bp", "bonus_bp", "maturity", "recover_after", "threshold"):
             setattr(self, k, int(getattr(self, k)))
-        for k in ("collateral_asset", "debt_asset", "oracle_x", "beacon_asset"):
+        self.oracles = [str(k).lower() for k in (self.oracles or [])]
+        self.beacon_assets = [str(a).lower() for a in (self.beacon_assets or [])]
+        single = ("oracle_x", "beacon_asset")
+        if self.oracles:
+            if self.oracle_x or self.beacon_asset:
+                raise V2Error("a threshold loan names its oracles in `oracles`, not in oracle_x")
+            if not 2 <= len(self.oracles) <= 3 or len(self.beacon_assets) != len(self.oracles):
+                raise V2Error("a threshold loan names two or three oracle keys, each with its beacon asset")
+            if len(self.oracles) == 2:
+                self.oracles.append(NO_ORACLE)
+                self.beacon_assets.append(NO_BEACON_ASSET)
+            if len(set(self.oracles)) != 3:
+                raise V2Error("the oracle keys must be distinct: m signatures must be m signers")
+            real = sum(1 for k in self.oracles if k != NO_ORACLE)
+            if not 1 <= self.threshold <= real:
+                raise V2Error(f"the threshold is 1 to {real}, the number of oracles named")
+            for k in self.oracles + self.beacon_assets:
+                if len(bytes.fromhex(k)) != 32:
+                    raise V2Error("oracle keys and beacon assets are 32 bytes of hex")
+            single = ()
+        elif self.threshold or self.beacon_assets:
+            raise V2Error("a threshold names its oracles")
+        for k in ("collateral_asset", "debt_asset") + single:
             if len(bytes.fromhex(getattr(self, k))) != 32:
                 raise V2Error(f"{k} is 32 bytes of hex")
         if not self.lender_spk:
@@ -153,13 +193,35 @@ class V2Terms:
         elif self.borrower_hash and len(bytes.fromhex(self.borrower_hash)) != 32:
             raise V2Error("borrower_hash is 32 bytes of hex")
 
+    @property
+    def is_threshold(self):
+        return bool(self.oracles)
+
+    def oracle_keys(self):
+        """The keys that can attest: the one oracle, or the set without the
+        key that fills an unused slot."""
+        return [k for k in self.oracles if k != NO_ORACLE] if self.oracles else [self.oracle_x]
+
+    def beacon_asset_of(self, key):
+        if not self.oracles:
+            return self.beacon_asset if key == self.oracle_x else None
+        return self.beacon_assets[self.oracles.index(key)] if key in self.oracles else None
+
     def params(self, with_borrower=True):
-        p = {"COLL": _internal(self.collateral_asset), "DEBT_ASSET": _internal(self.debt_asset),
-             "ORACLE": self.oracle_x, "BEACON_ASSET": _internal(self.beacon_asset),
-             "PRECISION": "%02x" % self.precision, "LIQ_BP": "%08x" % self.liq_bp,
-             "TARGET_BP": "%08x" % self.target_bp, "BONUS_BP": "%08x" % self.bonus_bp,
-             "MATURITY": "%08x" % self.maturity, "RECOVER_AFTER": "%08x" % self.recover_after,
-             "LENDER": script_hash(self.lender_spk)}
+        if self.oracles:
+            p = {"COLL": _internal(self.collateral_asset), "DEBT_ASSET": _internal(self.debt_asset)}
+            for i, k in enumerate(self.oracles):
+                p["ORACLE_%d" % (i + 1)] = k
+            for i, a in enumerate(self.beacon_assets):
+                p["BEACON_ASSET_%d" % (i + 1)] = _internal(a)
+            p["THRESHOLD"] = "%02x" % self.threshold
+        else:
+            p = {"COLL": _internal(self.collateral_asset), "DEBT_ASSET": _internal(self.debt_asset),
+                 "ORACLE": self.oracle_x, "BEACON_ASSET": _internal(self.beacon_asset)}
+        p.update({"PRECISION": "%02x" % self.precision, "LIQ_BP": "%08x" % self.liq_bp,
+                  "TARGET_BP": "%08x" % self.target_bp, "BONUS_BP": "%08x" % self.bonus_bp,
+                  "MATURITY": "%08x" % self.maturity, "RECOVER_AFTER": "%08x" % self.recover_after,
+                  "LENDER": script_hash(self.lender_spk)})
         if with_borrower:
             if not self.borrower_hash:
                 raise V2Error("a vault's terms name the borrower's payout script")
@@ -182,6 +244,28 @@ class V2Terms:
         if self.collateral_asset == self.debt_asset:
             bad.append("the collateral and the debt are different assets")
         return bad
+
+    def vault_desc(self):
+        return VAULT_T_DESC if self.oracles else VAULT_DESC
+
+    def vault_source(self):
+        return VAULT_T_SOURCE if self.oracles else VAULT_SOURCE
+
+    def vault_template(self):
+        return VAULT_T_TEMPLATE if self.oracles else VAULT_TEMPLATE
+
+    def offer_desc(self):
+        return OFFER_T_DESC if self.oracles else OFFER_DESC
+
+    def offer_source(self):
+        return OFFER_T_SOURCE if self.oracles else OFFER_SOURCE
+
+    def offer_template(self):
+        return OFFER_T_TEMPLATE if self.oracles else OFFER_TEMPLATE
+
+    def oracle_label(self):
+        """"one oracle", or "2-of-3"."""
+        return f"{self.threshold}-of-{len(self.oracle_keys())}" if self.oracles else "one oracle"
 
     def to_json(self):
         return json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
@@ -214,7 +298,7 @@ class V2Offer:
         return p
 
     def derive(self):
-        return SA.derive(OFFER_DESC, self.params(), {})
+        return SA.derive(self.terms.offer_desc(), self.params(), {})
 
     def script_pubkey(self):
         return self.derive()["script_pubkey"]
@@ -249,7 +333,7 @@ def vault_slots(debt, last):
 
 
 def derive_vault(terms, debt, last):
-    return SA.derive(VAULT_DESC, terms.params(), vault_slots(debt, last))
+    return SA.derive(terms.vault_desc(), terms.params(), vault_slots(debt, last))
 
 
 def vault_spk(terms, debt, last):
@@ -344,24 +428,34 @@ def _vu(n, bits):
     return {"value": str(int(n)), "type": "u%d" % bits}
 
 
+def _oracle_witness(terms, p):
+    if not terms.oracles:
+        return {"ORACLE": {"value": "0x" + p["ORACLE"], "type": "Pubkey"},
+                "BEACON_ASSET": _v256(p["BEACON_ASSET"])}
+    w = {"THRESHOLD": _vu(terms.threshold, 8)}
+    for i in (1, 2, 3):
+        w["ORACLE_%d" % i] = {"value": "0x" + p["ORACLE_%d" % i], "type": "Pubkey"}
+        w["BEACON_ASSET_%d" % i] = _v256(p["BEACON_ASSET_%d" % i])
+    return w
+
+
 def vault_witness(terms, debt, last, path):
     p = terms.params()
     return {"COLL": _v256(p["COLL"]), "DEBT_ASSET": _v256(p["DEBT_ASSET"]),
-            "ORACLE": {"value": "0x" + p["ORACLE"], "type": "Pubkey"},
-            "BEACON_ASSET": _v256(p["BEACON_ASSET"]), "PRECISION": _vu(terms.precision, 8),
+            **_oracle_witness(terms, p), "PRECISION": _vu(terms.precision, 8),
             "LIQ_BP": _vu(terms.liq_bp, 32), "TARGET_BP": _vu(terms.target_bp, 32),
             "BONUS_BP": _vu(terms.bonus_bp, 32), "MATURITY": _vu(terms.maturity, 32),
             "RECOVER_AFTER": _vu(terms.recover_after, 32), "LENDER": _v256(p["LENDER"]),
             "BORROWER": _v256(p["BORROWER"]), "DEBT_OUT": _vu(debt, 64), "LAST_TIME": _vu(last, 32),
-            "PATH": {"value": path, "type": VAULT_PATH_T}}
+            "PATH": {"value": path, "type": VAULT_T_PATH_T if terms.oracles else VAULT_PATH_T}}
 
 
 def offer_witness(offer, path):
     p = offer.params()
-    w = {k: _v256(p[k]) for k in ("COLL", "DEBT_ASSET", "BEACON_ASSET", "LENDER")}
+    w = {k: _v256(p[k]) for k in ("COLL", "DEBT_ASSET", "LENDER")}
     t = offer.terms
-    w.update({"ORACLE": {"value": "0x" + p["ORACLE"], "type": "Pubkey"},
-              "PRECISION": _vu(t.precision, 8), "LIQ_BP": _vu(t.liq_bp, 32),
+    w.update(_oracle_witness(t, p))
+    w.update({"PRECISION": _vu(t.precision, 8), "LIQ_BP": _vu(t.liq_bp, 32),
               "TARGET_BP": _vu(t.target_bp, 32), "BONUS_BP": _vu(t.bonus_bp, 32),
               "MATURITY": _vu(t.maturity, 32), "RECOVER_AFTER": _vu(t.recover_after, 32),
               "LOT": _vu(offer.lot, 64), "DEBT": _vu(offer.debt, 64),
@@ -374,6 +468,14 @@ def liquidate_path(att, beacon_at, matured):
     return "Right(Left((%d, %d, 0x%s, 0x%s, %d, %s)))" % (
         int(att["price"]), int(att["time"]), att["beacon"], att["signature"], int(beacon_at),
         "true" if matured else "false")
+
+
+def liquidate_threshold_path(price, time, slots, matured):
+    """`slots`: three entries, each None (abstain) or (signature, beacon, input)."""
+    def one(s):
+        return "None" if s is None else "Some((0x%s, 0x%s, %d))" % (s[0], s[1], int(s[2]))
+    return "Right(Left((%d, %d, [%s], %s)))" % (int(price), int(time), ", ".join(one(s) for s in slots),
+                                                 "true" if matured else "false")
 
 
 # ------------------------------------------------------------ transactions
@@ -552,9 +654,9 @@ def compose_take(node, offer, offer_coin, borrower_spk, change_spk, collateral=N
     ins = [offer_coin] + coins
     s = Spend(_tx(m, ins, outs, last), ins, 0, kind="take")
     d = offer.derive()
-    s.finish(_genesis(node), d["leaves"]["offer"]["control_block"], OFFER_SOURCE,
+    s.finish(_genesis(node), d["leaves"]["offer"]["control_block"], offer.terms.offer_source(),
              offer_witness(offer, "Left(0x%s)" % script_hash(borrower_spk)))
-    s.summary = {"path": "take", "template": OFFER_TEMPLATE, "terms": t, "state": (offer.debt, last),
+    s.summary = {"path": "take", "template": offer.terms.offer_template(), "terms": t, "state": (offer.debt, last),
                  "vault_spk": vault_spk(t, offer.debt, last), "fee": (fee, offer.terms.debt_asset)}
     return s
 
@@ -570,7 +672,7 @@ def _vault_spend(node, terms, state, vcoin, kind, path, outs, wallet, need, chan
     ins = [vcoin] + list(extra) + wallet
     outs = list(outs) + _change(m, wallet, need, change_spk)
     s = Spend(_tx(m, ins, outs, locktime), ins, 0, kind=kind, witnesses=dict(witnesses or {}))
-    s.finish(_genesis(node), d["leaves"]["vault"]["control_block"], VAULT_SOURCE,
+    s.finish(_genesis(node), d["leaves"]["vault"]["control_block"], terms.vault_source(),
              vault_witness(terms, debt, last, path))
     return s
 
@@ -594,7 +696,7 @@ def compose_repay(node, terms, state, vcoin, amount, change_spk, feerate=None):
         first = _out(m, vcoin.amount, terms.borrower_spk, terms.collateral_asset)
     outs = [first, _out(m, amount, terms.lender_spk, terms.debt_asset), _fee(m, fee, terms.debt_asset)]
     s = _vault_spend(node, terms, state, vcoin, "repay", PATH_REPAY, outs, wallet, need, change_spk)
-    s.summary = {"path": "repay", "template": VAULT_TEMPLATE, "terms": terms, "state": state,
+    s.summary = {"path": "repay", "template": terms.vault_template(), "terms": terms, "state": state,
                  "next": None if amount >= debt else (debt - amount, last), "paid": amount,
                  "fee": (fee, terms.debt_asset)}
     return s
@@ -611,7 +713,7 @@ def compose_top_up(node, terms, state, vcoin, amount, change_spk, feerate=None):
     wallet = _wallet_coins(node, need, terms.collateral_asset)
     outs = [_out(m, vcoin.amount + amount, vcoin.spk, terms.collateral_asset), _fee(m, fee, terms.collateral_asset)]
     s = _vault_spend(node, terms, state, vcoin, "top_up", PATH_TOP_UP, outs, wallet, need, change_spk)
-    s.summary = {"path": "top_up", "template": VAULT_TEMPLATE, "terms": terms, "state": state,
+    s.summary = {"path": "top_up", "template": terms.vault_template(), "terms": terms, "state": state,
                  "next": state, "added": amount, "fee": (fee, terms.collateral_asset)}
     return s
 
@@ -651,9 +753,77 @@ def compose_liquidation(node, terms, state, vcoin, att, beacon, plan, taker_spk,
     s = _vault_spend(node, terms, state, vcoin, "liquidate",
                      liquidate_path(att, 1, matured), outs, wallet, need, change_spk,
                      locktime=t, extra=[bcoin], witnesses={1: bwit})
-    s.summary = {"path": "call" if matured else "liquidate", "template": VAULT_TEMPLATE, "terms": terms,
+    s.summary = {"path": "call" if matured else "liquidate", "template": terms.vault_template(), "terms": terms,
                  "state": state, "next": None if closes else (debt - r, t), "paid": r, "seized": seized,
                  "price": int(att["price"]), "fee": (fee, terms.debt_asset)}
+    return s
+
+
+def compose_liquidation_threshold(node, terms, state, vcoin, record, beacons, plan, taker_spk, change_spk,
+                                  matured=False, feerate=None):
+    """Liquidate a threshold vault under `record`: {"price", "time", "slots"},
+    slots three entries in the vault's key order, each None or {"signature",
+    "beacon"}, at least THRESHOLD of them given. `beacons` holds, for each
+    given slot in order, the (Coin, recreate witness) of a live coin at the
+    beacon that slot names. The vault is input 0 and owns outputs 0 and 1;
+    the j-th beacon coin is input j and is recreated at output 2j; the
+    seizure, the change and the fee fill the outputs between. The lock time
+    is the record's time."""
+    m, _ = _tf()
+    debt, last = state
+    t = int(record["time"])
+    mtp = node.getblockchaininfo()["mediantime"]
+    if t >= mtp:
+        raise V2Error(f"the record's time {t} is not yet past the chain's median time {mtp}: "
+                      "the transaction could not be mined until it is")
+    given = [i for i, sl in enumerate(record["slots"]) if sl]
+    if len(record["slots"]) != 3 or len(given) < terms.threshold:
+        raise V2Error(f"a {terms.oracle_label()} vault needs {terms.threshold} of its oracles' signatures")
+    if len(beacons) != len(given):
+        raise V2Error("one live beacon coin per signature given")
+    r, kept = int(plan["repaid"]), int(plan["kept"])
+    check_liquidation(terms, vcoin.amount, state, t, int(record["price"]), r, kept, matured)
+    fee = fee_for(node, terms.debt_asset, "liquidate", feerate)
+    need = {terms.debt_asset: r + fee}
+    wallet = _wallet_coins(node, need, terms.debt_asset)
+    seized = vcoin.amount - kept
+    closes = r >= debt
+    if closes:
+        first = (_out(m, kept, terms.borrower_spk, terms.collateral_asset) if kept
+                 else _out(m, seized, taker_spk, terms.collateral_asset))
+    else:
+        first = _out(m, kept, vault_spk(terms, debt - r, t), terms.collateral_asset)
+    fillers = []
+    if seized and (kept or not closes):
+        fillers.append(_out(m, seized, taker_spk, terms.collateral_asset))
+    fillers += _change(m, wallet, need, change_spk)
+    fillers.append(_fee(m, fee, terms.debt_asset))
+    outs = [first, _out(m, r, terms.lender_spk, terms.debt_asset)]
+    slots = [None, None, None]
+    for j, (i, (bcoin, _wit)) in enumerate(zip(given, beacons), start=1):
+        while len(outs) < 2 * j:
+            if not fillers:
+                raise V2Error("too few outputs to put each beacon coin at its output 2k")
+            outs.append(fillers.pop(0))
+        outs.append(bcoin.txout())
+        sl = record["slots"][i]
+        if bcoin.spk != "5120" + str(sl["beacon"]):
+            raise V2Error(f"the beacon coin for slot {i + 1} is not at the beacon its signature names")
+        slots[i] = (sl["signature"], sl["beacon"], j)
+    outs += fillers
+    d = derive_vault(terms, debt, last)
+    if vcoin.spk != d["script_pubkey"]:
+        raise V2Error("the coin is not this vault in this state: its script differs from the one the "
+                      "terms and state derive")
+    ins = [vcoin] + [b for b, _w in beacons] + wallet
+    s = Spend(_tx(m, ins, outs, t), ins, 0, kind="liquidate",
+              witnesses={j: w for j, (_b, w) in enumerate(beacons, start=1)})
+    s.finish(_genesis(node), d["leaves"]["vault"]["control_block"], terms.vault_source(),
+             vault_witness(terms, debt, last, liquidate_threshold_path(record["price"], t, slots, matured)))
+    s.summary = {"path": "call" if matured else "liquidate", "template": terms.vault_template(), "terms": terms,
+                 "state": state, "next": None if closes else (debt - r, t), "paid": r, "seized": seized,
+                 "price": int(record["price"]), "signers": [terms.oracles[i] for i in given],
+                 "fee": (fee, terms.debt_asset)}
     return s
 
 
@@ -670,7 +840,7 @@ def compose_recover(node, terms, state, vcoin, change_spk, feerate=None):
     outs = [_out(m, vcoin.amount, terms.lender_spk, terms.collateral_asset), _fee(m, fee, terms.collateral_asset)]
     s = _vault_spend(node, terms, state, vcoin, "recover", PATH_RECOVER, outs, wallet, need, change_spk,
                      locktime=terms.recover_after)
-    s.summary = {"path": "recover", "template": VAULT_TEMPLATE, "terms": terms, "state": state, "next": None,
+    s.summary = {"path": "recover", "template": terms.vault_template(), "terms": terms, "state": state, "next": None,
                  "fee": (fee, terms.collateral_asset)}
     return s
 
@@ -689,9 +859,9 @@ def compose_refund(node, offer, ocoin, change_spk, feerate=None):
     outs += _change(m, wallet, need, change_spk) + [_fee(m, fee, offer.terms.debt_asset)]
     ins = [ocoin] + wallet
     s = Spend(_tx(m, ins, outs, offer.expiry), ins, 0, kind="refund")
-    s.finish(_genesis(node), offer.derive()["leaves"]["offer"]["control_block"], OFFER_SOURCE,
+    s.finish(_genesis(node), offer.derive()["leaves"]["offer"]["control_block"], offer.terms.offer_source(),
              offer_witness(offer, PATH_REFUND))
-    s.summary = {"path": "refund", "template": OFFER_TEMPLATE, "terms": offer.terms, "fee": (fee, offer.terms.debt_asset)}
+    s.summary = {"path": "refund", "template": offer.terms.offer_template(), "terms": offer.terms, "fee": (fee, offer.terms.debt_asset)}
     return s
 
 
@@ -791,8 +961,15 @@ def approval(spend, wallet_changes, labels=None):
     t = sm["terms"]
     name = KNOWN_TEMPLATES.get(sm["template"])
     lab = lambda a: labels.get(a) or a[:12] + "…"   # noqa: E731
-    roles = [("collateral asset", lab(t.collateral_asset)), ("debt asset", lab(t.debt_asset)),
-             ("oracle key", t.oracle_x), ("beacon asset", lab(t.beacon_asset)),
+    if t.is_threshold:
+        oracle_roles = [("oracles", f"{t.oracle_label()}: a price at least {t.threshold} of them sign")]
+        for i, k in enumerate(t.oracles, start=1):
+            oracle_roles.append((f"oracle {i} key", "none (an unused slot)" if k == NO_ORACLE else k))
+            if k != NO_ORACLE:
+                oracle_roles.append((f"oracle {i} beacon asset", lab(t.beacon_assets[i - 1])))
+    else:
+        oracle_roles = [("oracle key", t.oracle_x), ("beacon asset", lab(t.beacon_asset))]
+    roles = [("collateral asset", lab(t.collateral_asset)), ("debt asset", lab(t.debt_asset))] + oracle_roles + [
              ("price precision", t.precision),
              ("liquidation threshold", f"{t.liq_bp / 100:.2f}%"),
              ("liquidation target", f"{t.target_bp / 100:.2f}%"),

@@ -257,6 +257,26 @@ until then the old attestations still verify. `pignusd` checks each oracle's
 beacon on its own node; pin each oracle's beacon asset in its
 `oracle_beacon_assets`, in the order of `oracle_keys`.
 
+### The bond
+
+An oracle can stand behind its format-2 attestations with a bond: coins of any
+asset in sequentia-contracts' `templates/oracle_bond`, burned half and paid half
+to whoever shows two of its attestations of one pair and time at two prices,
+and taken back by its key only after notice and a wait. sequentia-oracle's
+runbook, "The bond", is the procedure: the signer's `bond` section declares the
+bond's terms on its bond log, and `sequentia-oracle-bond` posts the coins from
+an operating wallet the operator names (never a reserve, SBTC, bridge or
+treasury wallet).
+
+For the book to show it, add `"bond_log": "/root/sequentia/pignus-data/bond.log"`
+(oracle 2: `bond-2.log`, and so on, as the signer's `bond.log` names it) to the
+oracle's `signer` section and restart `pignus-oracle`: it serves the log at
+`/v2/bond/log`. `pignusd` reads it about once a minute, recomputes the bond's
+scripts itself, counts the coins on its own node, and shows each oracle's bond
+(asset, amount, status) at `/v1/oracles`, `/v2/bonds`, beside every version 2
+offer and loan, and on the page. A bond deters that one conflict; it does not
+deter a single consistent false price, and the page says so.
+
 ## Backups
 
 Everything Pignus keeps that is not on a chain: the oracle keys and their
@@ -625,7 +645,17 @@ Run more than one `pignus-oracle` and list the extra ones in `pignusd.json`:
 
 `/v1/oracles` then lists the set and `/v1/attestations/{market}` returns one
 attestation per oracle; a lender opens a 2-of-3 with `offer-fund --oracles book
---oracle-threshold 2`.
+--oracle-threshold 2`, or a version 2 one with `v2-offer-fund --oracles book
+--oracle-threshold 2` (sequentia-contracts' `templates/pignus_vault_threshold`).
+
+A version 2 loan of several oracles is liquidated on one price record that at
+least its threshold of them signed alike: the same price at the same time,
+each under its own live beacon. Oracles that read one price server and stamp
+its observation time sign the same record; oracles on different feeds or
+clocks rarely do, and a threshold they cannot meet together leaves the loan
+to its maturity call and its recovery. The book keeps each oracle's last 64
+records (`/v2/records/{market}`) and the liquidator settles on the newest one
+enough of them share.
 
 `pignus-oracle@.service` is the unit for every instance after the first, and
 First install has already put it in `/etc/systemd/system` — it is one of the

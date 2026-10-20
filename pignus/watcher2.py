@@ -32,10 +32,17 @@ import time
 from . import atoms as _atoms
 from . import vault2 as V2
 
-# The offer's terms take 1,672 bits of its witness (five 256-bit values, one
-# byte, six 32-bit and three 64-bit values); then the path's tag, then, on a
-# take, the borrower's script hash.
+# The offer's witness holds its terms first, each at its width, in the order
+# the program reads them; then the path's tag, then, on a take, the
+# borrower's script hash. A single-oracle offer's terms take 1,672 bits (five
+# 256-bit values, one byte, six 32-bit and three 64-bit values), a threshold
+# offer's 2,704 (nine 256-bit values, two bytes, six 32-bit and three 64-bit).
 BORROWER_BIT = 1673
+
+
+def borrower_bit(offer):
+    """Where the borrower's script hash starts in a take's offer witness."""
+    return 8 * sum(len(v) // 2 for v in offer.params().values()) + 1
 
 OPEN = ("UNCONFIRMED", "LIVE")
 CLOSED = ("REPAID", "LIQUIDATED", "RECOVERED", "SPENT_UNKNOWN", "GHOST")
@@ -61,13 +68,14 @@ def borrower_from_take(offer, tx, k):
         return None
     lock = int(tx.get("locktime", 0))
     spk = main.get("scriptPubKey", {}).get("hex", "")
-    cand = bits[BORROWER_BIT:BORROWER_BIT + 256]
+    at = borrower_bit(offer)
+    cand = bits[at:at + 256]
     if len(cand) != 256:
         return None
     h = "%064x" % int(cand, 2)
     params = offer.terms.params(with_borrower=False)
     params["BORROWER"] = h
-    d = V2.SA.derive(V2.VAULT_DESC, params, V2.vault_slots(offer.debt, lock))
+    d = V2.SA.derive(offer.terms.vault_desc(), params, V2.vault_slots(offer.debt, lock))
     return h if d["script_pubkey"] == spk else None
 
 

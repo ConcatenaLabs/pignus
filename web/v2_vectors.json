@@ -94,6 +94,121 @@
    }
   ]
  },
+ "offer_threshold": {
+  "cmr": "1d31ebc5104f93e3c514059cdd1150c539d5ad03d805c4c285d5e650c066c88d",
+  "hash": "c8d981f09b6bd60b52e152a093ed54070e76fe82b305ca02a43c568e81e1e811",
+  "name": "pignus/offer-threshold v1",
+  "vectors": [
+   {
+    "name": "instance 0: data leaf first, output key parity 0, 2 of keys A/B/C",
+    "params": {
+     "BEACON_ASSET_1": "cdcd7666e837d684d12a5c7875eafb4e8faceadc3f5009944e332001de3fcb21",
+     "BEACON_ASSET_2": "8dcb34f87e9de941491817645e4035f9ea120c9b33891d14be8417d62a9940b1",
+     "BEACON_ASSET_3": "3d26eca59becfb8ffbd2e605252ea8ba8055567641a707ed27e576416850a003",
+     "BONUS_BP": "00002904",
+     "COLL": "8038005026e58a8cec3d28bb9d67e7733beabb2faee42ac558454a780f0298ad",
+     "COLLATERAL": "000110d9316ec000",
+     "DEBT": "0000befe6f672000",
+     "DEBT_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+     "EXPIRY": "6afd86c0",
+     "LENDER": "a0388c98039314432d356f5f69398d6d4e82527bbe8800b88519c745c6987d68",
+     "LIQ_BP": "000030d4",
+     "LOT": "0000b5e620f48000",
+     "MATURITY": "6b49d200",
+     "ORACLE_1": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec",
+     "ORACLE_2": "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7",
+     "ORACLE_3": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "PRECISION": "05",
+     "RECOVER_AFTER": "6be26880",
+     "TARGET_BP": "00003a98",
+     "THRESHOLD": "02"
+    },
+    "script_pubkey": "512001ce58fb3bbff3c5a6554b61a87b930ca28b4dbe09e4a2af6df72840ad67df76",
+    "slots": {}
+   },
+   {
+    "name": "instance 1: data leaf first, output key parity 1, 2 of keys A/B/NUMS",
+    "params": {
+     "BEACON_ASSET_1": "cdcd7666e837d684d12a5c7875eafb4e8faceadc3f5009944e332001de3fcb21",
+     "BEACON_ASSET_2": "8dcb34f87e9de941491817645e4035f9ea120c9b33891d14be8417d62a9940b1",
+     "BEACON_ASSET_3": "3d26eca59becfb8ffbd2e605252ea8ba8055567641a707ed27e576416850a003",
+     "BONUS_BP": "00002904",
+     "COLL": "8038005026e58a8cec3d28bb9d67e7733beabb2faee42ac558454a780f0298ad",
+     "COLLATERAL": "000110d9316ec000",
+     "DEBT": "0000befe6f672000",
+     "DEBT_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+     "EXPIRY": "6afd86c0",
+     "LENDER": "da56c7c8ea87157cf0141777177ccbc129bd92044c15b2916e76235ca99e267a",
+     "LIQ_BP": "000030d4",
+     "LOT": "0000b5e620f48000",
+     "MATURITY": "6b49d200",
+     "ORACLE_1": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec",
+     "ORACLE_2": "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7",
+     "ORACLE_3": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+     "PRECISION": "05",
+     "RECOVER_AFTER": "6be26880",
+     "TARGET_BP": "00003a98",
+     "THRESHOLD": "02"
+    },
+    "script_pubkey": "5120539e701849176f7c38d3726bb1821b6d3b4b6c00cd70a28dedb98ef2761480f5",
+    "slots": {}
+   },
+   {
+    "name": "instance 2: program first, output key parity 0, 3 of keys C/A/B",
+    "params": {
+     "BEACON_ASSET_1": "cdcd7666e837d684d12a5c7875eafb4e8faceadc3f5009944e332001de3fcb21",
+     "BEACON_ASSET_2": "8dcb34f87e9de941491817645e4035f9ea120c9b33891d14be8417d62a9940b1",
+     "BEACON_ASSET_3": "3d26eca59becfb8ffbd2e605252ea8ba8055567641a707ed27e576416850a003",
+     "BONUS_BP": "00002904",
+     "COLL": "8038005026e58a8cec3d28bb9d67e7733beabb2faee42ac558454a780f0298ad",
+     "COLLATERAL": "000110d9316ec000",
+     "DEBT": "0000befe6f672000",
+     "DEBT_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+     "EXPIRY": "6afd86c0",
+     "LENDER": "a0388c98039314432d356f5f69398d6d4e82527bbe8800b88519c745c6987d68",
+     "LIQ_BP": "000030d4",
+     "LOT": "0000b5e620f48000",
+     "MATURITY": "6b49d200",
+     "ORACLE_1": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "ORACLE_2": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec",
+     "ORACLE_3": "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7",
+     "PRECISION": "05",
+     "RECOVER_AFTER": "6be26880",
+     "TARGET_BP": "00003a98",
+     "THRESHOLD": "03"
+    },
+    "script_pubkey": "51203f25b5dfeb64a3a8961db6eb5c42acd0e431a583ae9fe00f00e952a5f217d30a",
+    "slots": {}
+   },
+   {
+    "name": "instance 3: program first, output key parity 1, 1 of keys A/B/C",
+    "params": {
+     "BEACON_ASSET_1": "cdcd7666e837d684d12a5c7875eafb4e8faceadc3f5009944e332001de3fcb21",
+     "BEACON_ASSET_2": "8dcb34f87e9de941491817645e4035f9ea120c9b33891d14be8417d62a9940b1",
+     "BEACON_ASSET_3": "3d26eca59becfb8ffbd2e605252ea8ba8055567641a707ed27e576416850a003",
+     "BONUS_BP": "00002904",
+     "COLL": "8038005026e58a8cec3d28bb9d67e7733beabb2faee42ac558454a780f0298ad",
+     "COLLATERAL": "000110d9316ec000",
+     "DEBT": "0000befe6f672000",
+     "DEBT_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+     "EXPIRY": "6afd86c0",
+     "LENDER": "df6e47bee94d8226444c98aa58c5b12b29db7b666629854fb2062dc9161fa414",
+     "LIQ_BP": "000030d4",
+     "LOT": "0000b5e620f48000",
+     "MATURITY": "6b49d200",
+     "ORACLE_1": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec",
+     "ORACLE_2": "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7",
+     "ORACLE_3": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "PRECISION": "05",
+     "RECOVER_AFTER": "6be26880",
+     "TARGET_BP": "00003a98",
+     "THRESHOLD": "01"
+    },
+    "script_pubkey": "5120104339c662c09319f4b9459e5f9b86daa0de206154e64d66bc15735d541376d6",
+    "slots": {}
+   }
+  ]
+ },
  "rules": {
   "healthy": [
    {
@@ -541,6 +656,7 @@
    "script_pubkey": "51206f54798eefd13d53e45bdebe2eaf3d8c45cadfcecb6a1028669190b594f62dc6",
    "terms": {
     "beacon_asset": "00000000000000000000000000000000000000000000000000000000000000c0",
+    "beacon_assets": [],
     "bonus_bp": 10500,
     "borrower_hash": "08e7b85b724d2f0006ebdb795764ef60d3e74497e652582cf78f9c2732aac404",
     "borrower_spk": "51202222222222222222222222222222222222222222222222222222222222222222",
@@ -551,9 +667,11 @@
     "market": "GOLD/USDX",
     "maturity": 1800000000,
     "oracle_x": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "oracles": [],
     "precision": 8,
     "recover_after": 1802592000,
-    "target_bp": 15000
+    "target_bp": 15000,
+    "threshold": 0
    }
   },
   {
@@ -564,6 +682,7 @@
     "lot": "200000000000000",
     "terms": {
      "beacon_asset": "00000000000000000000000000000000000000000000000000000000000000c0",
+     "beacon_assets": [],
      "bonus_bp": 10500,
      "borrower_hash": "",
      "borrower_spk": "",
@@ -574,9 +693,11 @@
      "market": "GOLD/USDX",
      "maturity": 1800000000,
      "oracle_x": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+     "oracles": [],
      "precision": 8,
      "recover_after": 1802592000,
-     "target_bp": 15000
+     "target_bp": 15000,
+     "threshold": 0
     }
    },
    "script_pubkey": "512066afcbc9b3fc65ed559970ba8bb0d7a508b2bd672901020432ded98110cb4d9c"
@@ -587,6 +708,7 @@
    "script_pubkey": "5120ba56dd4093b03f25372e13d8b5581fc65d0b1ede705ad3002395064a6996a900",
    "terms": {
     "beacon_asset": "00000000000000000000000000000000000000000000000000000000000000c1",
+    "beacon_assets": [],
     "bonus_bp": 10501,
     "borrower_hash": "eed5299e54314101bf96cf6629731b49e7725f7f1f21c4766f2802ad4fc72323",
     "borrower_spk": "00144444444444444444444444444444444444444444",
@@ -597,9 +719,11 @@
     "market": "GOLD/USDX",
     "maturity": 1800000001,
     "oracle_x": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "oracles": [],
     "precision": 5,
     "recover_after": 1802592001,
-    "target_bp": 15001
+    "target_bp": 15001,
+    "threshold": 0
    }
   },
   {
@@ -610,6 +734,7 @@
     "lot": "200000000000001",
     "terms": {
      "beacon_asset": "00000000000000000000000000000000000000000000000000000000000000c1",
+     "beacon_assets": [],
      "bonus_bp": 10501,
      "borrower_hash": "",
      "borrower_spk": "",
@@ -620,12 +745,150 @@
      "market": "GOLD/USDX",
      "maturity": 1800000001,
      "oracle_x": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+     "oracles": [],
      "precision": 5,
      "recover_after": 1802592001,
-     "target_bp": 15001
+     "target_bp": 15001,
+     "threshold": 0
     }
    },
    "script_pubkey": "5120c0c29d394bf5cc8280bc141538a07a387b4c1b2d14782642b6adc24bc4333a07"
+  },
+  {
+   "debt": "210000000000000",
+   "last_time": 1790000000,
+   "script_pubkey": "512060ba481cb4e8407e9e81e700c1092e8a07557cf7504ac67ad0f82ec03985ec97",
+   "terms": {
+    "beacon_asset": "",
+    "beacon_assets": [
+     "00000000000000000000000000000000000000000000000000000000000000f0",
+     "00000000000000000000000000000000000000000000000000000000000000f1",
+     "00000000000000000000000000000000000000000000000000000000000000f2"
+    ],
+    "bonus_bp": 10500,
+    "borrower_hash": "884cc2e76c79ff71daf9fbddde00a761017a108f6e0dcfbde828332d9de5bcb4",
+    "borrower_spk": "51206666666666666666666666666666666666666666666666666666666666666666",
+    "collateral_asset": "00000000000000000000000000000000000000000000000000000000000000d0",
+    "debt_asset": "00000000000000000000000000000000000000000000000000000000000000e0",
+    "lender_spk": "00145555555555555555555555555555555555555555",
+    "liq_bp": 12500,
+    "market": "GOLD/USDX",
+    "maturity": 1800000000,
+    "oracle_x": "",
+    "oracles": [
+     "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+     "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    ],
+    "precision": 8,
+    "recover_after": 1802592000,
+    "target_bp": 15000,
+    "threshold": 2
+   }
+  },
+  {
+   "offer": {
+    "collateral": "300000000000",
+    "debt": "210000000000000",
+    "expiry": 1795000000,
+    "lot": "200000000000000",
+    "terms": {
+     "beacon_asset": "",
+     "beacon_assets": [
+      "00000000000000000000000000000000000000000000000000000000000000f0",
+      "00000000000000000000000000000000000000000000000000000000000000f1",
+      "00000000000000000000000000000000000000000000000000000000000000f2"
+     ],
+     "bonus_bp": 10500,
+     "borrower_hash": "",
+     "borrower_spk": "",
+     "collateral_asset": "00000000000000000000000000000000000000000000000000000000000000d0",
+     "debt_asset": "00000000000000000000000000000000000000000000000000000000000000e0",
+     "lender_spk": "00145555555555555555555555555555555555555555",
+     "liq_bp": 12500,
+     "market": "GOLD/USDX",
+     "maturity": 1800000000,
+     "oracle_x": "",
+     "oracles": [
+      "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+      "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+     ],
+     "precision": 8,
+     "recover_after": 1802592000,
+     "target_bp": 15000,
+     "threshold": 2
+    }
+   },
+   "script_pubkey": "5120113ceffa5e185b8663519c8a4676e75489e5d13d0ba4180dcfd9d29c6ab55e52"
+  },
+  {
+   "debt": "210000000000001",
+   "last_time": 1790000001,
+   "script_pubkey": "5120443cbc4992acb50595477c27ed691d431f692959c9db381741c35f5f15731b05",
+   "terms": {
+    "beacon_asset": "",
+    "beacon_assets": [
+     "00000000000000000000000000000000000000000000000000000000000000f0",
+     "00000000000000000000000000000000000000000000000000000000000000f1",
+     "0000000000000000000000000000000000000000000000000000000000000000"
+    ],
+    "bonus_bp": 10500,
+    "borrower_hash": "884cc2e76c79ff71daf9fbddde00a761017a108f6e0dcfbde828332d9de5bcb4",
+    "borrower_spk": "51206666666666666666666666666666666666666666666666666666666666666666",
+    "collateral_asset": "00000000000000000000000000000000000000000000000000000000000000d1",
+    "debt_asset": "00000000000000000000000000000000000000000000000000000000000000e1",
+    "lender_spk": "00145555555555555555555555555555555555555555",
+    "liq_bp": 12500,
+    "market": "GOLD/USDX",
+    "maturity": 1800000001,
+    "oracle_x": "",
+    "oracles": [
+     "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+     "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+    ],
+    "precision": 8,
+    "recover_after": 1802592001,
+    "target_bp": 15000,
+    "threshold": 2
+   }
+  },
+  {
+   "offer": {
+    "collateral": "300000000001",
+    "debt": "210000000000001",
+    "expiry": 1795000001,
+    "lot": "200000000000001",
+    "terms": {
+     "beacon_asset": "",
+     "beacon_assets": [
+      "00000000000000000000000000000000000000000000000000000000000000f0",
+      "00000000000000000000000000000000000000000000000000000000000000f1",
+      "0000000000000000000000000000000000000000000000000000000000000000"
+     ],
+     "bonus_bp": 10500,
+     "borrower_hash": "",
+     "borrower_spk": "",
+     "collateral_asset": "00000000000000000000000000000000000000000000000000000000000000d1",
+     "debt_asset": "00000000000000000000000000000000000000000000000000000000000000e1",
+     "lender_spk": "00145555555555555555555555555555555555555555",
+     "liq_bp": 12500,
+     "market": "GOLD/USDX",
+     "maturity": 1800000001,
+     "oracle_x": "",
+     "oracles": [
+      "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+      "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+     ],
+     "precision": 8,
+     "recover_after": 1802592001,
+     "target_bp": 15000,
+     "threshold": 2
+    }
+   },
+   "script_pubkey": "5120f5a305d8c45ed01b2e345f54881c2a01bfd30d10766a2daf8750520898931f7d"
   }
  ],
  "vault": {
@@ -719,6 +982,121 @@
     "slots": {
      "DEBT_OUT": "7fffffffffffffff",
      "LAST_TIME": "6ab13b86"
+    }
+   }
+  ]
+ },
+ "vault_threshold": {
+  "cmr": "3cac5bd7c27deeae0b7ce06d0d994f31f14ed466fd8d6a6aca9bf19ede8fb731",
+  "hash": "b7fee3aa3dd5f1078204e91384f14bd7c78d7d8a051fc7ace00e9b3bde0e6f75",
+  "name": "pignus/vault-threshold v1",
+  "vectors": [
+   {
+    "name": "instance 0: data leaf first, output key parity 0, 2 of keys A/B/C",
+    "params": {
+     "BEACON_ASSET_1": "cdcd7666e837d684d12a5c7875eafb4e8faceadc3f5009944e332001de3fcb21",
+     "BEACON_ASSET_2": "8dcb34f87e9de941491817645e4035f9ea120c9b33891d14be8417d62a9940b1",
+     "BEACON_ASSET_3": "3d26eca59becfb8ffbd2e605252ea8ba8055567641a707ed27e576416850a003",
+     "BONUS_BP": "00002904",
+     "BORROWER": "7609134475998bbc61e73f67766fcb9cdcf2fa09dd62f6429fdeab8ce084f4d0",
+     "COLL": "8038005026e58a8cec3d28bb9d67e7733beabb2faee42ac558454a780f0298ad",
+     "DEBT_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+     "LENDER": "da56c7c8ea87157cf0141777177ccbc129bd92044c15b2916e76235ca99e267a",
+     "LIQ_BP": "000030d4",
+     "MATURITY": "6b49d200",
+     "ORACLE_1": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec",
+     "ORACLE_2": "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7",
+     "ORACLE_3": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "PRECISION": "05",
+     "RECOVER_AFTER": "6be26880",
+     "TARGET_BP": "00003a98",
+     "THRESHOLD": "02"
+    },
+    "script_pubkey": "51209016fb0c844172329f5803c08caeff58d87971a6b6f983d1c6d659b22e638767",
+    "slots": {
+     "DEBT_OUT": "0000befe6f672000",
+     "LAST_TIME": "6ab13b80"
+    }
+   },
+   {
+    "name": "instance 1: data leaf first, output key parity 1, 2 of keys A/B/NUMS",
+    "params": {
+     "BEACON_ASSET_1": "cdcd7666e837d684d12a5c7875eafb4e8faceadc3f5009944e332001de3fcb21",
+     "BEACON_ASSET_2": "8dcb34f87e9de941491817645e4035f9ea120c9b33891d14be8417d62a9940b1",
+     "BEACON_ASSET_3": "3d26eca59becfb8ffbd2e605252ea8ba8055567641a707ed27e576416850a003",
+     "BONUS_BP": "00002904",
+     "BORROWER": "b7b975eb90a7914ac2793b1f785c9d775089a7b5d0dc728a83a3191e297951f6",
+     "COLL": "8038005026e58a8cec3d28bb9d67e7733beabb2faee42ac558454a780f0298ad",
+     "DEBT_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+     "LENDER": "a0388c98039314432d356f5f69398d6d4e82527bbe8800b88519c745c6987d68",
+     "LIQ_BP": "000030d4",
+     "MATURITY": "6b49d200",
+     "ORACLE_1": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec",
+     "ORACLE_2": "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7",
+     "ORACLE_3": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+     "PRECISION": "05",
+     "RECOVER_AFTER": "6be26880",
+     "TARGET_BP": "00003a98",
+     "THRESHOLD": "02"
+    },
+    "script_pubkey": "5120e4efc9555b8ad85ad94fad52077895e284e3e0da5a056581dc4705f2a1fdb1f0",
+    "slots": {
+     "DEBT_OUT": "0000befe6f672000",
+     "LAST_TIME": "6ab13b80"
+    }
+   },
+   {
+    "name": "instance 2: program first, output key parity 0, 3 of keys C/A/B",
+    "params": {
+     "BEACON_ASSET_1": "cdcd7666e837d684d12a5c7875eafb4e8faceadc3f5009944e332001de3fcb21",
+     "BEACON_ASSET_2": "8dcb34f87e9de941491817645e4035f9ea120c9b33891d14be8417d62a9940b1",
+     "BEACON_ASSET_3": "3d26eca59becfb8ffbd2e605252ea8ba8055567641a707ed27e576416850a003",
+     "BONUS_BP": "00002904",
+     "BORROWER": "b7b975eb90a7914ac2793b1f785c9d775089a7b5d0dc728a83a3191e297951f6",
+     "COLL": "8038005026e58a8cec3d28bb9d67e7733beabb2faee42ac558454a780f0298ad",
+     "DEBT_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+     "LENDER": "a0388c98039314432d356f5f69398d6d4e82527bbe8800b88519c745c6987d68",
+     "LIQ_BP": "000030d4",
+     "MATURITY": "6b49d200",
+     "ORACLE_1": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "ORACLE_2": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec",
+     "ORACLE_3": "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7",
+     "PRECISION": "05",
+     "RECOVER_AFTER": "6be26880",
+     "TARGET_BP": "00003a98",
+     "THRESHOLD": "03"
+    },
+    "script_pubkey": "5120525b95c8c313f07e85452efa59a97c8b2f64a19f990076859443b55873ba73d0",
+    "slots": {
+     "DEBT_OUT": "0000befe6f672000",
+     "LAST_TIME": "6ab13b80"
+    }
+   },
+   {
+    "name": "instance 3: program first, output key parity 1, 1 of keys A/B/C",
+    "params": {
+     "BEACON_ASSET_1": "cdcd7666e837d684d12a5c7875eafb4e8faceadc3f5009944e332001de3fcb21",
+     "BEACON_ASSET_2": "8dcb34f87e9de941491817645e4035f9ea120c9b33891d14be8417d62a9940b1",
+     "BEACON_ASSET_3": "3d26eca59becfb8ffbd2e605252ea8ba8055567641a707ed27e576416850a003",
+     "BONUS_BP": "00002904",
+     "BORROWER": "7609134475998bbc61e73f67766fcb9cdcf2fa09dd62f6429fdeab8ce084f4d0",
+     "COLL": "8038005026e58a8cec3d28bb9d67e7733beabb2faee42ac558454a780f0298ad",
+     "DEBT_ASSET": "faf4732db47da96b9e3b5bce4348aa40986d2fb1ca969a5d6825e2bb7c1e7f11",
+     "LENDER": "da56c7c8ea87157cf0141777177ccbc129bd92044c15b2916e76235ca99e267a",
+     "LIQ_BP": "000030d4",
+     "MATURITY": "6b49d200",
+     "ORACLE_1": "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec",
+     "ORACLE_2": "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7",
+     "ORACLE_3": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+     "PRECISION": "05",
+     "RECOVER_AFTER": "6be26880",
+     "TARGET_BP": "00003a98",
+     "THRESHOLD": "01"
+    },
+    "script_pubkey": "51207bb81486505f638649738cd5962e15605eeefa88ad8c57cb1b8ace9c174bb70a",
+    "slots": {
+     "DEBT_OUT": "0000befe6f672000",
+     "LAST_TIME": "6ab13b80"
     }
    }
   ]

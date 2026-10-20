@@ -199,18 +199,23 @@ pignus/dlc.py            DLC primitives for settling BTC collateral at maturity;
 pignus/btcscript.py      the Bitcoin script and taproot primitives Tier B needs
 pignus/openamp.py        Tier C pledges at an OpenAMP policy server
 pignus/repurchase.py     Tier D: the OpenDAMP repurchase, labelled as one, never a loan
-pignus/vault2.py         version 2 loans: terms, addresses, the rule, every
-                         spend finished by seqc, the next state read off a
-                         spend, and the five points shown before signing
+pignus/vault2.py         version 2 loans, of one oracle or a threshold of three:
+                         terms, addresses, the rule, every spend finished by
+                         seqc, the next state read off a spend, and the five
+                         points shown before signing
+pignus/bonds.py          each oracle's bond: its published terms, its scripts
+                         recomputed, its coins counted on the book's node
 pignus/watcher2.py       follow version 2 offers and vaults from coin to coin,
                          a take's borrower off its witness, undo what a reorg
                          removed
-pignus/service_v2.py     pignusd's /v2/offers, /v2/loans and /v2/beacon
+pignus/service_v2.py     pignusd's /v2/offers, /v2/loans, /v2/beacon, /v2/bonds
+                         and /v2/records
 pignus/liquidator_v2.py  the liquidator's round over version 2 loans
 pignus/cli_v2.py         pignus-cli's v2-* commands
-pignus/sequentia_contracts/ the version 2 vault and offer templates and the
-                         address mirror, vendored from sequentia-contracts
-                         (PIN.json)
+pignus/sequentia_contracts/ the version 2 vault and offer templates, of one
+                         oracle and of a threshold, the oracle bond template
+                         and the address mirror, vendored from
+                         sequentia-contracts (PIN.json)
 pignus/node.py           a thin JSON-RPC client; many calls in one round trip
 pignus/ratelimit.py      the token bucket both daemons ration unauthenticated
                          requests with, in one place rather than a copy each
@@ -487,6 +492,13 @@ pignus-cli v2-show --loan <id> --book http://127.0.0.1:8741
 pignus-cli v2-recover --loan <id> ... ; pignus-cli v2-refund --offer <id> ...
 ```
 
+A loan of several oracles is the same with `--oracles book --oracle-threshold 2`
+on `v2-offer-fund` (or two or three keys in place of `book`, and
+`--beacon-assets` when the book does not know them): the offer opens vaults of
+sequentia-contracts' `templates/pignus_vault_threshold`, liquidated on a price
+record at least that many of the oracles signed alike, each under its own
+beacon. Every other command takes such a loan as it takes any other.
+
 Before any spend is signed the command prints the five points: the template,
 known here by its hash; every script the spend spends or creates, recomputed
 here from the terms and the state; the program, run against the final
@@ -509,7 +521,16 @@ recomputed in the browser and each loan's health judged there, with the five
 points and the command for each action. A take, a repayment and a top-up can
 also be signed from the page: it composes the spend and the wallet
 extension's contract engine funds it from the wallet, runs the program
-against the final transaction, shows its own five points and signs.
+against the final transaction, shows its own five points and signs. A loan of
+several oracles is shown the same way, 2-of-3 with the record its oracles
+signed alike, and its spends are the commands shown beside it, because the
+wallet's engine carries the single-oracle templates only.
+
+The same tab lists the oracles the book quotes with each one's bond (asset,
+amount, and whether it is bonded, in notice or absent), and each offer and
+loan shows its own oracles' bonds. A bond is slashed by two of its oracle's
+attestations of one pair and time at two prices; it does not deter a single
+consistent false price.
 
 ### Native BTC collateral (Tier B, cross-chain)
 
@@ -1257,6 +1278,11 @@ tests/test_lifecycle_v2.py         a version 2 loan through the CLI, pignusd and
                                    partial repay, two partial liquidations
                                    across a beacon rotation, full repay, and a
                                    reorg of the close; needs seqc
+tests/test_threshold_v2.py         a 2-of-3 version 2 loan and each oracle's bond:
+                                   three signers on one feed, bonded, in notice
+                                   and unbonded on the book; a 2-of-3 offer
+                                   taken; one signature not enough, two
+                                   liquidating; needs seqc and sequentia-oracle
 tests/test_btc_collateral.py       Tier B's covenant and crypto
 tests/test_btc_cli.py              the BTC-collateral library legs
 tests/test_btc_cli_flow.py         the BTC-collateral CLI handshake

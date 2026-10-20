@@ -14,7 +14,11 @@
   * reading a vault's next state off a spending transaction (`vault2.follow`)
     for every path the program allows, and a take's borrower off the offer's
     witness, accepted only when the vault it derives is the take's output;
-  * the five points, refusing an unknown template and a script not created.
+  * the five points, refusing an unknown template and a script not created;
+  * terms of several oracles: the threshold templates and their vectors, the
+    take's borrower bit, the padding of two oracles, every refusal;
+  * the oracle bond the book shows: its scripts, a declaration refused for
+    another key, script, template or a notice in blocks, coins counted.
 """
 
 import copy
@@ -200,8 +204,145 @@ def main():
 
     watcher_cases(t)
 
+    threshold_cases()
+    bond_cases()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0
+
+
+A_KEY = "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec"
+B_KEY = "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7"
+C_KEY = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+
+
+def threshold_terms(**kw):
+    d = dict(collateral_asset="aa" * 32, debt_asset="bb" * 32, oracle_x="", beacon_asset="", precision=8,
+             liq_bp=12500, target_bp=15000, bonus_bp=10500, maturity=1_800_000_000, recover_after=1_802_592_000,
+             lender_spk="0014" + "11" * 20, borrower_spk="5120" + "22" * 32, market="GOLD/USDX",
+             oracles=[A_KEY, B_KEY, C_KEY], beacon_assets=["c1" * 32, "c2" * 32, "c3" * 32], threshold=2)
+    d.update(kw)
+    return V2.V2Terms(**d)
+
+
+def threshold_cases():
+    """Terms of several oracles: the templates they choose, the vectors, the
+    take's borrower bit, and what they refuse."""
+    t = threshold_terms()
+    check("a threshold loan uses the threshold templates, and says 2-of-3",
+          t.is_threshold and t.vault_template() == V2.VAULT_T_TEMPLATE
+          and t.offer_template() == V2.OFFER_T_TEMPLATE and t.oracle_label() == "2-of-3")
+    for name in ("pignus_vault_threshold", "pignus_offer_threshold"):
+        v = json.load(open(os.path.join(VENDOR, "templates", name, "vectors.json")))
+        desc = V2.VAULT_T_DESC if "vault" in name else V2.OFFER_T_DESC
+        ok = all(V2.SA.derive(desc, a["params"], a["slots"])["script_pubkey"] == a["script_pubkey"]
+                 for a in v["addresses"])
+        check(f"the mirror reproduces {name}'s {len(v['addresses'])} address vectors", ok)
+    # The terms' parameters are the template's: one vector rebuilt from terms.
+    v = json.load(open(os.path.join(VENDOR, "templates", "pignus_vault_threshold", "vectors.json")))["addresses"][0]
+    p = v["params"]
+    disp = lambda h: bytes.fromhex(h)[::-1].hex()     # noqa: E731
+    keys = [p["ORACLE_%d" % i] for i in (1, 2, 3)]
+    tv = V2.V2Terms(disp(p["COLL"]), disp(p["DEBT_ASSET"]), "", "", int(p["PRECISION"], 16), int(p["LIQ_BP"], 16),
+                    int(p["TARGET_BP"], 16), int(p["BONUS_BP"], 16), int(p["MATURITY"], 16),
+                    int(p["RECOVER_AFTER"], 16), "00", borrower_hash=p["BORROWER"],
+                    oracles=keys, beacon_assets=[disp(p["BEACON_ASSET_%d" % i]) for i in (1, 2, 3)],
+                    threshold=int(p["THRESHOLD"], 16))
+    got = dict(tv.params(), LENDER=p["LENDER"])
+    check("V2Terms of several oracles give exactly the template's parameters", got == p,
+          json.dumps({k: (got.get(k), p.get(k)) for k in p if got.get(k) != p.get(k)}))
+    two = threshold_terms(oracles=[A_KEY, B_KEY], beacon_assets=["c1" * 32, "c2" * 32])
+    check("two oracles fill the third slot with the key nobody holds and a zero beacon asset",
+          two.oracles[2] == V2.NO_ORACLE and two.beacon_assets[2] == "00" * 32 and two.oracle_label() == "2-of-2"
+          and two.oracle_keys() == [A_KEY, B_KEY])
+    for why, kw in (("a key named twice", {"oracles": [A_KEY, A_KEY, C_KEY]}),
+                    ("a threshold of 0", {"threshold": 0}),
+                    ("a threshold above the oracles named", {"threshold": 4}),
+                    ("a threshold of 3 over two oracles", {"oracles": [A_KEY, B_KEY],
+                                                           "beacon_assets": ["c1" * 32, "c2" * 32], "threshold": 3}),
+                    ("a beacon asset short", {"beacon_assets": ["c1" * 32, "c2" * 32]}),
+                    ("one oracle named both ways", {"oracle_x": A_KEY}),
+                    ("four oracles", {"oracles": [A_KEY, B_KEY, C_KEY, A_KEY[:-2] + "00"],
+                                      "beacon_assets": ["c1" * 32] * 4})):
+        try:
+            threshold_terms(**kw)
+            refused = False
+        except V2.V2Error:
+            refused = True
+        check(f"threshold terms refused: {why}", refused)
+    o = V2.V2Offer(t.with_borrower(), 2 * 10 ** 14, 21 * 10 ** 13, 3 * 10 ** 11, 1_795_000_000)
+    single = V2.V2Offer(terms().with_borrower(), 2 * 10 ** 14, 21 * 10 ** 13, 3 * 10 ** 11, 1_795_000_000)
+    check("a take's borrower sits at bit 2,705 of a threshold offer's witness and 1,673 of a single one's",
+          W2.borrower_bit(o) == 2705 and W2.borrower_bit(single) == W2.BORROWER_BIT == 1673)
+    a = V2.approval(type("S", (), {"summary": {"template": V2.VAULT_T_TEMPLATE, "terms": t, "path": "repay",
+                                                "state": (1, 2)},
+                                   "tx": type("T", (), {"vout": []})(), "prev": [V2.Coin("00" * 32, 0, 1, "aa" * 32, "51")],
+                                   "covenant": 0, "run": {"executed": True}})(), {})
+    roles = dict(a["4_shown"]["terms"])
+    check("the five points show the oracle set: 2-of-3, each key and its beacon asset",
+          a["1_template"]["known"] and roles.get("oracles", "").startswith("2-of-3")
+          and roles.get("oracle 3 key") == C_KEY and "oracle 1 beacon asset" in roles, json.dumps(roles)[:300])
+    path = V2.liquidate_threshold_path(5, 7, [("aa" * 64, "bb" * 32, 1), None, ("cc" * 64, "dd" * 32, 2)], False)
+    check("the liquidation witness: price, time, three slots, the maturity flag",
+          path == "Right(Left((5, 7, [Some((0x%s, 0x%s, 1)), None, Some((0x%s, 0x%s, 2))], false)))"
+          % ("aa" * 64, "bb" * 32, "cc" * 64, "dd" * 32), path)
+
+
+def bond_cases():
+    """The oracle bond the book shows: scripts recomputed, a forged
+    declaration refused, coins counted, statuses in words."""
+    from pignus import bonds as BD
+    v = json.load(open(os.path.join(VENDOR, "templates", "oracle_bond", "vectors.json")))["addresses"]
+    ok = True
+    for e in v:
+        p = e["params"]
+        got = BD.scripts(p["ORACLE"], bytes.fromhex(p["BOND_ASSET"])[::-1].hex(), int(p["NOTICE"], 16))
+        ok &= got[int(e["slots"]["STATE"], 16)] == e["script_pubkey"]
+    check("the bond's scripts reproduce the template's vectors", ok and BD.SOURCE_OK)
+    asset = "c5" * 32
+    bonded, noticed = BD.scripts(A_KEY, asset, (1 << 22) | 5063)
+    decl = {"kind": "bond", "key": A_KEY, "asset": asset, "notice": "%08x" % ((1 << 22) | 5063),
+            "template": BD.TEMPLATE, "bonded": bonded, "noticed": noticed}
+    check("a declaration is read with both scripts recomputed",
+          BD.declared(A_KEY, [decl])[0]["bonded_script"] == bonded)
+    for why, bad in (("another key's", dict(decl, key=B_KEY)),
+                     ("a script that is not the terms'", dict(decl, bonded="5120" + "00" * 32)),
+                     ("another template", dict(decl, template="00" * 32)),
+                     ("a notice in blocks", dict(decl, notice="%08x" % 5063, bonded=None, noticed=None))):
+        bad = {k: v for k, v in bad.items() if v is not None}
+        try:
+            BD.declared(A_KEY, [bad])
+            refused = False
+        except (BD.BondError, ValueError):
+            refused = True
+        check(f"a bond declaration refused: {why}", refused)
+
+    class Node:
+        def __init__(self, coins):
+            self.coins = coins
+
+        def scantxoutset(self, action, descs):
+            return {"unspents": self.coins}
+
+        def getblockchaininfo(self):
+            return {"mediantime": 1_800_000_000}
+
+        def getblockhash(self, h):
+            return "%064x" % h
+
+        def getblockheader(self, h):
+            return {"mediantime": 1_799_000_000}
+    coin = lambda spk, amt, a=asset: {"txid": "ab" * 32, "vout": 0, "scriptPubKey": spk,  # noqa: E731
+                                      "amount": amt, "asset": a, "height": 10}
+    s = BD.summary(Node([coin(bonded, "500")]), A_KEY, [decl])
+    check("500 bonded: bonded", s["status"] == "bonded" and s["bonded_atoms"] == 500 * 10 ** 8, json.dumps(s)[:200])
+    s = BD.summary(Node([coin(noticed, "300")]), A_KEY, [decl])
+    c = s["bonds"][0]["coins"][0]
+    check("300 in notice: leaving, withdrawable from its block's median time plus the notice, not yet",
+          s["status"] == "notice given: leaving" and s["noticed_atoms"] == 300 * 10 ** 8
+          and c["withdrawable_from"] == 1_799_000_000 + 5063 * 512 and c["withdrawable"] is False, json.dumps(c))
+    s = BD.summary(Node([coin(bonded, "7", "dd" * 32)]), A_KEY, [decl])
+    check("a coin of another asset at the bond's script is no bond", s["status"] == "declared, no coin")
+    check("no declaration: no bond declared", BD.summary(Node([]), A_KEY, [])["status"] == "no bond declared")
 
 
 class FakeNode:

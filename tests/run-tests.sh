@@ -108,6 +108,7 @@ run "CLI lifecycle + book discovery"   python3 tests/test_lifecycle.py
 run "threshold oracles end to end"     python3 tests/test_threshold.py
 run "fresh attestations through a beacon" python3 tests/test_beacon.py
 run "a version 2 loan through the CLI, the book and the liquidator" python3 tests/test_lifecycle_v2.py
+run "a 2-of-3 version 2 loan and each oracle's bond" python3 tests/test_threshold_v2.py
 run "BTC collateral: the covenant + crypto" python3 tests/test_btc_collateral.py
 run "BTC collateral: the library legs"  python3 tests/test_btc_cli.py
 run "BTC collateral: the CLI handshake" python3 tests/test_btc_cli_flow.py

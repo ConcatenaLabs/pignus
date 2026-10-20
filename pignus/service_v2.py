@@ -17,6 +17,17 @@ state the watcher read off the chain.
                               {terms, txid, vout, debt, last_time}
     GET  /v2/beacon           an oracle's beacon log, checked, and its live
                               coins on this book's node  (?oracle=<key>)
+    GET  /v2/bonds            each quoted oracle's bond: its declared terms and
+                              the coins this book's node counts at its scripts
+    GET  /v2/records/{market} an oracle's last verified format-2 records of a
+                              market, newest first, each with its beacon's state
+                              (?oracle=<key>)
+
+A loan of several oracles (`templates/pignus_vault_threshold`) is priced by a
+record: one price at one time that at least its threshold of its oracles
+signed alike, each under a beacon that is live on this book's node. Each
+oracle signs its own message (its key and its beacon are in it), so the book
+matches them by pair, precision, price and time.
 """
 
 import json
@@ -55,12 +66,52 @@ class V2Service:
 
     # ---------------------------------------------------------------- price
 
+    def _ours(self, terms, rec, key):
+        a = rec.att
+        return (a.key.hex() == key and a.base.hex() == V2._internal(terms.collateral_asset)
+                and a.quote.hex() == V2._internal(terms.debt_asset) and a.precision == terms.precision)
+
+    def record_for(self, terms, after=None, before=None):
+        """For a threshold vault: the newest record (price, time) that at
+        least THRESHOLD of its oracles signed alike, each beacon live on this
+        book's node, newer than `after` and older than `before` when given;
+        with its three slots in the vault's key order. None when there is
+        none. Advice: the liquidator checks every signature and beacon again,
+        and the program last."""
+        s = self.svc
+        market = _canon(terms.market)
+        by = {}
+        for key in terms.oracle_keys():
+            url = s._url_of_key(key)
+            for rec in s.att_v2_history.get(s._att_key(key, market), []):
+                if not self._ours(terms, rec, key):
+                    continue
+                a = rec.att
+                if (after is not None and a.time <= after) or (before is not None and a.time >= before):
+                    continue
+                if not url or s.beacon_state(url, a.beacon) != "live":
+                    continue
+                by.setdefault((a.time, a.price), {})[key] = a
+        for (t, price), signed in sorted(by.items(), reverse=True):
+            if len(signed) >= terms.threshold:
+                chosen = [k for k in terms.oracles if k in signed][:terms.threshold]
+                slots = [({"signature": signed[k].signature.hex(), "beacon": signed[k].beacon.hex()}
+                          if k in chosen else None) for k in terms.oracles]
+                return {"price": price, "time": t, "slots": slots, "signers": chosen,
+                        "signed_by": sorted(signed)}
+        return None
+
+    def bonds_for(self, terms):
+        return {k: self.svc.oracle_bonds.get(k) for k in terms.oracle_keys()}
+
     def attestation_for(self, terms):
         """The newest format-2 record from the vault's own oracle, of the
         vault's own pair at the vault's own precision, or None. What the book
         quotes is advice; a liquidator checks it again, and the program checks
         it last."""
         s = self.svc
+        if terms.is_threshold:
+            return self.record_for(terms)
         rec = s.att_v2_by_oracle.get(s._att_key(terms.oracle_x, _canon(terms.market)))
         if rec is None:
             return None
@@ -78,8 +129,11 @@ class V2Service:
         offer = V2.V2Offer.from_json(rec["offer"])
         out = {k: v for k, v in rec.items() if k != "offer"}
         out["offer"] = json.loads(rec["offer"])
-        out["template"] = {"hash": V2.OFFER_TEMPLATE, "name": V2.KNOWN_TEMPLATES[V2.OFFER_TEMPLATE]}
-        out["vault_template"] = {"hash": V2.VAULT_TEMPLATE, "name": V2.KNOWN_TEMPLATES[V2.VAULT_TEMPLATE]}
+        t = offer.terms
+        out["template"] = {"hash": t.offer_template(), "name": V2.KNOWN_TEMPLATES[t.offer_template()]}
+        out["vault_template"] = {"hash": t.vault_template(), "name": V2.KNOWN_TEMPLATES[t.vault_template()]}
+        out["oracles"] = t.oracle_label()
+        out["bonds"] = self.bonds_for(t)
         out["spk_recomputed"] = offer.script_pubkey()
         out["lots_left"] = (rec.get("coin") or {}).get("amount", 0) // offer.lot if rec.get("status") == "open" else 0
         out["warnings"] = offer.sanity_check()
@@ -89,8 +143,10 @@ class V2Service:
         terms = V2.V2Terms.from_json(rec["terms"])
         out = {k: v for k, v in rec.items() if k != "terms"}
         out["terms"] = json.loads(rec["terms"])
-        out["template"] = {"hash": V2.VAULT_TEMPLATE, "name": V2.KNOWN_TEMPLATES[V2.VAULT_TEMPLATE]}
+        out["template"] = {"hash": terms.vault_template(), "name": V2.KNOWN_TEMPLATES[terms.vault_template()]}
         out["kind"] = "v2"
+        out["oracles"] = terms.oracle_label()
+        out["bonds"] = self.bonds_for(terms)
         if rec.get("state") in ("LIVE", "UNCONFIRMED"):
             cur = rec["line"][-1]
             spk = V2.vault_spk(terms, cur["debt"], cur["last_time"])
@@ -104,7 +160,7 @@ class V2Service:
                 out["healthy"] = V2.healthy(terms, cur["amount"], cur["debt"], price)
                 plan = V2.liquidation_plan(terms, cur["amount"], cur["debt"], price)
                 out["liquidatable"] = bool(plan) and att["time"] > cur["last_time"] \
-                    and att["beacon_state"] == "live"
+                    and (terms.is_threshold or att["beacon_state"] == "live")
                 out["liquidation"] = plan
             mtp = self.svc.median_time() if hasattr(self.svc, "median_time") else None
             out["matured"] = bool(mtp and mtp > terms.maturity)
@@ -167,6 +223,18 @@ class V2Service:
             return (404, {"error": "no such loan"}) if rec is None else (200, self.loan_view(rec))
         if path == "/v2/beacon":
             return self.beacon_view((q.get("oracle", [""])[0] or "").lower())
+        if path == "/v2/bonds":
+            return 200, {"bonds": self.svc.oracle_bonds, "errors": self.svc.bond_errors}
+        if path.startswith("/v2/records/"):
+            s = self.svc
+            market = _canon(path[len("/v2/records/"):].replace("_", "/"))
+            key = (q.get("oracle", [""])[0] or "").lower()
+            url = s._url_of_key(key)
+            if not url:
+                return 404, {"error": "no oracle of that key is quoted here"}
+            recs = list(reversed(s.att_v2_history.get(s._att_key(key, market), [])))
+            return 200, {"records": [dict(r.to_dict(), beacon_state=s.beacon_state(url, r.att.beacon))
+                                     for r in recs]}
         return None
 
     def post(self, path, body):
@@ -176,8 +244,10 @@ class V2Service:
             bad = offer.sanity_check()
             if bad:
                 return 400, {"error": "the offer's terms are refused: " + "; ".join(bad)}
-            if offer.terms.oracle_x not in s.oracle_keys:
-                return 400, {"error": "the offer's oracle is not one this book quotes"}
+            strangers = [k for k in offer.terms.oracle_keys() if k not in s.oracle_keys]
+            if strangers:
+                return 400, {"error": "the offer names an oracle this book does not quote: " + ", ".join(
+                    k[:16] + "…" for k in strangers)}
             coin = V2.coin_at(s.node, body["txid"], int(body["vout"]))
             if coin is None:
                 return 400, {"error": "no unspent coin at that outpoint"}

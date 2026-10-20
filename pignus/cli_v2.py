@@ -134,19 +134,36 @@ def _coin(node, cur):
 def cmd_offer_fund(args, node):
     debt_asset = _asset(node, args.debt_asset)
     coll = _asset(node, args.collateral_asset)
-    oracle = (args.oracle_key or _book(args.book, "/v1/oracle")["oracle_x"]).lower()
-    beacon_asset = (args.beacon_asset or _book(args.book, f"/v2/beacon?oracle={oracle}")["asset"]).lower()
     mtp = node.getblockchaininfo()["mediantime"]
     days = lambda d: int(mtp + float(d) * 86400)    # noqa: E731
-    terms = V2.V2Terms(coll, debt_asset, oracle, beacon_asset, args.precision, args.liq_bp, args.target_bp,
-                       args.bonus_bp, days(args.term_days), days(args.term_days + args.recover_days),
-                       _payout(node, args.lender_address), market=args.market.upper())
+    beacon_of = lambda k: _book(args.book, f"/v2/beacon?oracle={k}")["asset"].lower()   # noqa: E731
+    if args.oracles:
+        keys = (_book(args.book, "/v1/oracles")["oracles"] if args.oracles == "book"
+                else [k.strip() for k in args.oracles.split(",") if k.strip()])
+        keys = [k.lower() for k in keys]
+        if not 2 <= len(keys) <= 3:
+            raise V2.V2Error("a threshold loan names two or three oracles")
+        assets = ([a.strip().lower() for a in args.beacon_assets.split(",")] if args.beacon_assets
+                  else [beacon_of(k) for k in keys])
+        if args.oracle_key or args.beacon_asset:
+            raise V2.V2Error("--oracles names the oracles; leave out --oracle-key and --beacon-asset")
+        terms = V2.V2Terms(coll, debt_asset, "", "", args.precision, args.liq_bp, args.target_bp,
+                           args.bonus_bp, days(args.term_days), days(args.term_days + args.recover_days),
+                           _payout(node, args.lender_address), market=args.market.upper(),
+                           oracles=keys, beacon_assets=assets, threshold=args.oracle_threshold or len(keys))
+    else:
+        oracle = (args.oracle_key or _book(args.book, "/v1/oracle")["oracle_x"]).lower()
+        beacon_asset = (args.beacon_asset or beacon_of(oracle)).lower()
+        terms = V2.V2Terms(coll, debt_asset, oracle, beacon_asset, args.precision, args.liq_bp, args.target_bp,
+                           args.bonus_bp, days(args.term_days), days(args.term_days + args.recover_days),
+                           _payout(node, args.lender_address), market=args.market.upper())
     offer = V2.V2Offer(terms, args.lot, args.debt, args.collateral, days(args.expiry_days))
     bad = offer.sanity_check()
     if bad:
         raise V2.V2Error("refused: " + "; ".join(bad))
     spk = offer.script_pubkey()
-    print(f"Before funding: template {V2.KNOWN_TEMPLATES[V2.OFFER_TEMPLATE]} ({V2.OFFER_TEMPLATE[:16]}…), "
+    th = terms.offer_template()
+    print(f"Before funding: template {V2.KNOWN_TEMPLATES[th]} ({th[:16]}…), {terms.oracle_label()}, "
           f"its script recomputed here {spk[:20]}…; this wallet pays {args.lots} lot(s) of {args.lot} atoms of "
           f"{debt_asset[:16]}…; no contract key.", file=sys.stderr)
     if not args.yes:
@@ -265,6 +282,11 @@ def register(sub, add_node_args, node_from, refuse):
     p.add_argument("--debt-asset", required=True)
     p.add_argument("--oracle-key", help="x-only hex; default: the book's primary oracle")
     p.add_argument("--beacon-asset", help="default: the oracle's, from the book")
+    p.add_argument("--oracles", help="a loan of several oracles: `book` for every oracle the book quotes, "
+                                     "or two or three x-only keys, comma-separated")
+    p.add_argument("--oracle-threshold", type=int, help="how many of --oracles must sign one price; default all")
+    p.add_argument("--beacon-assets", help="each of --oracles' beacon assets, comma-separated, in their "
+                                           "order; default: each oracle's, from the book")
     p.add_argument("--precision", type=int, required=True, help="the oracle's format-2 precision")
     p.add_argument("--liq-bp", type=int, default=12500, help="liquidation threshold, basis points")
     p.add_argument("--target-bp", type=int, default=15000, help="liquidation target, basis points")

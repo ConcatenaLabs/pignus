@@ -60,6 +60,9 @@ With a `signer` (a separate sequentia-oracle signer holds the key):
     GET /v2/beacon                 with a `beacon`: the beacon asset, the current
                                    epoch and program, and the coins on chain
     GET /v2/beacon/log             the signer's beacon log, every rotation signed
+    GET /v2/bond/log               with `signer.bond_log`: the signer's bond log, the
+                                   bond's declared terms and every notice and
+                                   withdrawal its key signed
 
 With a `beacon`, this process also puts the signer's rotations on chain:
 
@@ -166,7 +169,7 @@ CONFIG_KEYS = ("beacon", "book", "compromised_keys", "flat_rounds", "interval", 
 SIGNER_OWNS = ("keyfile", "source", "max_jump", "jump_rounds", "flat_rounds")
 SIGNER_KEYS = ("key", "log_v2", "status")
 # Optional in `signer`: the signer's beacon log, which a `beacon` section needs.
-SIGNER_OPTIONAL = ("beacon_log",)
+SIGNER_OPTIONAL = ("beacon_log", "bond_log")
 # What a `beacon` section takes: the beacon asset (empty until funded), the
 # asset this process pays rotation fees in (required: no fee asset is the
 # default), and the request file the signer rotates on.
@@ -493,6 +496,15 @@ class Oracle:
         path = self.signer["beacon_log"]
         if not os.path.exists(path):
             return []
+        with open(path) as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def read_bond_log(self):
+        """The signer's bond log: the bond's declared terms and every notice
+        and withdrawal its key signed. Public; it holds no secret."""
+        path = (self.signer or {}).get("bond_log")
+        if not path or not os.path.exists(path):
+            return None
         with open(path) as f:
             return [json.loads(x) for x in f if x.strip()]
 
@@ -1344,6 +1356,12 @@ class Handler(BaseHTTPRequestHandler):
             if o.chain is None:
                 return self._send(404, {"error": "this oracle publishes no beacon"})
             return self._send(200, {"key": o.xonly.hex(), "log": o.read_beacon_log()})
+        if path == "/v2/bond/log":
+            log = o.read_bond_log()
+            if log is None:
+                return self._send(404, {"error": "this oracle publishes no bond log: its signer "
+                                                 "declares no bond, or `signer.bond_log` is not set"})
+            return self._send(200, {"key": o.xonly.hex(), "log": log})
         if path == "/v2/digest":
             return self._send(200, {"digest": o.log_v2.digest(),
                                     "file": os.path.basename(o.log_v2.path)})

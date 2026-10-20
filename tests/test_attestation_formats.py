@@ -475,7 +475,7 @@ def test_signer_mode():
         mod = load_pignusd()
         s = mod.Service.__new__(mod.Service)
         s._lock = threading.Lock()
-        s.att_v2_by_oracle, s.attestations_v2 = {}, {}
+        s.att_v2_by_oracle, s.attestations_v2, s.att_v2_history = {}, {}, {}
         s.price_scales = {"GOLD/USDX": 100_000, "SILVR/USDX": 100_000}
         s.by_ticker = {"GOLD": GOLD, "SILVR": SILVR, "USDX": USDX}
         s.assets = {GOLD: {"ticker": "GOLD"}, SILVR: {"ticker": "SILVR"},
@@ -485,6 +485,9 @@ def test_signer_mode():
         got = s.attestations_v2.get("GOLD/USDX")
         check("pignusd keeps the oracle's format-2 record of the market",
               got is not None and got.price == 310_000 and not errors, str(errors))
+        hist = s.att_v2_history.get((key.hex(), "GOLD/USDX")) or []
+        check("and keeps it in the oracle's record history, which a threshold loan reads",
+              len(hist) == 1 and hist[0] is got)
         s.price_scales["SILVR/USDX"] = 1_000_000
         errors = []
         s._refresh_v2(base, key.hex(), "SILVR/USDX", True, errors)

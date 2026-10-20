@@ -1,0 +1,167 @@
+{
+  "chains": [
+    {
+      "bech32_hrp": "tb",
+      "genesis": "ddd11d54c87a2bd94400fd31ce05d8e1110bb4b78e7103f738342086fc4ea92e",
+      "name": "sequentia-testnet"
+    },
+    {
+      "bech32_hrp": "ert",
+      "genesis": null,
+      "name": "elementsregtest"
+    }
+  ],
+  "descriptor": 2,
+  "measured": {
+    "notice": {
+      "budget_wu": 4638,
+      "cost_bound_wu": 433,
+      "program_bytes": 909,
+      "transaction": "the bond coin and a wallet fee coin; the bond with notice given, change, the fee",
+      "vsize": 598,
+      "weight": 2390,
+      "witness_bytes": 134
+    },
+    "slash": {
+      "budget_wu": 6266,
+      "cost_bound_wu": 749,
+      "program_bytes": 1101,
+      "transaction": "the bond coin alone; the burn, the presenter's half less the fee, the fee in the bond's asset",
+      "vsize": 598,
+      "weight": 2391,
+      "witness_bytes": 347
+    },
+    "slash_two_coins": {
+      "budget_wu": 6266,
+      "cost_bound_wu": 749,
+      "program_bytes": 1101,
+      "transaction": "two bond coins; a burn at output 0 and output 2, the presenter's halves, the fee",
+      "vsize": 1140,
+      "weight": 4560,
+      "witness_bytes": 347
+    },
+    "source": "harness/records/b1.json",
+    "withdraw": {
+      "budget_wu": 4986,
+      "cost_bound_wu": 294,
+      "program_bytes": 964,
+      "transaction": "the coin in notice, after the notice, and a wallet fee coin; the withdrawal, change, the fee",
+      "vsize": 608,
+      "weight": 2429,
+      "witness_bytes": 166
+    }
+  },
+  "template": {
+    "budget": {
+      "max": 4000050,
+      "offset": 50,
+      "per_witness_byte": 4
+    },
+    "internal_key": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+    "name": "sequentia/oracle-bond",
+    "params": [
+      {
+        "label": "Oracle key, whose format-2 attestations the bond stands behind",
+        "name": "ORACLE",
+        "role": "pubkey",
+        "type": "Pubkey"
+      },
+      {
+        "label": "Asset the bond is held in",
+        "name": "BOND_ASSET",
+        "role": "asset",
+        "type": "u256"
+      },
+      {
+        "label": "Notice: how long a coin waits between notice and withdrawal, a BIP68 relative lock in units of 512 seconds",
+        "name": "NOTICE",
+        "role": "sequence",
+        "type": "u32"
+      }
+    ],
+    "paths": [
+      {
+        "effect": "While STATE is 0: output 2k is this bond with STATE 1, holding at least this coin in BOND_ASSET, explicitly. ORACLE signs, BIP340, tagged(\"Sequentia/oracle/bond\", 0x01 || genesis hash || this coin's txid || vout as 4 bytes big-endian). This coin is input k.",
+        "leaf": "bond",
+        "name": "notice",
+        "who": "the holder of ORACLE"
+      },
+      {
+        "effect": "While STATE is 1, once this coin has waited NOTICE by its own sequence: output 2k pays the script whose SHA256 is DEST at least this coin in BOND_ASSET, explicitly. ORACLE signs, BIP340, tagged(\"Sequentia/oracle/bond\", 0x02 || genesis hash || this coin's txid || vout as 4 bytes big-endian || DEST). This coin is input k.",
+        "leaf": "bond",
+        "name": "withdraw",
+        "who": "the holder of ORACLE"
+      },
+      {
+        "effect": "In either state, with two format-2 attestations by ORACLE of one base, quote, precision and time at two different prices (each with its own beacon): output 2k burns at least half this coin, rounded up, in BOND_ASSET to the script OP_RETURN, explicitly; the rest goes wherever the presenter puts it. This coin is input k.",
+        "leaf": "bond",
+        "name": "slash",
+        "who": "anyone"
+      }
+    ],
+    "slots": [
+      {
+        "label": "0 while bonded, 1 once notice is given",
+        "name": "STATE",
+        "role": "number",
+        "type": "u8"
+      }
+    ],
+    "summary": "Coins an oracle puts behind its price attestations: withdrawn by its key only after giving notice and waiting it out, and slashed at once by anyone who shows two of its attestations of one pair at one time with different prices, half burned and half to the presenter.",
+    "tree": {
+      "branch": [
+        {
+          "leaf": "bond",
+          "simplicity": {
+            "cmr": "55ef67715810f21dc359f5157f083bb840d3002bff0916c97289c50d209b1a0f",
+            "compiler": {
+              "name": "simplicityhl",
+              "version": "0.7.2"
+            },
+            "max_cost_wu": 749,
+            "source": "oracle_bond.simf",
+            "source_sha256": "af182e2787dfe720039825af03d2cdcc0f9749428cc6b80d9e391ab84c7882de",
+            "witness": [
+              {
+                "name": "ORACLE",
+                "source": "param:ORACLE",
+                "type": "Pubkey"
+              },
+              {
+                "name": "BOND_ASSET",
+                "source": "param:BOND_ASSET",
+                "type": "u256"
+              },
+              {
+                "name": "NOTICE",
+                "source": "param:NOTICE",
+                "type": "u32"
+              },
+              {
+                "name": "STATE",
+                "source": "slot:STATE",
+                "type": "u8"
+              },
+              {
+                "name": "PATH",
+                "source": "spender",
+                "type": "Either<Either<Signature, (u256, Signature)>, (u256, u256, u8, u32, (u64, u256, Signature), (u64, u256, Signature))>"
+              }
+            ]
+          }
+        },
+        {
+          "data": [
+            "ORACLE",
+            "BOND_ASSET",
+            "NOTICE",
+            "STATE"
+          ],
+          "leaf": "terms"
+        }
+      ]
+    },
+    "version": 1
+  },
+  "template_hash": "36e09201b19cdd4ad589ce35c6f04fc25010c9ccc2a684355d37ee361aed9b96"
+}
