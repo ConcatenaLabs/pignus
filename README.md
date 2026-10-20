@@ -522,9 +522,9 @@ points and the command for each action. A take, a repayment and a top-up can
 also be signed from the page: it composes the spend and the wallet
 extension's contract engine funds it from the wallet, runs the program
 against the final transaction, shows its own five points and signs. A loan of
-several oracles is shown the same way, 2-of-3 with the record its oracles
-signed alike, and its spends are the commands shown beside it, because the
-wallet's engine carries the single-oracle templates only.
+several oracles is shown and signed the same way, 2-of-3 with the record its
+oracles signed alike: the wallet's engine carries the threshold templates as
+well as the single-oracle ones.
 
 The same tab lists the oracles the book quotes with each one's bond (asset,
 amount, and whether it is bonded, in notice or absent), and each offer and

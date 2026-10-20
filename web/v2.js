@@ -274,7 +274,7 @@ export function takeSpend(o, { borrowerSpk, lockTime, ratePerKvb, genesis, colla
     { to: "wallet", script: borrowerSpk, asset: t.debt_asset, amount: Number(BigInt(offer.lot) - BigInt(fee)) },
     { to: "fee", asset: t.debt_asset, amount: fee },
   ];
-  return { templateHash: PIN.offer.hash, instance: offerInstance(offer, genesis), fund: true,
+  return { templateHash: offerPin(t).hash, instance: offerInstance(offer, genesis), fund: true,
     request: { path: "take", coin: { txid: coin.txid, vout: coin.vout, script_pubkey: o.spk, asset: t.debt_asset, amount: Number(coin.amount) },
                inputs: [{ is: "contract" }], lock_time: Number(lockTime), outputs,
                spender: { PATH: `Left(0x${hexOfHash(borrowerSpk)})` } } };
@@ -289,7 +289,7 @@ function vaultCoin(l) {
 export function topUpSpend(l, { add, ratePerKvb, genesis }) {
   const { cur, coin } = vaultCoin(l), t = l.terms;
   if (BigInt(add) <= 0n) throw new Error("a top-up adds at least one atom");
-  return { templateHash: PIN.vault.hash, instance: vaultInstance(t, cur.debt, cur.last_time, genesis), fund: true,
+  return { templateHash: vaultPin(t).hash, instance: vaultInstance(t, cur.debt, cur.last_time, genesis), fund: true,
     request: { path: "top_up", coin, inputs: [{ is: "contract" }],
       outputs: [{ to: "contract", script: cur.spk, asset: t.collateral_asset, amount: Number(BigInt(cur.amount) + BigInt(add)) },
                 { to: "fee", asset: t.collateral_asset, amount: feeFor("top_up", ratePerKvb) }],
@@ -314,7 +314,7 @@ export function repaySpend(l, { amount, ratePerKvb, genesis }) {
   const first = full
     ? { to: "wallet", script: t.borrower_spk, asset: t.collateral_asset, amount: Number(cur.amount) }
     : { to: "contract", script: vaultSpk(t, debt - a, cur.last_time), asset: t.collateral_asset, amount: Number(cur.amount) };
-  return { templateHash: PIN.vault.hash, instance: vaultInstance(t, cur.debt, cur.last_time, genesis), fund: true,
+  return { templateHash: vaultPin(t).hash, instance: vaultInstance(t, cur.debt, cur.last_time, genesis), fund: true,
     request: { path: "repay", coin, inputs: [{ is: "contract" }],
       outputs: [first, { to: "pay", script: t.lender_spk, asset: t.debt_asset, amount: Number(a) },
                 { to: "fee", asset: t.debt_asset, amount: fee }],
@@ -402,7 +402,7 @@ export function render(offers, loans, label = (a) => short(a), oracles = null) {
       `${(t.bonus_bp / 100 - 100).toFixed(2)}%. ${o.lots_left} lot(s) left. ` +
       (ok ? `Script recomputed here: ${short(o.spk)}.` : "<b>Its script does NOT match its terms: do not take it.</b>") +
       oracleNote +
-      (ok && !set ? `<br><button type="button" data-v2-take="${esc(o.offer_id)}">Take one lot with your wallet</button>` : "") +
+      (ok ? `<br><button type="button" data-v2-take="${esc(o.offer_id)}">Take one lot with your wallet</button>` : "") +
       `<br>Or: ${cmd(["pignus-cli", "v2-take", "--offer", o.offer_id, "--book", "<this book>"])}</div>`);
   }
   out.push("<h3>Loans</h3>");
@@ -427,10 +427,9 @@ export function render(offers, loans, label = (a) => short(a), oracles = null) {
     out.push(`<div class="card"><b>${esc(t.market)}</b> ${esc(l.state)}: owes ${esc(l.debt)} of ` +
       `${label(t.debt_asset)}, holds ${esc(l.collateral)} of ${label(t.collateral_asset)}.${health}${oracleNote}` +
       (live ? `<details open><summary>Before anything is signed</summary><ul>${points}</ul>` +
-              (set ? "" :
               `<label>Amount, in atoms <input data-v2-amount="${esc(l.loan_id)}" inputmode="numeric"></label> ` +
               `<button type="button" data-v2-repay="${esc(l.loan_id)}">Repay with your wallet</button> ` +
-              `<button type="button" data-v2-topup="${esc(l.loan_id)}">Top up with your wallet</button>`) +
+              `<button type="button" data-v2-topup="${esc(l.loan_id)}">Top up with your wallet</button>` +
               `<br>Or repay: ${cmd(["pignus-cli", "v2-repay", "--loan", l.loan_id, "--amount", "<atoms>", "--book", "<this book>"])}` +
               `<br>Top up: ${cmd(["pignus-cli", "v2-topup", "--loan", l.loan_id, "--amount", "<atoms>", "--book", "<this book>"])}` +
               `</details>` : "") +
