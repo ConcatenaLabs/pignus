@@ -206,6 +206,7 @@ def main():
 
     threshold_cases()
     bond_cases()
+    address_prefix_cases()
     print(f"\n{PASS} checks passed, {FAIL} failed")
     return 1 if FAIL else 0
 
@@ -213,6 +214,19 @@ def main():
 A_KEY = "04e735a2a3b97c355b36aaedc221c8e467bacc976684ca694ad130f7630de6ec"
 B_KEY = "8dc0e04a85e7859124a4212777053e6c7d0c99d5a11f31811abd2e27ef8107f7"
 C_KEY = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+
+
+def address_prefix_cases():
+    class Chain:
+        def __init__(self, chain):
+            self.chain = chain
+
+        def getblockchaininfo(self):
+            return {"chain": self.chain}
+    spk = "5120" + "11" * 32
+    for chain, prefix in (("sequentia", "bc1p"), ("test", "tb1p"), ("elementsregtest", "ert1p"), ("liquidv1", "ex1p")):
+        a = V2.address(Chain(chain), spk)
+        check(f"an address on chain {chain} starts {prefix}", a.startswith(prefix), a)
 
 
 def threshold_terms(**kw):
