@@ -144,6 +144,10 @@ class Book:
         # and a secret is not: reusing one is how two loans come to share a
         # settlement, and either borrower then releases the other's collateral.
         self.btc_commitments = {}
+        # Version 2 offers and loans (pignus/vault2.py): kept apart from the
+        # version 1 ones, which they share nothing with but the book.
+        self.offers_v2 = {}
+        self.loans_v2 = {}
         self._load()
         self._sweep_temps()
 
@@ -167,7 +171,7 @@ class Book:
         if not isinstance(d, dict) or not all(
                 isinstance(d.get(k, {}), dict)
                 for k in ("offers", "loans", "btc_offers", "btc_takes",
-                          "btc_commitments")):
+                          "btc_commitments", "offers_v2", "loans_v2")):
             raise SystemExit(
                 f"book {self.path} does not have the shape of a loan book (a "
                 "JSON object with offers, loans, btc_offers and btc_takes "
@@ -177,6 +181,8 @@ class Book:
         self.btc_offers = d.get("btc_offers", {})
         self.btc_takes = d.get("btc_takes", {})
         self.btc_commitments = d.get("btc_commitments", {})
+        self.offers_v2 = d.get("offers_v2", {})
+        self.loans_v2 = d.get("loans_v2", {})
         # A book written before this ledger existed still has its takes; read
         # the commitments back out of them so an upgrade does not free every
         # commitment in flight.
@@ -241,6 +247,7 @@ class Book:
         d = {"meta": self.meta, "offers": self.offers, "loans": self.loans,
              "btc_offers": self.btc_offers, "btc_takes": self.btc_takes,
              "btc_commitments": self.btc_commitments,
+             "offers_v2": self.offers_v2, "loans_v2": self.loans_v2,
              "updated": int(time.time())}
         dirn = os.path.dirname(os.path.abspath(self.path)) or "."
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".book-")
@@ -483,6 +490,106 @@ class Book:
         if market:
             out = [x for x in out if x.get("market", "").upper() == market.upper()]
         return sorted(out, key=lambda x: x.get("updated", 0), reverse=True)
+
+    # ------------------------------------------------------------ version 2
+    #
+    # A version 2 offer or loan is a LINE of coins: the coin that funded or
+    # opened it, then each successor a spend made, each step with the
+    # transaction behind it and where that transaction is. The watcher
+    # (pignus/watcher2.py) moves along it and back; these methods only keep it.
+
+    def v2_items(self, kind):
+        """[(id, copy)] of `offers` or `loans`, copied under the lock so the
+        caller can change them freely and put them back with put_v2."""
+        import copy
+        table = self.offers_v2 if kind == "offers" else self.loans_v2
+        with self._lock:
+            return [(k, copy.deepcopy(v)) for k, v in table.items()]
+
+    def put_v2(self, kind, key, rec):
+        table = self.offers_v2 if kind == "offers" else self.loans_v2
+        with self._lock:
+            table[key] = rec
+            self._save()
+
+    def get_v2(self, kind, key):
+        import copy
+        table = self.offers_v2 if kind == "offers" else self.loans_v2
+        with self._lock:
+            rec = table.get(key)
+            return copy.deepcopy(rec) if rec is not None else None
+
+    def list_v2(self, kind, state=None, market=None):
+        import copy
+        table = self.offers_v2 if kind == "offers" else self.loans_v2
+        with self._lock:
+            out = [copy.deepcopy(v) for v in table.values()]
+        key = "status" if kind == "offers" else "state"
+        if state and state != "all":
+            out = [r for r in out if r.get(key) == state]
+        if market:
+            out = [r for r in out if str(r.get("market", "")).upper() == market.upper()]
+        return sorted(out, key=lambda r: r.get("created", 0), reverse=True)
+
+    def put_offer_v2(self, offer, coin, where):
+        """A funded version 2 offer, at the coin that funds it. The id is the
+        offer's own (its script); the record starts its line at that coin."""
+        oid = offer.offer_id()
+        rec = {"offer_id": oid, "offer": offer.to_json(), "market": offer.terms.market,
+               "spk": offer.script_pubkey(), "status": "open", "taken": 0,
+               "coin": {"txid": coin.txid, "vout": coin.vout, "amount": coin.amount, "confirmed":
+                        where.get("in") == "block"},
+               "line": [{"txid": coin.txid, "vout": coin.vout, "amount": coin.amount, "spk": coin.spk,
+                         "event": "fund", "where": where}],
+               "created": int(time.time())}
+        with self._lock:
+            old = self.offers_v2.get(oid)
+            if old is not None and any(st["txid"] == coin.txid and st.get("vout") == coin.vout
+                                       for st in old.get("line", [])):
+                return old
+            if old is not None and old.get("status") == "open":
+                raise OfferExists("this offer is already listed at another coin; it rests at "
+                                  f"{old['coin']['txid']}:{old['coin']['vout']}")
+            self.offers_v2[oid] = rec
+            self._save()
+        return rec
+
+    def open_v2_loan(self, o, borrower_spk=""):
+        """A loan opened at a vault coin: from a take the watcher read off the
+        chain, or registered by its borrower, who alone can name the payout
+        script a close pays (the chain shows only its hash)."""
+        from . import vault2 as V2
+        terms = o["terms"].with_borrower(borrower_spk, o.get("borrower_hash", ""))
+        key = V2.loan_key(V2.V2Terms.from_json(dict(terms.__dict__, borrower_spk="")),
+                          o["txid"], o["vout"])
+        step = {"txid": o["txid"], "vout": int(o["vout"]), "amount": int(o["amount"]), "asset": o["asset"],
+                "spk": o["spk"], "debt": int(o["debt"]), "last_time": int(o["last_time"]),
+                "event": "open", "where": o["where"]}
+        with self._lock:
+            rec = self.loans_v2.get(key)
+            if rec is None:
+                # A loan registered at a later coin of a line the watcher
+                # already follows is that loan, not another.
+                for r in self.loans_v2.values():
+                    if any(st.get("txid") == step["txid"] and st.get("vout") == step["vout"]
+                           for st in r.get("line", [])) and \
+                            V2.V2Terms.from_json(r["terms"]).borrower_hash == terms.borrower_hash:
+                        rec = r
+                        break
+            if rec is not None:
+                if borrower_spk and not V2.V2Terms.from_json(rec["terms"]).borrower_spk:
+                    rec["terms"] = terms.to_json()
+                    self._save()
+                return dict(rec)
+            if rec is None:
+                rec = {"loan_id": key, "terms": terms.to_json(), "market": terms.market,
+                       "offer_id": o.get("offer_id"), "state": "UNCONFIRMED", "opening": dict(step),
+                       "line": [step], "debt": step["debt"], "last_time": step["last_time"],
+                       "collateral": step["amount"], "txid": step["txid"], "vout": step["vout"],
+                       "created": int(time.time())}
+                self.loans_v2[key] = rec
+            self._save()
+            return dict(rec)
 
     # ------------------------------------------------------- BTC collateral
 

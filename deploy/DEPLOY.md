@@ -713,6 +713,29 @@ the node's `wallet=`) and the taker address must belong to it: the bot exits
 judged against the key it bakes, so a loan naming an oracle neither watched
 here nor aggregated by the book is skipped.
 
+### Version 2 loans
+
+The same bot closes version 2 loans from the book's `/v2/loans` each round,
+and needs `seqc` for it: every version 2 spend is the vault's Simplicity
+program, satisfied and pruned against the final transaction by the contracts
+toolchain. Build it from a clone of `ConcatenaLabs/sequentia-contracts` at
+the commit `pignus/sequentia_contracts/PIN.json` names, on the box, and name
+it in the environment file:
+
+```bash
+git clone https://github.com/ConcatenaLabs/sequentia-contracts /root/sequentia/sequentia-contracts
+cd /root/sequentia/sequentia-contracts
+git checkout "$(jq -r .commit /root/sequentia/pignus/pignus/sequentia_contracts/PIN.json)"
+cargo build --release --locked --bin seqc
+echo PIGNUS_SEQC=/root/sequentia/sequentia-contracts/target/release/seqc >> /root/sequentia/pignus-liquidator.env
+```
+
+Without it the bot says so for every version 2 loan and goes on with the
+version 1 ones. `pignusd` needs no `seqc`: the book derives addresses with the
+vendored mirror and composes nothing. A version 2 loan's oracle must publish
+format 2 with a beacon (*The beacon*), and the book must quote it, or the
+loan has no price here.
+
 ## Alerting
 
 Every Pignus unit except the check carries `OnFailure=pignus-alert@%n.service`,

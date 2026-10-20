@@ -30,6 +30,28 @@ explicit `SEQUENTIA_SRC` is treated as a decision, not a hint: a wrong one is
 reported rather than silently falling back to another checkout whose covenant
 may differ.
 
+## Version 2 loans
+
+The version 2 vault and offer are Simplicity programs, and they live in
+`ConcatenaLabs/sequentia-contracts` (`templates/pignus_vault`,
+`templates/pignus_offer`), proven there by harness test `l1`, not in the node
+repository. They are vendored in `pignus/sequentia_contracts/` with the
+contracts' Python address mirror, each program's source as compiled, and
+pinned by its `PIN.json`; CI compares the files with that repository at the
+pinned commit. Do not edit them here, and do not write a second Python
+derivation: `pignus/vault2.py` derives through the vendored mirror. The
+browser's derivation in `web/v2.js` is the second implementation, pinned to
+`web/v2_vectors.json`, which `tests/gen_v2_web_vectors.py` writes from the
+vendored files and `tests/test_v2.py` checks.
+
+Every version 2 spend is finished by `seqc` (`PIGNUS_SEQC`), the contracts
+toolchain's command line: it satisfies and prunes the program against the
+final transaction and runs it, so a spend the program refuses never reaches
+a wallet. Two rules of the vault are what let the watcher read a vault's next
+state off the chain without decoding a witness: a successor owes the old
+debt less what output `2k+1` paid the lender, and a liquidation's lock time
+is its attestation's time. Keep `vault2.follow` in step with them.
+
 ## Regenerating the vectors
 
 Only when the covenant itself changes, and in the same change as the node-repo

@@ -1,0 +1,726 @@
+{
+ "offer": {
+  "cmr": "c88d2c4ea79563ad0d6c28e1c9d6b99e1131b0c66ddf48d326618deca0b5d9bc",
+  "hash": "4e999cdc9efa1186c0876ce9ebcc8e6dac60c10885bfb2cb5dce9489840084e7",
+  "name": "pignus/offer v2",
+  "vectors": [
+   {
+    "name": "instance 0: program leaf first, output key parity 1",
+    "params": {
+     "BEACON_ASSET": "11a9fda482f630c943f27be91ea64e8285fe8adb7bd76b85374b17473807a40d",
+     "BONUS_BP": "00002904",
+     "COLL": "5c97d1f3edf4302797ce8b1404cc85ad209ee23a4ee564699bc1b925ad809170",
+     "COLLATERAL": "00000045d964b800",
+     "DEBT": "017508f1956a8000",
+     "DEBT_ASSET": "c86ac02858dfe54a8bd0babd634778d94784658ede2c6c99fc7b9ca92af30107",
+     "EXPIRY": "6afd86c0",
+     "LENDER": "3394b9998d5b3649517b19448761489e3c33add8f21b968483b1fa4a76f43842",
+     "LIQ_BP": "000030d4",
+     "LOT": "016345785d8a0000",
+     "MATURITY": "6b49d200",
+     "ORACLE": "98dcaac3a5159aa69259ba0316c464aeb97f683d3032174b5259c48fa7f8bbba",
+     "PRECISION": "08",
+     "RECOVER_AFTER": "6b715f00",
+     "TARGET_BP": "000036b0"
+    },
+    "script_pubkey": "512003abfe5d20bdd97aa9001f3eefe2d1f831944de014b8605da7c02bd8f081add6",
+    "slots": {}
+   },
+   {
+    "name": "instance 3: data leaf first, output key parity 1",
+    "params": {
+     "BEACON_ASSET": "abea91c470d8dec1094580f79a5fe10fd0bb80f8ba78d94a59dabe066d15fd9a",
+     "BONUS_BP": "00002710",
+     "COLL": "5a5137f33044a17a418711ce826147a55deeb44974ec15686d77409c81ea2a45",
+     "COLLATERAL": "ffffffffffffffff",
+     "DEBT": "0000000000000003",
+     "DEBT_ASSET": "10a8cce6bc63f9324015f851d9cf70cd2553ff527b62344d69e92973d4d9cdbe",
+     "EXPIRY": "6afd86c3",
+     "LENDER": "5552e5e17a0308e8318961b861e3c19658194a1eaaac129b8e92bb6dc0faa70b",
+     "LIQ_BP": "000032c8",
+     "LOT": "0000000000000002",
+     "MATURITY": "6b4dc680",
+     "ORACLE": "212a344623f43d2463861bb79d8612a24557167bba3dd71b0d616800845937d1",
+     "PRECISION": "12",
+     "RECOVER_AFTER": "6b755380",
+     "TARGET_BP": "000032c8"
+    },
+    "script_pubkey": "5120203548e2b79d157a8c540fd2084671f89898b83195549036b3864ca1f7d059bf",
+    "slots": {}
+   },
+   {
+    "name": "instance 4: data leaf first, output key parity 0",
+    "params": {
+     "BEACON_ASSET": "b1d3185e2e0503c489f560e1f59b4fd64f251d62e7491fac38c793b49c3bd366",
+     "BONUS_BP": "00002904",
+     "COLL": "de711eef8b0900140114c4dd265adf130d7e8ac70ad027eff319cbd945740d6c",
+     "COLLATERAL": "00000045d964b800",
+     "DEBT": "017508f1956a8000",
+     "DEBT_ASSET": "171af4bdc3e105264829e024cc2cfb17e8107b19af85fe75e0813a2fed273ffc",
+     "EXPIRY": "6afd86c4",
+     "LENDER": "4a5a66037c9d8a9df8f1b46bc32abb6d3d9a55b0313d1d66cb23578bc9fc1a55",
+     "LIQ_BP": "000030d4",
+     "LOT": "016345785d8a0000",
+     "MATURITY": "6b4f1800",
+     "ORACLE": "a5266d0ac1b9d74c0bdef039c56f6fd5563fe6803dd4d705d7f017a334438852",
+     "PRECISION": "08",
+     "RECOVER_AFTER": "6b76a500",
+     "TARGET_BP": "000036b0"
+    },
+    "script_pubkey": "5120b68fd62edaa782f9911c356925e040403621dd74dd7221cd627031553b5892fd",
+    "slots": {}
+   },
+   {
+    "name": "instance 6: program leaf first, output key parity 0",
+    "params": {
+     "BEACON_ASSET": "df3509eb9c7527320ac469e674fce4a3cfa22c271203cbe4243cae6a1369b68e",
+     "BONUS_BP": "00002774",
+     "COLL": "009bbf0d26a8cfc3410c3d821678b298b10da33a7e4f26d3a9c463bfb507c393",
+     "COLLATERAL": "0000000000000007",
+     "DEBT": "0000000138eca480",
+     "DEBT_ASSET": "6eda451691395693c9bd893909eef21f623be38937cec5c1950811fd3f51742b",
+     "EXPIRY": "6afd86c6",
+     "LENDER": "f593dafb6ffe88931ce4f56d1dad1287168bdcb331b10dce6ef2744af1207771",
+     "LIQ_BP": "00002af8",
+     "LOT": "000000012a05f200",
+     "MATURITY": "6b51bb00",
+     "ORACLE": "1dc61fe6f5d0569cabf4ebc303f29501ace1d6cc8619f88cee8ede2b861b5484",
+     "PRECISION": "00",
+     "RECOVER_AFTER": "6b794800",
+     "TARGET_BP": "00002ee0"
+    },
+    "script_pubkey": "51206a2777502b1514ea9941109ab78335649cfe1b91cb297eb0ef83ad23bb864b63",
+    "slots": {}
+   }
+  ]
+ },
+ "rules": {
+  "healthy": [
+   {
+    "collateral": "300000000",
+    "debt": "200000000",
+    "healthy": true,
+    "liq_bp": 12500,
+    "name": "150% at the threshold of 125%",
+    "precision": 8,
+    "price": "100000000"
+   },
+   {
+    "collateral": "12500000000",
+    "debt": "10000000000",
+    "healthy": true,
+    "liq_bp": 12500,
+    "name": "exactly at the threshold",
+    "precision": 8,
+    "price": "100000000"
+   },
+   {
+    "collateral": "12499999999",
+    "debt": "10000000000",
+    "healthy": false,
+    "liq_bp": 12500,
+    "name": "one atom under the threshold",
+    "precision": 8,
+    "price": "100000000"
+   },
+   {
+    "collateral": "18446744073709551615",
+    "debt": "18446744073709551615",
+    "healthy": false,
+    "liq_bp": 4294967295,
+    "name": "products above 2^128",
+    "precision": 18,
+    "price": "9223372036854775807"
+   },
+   {
+    "collateral": "1",
+    "debt": "0",
+    "healthy": true,
+    "liq_bp": 12500,
+    "name": "no debt",
+    "precision": 0,
+    "price": "1"
+   },
+   {
+    "collateral": "0",
+    "debt": "1",
+    "healthy": false,
+    "liq_bp": 1,
+    "name": "no collateral",
+    "precision": 0,
+    "price": "9223372036854775807"
+   }
+  ],
+  "liquidation": [
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "14848484848",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "partial, to the target",
+    "paid": "10555555556",
+    "precision": 8,
+    "price": "55000000",
+    "result": {
+     "closes": false,
+     "debt_after": "5444444444",
+     "last_time_after": 1790000001,
+     "repaid": "10555555556",
+     "seized": "20151515152"
+    },
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "14848484848",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "one atom over the target",
+    "paid": "10555555557",
+    "precision": 8,
+    "price": "55000000",
+    "refused": "repays beyond the target",
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "14848484847",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "seizure one atom over",
+    "paid": "10555555556",
+    "precision": 8,
+    "price": "55000000",
+    "refused": "seizes more than the price allows",
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "14848484848",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "healthy vault",
+    "paid": "10555555556",
+    "precision": 8,
+    "price": "60000000",
+    "refused": "the vault is healthy at this price",
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "14848484848",
+    "last_time": 1790000001,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "attestation no newer than the last",
+    "paid": "10555555556",
+    "precision": 8,
+    "price": "55000000",
+    "refused": "attestation not newer than the vault's last",
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "35000000000",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "nothing paid",
+    "paid": "0",
+    "precision": 8,
+    "price": "55000000",
+    "refused": "nothing paid to the lender",
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "31945454546",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "small repayment at its full seizure leaves it unhealthy",
+    "paid": "1600000000",
+    "precision": 8,
+    "price": "55000000",
+    "refused": "leaves the vault unhealthy",
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "35000000000",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "small repayment, seizing nothing",
+    "paid": "1600000000",
+    "precision": 8,
+    "price": "55000000",
+    "result": {
+     "closes": false,
+     "debt_after": "14400000000",
+     "last_time_after": 1790000001,
+     "repaid": "1600000000",
+     "seized": "0"
+    },
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "35000000001",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "keeps more than the collateral",
+    "paid": "10555555556",
+    "precision": 8,
+    "price": "55000000",
+    "refused": "keeps more than the collateral",
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "10000000000",
+    "debt": "10000000000",
+    "kept": "0",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "under water: closes, everything seized",
+    "paid": "10000000000",
+    "precision": 8,
+    "price": "50000000",
+    "result": {
+     "closes": true,
+     "debt_after": "0",
+     "last_time_after": 1790000001,
+     "repaid": "10000000000",
+     "seized": "10000000000"
+    },
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "10000000000",
+    "debt": "10000000000",
+    "kept": "0",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "under water: a partial cannot leave it healthy",
+    "paid": "5000000000",
+    "precision": 8,
+    "price": "50000000",
+    "refused": "leaves the vault unhealthy",
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "14000000000",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": true,
+    "name": "called at maturity, surplus returned",
+    "paid": "16000000000",
+    "precision": 8,
+    "price": "80000000",
+    "result": {
+     "closes": true,
+     "debt_after": "0",
+     "last_time_after": 1790000001,
+     "repaid": "16000000000",
+     "seized": "21000000000"
+    },
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "0",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": true,
+    "name": "called at maturity, surplus kept back",
+    "paid": "16000000000",
+    "precision": 8,
+    "price": "80000000",
+    "refused": "seizes more than the price allows",
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "14000000000",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": true,
+    "name": "called at maturity, overpaid",
+    "paid": "16000000007",
+    "precision": 8,
+    "price": "80000000",
+    "result": {
+     "closes": true,
+     "debt_after": "0",
+     "last_time_after": 1790000001,
+     "repaid": "16000000000",
+     "seized": "21000000000"
+    },
+    "target_bp": 15000,
+    "time": 1790000001
+   },
+   {
+    "bonus_bp": 4294967295,
+    "collateral": "18446744073709551615",
+    "debt": "18446744073709551615",
+    "kept": "0",
+    "last_time": 0,
+    "liq_bp": 4294967295,
+    "matured": false,
+    "name": "at the largest amounts, under water, closes",
+    "paid": "18446744073709551615",
+    "precision": 18,
+    "price": "1",
+    "result": {
+     "closes": true,
+     "debt_after": "0",
+     "last_time_after": 4294967295,
+     "repaid": "18446744073709551615",
+     "seized": "18446744073709551615"
+    },
+    "target_bp": 4294967295,
+    "time": 4294967295
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "kept": "14848484848",
+    "last_time": 1790000000,
+    "liq_bp": 12500,
+    "matured": false,
+    "name": "precision above 18",
+    "paid": "10555555556",
+    "precision": 19,
+    "price": "55000000",
+    "refused": "precision above 18",
+    "target_bp": 15000,
+    "time": 1790000001
+   }
+  ],
+  "max_repay": [
+   {
+    "bonus_bp": 10500,
+    "collateral": "35000000000",
+    "debt": "16000000000",
+    "max_repay": "10555555556",
+    "name": "restores to 150%",
+    "precision": 8,
+    "price": "55000000",
+    "target_bp": 15000
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "10000000000",
+    "debt": "10000000000",
+    "max_repay": "10000000000",
+    "name": "under water: all of it",
+    "precision": 8,
+    "price": "50000000",
+    "target_bp": 15000
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "15000000000",
+    "debt": "10000000000",
+    "max_repay": "0",
+    "name": "at the target: nothing",
+    "precision": 8,
+    "price": "100000000",
+    "target_bp": 15000
+   },
+   {
+    "bonus_bp": 10500,
+    "collateral": "10000000000",
+    "debt": "10000000000",
+    "max_repay": "10000000000",
+    "name": "target not above the bonus: all of it",
+    "precision": 8,
+    "price": "90000000",
+    "target_bp": 10500
+   },
+   {
+    "bonus_bp": 10000,
+    "collateral": "18446744073709551615",
+    "debt": "18446744073709551615",
+    "max_repay": "18446744073709551615",
+    "name": "largest values",
+    "precision": 18,
+    "price": "1",
+    "target_bp": 4294967295
+   }
+  ],
+  "max_seizure": [
+   {
+    "bonus_bp": 10500,
+    "max_seizure": "10500000000",
+    "name": "5% bonus at 1.0",
+    "precision": 8,
+    "price": "100000000",
+    "repaid": "10000000000"
+   },
+   {
+    "bonus_bp": 10500,
+    "max_seizure": "0",
+    "name": "rounds down",
+    "precision": 0,
+    "price": "3",
+    "repaid": "1"
+   },
+   {
+    "bonus_bp": 4294967295,
+    "max_seizure": "18446744073709551615",
+    "name": "largest values",
+    "precision": 18,
+    "price": "1",
+    "repaid": "18446744073709551615"
+   },
+   {
+    "bonus_bp": 10000,
+    "max_seizure": "0",
+    "name": "price above the bonus",
+    "precision": 18,
+    "price": "9223372036854775807",
+    "repaid": "1"
+   }
+  ],
+  "rules": 1,
+  "template": "templates/pignus_vault"
+ },
+ "terms_cases": [
+  {
+   "debt": "210000000000000",
+   "last_time": 1790000000,
+   "script_pubkey": "51206f54798eefd13d53e45bdebe2eaf3d8c45cadfcecb6a1028669190b594f62dc6",
+   "terms": {
+    "beacon_asset": "00000000000000000000000000000000000000000000000000000000000000c0",
+    "bonus_bp": 10500,
+    "borrower_hash": "08e7b85b724d2f0006ebdb795764ef60d3e74497e652582cf78f9c2732aac404",
+    "borrower_spk": "51202222222222222222222222222222222222222222222222222222222222222222",
+    "collateral_asset": "00000000000000000000000000000000000000000000000000000000000000a0",
+    "debt_asset": "00000000000000000000000000000000000000000000000000000000000000b0",
+    "lender_spk": "00141111111111111111111111111111111111111111",
+    "liq_bp": 12500,
+    "market": "GOLD/USDX",
+    "maturity": 1800000000,
+    "oracle_x": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "precision": 8,
+    "recover_after": 1802592000,
+    "target_bp": 15000
+   }
+  },
+  {
+   "offer": {
+    "collateral": "300000000000",
+    "debt": "210000000000000",
+    "expiry": 1795000000,
+    "lot": "200000000000000",
+    "terms": {
+     "beacon_asset": "00000000000000000000000000000000000000000000000000000000000000c0",
+     "bonus_bp": 10500,
+     "borrower_hash": "",
+     "borrower_spk": "",
+     "collateral_asset": "00000000000000000000000000000000000000000000000000000000000000a0",
+     "debt_asset": "00000000000000000000000000000000000000000000000000000000000000b0",
+     "lender_spk": "00141111111111111111111111111111111111111111",
+     "liq_bp": 12500,
+     "market": "GOLD/USDX",
+     "maturity": 1800000000,
+     "oracle_x": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+     "precision": 8,
+     "recover_after": 1802592000,
+     "target_bp": 15000
+    }
+   },
+   "script_pubkey": "512066afcbc9b3fc65ed559970ba8bb0d7a508b2bd672901020432ded98110cb4d9c"
+  },
+  {
+   "debt": "209999999999999",
+   "last_time": 1790000001,
+   "script_pubkey": "5120ba56dd4093b03f25372e13d8b5581fc65d0b1ede705ad3002395064a6996a900",
+   "terms": {
+    "beacon_asset": "00000000000000000000000000000000000000000000000000000000000000c1",
+    "bonus_bp": 10501,
+    "borrower_hash": "eed5299e54314101bf96cf6629731b49e7725f7f1f21c4766f2802ad4fc72323",
+    "borrower_spk": "00144444444444444444444444444444444444444444",
+    "collateral_asset": "00000000000000000000000000000000000000000000000000000000000000a1",
+    "debt_asset": "00000000000000000000000000000000000000000000000000000000000000b1",
+    "lender_spk": "51203333333333333333333333333333333333333333333333333333333333333333",
+    "liq_bp": 12501,
+    "market": "GOLD/USDX",
+    "maturity": 1800000001,
+    "oracle_x": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "precision": 5,
+    "recover_after": 1802592001,
+    "target_bp": 15001
+   }
+  },
+  {
+   "offer": {
+    "collateral": "300000000001",
+    "debt": "210000000000001",
+    "expiry": 1795000001,
+    "lot": "200000000000001",
+    "terms": {
+     "beacon_asset": "00000000000000000000000000000000000000000000000000000000000000c1",
+     "bonus_bp": 10501,
+     "borrower_hash": "",
+     "borrower_spk": "",
+     "collateral_asset": "00000000000000000000000000000000000000000000000000000000000000a1",
+     "debt_asset": "00000000000000000000000000000000000000000000000000000000000000b1",
+     "lender_spk": "51203333333333333333333333333333333333333333333333333333333333333333",
+     "liq_bp": 12501,
+     "market": "GOLD/USDX",
+     "maturity": 1800000001,
+     "oracle_x": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+     "precision": 5,
+     "recover_after": 1802592001,
+     "target_bp": 15001
+    }
+   },
+   "script_pubkey": "5120c0c29d394bf5cc8280bc141538a07a387b4c1b2d14782642b6adc24bc4333a07"
+  }
+ ],
+ "vault": {
+  "cmr": "5fbca220e82362f0896b29d49812f244ca0ac30209e3d74429700e75b9ed2649",
+  "hash": "6b17869c4e2abe782fe3d8a3ece4865b8f0aa483028b1d0a815e6bcb4e8939ac",
+  "name": "pignus/vault v2",
+  "vectors": [
+   {
+    "name": "instance 0: data leaf first, output key parity 1",
+    "params": {
+     "BEACON_ASSET": "11a9fda482f630c943f27be91ea64e8285fe8adb7bd76b85374b17473807a40d",
+     "BONUS_BP": "00002904",
+     "BORROWER": "49ec40854ca911663284ccfb9f78d6f7dbebb1e03a7c9ad7d43a070f88340b05",
+     "COLL": "5c97d1f3edf4302797ce8b1404cc85ad209ee23a4ee564699bc1b925ad809170",
+     "DEBT_ASSET": "c86ac02858dfe54a8bd0babd634778d94784658ede2c6c99fc7b9ca92af30107",
+     "LENDER": "3394b9998d5b3649517b19448761489e3c33add8f21b968483b1fa4a76f43842",
+     "LIQ_BP": "000030d4",
+     "MATURITY": "6b49d200",
+     "ORACLE": "98dcaac3a5159aa69259ba0316c464aeb97f683d3032174b5259c48fa7f8bbba",
+     "PRECISION": "08",
+     "RECOVER_AFTER": "6b715f00",
+     "TARGET_BP": "000036b0"
+    },
+    "script_pubkey": "5120bf33f10023aa4ca963853d46829b9c49e25af754b4bad2a37fa5d7feee241683",
+    "slots": {
+     "DEBT_OUT": "017508f1956a8000",
+     "LAST_TIME": "6ab13b80"
+    }
+   },
+   {
+    "name": "instance 1: program leaf first, output key parity 1",
+    "params": {
+     "BEACON_ASSET": "1ff1e8b4ab99cc9fa3bb4b22863c5e804e088aec783b79b50d3fadb3faf7cd3e",
+     "BONUS_BP": "00002af8",
+     "BORROWER": "4f4196df88a13f3002d0f785627a8607aa88b8073c602ee6079b797a44a172c3",
+     "COLL": "2bf0a1dec6cea0a94580a935984818a3e03e215337a8844d2b3596a091b35387",
+     "DEBT_ASSET": "42538f5fcb02a1d95c348d912286e8e3edebe3795c2be87a2e635cfe8ba2470c",
+     "LENDER": "34a52b0fd04e753018143c867671c8c3daf188a6ef65f5ebec6328d3196068fc",
+     "LIQ_BP": "00003a98",
+     "MATURITY": "6b4b2380",
+     "ORACLE": "632b63ae3542ec7705bd928ef7a05b5fcdf438dd8dd5bb720bcf7ca0b79668e4",
+     "PRECISION": "05",
+     "RECOVER_AFTER": "6b72b080",
+     "TARGET_BP": "0000445c"
+    },
+    "script_pubkey": "5120353e3b124fc745ef24b7a7f95d30108c4c4111f639f2ddb3b1bf5b70bc69b7dc",
+    "slots": {
+     "DEBT_OUT": "0000000000000001",
+     "LAST_TIME": "6ab13b81"
+    }
+   },
+   {
+    "name": "instance 4: data leaf first, output key parity 0",
+    "params": {
+     "BEACON_ASSET": "b1d3185e2e0503c489f560e1f59b4fd64f251d62e7491fac38c793b49c3bd366",
+     "BONUS_BP": "00002904",
+     "BORROWER": "0b6724c18848049bdd44865f5839afbd2fb3f9c4cf6373060be27b117734b7e0",
+     "COLL": "de711eef8b0900140114c4dd265adf130d7e8ac70ad027eff319cbd945740d6c",
+     "DEBT_ASSET": "171af4bdc3e105264829e024cc2cfb17e8107b19af85fe75e0813a2fed273ffc",
+     "LENDER": "4a5a66037c9d8a9df8f1b46bc32abb6d3d9a55b0313d1d66cb23578bc9fc1a55",
+     "LIQ_BP": "000030d4",
+     "MATURITY": "6b4f1800",
+     "ORACLE": "a5266d0ac1b9d74c0bdef039c56f6fd5563fe6803dd4d705d7f017a334438852",
+     "PRECISION": "08",
+     "RECOVER_AFTER": "6b76a500",
+     "TARGET_BP": "000036b0"
+    },
+    "script_pubkey": "5120d8f2870be66fdc0de1b32a05f6558086b34904fbcc03635f4ff1de5d2d377b62",
+    "slots": {
+     "DEBT_OUT": "017508f1956a8000",
+     "LAST_TIME": "6ab13b84"
+    }
+   },
+   {
+    "name": "instance 6: program leaf first, output key parity 0",
+    "params": {
+     "BEACON_ASSET": "df3509eb9c7527320ac469e674fce4a3cfa22c271203cbe4243cae6a1369b68e",
+     "BONUS_BP": "00002774",
+     "BORROWER": "ef7c13441a96429f2ea92651fd0b47801183db63aa8f346c4d29e9eb7f2d7f1c",
+     "COLL": "009bbf0d26a8cfc3410c3d821678b298b10da33a7e4f26d3a9c463bfb507c393",
+     "DEBT_ASSET": "6eda451691395693c9bd893909eef21f623be38937cec5c1950811fd3f51742b",
+     "LENDER": "f593dafb6ffe88931ce4f56d1dad1287168bdcb331b10dce6ef2744af1207771",
+     "LIQ_BP": "00002af8",
+     "MATURITY": "6b51bb00",
+     "ORACLE": "1dc61fe6f5d0569cabf4ebc303f29501ace1d6cc8619f88cee8ede2b861b5484",
+     "PRECISION": "00",
+     "RECOVER_AFTER": "6b794800",
+     "TARGET_BP": "00002ee0"
+    },
+    "script_pubkey": "512051d3ca3a42df47f991cb75138010128ab09af0170ab846626738e411b98c1da8",
+    "slots": {
+     "DEBT_OUT": "7fffffffffffffff",
+     "LAST_TIME": "6ab13b86"
+    }
+   }
+  ]
+ }
+}

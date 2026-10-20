@@ -1,0 +1,39 @@
+{
+ "_note": "Vendored from sequentia-contracts at this commit: the Python address mirror, and the Pignus vault and offer templates with each program's source as compiled (its helper includes resolved, as `seqc expand` prints it, which is what the descriptor's source_sha256 hashes). Replace the files only with newer copies from that repository and update every field; tests/test_v2.py checks the hashes and CI compares them with that repository.",
+ "repository": "https://github.com/ConcatenaLabs/sequentia-contracts",
+ "commit": "69456833329b8ab92ebce8830ac98f3dc90ced93",
+ "files": {
+  "sequentia_address.py": {
+   "from": "mirrors/python/sequentia_address.py",
+   "sha256": "7e484c7b6f69c7ddf9bf9376f00ca9227351f4f385b881de32b789ee78a1034b"
+  },
+  "templates/pignus_vault/descriptor.json": {
+   "from": "templates/pignus_vault/descriptor.json",
+   "sha256": "c823db9be6968f630c382a0a5401c79579af3fd02a9784ec04e5d57b9874c4ef"
+  },
+  "templates/pignus_vault/vectors.json": {
+   "from": "templates/pignus_vault/vectors.json",
+   "sha256": "5d3fc79d0131681b0e0505a8dd05410d06562d3448def7a3b839b24d22f4ec5e"
+  },
+  "templates/pignus_vault/pignus_vault.simf": {
+   "from": "seqc expand templates/pignus_vault/pignus_vault.simf",
+   "sha256": "1278cf68cb29ba89a5f95e64c5552ddc5be35cd6755053f021653dc2a7e84ffd"
+  },
+  "templates/pignus_offer/descriptor.json": {
+   "from": "templates/pignus_offer/descriptor.json",
+   "sha256": "2d6195a6497953d70999464e7baaed383768d214b4bb67e351d453535e62130c"
+  },
+  "templates/pignus_offer/vectors.json": {
+   "from": "templates/pignus_offer/vectors.json",
+   "sha256": "97ae5572ec0ebcb673b335b9d4ff5c907ad53fa34f8d9a6b7eaaf14768d0c341"
+  },
+  "templates/pignus_offer/pignus_offer.simf": {
+   "from": "seqc expand templates/pignus_offer/pignus_offer.simf",
+   "sha256": "38dfaa068ae52eef02997a5b025f7bc262371da3b8feb3e775988e89a7e0df4d"
+  },
+  "templates/pignus_vault/rules.json": {
+   "from": "templates/pignus_vault/rules.json",
+   "sha256": "c1d1de264c478b0dbf0a0dc9fbc5bfee8ae2a1b492d9ab12946f4f0a091ad55a"
+  }
+ }
+}

@@ -6856,6 +6856,10 @@ def main():
                    "golden vectors and an oracle round trip"
                    ).set_defaults(fn=cmd_selftest)
 
+    # --- version 2: pignus/cli_v2.py ------------------------------------------
+    from pignus import cli_v2
+    cli_v2.register(sub, add_node_args, node_from, refuse)
+
     # --- Tier C ---------------------------------------------------------------
     def issuer_args(q):
         q.add_argument("--issuer", default=os.environ.get(

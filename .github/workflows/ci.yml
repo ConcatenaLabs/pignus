@@ -62,6 +62,17 @@ jobs:
           path: sequentia-oracle
           fetch-depth: 1
 
+      # The version 2 templates, from the repository that owns them, at the
+      # commit pignus/sequentia_contracts/PIN.json names: every vendored file
+      # must be byte for byte that commit's.
+      - name: the vendored version 2 templates are sequentia-contracts'
+        run: |
+          set -e
+          commit=$(python3 -c "import json;print(json.load(open('pignus/pignus/sequentia_contracts/PIN.json'))['commit'])")
+          git clone --quiet --filter=blob:none https://github.com/ConcatenaLabs/sequentia-contracts contracts
+          git -C contracts checkout --quiet "$commit"
+          python3 pignus/tests/check_contracts_pin.py contracts
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -110,6 +121,9 @@ jobs:
           # beside this repository) without holding its key.
           SEQUENTIA_ORACLE=${{ github.workspace }}/sequentia-oracle python3 tests/test_attestation_formats.py
           python3 tests/test_liquidator.py
+          # Version 2: the vendored templates, their vectors, the rule, reading
+          # a vault's next state off a spend, and the five points.
+          python3 tests/test_v2.py
           python3 tests/test_btc_relay_auth.py
           # The Python repurchase composer against the same golden vectors the
           # browser is pinned to. Without it, two of the three implementations

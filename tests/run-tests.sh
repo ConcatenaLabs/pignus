@@ -66,6 +66,7 @@ run "watcher: the reorgs that were its blind spots" python3 tests/test_watcher_r
 run "oracle service: what it will not sign" python3 tests/test_oracle_service.py
 run "attestation formats, and a separate signer" python3 tests/test_attestation_formats.py
 run "liquidation bot: what it refuses" python3 tests/test_liquidator.py
+run "version 2: templates, rule, following, five points" python3 tests/test_v2.py
 run "browser: covenant vs vectors"    node tests/test_web.mjs
 run "browser: offers vs vectors"      node tests/test_offer_web.mjs
 run "browser: repurchase vs vectors"  node tests/test_repurchase_web.mjs
@@ -75,6 +76,7 @@ run "browser: what the BTC borrow flow refuses" node tests/test_btcborrow_web.mj
 run "browser: what a take puts at index 1" node tests/test_takeoffer_web.mjs
 run "browser: amounts the page shows exactly" node tests/test_format_web.mjs
 run "alerts: what needs a person, per seat" node tests/test_alerts_web.mjs
+run "browser: version 2 vs vectors"   node tests/test_v2_web.mjs
 run "a cached spend's depth, and a reorg under it" python3 tests/test_spend_depth.py
 run "a cross-chain offer's own end"   python3 tests/test_offer_expiry.py
 run "BTC relay: what it may be believed about" python3 tests/test_btc_relay_auth.py
@@ -105,6 +107,7 @@ run "tier D settled against OpenDAMP"  python3 tests/test_repo_opendamp.py
 run "CLI lifecycle + book discovery"   python3 tests/test_lifecycle.py
 run "threshold oracles end to end"     python3 tests/test_threshold.py
 run "fresh attestations through a beacon" python3 tests/test_beacon.py
+run "a version 2 loan through the CLI, the book and the liquidator" python3 tests/test_lifecycle_v2.py
 run "BTC collateral: the covenant + crypto" python3 tests/test_btc_collateral.py
 run "BTC collateral: the library legs"  python3 tests/test_btc_cli.py
 run "BTC collateral: the CLI handshake" python3 tests/test_btc_cli_flow.py

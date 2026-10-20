@@ -16,6 +16,13 @@ are Simplicity spends of the issuer's covenants, which the lender signs with
 `opendamp transfer-cosign`; this repository signs neither, and section 8.1
 says what that means for a holder.
 
+Beside it, a loan can sit in a **version 2 vault** (section 10): one
+Simplicity program with the loan's terms and its debt in a data leaf beside
+it, which lives in the
+[`sequentia-contracts`](https://github.com/ConcatenaLabs/sequentia-contracts)
+repository as `templates/pignus_vault`, with the funded offer that opens it,
+`templates/pignus_offer`, and is proven there by harness test `l1`.
+
 *Pignus* is the Roman-law term for property pledged as security for a debt: the
 creditor holds the pledge, the debt is owed separately, and redeeming the debt
 redeems the pledge. That is exactly the shape of the thing.
@@ -193,9 +200,9 @@ Measured leaf sizes for a real loan: REPAY 192 bytes, LIQUIDATE 352,
 DEFAULT 346, RECOVER 98. DEFAULT and RECOVER vary by a byte with the size of
 the locktime they carry, so those are the figures for an ordinary height.
 A REPAY spend is in the same class as a covenant CLOB fill (a few hundred
-vbytes; the measured user capacity of a block is about 89,999 vB). The vault
-exists only as tapscript; no Simplicity version of it has been written, so
-there is no Simplicity size to compare it with. Tapscript introspection needs
+vbytes; the measured user capacity of a block is about 89,999 vB). The
+version 2 vault (section 10) is the Simplicity one, and its spends are larger:
+730 vB for a partial repayment and 1,427 vB for a partial liquidation. Tapscript introspection needs
 no consensus change at all -- 0xc4 is gated only by always-active
 `SCRIPT_VERIFY_TAPROOT`.
 
@@ -326,7 +333,8 @@ over its tagged hash, which a Simplicity program and a tapscript leaf both
 rebuild. It also signs what format 1 leaves to each consumer: the precision
 (format 1's `price_scale` is not in the message) and the assets themselves
 rather than a market name. A vault checks one format, fixed when it is built,
-so each loan says which (`attestation_format`, 1 for every vault here), and
+so each loan says which (`attestation_format`: 1 for every version 1 vault,
+2 for every version 2 vault), and
 an oracle whose key backs open format-1 loans publishes format 1 for as long
 as one is open, and format 2 for the same observations beside it.
 
@@ -368,7 +376,8 @@ Two mitigations, in increasing cost.
 A borrower adding collateral moves to a fresh vault with a later `not_before`,
 which retires every attestation older than the top-up. This is the practical
 answer and it falls out of the design for free: a top-up is a REPAY-and-reopen,
-or an explicit new origination.
+or an explicit new origination. A version 2 vault is topped up in place
+(section 10) and keeps its state.
 
 ### 5.2 Epoch commitment
 
@@ -389,7 +398,8 @@ the oracle rotates them to a new script on a schedule and on demand; from then
 on an attestation saved from a dip has no coin to point at. That narrows the
 window to one rotation interval, with no re-covenanting, because a covenant
 pins the beacon asset rather than one beacon. The sequentia-contracts harness
-test `o2` proves it on a regtest chain. Every vault here checks format 1, which
+test `o2` proves it on a regtest chain. A version 2 vault checks format 2 and
+its beacon (section 10). Every version 1 vault checks format 1, which
 carries no beacon, so for them the gap above stands; `pignus-oracle` and
 `pignusd` already refuse a format-2 attestation whose beacon has moved.
 
@@ -1241,7 +1251,11 @@ document it writes.
 The platform lives in this repository, `pignus`, alongside the other
 Sequentia sub-projects; the covenant and its consensus-level proof stay in the
 node repository, the same way SeqOB's covenant ships with the node while the
-daemon driving it ships separately.
+daemon driving it ships separately. The version 2 vault and offer (section 10)
+live in `sequentia-contracts` with their proof, and are vendored here, pinned
+by `pignus/sequentia_contracts/PIN.json`; every version 2 spend is finished by
+that repository's `seqc`. The browser shows version 2 offers and loans and
+composes none of their spends (section 10.7).
 
 What runs where:
 
@@ -1293,3 +1307,140 @@ What runs where:
   conditions section 7.3 lists, which is the one place it does more than
   assert.
   `docs/api.md` in this repository documents everything both of them serve.
+
+## 10. The vault, version 2
+
+The version 1 vault is one tapscript leaf per exit with every term a constant:
+its strike is fixed, so health is a price threshold and not a function of the
+collateral and the debt; its 64-bit seizure arithmetic caps a loan (section
+2.7); a top-up means a new vault; and nothing stops an old attestation from
+being replayed while its time is after `not_before` (section 5). Version 2 is
+the same agreement in one Simplicity program that keeps its terms and its
+state beside it.
+
+### 10.1 The output
+
+```text
+P2TR(NUMS, TapBranch(TapLeaf_0xbe(vault program), H_TapData(terms || state)))
+```
+
+The terms are the collateral and debt assets (any accepted assets), the oracle
+key and its beacon asset, the precision of the oracle's price, the liquidation
+threshold, the target a liquidation restores and the bonus (collateral ratios
+in basis points), the maturity, the recovery time, and the SHA-256 of each
+party's payout script, so any script can be paid. The state is the debt
+outstanding and `LAST_TIME`, the time of the newest attestation a liquidation
+used or of the loan's start. The collateral is the coin's own amount, read
+live, and is kept nowhere else.
+
+The program has one commitment root for every loan, so a vault's address is
+one hash per leaf and one curve tweak from its terms and state, which is what
+the CLI, the book, the browser and the liquidator each compute and compare.
+The coin at input `k` owns outputs `2k` and `2k+1`, as in section 2.1; output
+`2k` is the successor (or the collateral's payout when the vault closes) and
+`2k+1` pays the lender.
+
+### 10.2 The paths
+
+| path | who | rule |
+|---|---|---|
+| repay | anyone | the lender is paid `P >= 1`; below the debt, the successor holds the same collateral and owes `debt - P`; at or above it, the borrower gets at least the whole collateral back |
+| top-up | anyone | the same script, holding more collateral |
+| liquidate | anyone | the oracle's format-2 attestation of the collateral in the debt asset at the pinned precision, its beacon live at an input, its time after `LAST_TIME` and equal to the lock time; before maturity the vault is under the threshold and the repayment no more than brings it to the target; the seizure is worth at most the bonus on the repayment at that price; the successor owes the rest, with `LAST_TIME` the attestation's time, and is healthy at that price; at the debt, the vault closes and output `2k` returns the surplus |
+| call | anyone | the liquidation rule without the health test, once the lock time reaches maturity |
+| recover | anyone | after the recovery time, the whole collateral to the lender |
+
+Health compares `collateral * price * 10^4` with `LIQ_BP * debt * 10^precision`,
+both products of three 64-bit numbers formed at 192 bits, so no amount is too
+large: section 2.7's ceiling does not apply. The target rule lets a liquidator
+repay at most what brings the vault back to its target, so a borrower who is
+slightly under water loses the bonus on part of the debt rather than on all of
+it, and every liquidation that is not a close must leave the vault healthy at
+the price it was made at.
+
+### 10.3 Freshness
+
+A liquidation names a beacon (section 5.3) and must spend a coin of the
+oracle's beacon asset from that beacon's script, so an attestation from before
+the oracle's last rotation has no coin to point at. Its time must be newer
+than the vault's `LAST_TIME`, so the attestation a liquidation used cannot be
+used again on that vault, and it must be the transaction's lock time, so the
+chain's median time must pass it before the liquidation can be mined: the
+attestation is judged against the chain's own clock, which follows the
+Bitcoin anchor. That last rule costs a few blocks of delay after a price is
+signed and buys two things: an attestation dated in the future cannot set the
+vault's `LAST_TIME` past anything the chain has reached, and the successor's
+state can be read off the transaction (10.5).
+
+The window section 5 describes narrows to one rotation interval and is
+otherwise the same fact: within an epoch, a liquidator may still present the
+lowest price signed since the vault's last liquidation. A borrower's cure is a
+top-up or a repayment, either of which works in place.
+
+### 10.4 What the oracle can do
+
+As in section 6.1, its power is to assert a price low enough to make a vault
+unhealthy. Version 2 adds one thing to guard, because a liquidation may now
+repay only part of the debt: a false low price must not let a liquidator pay a
+little and take a lot. The rule that a partial liquidation leaves the vault
+healthy at the attested price closes that: at a fabricated price the vault
+can be made healthy only by repaying nearly all of the debt, and a close
+repays all of it. The lender is paid in full in every case, as in version 1;
+the borrower's loss is bounded as section 6.1 says.
+
+### 10.5 Following a vault
+
+Every repayment, top-up and liquidation spends the vault's coin and makes a
+successor whose state is behind a hash. The programs are written so that the
+state can be read off the transaction anyway: the successor owes the old debt
+less what output `2k+1` paid the lender; its `LAST_TIME` is unchanged after a
+repayment and is the lock time after a liquidation; a top-up leaves the script
+unchanged. A close is a liquidation when a beacon coin was spent through its
+recreate leaf, and a repayment otherwise. The watcher (`pignus/watcher2.py`)
+keeps each loan's line of coins and steps along it as the chain does, and back
+when a reorg removes a step, whatever its depth: a loan whose opening coin has
+gone is GHOST and watched in case it returns.
+
+A take reveals the borrower in the offer's witness: the offer's terms are
+fixed-width, so the borrower's script hash sits at a fixed bit of it, and the
+watcher takes it only when the vault it derives is the take's output. So a
+loan opened from any wallet shows up in the book; only the borrower's whole
+payout script, which a close pays and which the chain shows only as a hash,
+must come from the borrower, and `pignus-cli v2-take` registers it.
+
+### 10.6 Origination
+
+A version 2 loan is taken from a funded offer, `templates/pignus_offer`: the
+lender's principal rests in it and anyone takes one lot by opening a version 2
+vault on the offer's terms with at least the offer's collateral, the rest of
+the offer resting again at the same script; after its expiry anyone returns it
+to the lender. The vault's start time, its first `LAST_TIME`, is the take's
+lock time, which the chain's median time has passed, so it is never in the
+future.
+
+### 10.7 Signing
+
+No path checks a signature but the oracle's, so a wallet signs only its own
+inputs: the debt it repays with, the collateral it adds or locks. Before it
+does, `pignus-cli` shows the five points of sequentia-contracts'
+`docs/descriptor.md` ("Signing for a contract"): the template, known by its
+hash; every script the spend spends or creates, recomputed from the terms and
+the state; the program, run against the final transaction by `seqc`; the path,
+the terms by role and the wallet's own balance changes; and the key, which is
+none. It refuses when a point does not hold.
+
+The page recomputes every version 2 script and judges health and each
+liquidation with the rule written out in the browser, pinned to the same
+vectors as every other implementation, and shows the five points and the
+command for each action. It signs no version 2 spend: the witness is the
+program pruned against the final transaction, which takes the Simplicity
+runtime, and the wallet extension's contract engine builds a spend of one
+contract coin with nothing beside it, where a repayment adds the wallet's own
+coin and a liquidation a beacon coin.
+
+### 10.8 Native BTC collateral
+
+Version 2 is a Sequentia covenant and cannot hold Bitcoin. A loan against
+native BTC stays the cross-chain construction of section 7; nothing here
+introduces a pegged representation of it.
+
