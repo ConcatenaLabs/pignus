@@ -862,8 +862,13 @@ Amounts are integers of atoms; asset ids are in RPC display order.
              "lots_left": 1, "taken": 1, "line": [ … ],
              "template": {"hash": "…", "name": "pignus/offer v2"},
              "vault_template": {"hash": "…", "name": "pignus/vault v2"},
-             "warnings": []}]}
+             "warnings": []}],
+ "median_time": 1792500000}
 ```
+
+`median_time` is the chain's median time past on this book's node, or null
+when it cannot be read: a take's lock time, which becomes the vault's
+`LAST_TIME`, must be a time it has passed.
 
 `terms` are a version 2 loan's terms without the borrower: `collateral_asset`,
 `debt_asset`, `oracle_x`, `beacon_asset`, `precision`, `liq_bp`, `target_bp`,

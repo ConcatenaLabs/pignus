@@ -8,8 +8,9 @@
 // in JavaScript. web/v2_vectors.json carries the templates' golden address
 // vectors, the rule's vectors, and terms-to-script cases derived by the Python
 // in pignus/vault2.py, so the page and the CLI cannot disagree about a script or
-// a ruling without this failing. Then: a changed vector is refused, and the
-// panel shows the five points and never a signing button.
+// a ruling without this failing. Then: a changed vector is refused, the panel
+// shows the five points and the buttons that ask the wallet to sign, and the
+// take, top-up and repayment it composes are the spends the CLI makes.
 import { readFileSync } from "node:fs";
 import * as v2 from "../web/v2.js";
 
@@ -69,9 +70,53 @@ forged.line[0].spk = "5120" + "00".repeat(32);
 ok("a coin that is not the derived vault is called out",
    v2.fivePoints(forged, "repay")[1][1].includes("NOT the vault"));
 const html = v2.render([], [loan]);
-ok("the panel shows the loan, its health and the CLI commands, and no signing button",
+ok("the panel shows the loan, its health, the CLI commands and the wallet's buttons",
    html.includes("v2-repay") && html.includes("v2-topup") && html.includes("Collateral ratio")
-   && !/<button/i.test(html));
+   && html.includes('data-v2-repay="' + loan.loan_id + '"') && html.includes('data-v2-topup="' + loan.loan_id + '"'));
+
+// --- the spends the page asks the wallet to sign
+const G = "ee".repeat(32);
+const oc = vectors.terms_cases.find((x) => x.offer);
+const o = { offer_id: "o1", status: "open", offer: oc.offer, spk: oc.script_pubkey,
+            coin: { txid: "aa".repeat(32), vout: 1, amount: String(2n * BigInt(oc.offer.lot)) } };
+const borrower = "0014" + "11".repeat(20);
+const tk = v2.takeSpend(o, { borrowerSpk: borrower, lockTime: 1790000000, ratePerKvb: 2000, genesis: G });
+const vt = { ...oc.offer.terms, borrower_spk: borrower };
+ok("a take spends the offer's coin at its recomputed script, funded by the wallet",
+   tk.templateHash === vectors.offer.hash && tk.fund === true && tk.request.coin.script_pubkey === oc.script_pubkey
+   && tk.request.path === "take" && tk.request.lock_time === 1790000000);
+ok("output 0 opens the vault owing DEBT, its borrower this wallet, LAST_TIME the lock time",
+   tk.request.outputs[0].to === "open" && tk.request.outputs[0].script === v2.vaultSpk(vt, oc.offer.debt, 1790000000)
+   && tk.request.outputs[0].open.template_hash === vectors.vault.hash && tk.request.outputs[0].open.genesis === G
+   && tk.request.outputs[0].open.slots.LAST_TIME === (1790000000).toString(16).padStart(8, "0"));
+ok("the rest returns to the offer, the lot less the fee to the borrower, the fee in the debt asset",
+   tk.request.outputs[1].to === "contract" && tk.request.outputs[1].script === oc.script_pubkey
+   && tk.request.outputs[2].to === "wallet" && tk.request.outputs[2].script === borrower
+   && tk.request.outputs[3].to === "fee" && tk.request.outputs[3].asset === oc.offer.terms.debt_asset
+   && tk.request.outputs[3].amount === v2.feeFor("take", 2000));
+ok("the take's witness names the borrower's script hash", /^Left\(0x[0-9a-f]{64}\)$/.test(tk.request.spender.PATH)
+   && tk.request.spender.PATH.includes(tk.request.outputs[0].open.params.BORROWER));
+const live = { ...structuredClone(loan), terms: { ...t, borrower_spk: borrower } };
+live.line[0].vout = 0;
+live.line[0].spk = v2.vaultSpk(live.terms, c.debt, c.last_time);
+const part = v2.repaySpend(live, { amount: "1000", ratePerKvb: 2000, genesis: G });
+ok("a partial repayment returns the vault owing the rest and pays the lender",
+   part.request.outputs[0].to === "contract"
+   && part.request.outputs[0].script === v2.vaultSpk(live.terms, BigInt(c.debt) - 1000n, c.last_time)
+   && part.request.outputs[1].script === t.lender_spk && part.request.outputs[1].amount === 1000
+   && part.request.next_slots.LAST_TIME === live.line[0].last_time.toString(16).padStart(8, "0")
+   && part.request.spender.PATH === "Left(Left(()))");
+const full = v2.repaySpend(live, { amount: String(BigInt(c.debt) + 5n), ratePerKvb: 2000, genesis: G });
+ok("a full repayment returns the collateral to the borrower's script and pays exactly the debt",
+   full.request.outputs[0].to === "wallet" && full.request.outputs[0].script === borrower
+   && full.request.outputs[1].amount === Number(c.debt) && !full.request.next_slots);
+let threw = "";
+try { v2.repaySpend({ ...live, terms: { ...t, borrower_spk: "" } }, { amount: String(c.debt), ratePerKvb: 2000, genesis: G }); } catch (e) { threw = e.message; }
+ok("a full repayment of a loan whose borrower script is unknown is refused", threw.includes("borrower's script"));
+const tu = v2.topUpSpend(live, { add: "5000", ratePerKvb: 2000, genesis: G });
+ok("a top-up keeps the vault's script, adds the collateral, and pays its fee in the collateral",
+   tu.request.outputs[0].script === live.line[0].spk && tu.request.outputs[0].amount === Number(live.line[0].amount) + 5000
+   && tu.request.outputs[1].asset === t.collateral_asset && tu.request.spender.PATH === "Left(Right(()))");
 
 console.log(`\n${pass} checks passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -154,7 +154,8 @@ class V2Service:
         if path == "/v2/offers":
             st = q.get("status", ["open"])[0]
             rows = b.list_v2("offers", st, q.get("market", [None])[0])
-            return 200, {"offers": [self.offer_view(r) for r in rows]}
+            mtp = self.svc.median_time() if hasattr(self.svc, "median_time") else None
+            return 200, {"offers": [self.offer_view(r) for r in rows], "median_time": mtp}
         if path.startswith("/v2/offers/"):
             rec = b.get_v2("offers", path.rsplit("/", 1)[1])
             return (404, {"error": "no such offer"}) if rec is None else (200, self.offer_view(rec))

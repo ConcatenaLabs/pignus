@@ -3174,6 +3174,57 @@ async function renderV2() {
   }
   const [o, l] = await Promise.all([api("v2/offers?status=all"), api("v2/loans")]);
   el.innerHTML = v2.render(o.offers || [], l.loans || [], (a) => esc(meta(a).ticker));
+  const offers = new Map((o.offers || []).map(x => [x.offer_id, x]));
+  const loans = new Map((l.loans || []).map(x => [x.loan_id, x]));
+  for (const b of el.querySelectorAll("[data-v2-take]"))
+    b.onclick = () => v2Sign("take", () => offers.get(b.dataset.v2Take), o.median_time);
+  for (const b of el.querySelectorAll("[data-v2-repay]"))
+    b.onclick = () => v2Sign("repay", () => loans.get(b.dataset.v2Repay));
+  for (const b of el.querySelectorAll("[data-v2-topup]"))
+    b.onclick = () => v2Sign("top_up", () => loans.get(b.dataset.v2Topup));
+}
+
+// The atoms of the fee asset per 1,000 vB a version 2 spend proposes. The
+// wallet's engine measures the final transaction; the node's floor for that
+// asset decides whether it relays.
+const V2_FEE_RATE = 2000;
+
+/**
+ * A take, a repayment or a top-up of version 2, signed by the wallet's
+ * contract engine: this page composes the request, and the wallet adds its
+ * own coins, recomputes every script, runs the program, shows its five
+ * points and signs only what it showed.
+ */
+async function v2Sign(kind, pick, medianTime) {
+  const rec = pick();
+  try {
+    if (!rec) throw new Error("that offer or loan is no longer listed");
+    if (!state.wallet) await connect();
+    if (!state.wallet) throw new Error("connect a wallet first");
+    const caps = await state.wallet.capabilities();
+    if (!(caps.features || []).includes("contract-spend"))
+      throw new Error("this wallet cannot sign a contract spend: update it, or use pignus-cli");
+    const { genesis } = await state.wallet.request("getNetwork");
+    if (!genesis) throw new Error("this wallet does not name its chain's genesis: update it, or use pignus-cli");
+    const payout = state.payout || await payoutProgram(state.wallet);
+    let params;
+    if (kind === "take") {
+      if (!medianTime) throw new Error("the book cannot read the chain's median time, which a take's lock time must have passed");
+      params = v2.takeSpend(rec, { borrowerSpk: payout.spk, lockTime: medianTime - 1, ratePerKvb: V2_FEE_RATE, genesis });
+    } else {
+      const amount = ($(`[data-v2-amount="${rec.loan_id}"]`)?.value || "").trim();
+      if (!/^[0-9]+$/.test(amount)) throw new Error("give the amount in atoms");
+      params = kind === "repay"
+        ? v2.repaySpend(rec, { amount, ratePerKvb: V2_FEE_RATE, genesis })
+        : v2.topUpSpend(rec, { add: amount, ratePerKvb: V2_FEE_RATE, genesis });
+    }
+    busy(true, "waiting for the wallet's approval…");
+    const r = await state.wallet.request("signContractSpend", params);
+    note(`Signed by your wallet and broadcast: <code>${esc(r.txid || "")}</code>. ` +
+         "The book follows the vault from the chain.", "ok");
+  } catch (e) {
+    note("<strong>Not signed.</strong> " + esc(explain(e)), "bad");
+  } finally { busy(false); }
 }
 
 // ------------------------------------------------------------------ boot

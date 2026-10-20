@@ -1253,9 +1253,10 @@ Sequentia sub-projects; the covenant and its consensus-level proof stay in the
 node repository, the same way SeqOB's covenant ships with the node while the
 daemon driving it ships separately. The version 2 vault and offer (section 10)
 live in `sequentia-contracts` with their proof, and are vendored here, pinned
-by `pignus/sequentia_contracts/PIN.json`; every version 2 spend is finished by
-that repository's `seqc`. The browser shows version 2 offers and loans and
-composes none of their spends (section 10.7).
+by `pignus/sequentia_contracts/PIN.json`. A spend `pignus-cli` makes is finished
+by that repository's `seqc`; a take, a repayment or a top-up made in the
+browser is finished and signed by the wallet extension's contract engine
+(section 10.7).
 
 What runs where:
 
@@ -1431,12 +1432,17 @@ none. It refuses when a point does not hold.
 
 The page recomputes every version 2 script and judges health and each
 liquidation with the rule written out in the browser, pinned to the same
-vectors as every other implementation, and shows the five points and the
-command for each action. It signs no version 2 spend: the witness is the
-program pruned against the final transaction, which takes the Simplicity
-runtime, and the wallet extension's contract engine builds a spend of one
-contract coin with nothing beside it, where a repayment adds the wallet's own
-coin and a liquidation a beacon coin.
+vectors as every other implementation, and shows the five points. For a take,
+a repayment and a top-up it composes the spend as a contract spend request
+and asks the wallet to sign it (`signContractSpend`, with the wallet funding
+it). The wallet's contract engine, SWK's `lwk_contracts`, carries both
+templates: it adds the wallet's own coins for the collateral, the repayment
+and the fee, recomputes the offer's or the vault's script and every vault the
+spend opens or returns to, runs the program against the final transaction,
+shows its own five points with the wallet's balance change in every asset,
+and signs only the digest of what it showed, with the wallet's funding keys
+on the wallet's own inputs. A liquidation, a recovery and a refund are given
+as the `pignus-cli` command that makes them.
 
 ### 10.8 Native BTC collateral
 
