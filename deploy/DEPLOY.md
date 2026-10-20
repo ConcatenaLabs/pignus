@@ -188,8 +188,22 @@ co-signed seizure then takes the key file for that one command:
 `pignus-oracle --config /root/sequentia/pignus-oracle.json --sign-seize
 --request seizure.json --keyfile /root/sequentia/oracle-signer/1/oracle.key`.
 Back up `/root/sequentia/oracle-signer` with the rest (*Backups*): the key now
-lives there. The further oracles move the same way, each to its own instance
-(`2.json`, `2/oracle.key`, and its own log paths).
+lives there. The unit files that hide that directory from the web process and
+put it in the archive are this checkout's `pignus-oracle.service`,
+`pignus-oracle@.service` and `pignus-backup.service`; copy them over the
+installed ones first, as *Updating* says, or the keys are left out of every
+nightly archive.
+
+The further oracles move the same way, each to its own instance (`2.json`,
+`2/oracle.key`), and each names its own copy of every shared file, in both
+configurations: for oracle 2, `log_v2` `attestations-2-v2.log`, `status`
+`signer-status-2.json`, and with a beacon `beacon-2.log` and
+`beacon-rotate-2.request` (the signer's `beacon.log` and `beacon.request`,
+pignus-oracle's `signer.beacon_log` and `beacon.request`). Their defaults are
+fixed names in the directory of `log_v2`, which every oracle here shares: a
+second signer refuses a beacon log holding another key's epochs, and a
+rotation asked of one oracle through a shared request file is taken by
+whichever signer reads it first, which rotates its own beacon instead.
 
 ### The beacon
 
@@ -212,6 +226,17 @@ while its beacon is live on its node.
 
    and add `"beacon_log": "/root/sequentia/pignus-data/beacon.log"` to its
    `signer` section. `fee_asset` is required: there is no default fee asset.
+   With `user` and `password` in `rpc` the file holds the node's credentials:
+   `chmod 600` it.
+
+   Give each oracle a wallet of its own (`createwallet pignus-beacon-1` with
+   `load_on_startup` true, so a restart of the node loads it again) and send
+   it explicit coins of the fee asset, to its unconfidential address. A
+   rotation pays from the wallet's largest such coin and returns the change as
+   one coin per beacon coin, so the coins grow smaller as rotations go by and
+   nothing gathers them again: fund the wallet with a little over twice what
+   its rotations will pay in fees. One rotation of two beacon coins is about
+   700 vB.
 3. Fund the beacon once:
    `pignus-oracle --config /root/sequentia/pignus-oracle.json --fund-beacon 2`
    issues the beacon asset with no reissuance token, as two one-atom coins at
