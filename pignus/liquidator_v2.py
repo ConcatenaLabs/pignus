@@ -14,8 +14,11 @@ allows), `seqc` runs the program against the finished transaction, and the
 wallet signs only its own inputs.
 
 The transaction's lock time is the attestation's time, so it can be mined only
-once the chain's median time has passed that time: a record signed a moment
-ago waits a few blocks, and is tried again next round.
+once the chain's median time has passed that time. The median time runs about
+six blocks behind the tip, and an oracle signs more often than that, so its
+newest record is usually too young: the round takes the oracle's newest record
+the median time has passed, newer than the vault's last, under a beacon this
+node still shows live, from the records the book keeps of each oracle.
 
 A loan of several oracles settles on a record: one price at one time that at
 least its threshold of its oracles signed alike. The liquidator reads each
@@ -46,22 +49,6 @@ def _note(warned, who, reason):
         print(f"  v2 {who[:12]}: {reason}", file=sys.stderr)
 
 
-def attestation(book, terms, max_age=None):
-    """The oracle's newest format-2 record for this vault, checked here."""
-    url = f"{book.rstrip('/')}/v2/attestation/{terms.market.replace('/', '_')}?oracle={terms.oracle_x}"
-    d = _get(url)
-    a = AF.AttestationV2.from_dict(d)
-    if not a.verify(bytes.fromhex(terms.oracle_x)):
-        raise V2.V2Error("the record is not the vault's oracle's signature")
-    if a.base.hex() != V2._internal(terms.collateral_asset) or a.quote.hex() != V2._internal(terms.debt_asset):
-        raise V2.V2Error("the record prices another pair")
-    if a.precision != terms.precision:
-        raise V2.V2Error(f"the record's precision is {a.precision}, the vault's {terms.precision}")
-    if max_age and time.time() - a.time > max_age:
-        raise V2.V2Error(f"the record is {int(time.time() - a.time)} s old")
-    return {"price": a.price, "time": a.time, "beacon": a.beacon.hex(), "signature": a.signature.hex()}
-
-
 def beacon_coin(node, book, oracle_x, beacon_asset, program):
     """(Coin, recreate witness) of a live coin at the beacon `program` of the
     oracle `oracle_x`, holding its beacon asset."""
@@ -89,20 +76,59 @@ def beacon_coin(node, book, oracle_x, beacon_asset, program):
     raise V2.V2Error("no live coin of the beacon this record names, on this node")
 
 
+def single_record(node, book, terms, state, mtp, max_age=None):
+    """(record, beacon) for a single-oracle vault: the oracle's newest record
+    of the vault's pair and precision that is newer than the vault's last and
+    older than the chain's median time, with a live coin of the beacon it
+    names; or (None, reason). A book that keeps no history (no
+    `/v2/records`) gives its newest record only."""
+    try:
+        found = records(book, terms, terms.oracle_x)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        url = f"{book.rstrip('/')}/v2/attestation/{terms.market.replace('/', '_')}?oracle={terms.oracle_x}"
+        found = [a for a in [_verified(_get(url), terms, terms.oracle_x)] if a]
+    if not found:
+        return None, "no record of its oracle on the book"
+    newest = max(a.time for a in found)
+    if newest <= state[1]:
+        return None, "no attestation newer than the vault's last"
+    usable = sorted((a for a in found if state[1] < a.time < mtp), key=lambda a: a.time, reverse=True)
+    if not usable:
+        return None, (f"its oracle's newest record ({newest}) is not yet past the chain's median time "
+                      f"{mtp}, and none older is newer than the vault's last; next round")
+    why = None
+    for a in usable:
+        if max_age and time.time() - a.time > max_age:
+            why = f"the newest record past the median time is {int(time.time() - a.time)} s old"
+            break
+        att = {"price": a.price, "time": a.time, "beacon": a.beacon.hex(), "signature": a.signature.hex()}
+        try:
+            return att, beacon_coin(node, book, terms.oracle_x, terms.beacon_asset, att["beacon"])
+        except (V2.V2Error, OSError, KeyError) as e:
+            why = f"record {a.time}: {e}"
+    return None, why
+
+
 def records(book, terms, key):
     """One oracle's recent records of this vault's market, each verified here
     as that oracle's attestation of the vault's pair at its precision."""
     url = f"{book.rstrip('/')}/v2/records/{terms.market.replace('/', '_')}?oracle={key}"
-    out = []
-    for d in _get(url).get("records") or []:
-        try:
-            a = AF.AttestationV2.from_dict(d)
-        except (ValueError, KeyError):
-            continue
-        if (a.verify(bytes.fromhex(key)) and a.base.hex() == V2._internal(terms.collateral_asset)
-                and a.quote.hex() == V2._internal(terms.debt_asset) and a.precision == terms.precision):
-            out.append(a)
-    return out
+    return [a for a in (_verified(d, terms, key) for d in _get(url).get("records") or []) if a]
+
+
+def _verified(d, terms, key):
+    """The record `d` as an attestation, when it is `key`'s signature over the
+    vault's pair at its precision; otherwise None."""
+    try:
+        a = AF.AttestationV2.from_dict(d)
+    except (ValueError, KeyError):
+        return None
+    if (a.verify(bytes.fromhex(key)) and a.base.hex() == V2._internal(terms.collateral_asset)
+            and a.quote.hex() == V2._internal(terms.debt_asset) and a.precision == terms.precision):
+        return a
+    return None
 
 
 def threshold_record(node, book, terms, state, mtp):
@@ -166,9 +192,9 @@ def round_v2(node, book, taker_spk, change_spk, warned, dry_run=False, call_due=
                 sent += _threshold_one(node, book, lid, terms, state, coin, mtp, taker_spk, change_spk,
                                        warned, dry_run, call_due, approve)
                 continue
-            att = attestation(book, terms, max_age)
-            if att["time"] <= state[1]:
-                _note(warned, lid, "no attestation newer than the vault's last")
+            att, beacon = single_record(node, book, terms, state, mtp, max_age)
+            if att is None:
+                _note(warned, lid, beacon)
                 continue
             matured = bool(call_due and mtp > terms.maturity)
             plan = V2.liquidation_plan(terms, coin.amount, state[0], att["price"], matured=matured)
@@ -176,15 +202,10 @@ def round_v2(node, book, taker_spk, change_spk, warned, dry_run=False, call_due=
                 _note(warned, lid, f"healthy at {att['price']} "
                                    f"({V2.ratio_bp(terms, coin.amount, state[0], att['price'])} bp)")
                 continue
-            if att["time"] >= mtp:
-                _note(warned, lid, f"the attestation's time {att['time']} is not yet past the chain's "
-                                   f"median time {mtp}; next round")
-                continue
             if plan["closes"] and plan["kept"] and not terms.borrower_spk:
                 _note(warned, lid, "a close returns a surplus to the borrower, whose payout script "
                                    "the book does not know (only its hash); waiting for its registration")
                 continue
-            beacon = beacon_coin(node, book, terms.oracle_x, terms.beacon_asset, att["beacon"])
             if dry_run:
                 _note(warned, lid, f"would repay {plan['repaid']} and seize {plan['seized']}")
                 continue

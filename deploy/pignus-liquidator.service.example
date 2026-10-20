@@ -49,6 +49,9 @@ EnvironmentFile=/root/sequentia/pignus-liquidator.env
 #   seizure at a loss. Raise it to cover the fee and the risk of losing a race.
 # --max-attestation-age refuses a price signed longer ago than that. The
 #   covenant cannot see a clock, so this is the only place recency is checked.
+#   A version 2 liquidation needs a record the chain's median time has passed,
+#   about six blocks old (six minutes at a block a minute), so keep it well
+#   above that.
 ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignus-liquidator \
     --book http://127.0.0.1:8741 \
     --oracle http://127.0.0.1:8740 \

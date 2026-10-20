@@ -157,7 +157,9 @@ def main():
     ap.add_argument("--max-attestation-age", type=int, default=600, metavar="S",
                     help="ignore a price signed longer ago than this (default "
                          "600 s); the covenant cannot check recency, so this is "
-                         "the only place it is checked")
+                         "the only place it is checked. A version 2 liquidation "
+                         "needs a record the chain's median time has passed, "
+                         "about six blocks old, so keep this well above that")
     ap.add_argument("--allow-stale", action="store_true",
                     help="act on attestations older than --max-attestation-age")
     ap.add_argument("--interval", type=float, default=30.0,

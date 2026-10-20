@@ -1368,8 +1368,11 @@ than the vault's `LAST_TIME`, so the attestation a liquidation used cannot be
 used again on that vault, and it must be the transaction's lock time, so the
 chain's median time must pass it before the liquidation can be mined: the
 attestation is judged against the chain's own clock, which follows the
-Bitcoin anchor. That last rule costs a few blocks of delay after a price is
-signed and buys two things: an attestation dated in the future cannot set the
+Bitcoin anchor. That last rule costs about six blocks of delay after a price
+is signed (the median of the last eleven blocks' times), so an oracle that
+signs more often than that never has a newest record old enough: a liquidator
+takes the newest record the median time has passed, from the oracle's recent
+records, and not the oracle's newest. The rule buys two things: an attestation dated in the future cannot set the
 vault's `LAST_TIME` past anything the chain has reached, and the successor's
 state can be read off the transaction (10.5).
 
