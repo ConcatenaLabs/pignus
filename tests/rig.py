@@ -21,7 +21,6 @@ that runs both kinds of test cannot give one name two meanings.
 
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -30,6 +29,9 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 
 from pignus.node import Node, RpcError   # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import ports                              # noqa: E402
 
 RPC_USER = "pignus"
 RPC_PASS = "pignus"
@@ -40,14 +42,13 @@ def _home(*parts):
 
 
 def _free_port():
-    """Ask the kernel for a port nobody is using.
+    """A port nobody is using, below the kernel's ephemeral range
+    (`tests/ports.py` says why).
 
     Fixed ports collide with whatever else is running on a developer's machine
     or on the box -- and a collision does not fail cleanly, it silently connects
     the rig to somebody else's node."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return ports.free_port()
 
 
 def _ensure_wallet(node, name):

@@ -40,7 +40,6 @@ import importlib.util
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -52,6 +51,7 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, ROOT)
 
+import ports                                                # noqa: E402  (tests/)
 from pignus import oracle as O                              # noqa: E402
 from pignus.compat import load_covenant                     # noqa: E402
 from pignus.sequentia_oracle import attestation as AF       # noqa: E402
@@ -91,9 +91,7 @@ def oracle_checkout():
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return ports.free_port()
 
 
 def get(url):

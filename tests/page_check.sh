@@ -47,8 +47,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
-OPORT=$(port); DPORT=$(port)
+# Ports below the kernel's ephemeral range, distinct (tests/ports.py says why).
+read -r OPORT DPORT <<<"$(python3 "$HERE/ports.py" 2)"
 
 cat > "$WORK/oracle.json" <<J
 {"keyfile":"$WORK/o.key","logfile":"$WORK/att.log","listen":"127.0.0.1:$OPORT",

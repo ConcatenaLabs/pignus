@@ -26,8 +26,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
-OPORT=$(port); DPORT=$(port)
+# Ports below the kernel's ephemeral range, distinct (tests/ports.py says why).
+read -r OPORT DPORT BPORT HPORT HPORTD <<<"$(python3 "$HERE/ports.py" 5)"
 
 cat > "$WORK/oracle.json" <<EOF
 {
@@ -499,7 +499,6 @@ echo "== a book file that is not valid JSON stops the daemon, intact =="
 # leaves the bytes where they are for an operator to restore or move aside.
 printf '{"offers": {"broken"' > "$WORK/corrupt.json"
 BEFORE=$(sha256sum < "$WORK/corrupt.json")
-BPORT=$(port)
 cat > "$WORK/corrupt-cfg.json" <<EOF
 {
   "listen": "127.0.0.1:$BPORT",
@@ -543,7 +542,6 @@ echo "  and an absent book starts empty, which is what a fresh install is"
 # after. A failing source costs its own step and nothing else.
 echo
 echo "-- a book whose oracle replies with nonsense"
-HPORT=$(port)
 python3 - "$HPORT" "$OPORT" <<'HOSTILE' &
 import http.server, json, sys, urllib.request
 port, real = int(sys.argv[1]), int(sys.argv[2])
@@ -573,7 +571,6 @@ HOSTILE
 PIDS+=($!)
 sleep 1
 
-HPORTD=$(port)
 cat > "$WORK/hostile-cfg.json" <<J
 {"listen":"127.0.0.1:$HPORTD","book":"$WORK/hostile-book.json",
  "oracle":"http://127.0.0.1:$OPORT","oracles":["http://127.0.0.1:$HPORT"],

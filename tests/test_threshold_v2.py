@@ -32,7 +32,6 @@ listener binds a port it found free between 21000 and 29999.
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -45,6 +44,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)
 
+import ports                                                # noqa: E402  (tests/)
 from pignus import vault2 as V2                                 # noqa: E402
 from pignus import bonds as BONDS                               # noqa: E402
 from pignus.sequentia_oracle import attestation as AF           # noqa: E402
@@ -57,9 +57,6 @@ LOT = 2_000_000 * UNIT
 DEBT = 2_100_000 * UNIT
 COLL = 1_000 * UNIT          # GOLD at 3,000 USDX: 142.9 %
 NOTICE = 1024
-_TAKEN = set()
-
-
 def check(name, cond, detail=""):
     global PASS, FAIL
     if cond:
@@ -73,17 +70,7 @@ def check(name, cond, detail=""):
 
 def port():
     """A port nobody listens on, below the kernel's ephemeral range."""
-    for p in range(21000, 30000):
-        if p in _TAKEN:
-            continue
-        with socket.socket() as s:
-            try:
-                s.bind(("127.0.0.1", p))
-            except OSError:
-                continue
-        _TAKEN.add(p)
-        return p
-    raise RuntimeError("no free port")
+    return ports.free_port()
 
 
 class Json(ThreadingHTTPServer):
