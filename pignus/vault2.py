@@ -875,9 +875,15 @@ def fund_offer(node, offer, lots, fee_asset=None):
                               fee_asset_label=fee_asset or offer.terms.debt_asset)
 
 
+# The unblinded segwit prefix of each chain the node can run (src/chainparams.cpp):
+# Sequentia's mainnet shares Bitcoin's `bc`, its testnet Bitcoin's `tb`; a custom
+# chain defaults to `ert`.
+_HRP = {"sequentia": "bc", "main": "bc", "test": "tb", "testnet": "tb", "signet": "tb",
+        "regtest": "bcrt", "liquidv1": "ex", "liquidtestnet": "tex"}
+
+
 def _hrp(node):
-    chain = node.getblockchaininfo()["chain"]
-    return {"liquidv1": "ex", "sequentia": "sq"}.get(chain, "tb" if chain in ("test", "testnet") else "ert")
+    return _HRP.get(node.getblockchaininfo()["chain"], "ert")
 
 
 def address(node, spk_hex):
