@@ -310,7 +310,9 @@ def main():
             evidence[label + "_liquidator"] = r.stderr.strip().splitlines()[-6:]
             sent = [ln for ln in r.stderr.splitlines() if "liquidated, repaid" in ln]
             check(f"{label}: pignus-liquidator liquidates part of the vault", bool(sent), r.stderr[-800:])
-            after = settle(lambda: (lambda x: x if x and x["last_time"] == att["time"] else None)(loan(lid)))
+            # In a block, not only seen: the checks after this read its block.
+            after = settle(lambda: (lambda x: x if x and x["last_time"] == att["time"]
+                                    and x["line"][-1].get("where", {}).get("in") == "block" else None)(loan(lid)))
             return att, pre, after
 
         att1, pre1, v = fall_and_liquidate(1700, "first")

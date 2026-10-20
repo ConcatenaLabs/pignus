@@ -1001,7 +1001,9 @@ bond as `/v1/oracles` gives it, keyed by key, and what could not be read.
 this book has verified (up to 64), newest first, each with `beacon_state`
 (`live`, `spent` or `none`) on this book's node. A loan of several oracles
 settles on a record several of them signed alike, which need not be any one
-oracle's newest; a liquidator reads these and verifies every one itself.
+oracle's newest; and any liquidation needs a record the chain's median time
+has passed, which an oracle signing every minute never has in its newest. A
+liquidator reads these and verifies every one itself.
 404 when no oracle of that key is quoted here.
 
 ## The cross-chain relay

@@ -467,9 +467,12 @@ the vault is under its threshold, repays what brings it back to its target
 and keeps the seizure the bonus allows. The program is run against the final
 transaction by `seqc` (see *Version 2 from the command line*), and the fee is
 paid in the debt asset. A liquidation's lock time is the attestation's time,
-so it waits until the chain's median time has passed it: a price signed a
-moment ago is acted on a few blocks later. `--call-due` calls version 2 loans
-past maturity as well.
+so the chain's median time must have passed it. The median time runs about six
+blocks behind the tip, and an oracle signs more often than that, so the
+liquidator takes the oracle's newest record the median time has passed (newer
+than the vault's last, under a beacon still live) from the records the book
+keeps (`/v2/records`): a fall in price is acted on about six blocks after it is
+signed. `--call-due` calls version 2 loans past maturity as well.
 
 ### Version 2 from the command line
 
@@ -1283,6 +1286,11 @@ tests/test_threshold_v2.py         a 2-of-3 version 2 loan and each oracle's bon
                                    and unbonded on the book; a 2-of-3 offer
                                    taken; one signature not enough, two
                                    liquidating; needs seqc and sequentia-oracle
+tests/test_v2_minute_blocks.py     a version 2 liquidation at a block and a feed
+                                   record a minute (PIGNUS_SPACING, 60 s; the
+                                   suite runs it at 10 s): the liquidator takes
+                                   the newest record the chain's median time
+                                   has passed; top-up and repay at that clock
 tests/test_btc_collateral.py       Tier B's covenant and crypto
 tests/test_btc_cli.py              the BTC-collateral library legs
 tests/test_btc_cli_flow.py         the BTC-collateral CLI handshake
