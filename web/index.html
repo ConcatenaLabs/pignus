@@ -337,9 +337,13 @@ a lender who is online.</p>
   threshold; it takes only what brings the vault back to its target and forces
   the rest back. This page recomputes every script below from the terms and the
   state, judges health with the rule written out here, and shows the five
-  points owed before anything is signed; the spends themselves are made by
-  <code>pignus-cli</code>, which runs the program against the final transaction
-  before its wallet signs.</p>
+  points owed before anything is signed. A take, a repayment and a top-up are
+  signed by your wallet: this page composes the spend, and the wallet's
+  contract engine adds your coins, recomputes every script, runs the program
+  against the final transaction and shows you its own five points before it
+  signs. A liquidation, a recovery and a refund are made by
+  <code>pignus-cli</code>, which runs the program the same way before its
+  wallet signs.</p>
   <div class="card" id="v2"><div class="empty">loading&hellip;</div></div>
 </section>
 

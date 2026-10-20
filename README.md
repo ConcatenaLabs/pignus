@@ -506,10 +506,10 @@ registers it with the book; a borrower who took an offer another way passes
 
 The page shows version 2 offers and loans on its *Vault v2* tab, each script
 recomputed in the browser and each loan's health judged there, with the five
-points and the command for each action. It signs no version 2 spend: the
-witness is the program pruned against the final transaction, which takes the
-Simplicity runtime, and the wallet extension's contract engine builds a spend
-of one contract coin and nothing else.
+points and the command for each action. A take, a repayment and a top-up can
+also be signed from the page: it composes the spend and the wallet
+extension's contract engine funds it from the wallet, runs the program
+against the final transaction, shows its own five points and signs.
 
 ### Native BTC collateral (Tier B, cross-chain)
 
