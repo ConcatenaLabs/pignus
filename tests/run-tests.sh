@@ -106,6 +106,7 @@ run "watcher against a real reorg"    python3 tests/test_watcher_reorg.py
 run "tiers C and D on a chain"         python3 tests/test_tiers.py
 run "tier D settled against OpenDAMP"  python3 tests/test_repo_opendamp.py
 run "CLI lifecycle + book discovery"   python3 tests/test_lifecycle.py
+run "standing offers: every market stocked, renewed, checked" python3 tests/test_standing.py
 run "threshold oracles end to end"     python3 tests/test_threshold.py
 run "fresh attestations through a beacon" python3 tests/test_beacon.py
 run "a version 2 loan through the CLI, the book and the liquidator" python3 tests/test_lifecycle_v2.py

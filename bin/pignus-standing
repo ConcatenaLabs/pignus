@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Sequentia developers
+# Distributed under the MIT software license.
+"""Standing offers: keep something to borrow in every market of a book.
+
+A funded offer closes at a height, and a cross-chain offer when its deadlines no
+longer leave both sides their margins. A book whose offers have all closed lets
+a visitor lend and nothing else. This keeps one offer open in every market it is
+given, from a lending wallet named for that market, and renews each one before
+it closes:
+
+  * a covenant market (USDX lent against GOLD, say): when no offer of the
+    market's wallet is open with lots left and more than `renew_days` before it
+    closes, it funds a new one with `pignus-cli offer-fund`; an offer of the
+    wallet that has closed with principal still in it is withdrawn home with
+    `pignus-cli offer-withdraw`;
+  * the cross-chain market (USDX lent against native bitcoin): when no offer of
+    the responder's key would still be takeable `renew_hours` from now, with
+    the parent chain running at `btc_pace` times its nominal speed, it publishes
+    a new one through `pignus-cli btc-offer-publish --config <responder>` and
+    withdraws the ones that will not last. The responder pays the principal of
+    every take from its own wallet, so that wallet is the market's lending
+    wallet.
+
+Where the coins come from is configuration, never a guess: each market names
+its wallet, the name must be `pignus-lend-<something>`, one per market, and a
+name that reads like a reserve, a treasury, a bridge, a faucet or any other
+service wallet is refused by name. A lending wallet short of the debt asset asks
+the faucet ONCE (recorded in the state file, and never again for that wallet
+and asset); after that it lives on what its loans repay and its closed offers
+bring home, and a pass that finds it short says SHORT and funds nothing.
+
+    pignus-standing --config /root/sequentia/pignus-standing.json
+    pignus-standing --config ... --dry-run        # says what it would do
+    pignus-standing --config ... --create-wallets # makes missing lending wallets
+
+Exit 0 after a pass (each market's outcome is a line of output), 2 when the
+configuration is refused, 1 when the pass could not run. An empty market is
+reported by `deploy/pignus-check.sh` (PIGNUS_STOCKED_MARKETS), not here.
+"""
+
+import argparse
+import fcntl
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, ".."))
+
+from pignus.node import Node, RpcError          # noqa: E402
+
+CLI = os.path.join(HERE, "pignus-cli")
+LENDING_NAME = re.compile(r"^pignus-lend-[a-z0-9][a-z0-9-]*$")
+# Words a lending wallet's name may not carry: each names a wallet that backs
+# something else on a box (a bridge's reserve, the treasury, the faucet's own
+# float, a service's escrow), and spending from one breaks what it backs.
+REFUSED = re.compile(r"(reserve|sbtc|bridge|treasury|faucet|escrow|compages|"
+                     r"seqpal|pool|bond|beacon|drip|oracle|maker|recovered|"
+                     r"service|founder|inventory|taker)", re.I)
+CONFIG_KEYS = ("book", "state", "faucet", "rpc", "markets", "defaults", "btc")
+MARKET_KEYS = ("market", "wallet", "principal", "lots", "interest", "open_ltv",
+               "liq_ltv", "term_days", "offer_days", "renew_days", "memo")
+BTC_KEYS = ("responder_config", "market", "btc_amount", "lots", "interest",
+            "open_ltv", "liq_ltv", "d_refund_blocks", "repay_blocks",
+            "abort_btc_blocks", "recover_btc_blocks", "renew_hours", "btc_pace",
+            "note")
+MARKET_DEFAULTS = {"lots": 10, "interest": 3, "open_ltv": 50, "liq_ltv": 75,
+                   "term_days": 7, "offer_days": 3, "renew_days": 1,
+                   "memo": "standing offer"}
+# The runbook's recipe for a cross-chain offer: wide Bitcoin margins, because
+# testnet4's pace is uneven and every hour it runs ahead eats an hour of them.
+BTC_DEFAULTS = {"market": "BTC/USDX", "btc_amount": 50000, "lots": 3,
+                "interest": 3, "open_ltv": 50, "liq_ltv": 75,
+                "d_refund_blocks": 4320, "repay_blocks": 20160,
+                "abort_btc_blocks": 1000, "recover_btc_blocks": 5000,
+                "renew_hours": 24, "btc_pace": 2.0,
+                "note": "standing offer"}
+
+
+class Refused(Exception):
+    pass
+
+
+def say(msg):
+    print(msg, flush=True)
+
+
+def check_wallet_name(name, what):
+    if not name or not LENDING_NAME.match(name):
+        raise Refused(f"{what}: wallet {name!r} is not a lending wallet; name "
+                      "it pignus-lend-<market>, one per market")
+    m = REFUSED.search(name)
+    if m:
+        raise Refused(f"{what}: wallet {name!r} carries {m.group(1)!r}, the "
+                      "name of a wallet that backs something else; a lending "
+                      "wallet holds only what it lends")
+
+
+def load_config(path):
+    with open(path) as f:
+        cfg = json.load(f)
+    odd = sorted(k for k in cfg if k not in CONFIG_KEYS and not k.startswith("_"))
+    if odd:
+        raise Refused(f"{path} sets {', '.join(odd)}, which nothing reads; it "
+                      f"takes {', '.join(CONFIG_KEYS)}")
+    defaults = dict(MARKET_DEFAULTS, **(cfg.get("defaults") or {}))
+    markets, seen = [], {}
+    for m in cfg.get("markets") or []:
+        odd = sorted(k for k in m if k not in MARKET_KEYS and not k.startswith("_"))
+        if odd:
+            raise Refused(f"market {m.get('market')}: {', '.join(odd)} is not "
+                          f"read; a market takes {', '.join(MARKET_KEYS)}")
+        m = dict(defaults, **m)
+        for k in ("market", "wallet", "principal"):
+            if not m.get(k):
+                raise Refused(f"a market without {k}: {json.dumps(m)}")
+        check_wallet_name(m["wallet"], m["market"])
+        if m["wallet"] in seen:
+            raise Refused(f"{m['market']} and {seen[m['wallet']]} both name "
+                          f"{m['wallet']}: one lending wallet per market")
+        seen[m["wallet"]] = m["market"]
+        markets.append(m)
+    btc = None
+    if cfg.get("btc"):
+        odd = sorted(k for k in cfg["btc"]
+                     if k not in BTC_KEYS and not k.startswith("_"))
+        if odd:
+            raise Refused(f"btc: {', '.join(odd)} is not read; it takes "
+                          f"{', '.join(BTC_KEYS)}")
+        btc = dict(BTC_DEFAULTS, **cfg["btc"])
+        if not btc.get("responder_config"):
+            raise Refused("btc: responder_config is required")
+        with open(btc["responder_config"]) as f:
+            rc = json.load(f)
+        btc["_rc"] = rc
+        btc["wallet"] = (rc.get("rpc") or {}).get("wallet") or ""
+        check_wallet_name(btc["wallet"], "the responder (" + btc["market"] + ")")
+        if btc["wallet"] in seen:
+            raise Refused(f"the responder's wallet {btc['wallet']} is also "
+                          f"{seen[btc['wallet']]}'s: one lending wallet per market")
+    return cfg, markets, btc
+
+
+def get(base, path):
+    with urllib.request.urlopen(base.rstrip("/") + path, timeout=30) as r:
+        return json.loads(r.read().decode())
+
+
+def post(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode() or "{}")
+        except ValueError:
+            return e.code, {"error": f"HTTP {e.code}"}
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, {"error": f"{type(e).__name__}: {e}"}
+
+
+def node_for(rpc, wallet=None):
+    return Node(url=rpc.get("url") or "http://127.0.0.1:18776",
+                user=rpc.get("user") or None, password=rpc.get("password"),
+                cookie_path=rpc.get("cookie") or None, wallet=wallet)
+
+
+def cli_env(rpc, wallet, book):
+    """The CLI's credentials travel in its environment, never its argv: every
+    user on the machine reads a command line."""
+    env = dict(os.environ, PIGNUS_RPC_URL=rpc.get("url") or "",
+               PIGNUS_RPC_WALLET=wallet or "", PIGNUS_BOOK=book)
+    for k in ("PIGNUS_RPC_USER", "PIGNUS_RPC_PASSWORD", "PIGNUS_RPC_COOKIE"):
+        env.pop(k, None)
+    if rpc.get("user"):
+        env["PIGNUS_RPC_USER"] = rpc["user"]
+        env["PIGNUS_RPC_PASSWORD"] = rpc.get("password") or ""
+    elif rpc.get("cookie"):
+        env["PIGNUS_RPC_COOKIE"] = rpc["cookie"]
+    return env
+
+
+def run_cli(args, env, cwd):
+    r = subprocess.run([sys.executable, CLI] + args, capture_output=True,
+                       text=True, env=env, cwd=cwd, timeout=900)
+    out = r.stdout.strip()
+    try:
+        doc = json.loads(out) if out else {}
+    except ValueError:
+        doc = {"raw": out[-400:]}
+    return r.returncode, doc, r.stderr.strip()
+
+
+def ensure_wallet(rpc, name, create, dry):
+    """The wallet loaded on the node: loaded if it is on the node's disk,
+    created only with --create-wallets. None when it cannot be had."""
+    w = node_for(rpc, name)
+    try:
+        w.getwalletinfo()
+        return w
+    except RpcError:
+        pass
+    base = node_for(rpc)
+    try:
+        # load_on_startup: the responder exits when its wallet is not loaded,
+        # and a node restart would otherwise drop it until the next pass.
+        base.loadwallet(filename=name, load_on_startup=True)
+        say(f"  {name}: loaded")
+        return w
+    except RpcError as e:
+        if "already loaded" in e.message:
+            return w
+        if not create:
+            say(f"  {name}: MISSING: no such wallet on the node ({e.message}); "
+                "make it with --create-wallets")
+            return None
+    if dry:
+        say(f"  {name}: would be created")
+        return None
+    base.createwallet(wallet_name=name, load_on_startup=True)
+    say(f"  {name}: created on the node")
+    return w
+
+
+def keep_copy(w, name, state_path):
+    """A copy of the lending wallet beside the state file, made by the node
+    (`backupwallet`), so the archive of pignus-data carries every lending
+    wallet's keys. Made once; a wallet's keys do not change."""
+    d = os.path.join(os.path.dirname(state_path), "wallets")
+    path = os.path.join(d, name + ".dat")
+    if os.path.exists(path):
+        return
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        w.backupwallet(path)
+        say(f"  {name}: its keys are copied to {path}")
+    except RpcError as e:
+        say(f"  {name}: NO COPY of its keys could be made at {path}: {e.message}")
+
+
+def holdings(w, asset):
+    return sum(int(round(float(u["amount"]) * 10 ** 8))
+               for u in w.listunspent(0)
+               if u.get("spendable") and u.get("asset") == asset)
+
+
+def owns(w, prog, ver, cache):
+    """Can this wallet spend from that payout program? The covenant pays a
+    program, so the address is derived from the script."""
+    key = (prog, int(ver or 0))
+    if key not in cache:
+        spk = ("0014" if int(ver or 0) == 0 else "5120") + prog
+        try:
+            desc = w.getdescriptorinfo(f"raw({spk})")["descriptor"]
+            addr = w.deriveaddresses(desc)[0]
+            cache[key] = bool(w.getaddressinfo(addr).get("ismine"))
+        except (RpcError, KeyError, IndexError):
+            cache[key] = False
+    return cache[key]
+
+
+def unconfidential_address(w):
+    addr = w.getnewaddress("", "bech32")
+    return w.getaddressinfo(addr).get("unconfidential") or addr
+
+
+def faucet_once(cfg, state, w, wallet, ticker, asset, want, dry):
+    """Ask the faucet for `ticker` for this wallet, once in its life. True when
+    the coins are in the wallet (or would be, on a dry run)."""
+    key = f"{wallet}|{ticker}"
+    asked = state.setdefault("faucet", {})
+    if key in asked:
+        return False
+    if not cfg.get("faucet"):
+        return False
+    if dry:
+        say(f"  {wallet}: would ask the faucet for {ticker} (once)")
+        return False
+    addr = unconfidential_address(w)
+    code, r = post(cfg["faucet"], {"address": addr, "asset": ticker})
+    asked[key] = {"at": int(time.time()), "code": code,
+                  "txid": r.get("txid"), "amount": r.get("amount"),
+                  "error": r.get("error")}
+    save_state(cfg, state)
+    if code != 200:
+        say(f"  {wallet}: the faucet refused {ticker} ({code}: "
+            f"{str(r.get('error'))[:160]}); it is not asked again")
+        return False
+    say(f"  {wallet}: the faucet paid {r.get('amount')} {ticker} "
+        f"({str(r.get('txid'))[:16]}…), its one payout of {ticker}")
+    for _ in range(60):
+        if holdings(w, asset) >= want:
+            return True
+        time.sleep(2)
+    return holdings(w, asset) >= want
+
+
+def save_state(cfg, state):
+    path = cfg["state"]
+    tmp = path + ".tmp"
+    # Mode 600 whatever the umask: it holds each offer's manage token.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def covenant_market(cfg, state, m, markets, height, args):
+    """One covenant market: withdraw what closed, fund what is missing."""
+    name, wallet = m["market"], m["wallet"]
+    mk = markets.get(name.upper())
+    if mk is None:
+        say(f"{name}: the book has no such market; skipped")
+        return
+    if mk.get("cross_chain"):
+        say(f"{name}: a cross-chain market; it is the btc block's")
+        return
+    w = ensure_wallet(cfg["rpc"], wallet, args.create_wallets, args.dry_run)
+    if w is None:
+        return
+    keep_copy(w, wallet, cfg["state"])
+    rows = get(cfg["book"], "/v1/offers?status=all&market="
+               + urllib.request.quote(mk["market"]))["offers"]
+    cache = {}
+    ours = [o for o in rows if o.get("market") == mk["market"]
+            and owns(w, o.get("lender_prog") or "", o.get("lender_ver"), cache)]
+    env = cli_env(cfg["rpc"], wallet, cfg["book"])
+    work = os.path.join(os.path.dirname(cfg["state"]), "offers")
+    os.makedirs(work, exist_ok=True)
+    # Home first: a closed offer's principal is what funds the next one.
+    for o in ours:
+        exp = int(o.get("expiry_locktime") or 0)
+        if (o.get("status") in ("open", "expired") and (o.get("lots_left") or 0)
+                and exp and height >= exp):
+            if args.dry_run:
+                say(f"{name}: would withdraw closed offer {o['offer_id'][:12]}")
+                continue
+            rc, doc, err = run_cli(["offer-withdraw", "--offer", o["offer_id"]],
+                                   env, work)
+            if rc == 0:
+                say(f"{name}: withdrew closed offer {o['offer_id'][:12]} home "
+                    f"to {wallet}: {doc.get('txid', '')}")
+            else:
+                say(f"{name}: the closed offer {o['offer_id'][:12]} could not "
+                    f"be withdrawn yet (exit {rc}): {err[-200:]}")
+    blocks_per_day = 86400 // int(markets.get("_block_seconds") or 60)
+    renew = int(float(m["renew_days"]) * blocks_per_day)
+    standing = [o for o in ours
+                if o.get("status") == "open" and not o.get("expired")
+                and (o.get("lots_left") or 0) > 0
+                and int(o.get("expiry_locktime") or 0) - height > renew]
+    if standing:
+        o = max(standing, key=lambda o: int(o["expiry_locktime"]))
+        left = int(o["expiry_locktime"]) - height
+        say(f"{name}: stocked: offer {o['offer_id'][:12]} from {wallet}, "
+            f"{o['lots_left']} lot(s) of {int(o['principal']) / 1e8:g} "
+            f"{mk['debt_ticker']}, closes in {left} blocks "
+            f"(~{left / blocks_per_day:.1f} days)")
+        return
+    if not mk.get("lendable"):
+        say(f"{name}: NOT LENDABLE now (stale price or unknown asset); "
+            "nothing funded")
+        return
+    prec = int(mk.get("debt_precision") or 8)
+    need = int(round(float(m["principal"]) * 10 ** prec)) * int(m["lots"])
+    # The node reports every asset in units of 1e-8, whatever its precision.
+    need_node = need * 10 ** (8 - prec) if prec <= 8 else need // 10 ** (prec - 8)
+    margin = max(need_node // 1000, 10 ** 8)
+    have = holdings(w, mk["debt_asset"])
+    if have < need_node + margin:
+        if not faucet_once(cfg, state, w, wallet, mk["debt_ticker"],
+                           mk["debt_asset"], need_node + margin, args.dry_run):
+            say(f"{name}: SHORT: {wallet} holds "
+                f"{holdings(w, mk['debt_asset']) / 1e8:g} {mk['debt_ticker']} "
+                f"and an offer of {m['lots']} x {m['principal']} needs "
+                f"{(need_node + margin) / 1e8:g}; it has had its one faucet "
+                "payout, so nothing funded")
+            return
+    why = ("the last offer closes within the renewal window" if ours
+           else "the wallet has no open offer")
+    if args.dry_run:
+        say(f"{name}: would fund {m['lots']} x {m['principal']} "
+            f"{mk['debt_ticker']} from {wallet} ({why})")
+        return
+    rc, doc, err = run_cli(
+        ["offer-fund", "--market", mk["market"], "--principal", str(m["principal"]),
+         "--lots", str(m["lots"]), "--interest", str(m["interest"]),
+         "--open-ltv", str(m["open_ltv"]), "--liq-ltv", str(m["liq_ltv"]),
+         "--term-days", str(m["term_days"]), "--offer-days", str(m["offer_days"]),
+         "--memo", str(m.get("memo") or "")], env, work)
+    if rc != 0 or not doc.get("offer_id"):
+        say(f"{name}: FUNDING FAILED from {wallet} (exit {rc}): "
+            f"{(err or json.dumps(doc))[-300:]}")
+        return
+    state.setdefault("offers", {})[doc["offer_id"]] = {
+        "market": mk["market"], "wallet": wallet, "at": int(time.time()),
+        "outpoint": doc.get("outpoint"), "manage_token": doc.get("manage_token"),
+        "expiry_locktime": doc.get("expiry_locktime")}
+    save_state(cfg, state)
+    say(f"{name}: funded offer {doc['offer_id'][:12]} from {wallet}: "
+        f"{m['lots']} x {m['principal']} {mk['debt_ticker']}, closes at "
+        f"block {doc.get('expiry_locktime')} ({why}); {doc.get('outpoint')}")
+
+
+def btc_life_ok(loan, btc_h, seq_h, horizon_s, pace):
+    """Would this offer still be takeable `horizon_s` from now, with the parent
+    chain running at `pace` times its nominal speed? Judged exactly as the
+    book's sweep and every responder judge it."""
+    from pignus.btc_collateral import (BTC_BLOCK_SECONDS, SEQ_BLOCK_SECONDS,
+                                       loan_from_dict, timelocks_sane)
+    judged = dict(loan, borrower_x="00" * 32, h_w="00" * 32)
+    later_btc = int(btc_h) + math.ceil(horizon_s * pace / BTC_BLOCK_SECONDS)
+    later_seq = int(seq_h) + math.ceil(horizon_s / SEQ_BLOCK_SECONDS)
+    return not timelocks_sane(loan_from_dict(judged), later_btc, later_seq)
+
+
+def btc_market(cfg, state, b, markets, args):
+    from pignus import adaptor as A
+    from pignus import oracle as O
+    from pignus.vault import wallet_payout
+    name, rc_path, rc = b["market"], b["responder_config"], b["_rc"]
+    mk = markets.get(name.upper())
+    if mk is None:
+        say(f"{name}: the book has no such market; skipped")
+        return
+    rpc = rc.get("rpc") or {}
+    w = ensure_wallet(rpc, b["wallet"], args.create_wallets, args.dry_run)
+    if w is None:
+        return
+    keep_copy(w, b["wallet"], cfg["state"])
+    lender_x = A.xonly_pubkey(O.read_key(rc["lender_key"], "the lender key")).hex()
+    tips = markets["_tips"]
+    btc_h, seq_h = tips.get("btc_height"), tips.get("height")
+    if btc_h is None or seq_h is None:
+        say(f"{name}: the book reports no Bitcoin height; nothing judged")
+        return
+    rows = get(cfg["book"], "/v1/btc/offers")["offers"]
+    ours = [o for o in rows if (o.get("loan") or {}).get("lender_x") == lender_x
+            and o.get("status", "open") == "open"]
+    horizon = float(b["renew_hours"]) * 3600
+    lasting = [o for o in ours if int(o.get("lots_left") or 0) > 0
+               and btc_life_ok(o["loan"], btc_h, seq_h, horizon, b["btc_pace"])]
+    env = cli_env(rpc, b["wallet"], cfg["book"])
+    work = os.path.join(os.path.dirname(cfg["state"]), "offers")
+    os.makedirs(work, exist_ok=True)
+    if lasting:
+        o = lasting[0]
+        say(f"{name}: stocked: offer {o['btc_offer_id'][:12]} of the responder's "
+            f"key, {o.get('lots_left')} lot(s) of "
+            f"{int(o['loan']['principal']) / 1e8:g} {mk['debt_ticker']} against "
+            f"{int(o['loan']['btc_amount'])} sats, takeable past the next "
+            f"{b['renew_hours']} h")
+        return
+    price, scale = int(mk.get("price") or 0), int(mk.get("price_scale") or 0)
+    if not price or not scale or mk.get("stale"):
+        say(f"{name}: NO PRICE for {name} now; nothing published")
+        return
+    sats = int(b["btc_amount"])
+    principal = int(sats * price * float(b["open_ltv"]) / 100 // scale)
+    debt = principal + int(round(principal * float(b["interest"]) / 100))
+    strike = math.ceil(debt * scale / (sats * float(b["liq_ltv"]) / 100))
+    need = principal * int(b["lots"])
+    have = holdings(w, mk["debt_asset"])
+    margin = max(need // 1000, 10 ** 8)
+    if have < need + margin:
+        if not faucet_once(cfg, state, w, b["wallet"], mk["debt_ticker"],
+                           mk["debt_asset"], need + margin, args.dry_run):
+            say(f"{name}: SHORT: {b['wallet']} holds "
+                f"{holdings(w, mk['debt_asset']) / 1e8:g} {mk['debt_ticker']} "
+                f"and {b['lots']} lots need {(need + margin) / 1e8:g}; it has "
+                "had its one faucet payout, so nothing published")
+            return
+    oracle_x = get(cfg["book"], "/v1/oracle")["oracle_x"]
+    terms = ["--oracle-x", oracle_x, "--btc-amount", str(sats),
+             "--debt-asset", mk["debt_asset"], "--debt", str(debt),
+             "--principal", str(principal),
+             "--d-refund", str(int(seq_h) + int(b["d_refund_blocks"])),
+             "--repay-deadline", str(int(seq_h) + int(b["repay_blocks"])),
+             "--abort-after", str(int(btc_h) + int(b["abort_btc_blocks"])),
+             "--recover-after", str(int(btc_h) + int(b["recover_btc_blocks"])),
+             "--market", mk["market"], "--strike", str(strike),
+             "--lots", str(b["lots"]), "--note", str(b.get("note") or "")]
+    if args.dry_run:
+        say(f"{name}: would publish {b['lots']} lot(s): {principal / 1e8:g} "
+            f"{mk['debt_ticker']} against {sats} sats, strike {strike}")
+        return
+    ver, prog, _spk = wallet_payout(w)
+    rcode, doc, err = run_cli(["btc-offer-publish", "--config", rc_path,
+                               "--book", cfg["book"], "--lender-prog", prog,
+                               "--lender-ver", str(ver)] + terms, env, work)
+    if rcode != 0 or not doc.get("btc_offer_id"):
+        say(f"{name}: PUBLISH FAILED (exit {rcode}): "
+            f"{(err or json.dumps(doc))[-300:]}")
+        return
+    state.setdefault("btc_offers", {})[doc["btc_offer_id"]] = {
+        "at": int(time.time()), "principal": principal, "btc_amount": sats,
+        "strike": strike, "lots": b["lots"]}
+    save_state(cfg, state)
+    say(f"{name}: published offer {doc['btc_offer_id'][:12]}: {b['lots']} "
+        f"lot(s) of {principal / 1e8:g} {mk['debt_ticker']} against {sats} "
+        f"sats, strike {strike}, principal from {b['wallet']}")
+    for o in ours:
+        rcode, _doc, err = run_cli(["btc-offer-withdraw", "--config", rc_path,
+                                    "--book", cfg["book"], "--offer",
+                                    o["btc_offer_id"]], env, work)
+        say(f"{name}: " + (f"withdrew offer {o['btc_offer_id'][:12]}, which "
+                           f"would not last {b['renew_hours']} h"
+                           if rcode == 0 else
+                           f"offer {o['btc_offer_id'][:12]} could not be "
+                           f"withdrawn: {err[-200:]}"))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--create-wallets", action="store_true",
+                    help="create a market's lending wallet on the node when it "
+                         "does not exist")
+    ap.add_argument("--only", default="",
+                    help="comma-separated markets to pass over (default all)")
+    args = ap.parse_args()
+    try:
+        cfg, markets_cfg, btc = load_config(args.config)
+    except Refused as e:
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 2
+    for k in ("book", "state", "rpc"):
+        if not cfg.get(k):
+            print(f"REFUSED: the config has no {k}", file=sys.stderr)
+            return 2
+    os.makedirs(os.path.dirname(cfg["state"]), exist_ok=True)
+    lock = open(cfg["state"] + ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        say("another pass is running; this one does nothing")
+        return 0
+    try:
+        with open(cfg["state"]) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        state = {}
+    only = {x.strip().upper() for x in args.only.split(",") if x.strip()}
+    tips = get(cfg["book"], "/v1/markets")
+    markets = {r["market"].upper(): r for r in tips.get("markets") or []}
+    markets["_block_seconds"] = tips.get("block_seconds") or 60
+    markets["_tips"] = tips
+    height = int(tips.get("height") or node_for(cfg["rpc"]).getblockcount())
+    for m in markets_cfg:
+        if only and m["market"].upper() not in only:
+            continue
+        try:
+            covenant_market(cfg, state, m, markets, height, args)
+        except (RpcError, OSError, ValueError, KeyError) as e:
+            say(f"{m['market']}: ERROR: {type(e).__name__}: {e}")
+    if btc and (not only or btc["market"].upper() in only):
+        try:
+            btc_market(cfg, state, btc, markets, args)
+        except (RpcError, OSError, ValueError, KeyError) as e:
+            say(f"{btc['market']}: ERROR: {type(e).__name__}: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

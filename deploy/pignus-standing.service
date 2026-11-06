@@ -1,0 +1,39 @@
+[Unit]
+# Runs bin/pignus-standing: keeps an offer open in every market of
+# /root/sequentia/pignus-standing.json, from a lending wallet named for the
+# market, and renews each one before it closes. The cross-chain market is
+# published through the responder's own configuration, whose wallet pays the
+# principal of every take.
+Description=Pignus standing offers
+Documentation=https://github.com/ConcatenaLabs/pignus
+After=network-online.target pignusd.service pignus-btc-responder.service
+# A pass that cannot run tells a person. A market it cannot stock is a line of
+# its output, and pignus-check says when a market has nothing to borrow.
+OnFailure=pignus-alert@%n.service
+
+[Service]
+Type=oneshot
+# A pass may wait on the faucet and on a funding send; this is the backstop.
+TimeoutStartSec=1200
+User=root
+WorkingDirectory=/root/sequentia/pignus
+Environment=SEQUENTIA_SRC=/root/sequentia/Sequentia
+Environment=PYTHONUNBUFFERED=1
+# The configuration carries the node's credentials; nothing secret is on the
+# command line.
+ExecStart=/usr/bin/python3 /root/sequentia/pignus/bin/pignus-standing \
+    --config /root/sequentia/pignus-standing.json
+# The state file (each wallet's one faucet payout, the manage tokens of the
+# offers it funded) and the offer records offer-fund writes before it
+# broadcasts both live under pignus-data/standing.
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/root/sequentia/pignus-data
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes

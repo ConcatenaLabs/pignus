@@ -1,0 +1,12 @@
+[Unit]
+Description=Pignus standing offers, every ten minutes
+Documentation=https://github.com/ConcatenaLabs/pignus
+
+[Timer]
+OnCalendar=*:0/10
+# A pass is about now: an offer that closed while the box was down is renewed
+# by the next pass, not by catching up the ones it missed.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

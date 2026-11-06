@@ -252,11 +252,14 @@ bin/pignus-cli           selftest, quote, propose, show, address, verify, status
                          (version 2 loans); btc-* (Tier B, both chains);
                          pledge-* (Tier C); repo-* (repurchase)
 bin/pignus-liquidator    one liquidator among however many people run one
+bin/pignus-standing      keeps an offer open in every market, from a lending
+                         wallet named for it, and renews it before it closes
 web/                     the browser client pignusd serves: pignus.js, offer.js,
                          repurchase.js, pset.js, flows.js, wallet.js, alerts.js, app.js,
                          for Tier B btc.js, adaptor.js, btcborrow.js, and for
                          version 2 v2.js with the v2_vectors.json it pins to
-deploy/                  systemd units (oracle, book, cross-chain responder),
+deploy/                  systemd units (oracle, book, cross-chain responder,
+                         standing offers),
                          example configs, DEPLOY.md
 docs/pignus-design.md    the design and security analysis
 docs/api.md              every HTTP endpoint the book and the oracle serve
@@ -1291,6 +1294,10 @@ tests/test_tiers.py                Tiers C and D
 tests/test_repo_opendamp.py        Tier D settled against a real OpenDAMP asset; needs the
                                    `opendamp` binary ($OPENDAMP_BIN, or a build beside this
                                    checkout at ../opendamp/target/{release,debug}/opendamp)
+tests/test_standing.py             standing offers: wallets refused by name,
+                                   the faucet asked once, renewal before the
+                                   close, a cross-chain offer replaced before
+                                   it would expire, the check on an empty market
 tests/test_lifecycle.py            the CLI through fund, take, repay,
                                    liquidate, withdraw, default, with the
                                    daemon discovering every step
