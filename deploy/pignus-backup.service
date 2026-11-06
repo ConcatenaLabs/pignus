@@ -53,6 +53,8 @@ ExecStart=/bin/sh -c 'exec tar czf /var/lib/pignus-backup/pignus-$(date +%%F).tg
     /root/sequentia/pignus-oracle*.json \
     $(test -f /root/sequentia/pignus-responder.json \
       && echo /root/sequentia/pignus-responder.json) \
+    $(test -f /root/sequentia/pignus-standing.json \
+      && echo /root/sequentia/pignus-standing.json) \
     $(test -f /root/sequentia/pignus-liquidator.env \
       && echo /root/sequentia/pignus-liquidator.env) \
     $(test -f /root/sequentia/pignus-alert.env \

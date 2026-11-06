@@ -1,0 +1,42 @@
+{
+  "_comment": "pignus-standing's configuration. It holds the node's credentials: keep it 0600, and never in a repository.",
+  "book": "http://127.0.0.1:8741",
+  "state": "/root/sequentia/pignus-data/standing/state.json",
+  "_faucet_note": "Each lending wallet short of the debt asset asks the faucet once in its life, and never again; the faucet answers its own machine's loopback without limits, so the once is this file's to keep.",
+  "faucet": "http://127.0.0.1:9960/",
+  "rpc": {
+    "url": "http://127.0.0.1:18200",
+    "user": "",
+    "password": "",
+    "cookie": ""
+  },
+  "defaults": {
+    "lots": 10,
+    "interest": 3,
+    "open_ltv": 50,
+    "liq_ltv": 75,
+    "term_days": 7,
+    "offer_days": 3,
+    "renew_days": 1
+  },
+  "markets": [
+    {"market": "GOLD/USDX", "wallet": "pignus-lend-gold", "principal": 1000},
+    {"market": "SILVR/USDX", "wallet": "pignus-lend-silvr", "principal": 1000},
+    {"market": "OILX/USDX", "wallet": "pignus-lend-oilx", "principal": 1000},
+    {"market": "SEQ/USDX", "wallet": "pignus-lend-seq", "principal": 1000},
+    {"market": "EURX/USDX", "wallet": "pignus-lend-eurx", "principal": 1000}
+  ],
+  "_btc_note": "The cross-chain market: published under the responder's key, its principal paid from the responder's rpc wallet, which must be a pignus-lend-* wallet of its own.",
+  "btc": {
+    "responder_config": "/root/sequentia/pignus-responder.json",
+    "market": "BTC/USDX",
+    "btc_amount": 50000,
+    "lots": 3,
+    "d_refund_blocks": 4320,
+    "repay_blocks": 20160,
+    "abort_btc_blocks": 1000,
+    "recover_btc_blocks": 5000,
+    "renew_hours": 24,
+    "btc_pace": 2.0
+  }
+}

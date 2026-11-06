@@ -28,6 +28,8 @@
 #   deploy/pignus-check.sh                    # the box's own services
 #   PIGNUS_ORACLES="http://127.0.0.1:8740 http://127.0.0.1:8742" \
 #       deploy/pignus-check.sh                # with the threshold oracles
+#   PIGNUS_STOCKED_MARKETS="GOLD/USDX SEQ/USDX" \
+#       deploy/pignus-check.sh                # and an offer open in each
 #
 # Exit 0 when everything checks out, 1 with a line naming each thing that does
 # not. pignus-check.service runs it on a timer.
@@ -178,6 +180,37 @@ raise SystemExit(1 if problems else 0)
         ok "every covenant market is priced within ${MAX_AGE}s, and every market is scaled the way the registry says"
     fi
 fi
+
+# Something to borrow in every market the box keeps stocked. An offer closes
+# at its own height, quietly, and a book whose offers have all closed still
+# answers every health check above while a visitor can lend and nothing else.
+# PIGNUS_STOCKED_MARKETS names the covenant markets `pignus-standing` keeps an
+# offer in; the cross-chain market is the responder's `--expect-offer` below.
+for m in ${PIGNUS_STOCKED_MARKETS:-}; do
+    q=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$m")
+    rows=$(curl -sS --max-time 10 "$BOOK/v1/offers?market=$q" 2>&1)
+    if [ $? -ne 0 ]; then
+        bad "the book ($BOOK) did not list $m's offers: $rows"
+        continue
+    fi
+    left=$(printf '%s' "$rows" | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin).get("offers") or []
+except ValueError:
+    print("unreadable")
+    raise SystemExit(0)
+m = sys.argv[1]
+print(sum(int(o.get("lots_left") or 0) for o in rows
+          if o.get("market") == m and o.get("status") == "open"
+          and not o.get("expired")))
+' "$m")
+    case "$left" in
+        unreadable) bad "the book's offers in $m were not JSON" ;;
+        0) bad "$m has nothing to borrow: no open offer with a lot left" ;;
+        *) ok "$m has $left lot(s) open to borrow" ;;
+    esac
+done
 
 # The set above is CONFIGURATION, and configuration drifts: a threshold oracle
 # enabled without being added here is one nothing watches, and the first thing

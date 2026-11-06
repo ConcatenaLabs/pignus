@@ -37,11 +37,13 @@ key that signs releases and the wallet that pays principals. It is listed here
 because the testnet runs one, and because a cross-chain offer nobody responds to
 is an offer nobody can take.
 
-Two systemd timers run beside those processes: `pignus-backup.timer` archives
-daily everything that is not on a chain, and `pignus-check.timer` runs
+Three systemd timers run beside those processes: `pignus-backup.timer` archives
+daily everything that is not on a chain, `pignus-check.timer` runs
 `deploy/pignus-check.sh` every five minutes to ask whether every oracle is
 signing, the book is being told, the responder and the liquidator are keeping
-up, and no loan has been left liquidatable. Neither serves anything; both are
+up, every stocked market has something to borrow, and no loan has been left
+liquidatable, and `pignus-standing.timer` keeps an offer open in every market
+(*Standing offers* below). None of them serves anything; all three are
 described below.
 
 All of it is pure Python and needs no build step. It does need a Sequentia
@@ -76,18 +78,24 @@ cp /root/sequentia/pignus/deploy/oracle2.example.json   /root/sequentia/pignus-o
 cp /root/sequentia/pignus/deploy/oracle3.example.json   /root/sequentia/pignus-oracle-3.json
 cp /root/sequentia/pignus/deploy/pignusd.example.json   /root/sequentia/pignusd.json
 cp /root/sequentia/pignus/deploy/responder.example.json /root/sequentia/pignus-responder.json
-# edit them: the node RPC credentials go in pignusd.json and
-# pignus-responder.json only, never on a command line. The Bitcoin node's
+cp /root/sequentia/pignus/deploy/standing.example.json  /root/sequentia/pignus-standing.json
+# edit them: the node RPC credentials go in pignusd.json,
+# pignus-responder.json and pignus-standing.json only, never on a command line. The Bitcoin node's
 # cookie is <bitcoin datadir>/testnet4/.cookie; that path is btc_rpc.cookie
 # in both files.
-chmod 600 /root/sequentia/pignusd.json /root/sequentia/pignus-responder.json
+chmod 600 /root/sequentia/pignusd.json /root/sequentia/pignus-responder.json \
+  /root/sequentia/pignus-standing.json
 
 /root/sequentia/pignus/bin/pignus-cli btc-keygen \
   --out /root/sequentia/pignus-data/lender.key
 
 # pignus-responder.json's rpc.wallet must be loaded on the node (name it in
 # the node's wallet=) and hold the debt asset of every lot on offer; the
-# responder exits at start otherwise.
+# responder exits at start otherwise. It is the cross-chain market's lending
+# wallet: name it pignus-lend-btc. pignus-standing makes it, and every other
+# market's lending wallet, and asks the faucet for their first coins:
+python3 /root/sequentia/pignus/bin/pignus-standing \
+  --config /root/sequentia/pignus-standing.json --create-wallets
 
 # the push channel a unit's failure and the check's verdict go to
 # (*Alerting* below): a topic name nobody guesses, in a root-only file
@@ -96,7 +104,7 @@ chmod 600 /root/sequentia/pignus-alert.env
 
 systemctl daemon-reload
 systemctl enable --now pignus-oracle pignus-oracle@2 pignus-oracle@3 pignusd pignus-btc-responder
-systemctl enable --now pignus-backup.timer pignus-check.timer
+systemctl enable --now pignus-backup.timer pignus-check.timer pignus-standing.timer
 systemctl start pignus-alert@test.service    # one test line reaches the topic
 ```
 
@@ -472,6 +480,7 @@ git pull --ff-only
 SEQUENTIA_SRC=/root/sequentia/Sequentia tests/cli_drill.sh
 systemctl restart pignus-oracle pignus-oracle@2 pignus-oracle@3 pignusd pignus-btc-responder
 systemctl restart pignus-liquidator          # only where one is installed
+# pignus-standing runs from the checkout on its timer; its next pass is the new code
 curl -s localhost:8741/healthz | jq -r .git_rev; git rev-parse --short HEAD
 ```
 
@@ -508,7 +517,8 @@ SEQUENTIA_SRC=/root/sequentia/Sequentia \
 every oracle's `/healthz` and the book's must say `ok`, every market that is
 not cross-chain must have a price signed within `PIGNUS_MAX_PRICE_AGE`
 seconds, no market may disagree with the registry about its assets' decimals,
-every key the book quotes must belong to a listed oracle, a liquidator unit
+every key the book quotes must belong to a listed oracle, every market in
+`PIGNUS_STOCKED_MARKETS` must have an open offer with a lot left, a liquidator unit
 that is installed must be running, no loan may sit under its strike and
 still open, the responder (when `PIGNUS_RESPONDER_CONFIG` names one) must
 have no take waiting on a person and must have an open, takeable offer on the
@@ -1059,6 +1069,68 @@ oracle's seizure log and published at `/v1/seizures`, so anyone can check
 afterwards that the price really was under the strike. That publication is the
 whole of this tier's accountability: nothing can refuse the signature at the
 time it is made.
+
+## Standing offers
+
+A funded offer closes at its own height, and a cross-chain offer once its
+deadlines stop leaving both sides their margins. Nothing else renews them, so a
+book left alone ends with nothing to borrow. `bin/pignus-standing` keeps one
+offer open in every market of `/root/sequentia/pignus-standing.json`
+(`deploy/standing.example.json` is the starting point, mode 600: it holds the
+node's credentials), and `pignus-standing.timer` runs it every ten minutes:
+
+- **A covenant market** (USDX lent against GOLD, SILVR, OILX, the Sequence
+  token or EURX on the testnet) is funded from its own lending wallet, named
+  in the config. When none of that wallet's offers is open with a lot left and
+  more than `renew_days` before it closes, a pass funds a new one with
+  `offer-fund` (`lots` x `principal`, `interest`, `open_ltv`, `liq_ltv`,
+  `term_days`, `offer_days`), so the successor is on the book before its
+  predecessor closes. An offer of the wallet that has closed with principal in
+  it is withdrawn home with `offer-withdraw`, which is what funds the next one.
+- **The cross-chain market** (USDX lent against native bitcoin) is published
+  under the responder's key with `btc-offer-publish --config
+  /root/sequentia/pignus-responder.json`, at the runbook's deadlines:
+  `d_refund` 4,320 Sequentia blocks ahead, `repay_deadline` 20,160,
+  `abort_after` 1,000 Bitcoin blocks and `recover_after` 5,000. Its principal
+  is the market's price times `btc_amount` times `open_ltv`, its strike the
+  price at `liq_ltv`. When no offer of the key would still be takeable
+  `renew_hours` from now with the parent chain running at `btc_pace` times its
+  nominal speed (judged by the same rule as the book's sweep), a pass
+  publishes a new one and withdraws the ones that would not last. The
+  responder pays every principal from its own `rpc.wallet`, so that wallet is
+  the market's lending wallet.
+
+Every lending wallet is named `pignus-lend-<market>`, one per market, and a
+name that carries `reserve`, `treasury`, `bridge`, `sbtc`, `faucet`, `escrow`,
+`pool`, `oracle`, `maker` or another service word is refused by name, the
+responder's included: a pass never spends from a wallet that backs something
+else. `--create-wallets` makes a missing lending wallet on the node; without
+it a missing one is reported `MISSING`. The wallet lives in the node's wallet
+directory, and a pass has the node copy it (`backupwallet`) to
+`pignus-data/standing/wallets/<name>.dat` once, so the nightly archive of
+`pignus-data` carries every lending wallet's keys.
+
+A lending wallet short of the debt asset asks the faucet (`faucet`, the
+faucet's loopback address) once in its life, and the state file
+(`state`, under `pignus-data/standing`) records that it did; the faucet pays
+its own machine's loopback without limits, so the once is the state file's to
+keep. After that the wallet lives on what its loans repay and its closed
+offers bring home, and a pass that finds it short says `SHORT` and funds
+nothing. The state file also keeps the manage token of every offer a pass
+funded (`offer-delist` takes it). Each pass prints one line per market:
+`stocked`, `funded offer`, `published offer`, `withdrew`, `SHORT`, `MISSING`,
+`NOT LENDABLE` or an error.
+
+```bash
+python3 /root/sequentia/pignus/bin/pignus-standing \
+    --config /root/sequentia/pignus-standing.json --dry-run   # what a pass would do
+journalctl -u pignus-standing -n 20                           # what the last passes did
+```
+
+`pignus-check.sh` fails when a market listed in `PIGNUS_STOCKED_MARKETS` has
+no open offer with a lot left, and (with `PIGNUS_RESPONDER_CONFIG`) when the
+responder has no takeable offer, so an empty market is noticed whatever the
+reason.
 
 ## Seeding the book
 
