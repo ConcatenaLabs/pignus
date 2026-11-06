@@ -1892,7 +1892,7 @@ function renderPreview() {
  */
 async function confirmAndSend(label, make, opts = {}) {
   const { flow, prefer = [], committed = {} } = opts;
-  let fee = feeFor(flow, prefer, committed);
+  let fee = await feeWithCoins(flow, prefer, committed);
   let built = await composeWithCoins(() => make(fee));   // a failure is the caller's
   const choices = feeChoices(flow, committed);
 
@@ -2007,6 +2007,31 @@ async function confirmAndSend(label, make, opts = {}) {
   }
   setTimeout(() => refresh().catch(() => {}), 2500);
   return txid;
+}
+
+/**
+ * The fee, priced in an asset the wallet holds on the chain. A wallet whose
+ * coins all sit in its operator's tree (the web wallet in its default mode)
+ * holds none there yet, so before saying it cannot pay, it is asked to bring
+ * what this transaction needs of the first asset it spends onto the chain,
+ * with a margin for the fee.
+ */
+async function feeWithCoins(flow, prefer, committed) {
+  try { return feeFor(flow, prefer, committed); } catch (e) {
+    const asset = prefer.find(Boolean);
+    const per = asset ? feeAtoms(flow, asset) : null;
+    if (!asset || !per || !state.wallet || !(await state.wallet.supports("prepareCoins"))) throw e;
+    const need = big(committed[asset] || 0n) + per * 2n;
+    busy(true, `Your wallet is getting ${units(need, asset)} ${meta(asset).ticker} ready: approve it there, then keep this page open.`);
+    try { await state.wallet.prepareCoins([{ asset, amount: need }]); }
+    catch (x) {
+      if (/rejected/.test(x?.message || "")) throw new WalletError("You declined in the wallet. Nothing moved.");
+      throw x;
+    } finally { busy(false); }
+    await loadWallet();
+    renderWallet();
+    return feeFor(flow, prefer, committed);
+  }
 }
 
 /**
