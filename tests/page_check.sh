@@ -198,11 +198,16 @@ want("a visitor with no wallet is told how to connect one",
      "To borrow or lend, connect a wallet." in dom)
 # Default mode's words: the machinery is named only behind a disclosure (the
 # details of an offer or a loan, More tools) or in the footer's checks.
-face = re.sub(r"<(details|footer|style|script|noscript|textarea)[^>]*>.*?</\1>", "", dom, flags=re.S)
+face = re.sub(r"<(details|style|script|noscript|textarea)[^>]*>.*?</\1>", "", dom, flags=re.S)
 face = re.sub(r'<section class="panel" data-panel="more".*?</section>', "", face, flags=re.S)
 face = re.sub(r"<[^>]+>", " ", face)
 jargon = sorted(set(re.findall(r"\b(covenant|tapscript|leaf|leaves|prog|LTV|oracle|strike|vault)\b", face, re.I)))
 want("the face carries none of the words kept for the details", not jargon, ", ".join(jargon))
+m = re.search(r'<details class="safe" id="design">(.*?)</details>', dom, re.S)
+want("the page's own checks (the covenant pin, the chain, the book) sit behind Design and security",
+     bool(m) and 'id="pinned"' in m.group(1) and 'id="chain"' in m.group(1)
+     and 'id="daemon"' in m.group(1) and "Design and security" in m.group(1)
+     and "covenant pinned" not in face, "")
 # A phone's viewport is about 360px and the content box inside a card is about
 # 296. An address or a 64-hex hash has no spaces in it, so without an explicit
 # break rule one of them widens EVERY row and the whole page gets a horizontal

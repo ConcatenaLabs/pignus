@@ -445,17 +445,16 @@
     <a href="#more" id="moretools">More tools</a>
     <a href="https://github.com/ConcatenaLabs/pignus#from-the-command-line">Use it from your own node</a>
     <a href="https://github.com/ConcatenaLabs/pignus">Source</a>
-    <a href="https://github.com/ConcatenaLabs/pignus/blob/main/docs/pignus-design.md">Design and security</a>
     <a href="/pignus-oracle/v1/log" id="oraclelog">Price signer's log</a>
     <span class="spacer"></span>
     <button class="btn sm" id="refresh" type="button">Refresh</button>
   </div>
-  <div class="status">
-    <span class="tag dim" id="pinned">checking this page's loan code&hellip;</span>
-    <span class="tag dim" id="chain">chain&hellip;</span>
-    <span class="tag dim" id="daemon">book&hellip;</span>
-  </div>
-  <details class="safe"><summary>How Pignus keeps your collateral safe</summary>
+  <details class="safe" id="design"><summary>Design and security</summary>
+    <div class="status">
+      <span class="tag dim" id="pinned">checking this page's loan code&hellip;</span>
+      <span class="tag dim" id="chain">chain&hellip;</span>
+      <span class="tag dim" id="daemon">book&hellip;</span>
+    </div>
     <p>Every loan's address is rebuilt in your browser from the terms shown and compared
     with the chain before anything is signed, and this page refuses to build a
     transaction when the two disagree. It holds no keys: your wallet shows you its own
@@ -466,6 +465,8 @@
     bitcoin, the Bitcoin fee to take your collateral back is fixed when the loan is taken
     and shown before you fund it. <code>pignus-cli</code> does everything this page does
     from your own node; a bitcoin loan begun one way is finished the same way.</p>
+    <p>The whole design and its security analysis are in
+    <a href="https://github.com/ConcatenaLabs/pignus/blob/main/docs/pignus-design.md">the design document</a>.</p>
   </details>
   <p class="small" style="margin-top:14px">Testnet. The assets have no value and the prices are demo feeds.</p>
 </footer>
