@@ -3,6 +3,8 @@ __pycache__/
 *.key
 *.log
 vendor/
+# ...but not the wallet connectors' own vendor folder, vendored from seqdex-web.
+!/web/shared/vendor/
 .venv/
 attestations.log
 .claude/
