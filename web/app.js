@@ -1588,7 +1588,9 @@ function renderLoanPage() {
         ${live || l.state === "UNCONFIRMED" ? `<div class="fact"><div class="k">When it is due</div><div class="v">${dueText(t.maturity)}</div><div class="s">Repaying gives ${you === "you" ? "you" : "the borrower"} every ${c} back at once, and needs nobody's permission.</div></div>
         <div class="fact"><div class="k">If ${c} falls below ${money(liq, liq < 10 ? 4 : 2)} ${d}</div><div class="s">Anyone may liquidate the loan: they repay the lender and take collateral worth what is owed, plus a ${bonus.toFixed(0)}% bonus. The rest comes back to ${you}.${ifNow}</div></div>
         <div class="fact"><div class="k">If it is not repaid when due</div><div class="s">Anyone may call it in at the price of the day, on the same terms as a liquidation. ${gapDays} days after it is due, the lender may take all of the collateral without a price.</div></div>` : ""}
-        ${l.spent_by ? `<div class="fact wide"><div class="k">How it ended</div><div data-exit="${esc(loanId(l))}">…</div></div>` : ""}
+        ${l.spent_by ? `<div class="fact wide"><div class="k">How it ended</div>${l.spent_height
+          ? `<div data-exit="${esc(loanId(l))}">…</div>`
+          : '<div class="s">The transaction that closed it is waiting for a block; the account of it is read once it is in one.</div>'}</div>` : ""}
       </div>
       ${detailsBox(key, detailsBlock({ idLabel: "Loan id", id: loanId(l),
         outpoint: `${l.txid}:${l.vout}`, spk, terms: l.terms, t,
