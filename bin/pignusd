@@ -28,9 +28,18 @@ Config:
       "back_scan_cap":    200,
       "prune_after":      2592000,
       "trusted_proxies":  ["127.0.0.1", "::1"],
+      "wallet_connectors": ["extension", "local", "webwallet", "phone"],
       "rpc":      {"url": "http://127.0.0.1:18200", "user": "...",
                    "password": "...", "wallet": ""}
     }
+
+`wallet_connectors` names the wallets the page offers to connect, in the order
+it looks for one: `extension` (Ambra browser), `local` (Sequentia Core through
+sequentia-connect on the visitor's own computer), `webwallet` (the Sequentia web
+wallet open in another tab of this origin) and `phone` (Ambra mobile, paired by
+a code). Without it the page offers all four. The page's content security
+policy opens the pairing relays and the loopback daemon only while `phone` and
+`local` are offered.
 
 `rpc` is optional: without a node the book still serves offers and whatever it
 last knew, and says so in /healthz rather than pretending the states are fresh.
@@ -133,10 +142,12 @@ Endpoints:
     POST /v1/btc/claimed-principal   the borrower reports taking the principal
     POST /v1/btc/repaid        the borrower reports paying the debt
     GET  /healthz
+    GET  /v1/site              the wallet connectors the page offers
 
 `/v1/offer/{id}` and `/v1/loan/{id}` are accepted as aliases of the plural
-forms. The page's own files in web/ are served by their bare name (.js, .json,
-.css, .svg) and nothing else is.
+forms. The page's own files in web/ are served by their bare name (.js, .mjs,
+.json, .css, .svg), and so are those of its wallet connectors in web/shared/ and
+web/shared/vendor/; nothing else is.
 """
 
 import argparse
@@ -481,7 +492,47 @@ def _views(render, rows):
 V2_HISTORY = 64
 BOND_POLL = 60
 
-CONFIG_KEYS = ("back_scan_cap", "block_seconds", "book", "btc_explorer_tx_url", "btc_rpc", "explorer_tx_url", "explorer_url", "listen", "markets", "max_price_age", "min_depth", "oracle", "oracle_beacon_assets", "oracle_keys", "oracle_public_url", "oracle_public_urls", "oracles", "poll", "prune_after", "reference_ticker", "registry", "rescan_depth", "rpc", "trusted_proxies")
+# The wallet connectors the page can offer (web/shared/connectors.js), and what
+# each must reach beyond this origin: its PAIR_RELAYS and LOCAL_DEFAULT_URL.
+WALLET_CONNECTORS = ("extension", "local", "webwallet", "phone")
+PAIR_RELAYS = ("wss://relay.primal.net", "wss://relay.damus.io")
+CONNECT_LOCAL = ("http://127.0.0.1:7419", "http://localhost:7419")
+
+
+def wallet_connectors(cfg):
+    """The connectors this book's page offers, in order: `wallet_connectors`
+    in the config, every one of them when it is absent. An unknown name or an
+    empty list is refused, since a page that offers nothing can sign
+    nothing."""
+    got = cfg.get("wallet_connectors", list(WALLET_CONNECTORS))
+    if not isinstance(got, list) or not got:
+        raise ValueError("wallet_connectors must be a non-empty list of "
+                         + ", ".join(WALLET_CONNECTORS))
+    out = []
+    for c in got:
+        if c not in WALLET_CONNECTORS:
+            raise ValueError(f"wallet_connectors: {c!r} is not one of "
+                             + ", ".join(WALLET_CONNECTORS))
+        if c not in out:
+            out.append(c)
+    return tuple(out)
+
+
+def content_security_policy(offered):
+    """The page's policy: nothing beyond this origin, except what an offered
+    connector must reach."""
+    connect = ["'self'"]
+    if "phone" in offered:
+        connect += PAIR_RELAYS
+    if "local" in offered:
+        connect += CONNECT_LOCAL
+    return ("default-src 'self'; script-src 'self'; style-src 'self' "
+            "'unsafe-inline'; img-src 'self' data:; connect-src "
+            + " ".join(connect) + "; object-src 'none'; base-uri 'none'; "
+            "form-action 'self'; frame-ancestors 'none'")
+
+
+CONFIG_KEYS = ("back_scan_cap", "block_seconds", "book", "btc_explorer_tx_url", "btc_rpc", "explorer_tx_url", "explorer_url", "listen", "markets", "max_price_age", "min_depth", "oracle", "oracle_beacon_assets", "oracle_keys", "oracle_public_url", "oracle_public_urls", "oracles", "poll", "prune_after", "reference_ticker", "registry", "rescan_depth", "rpc", "trusted_proxies", "wallet_connectors")
 
 
 class Service:
@@ -493,6 +544,7 @@ class Service:
         os.makedirs(os.path.dirname(os.path.abspath(cfg["book"])) or ".",
                     exist_ok=True)
         self.book = Book(cfg["book"])
+        self.wallet_connectors = wallet_connectors(cfg)
         self.oracle_url = cfg.get("oracle", "").rstrip("/")
         # One book can quote against several INDEPENDENT oracles, which is what
         # a threshold (m-of-n) loan needs. `oracle` is the default single one;
@@ -2534,18 +2586,21 @@ class Handler(BaseHTTPRequestHandler):
     # repay for the borrower, liquidate, return to lender -- would be
     # clicked through an invisible overlay; scripts from anywhere but here;
     # and a browser guessing a JSON file is HTML.
+    #
+    # The one thing the policy opens beyond this origin is what a wallet
+    # connector the page offers must reach: the pairing relays for a wallet on
+    # a phone, the sequentia-connect daemon on the visitor's own loopback
+    # address for Sequentia Core. Each is allowed only while it is offered
+    # (`wallet_connectors`), so a book that offers neither reaches nothing else.
     SECURITY_HEADERS = (
-        ("Content-Security-Policy",
-         "default-src 'self'; script-src 'self'; style-src 'self' "
-         "'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
-         "object-src 'none'; base-uri 'none'; form-action 'self'; "
-         "frame-ancestors 'none'"),
         ("X-Frame-Options", "DENY"),
         ("X-Content-Type-Options", "nosniff"),
         ("Referrer-Policy", "no-referrer"),
     )
 
     def _security_headers(self):
+        offered = self.svc.wallet_connectors if self.svc else ()
+        self.send_header("Content-Security-Policy", content_security_policy(offered))
         for k, v in self.SECURITY_HEADERS:
             self.send_header(k, v)
 
@@ -2707,20 +2762,29 @@ class Handler(BaseHTTPRequestHandler):
     # them by name. Only files that actually exist in web/ are served, and only
     # by their bare name -- no path traversal, no directory listing, nothing
     # outside that one directory.
+    #
+    # The one exception is the wallet connector layer, vendored from seqdex-web
+    # into web/shared/ and web/shared/vendor/ as it is laid out there (its
+    # modules import each other by those paths): those two directories are
+    # served the same way, by bare name and nothing deeper.
     STATIC = {".js": "application/javascript; charset=utf-8",
+              ".mjs": "application/javascript; charset=utf-8",
               ".json": "application/json",
               ".css": "text/css; charset=utf-8",
               ".svg": "image/svg+xml"}
+    STATIC_DIRS = ("", "shared", "shared/vendor")
 
     def _static(self, path):
-        name = os.path.basename(path)
-        if name != path.lstrip("/"):
+        rel = path.lstrip("/")
+        folder, name = os.path.split(rel)
+        if folder not in self.STATIC_DIRS or not name or name.startswith("."):
             return False
         ext = os.path.splitext(name)[1]
-        if ext not in self.STATIC or not name:
+        if ext not in self.STATIC:
             return False
-        full = os.path.realpath(os.path.join(WEB, name))
-        if os.path.dirname(full) != os.path.realpath(WEB) or not os.path.isfile(full):
+        base = os.path.realpath(os.path.join(WEB, folder))
+        full = os.path.realpath(os.path.join(base, name))
+        if os.path.dirname(full) != base or not os.path.isfile(full):
             return False
         with open(full, "rb") as f:
             return self._send(200, f.read(), self.STATIC[ext])
@@ -2804,6 +2868,9 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path == "/healthz":
             return self._send(200, s.health())
+        if path == "/v1/site":
+            # What the page needs before it loads its wallet connectors.
+            return self._send(200, {"wallet_connectors": list(s.wallet_connectors)})
         if path == "/v1/markets":
             return self._send(200, {"markets": s.market_rows(),
                                     "height": s.height,
@@ -3989,6 +4056,8 @@ def main():
     except compat.CovenantUnavailable as e:
         print(f"error: {e}", file=sys.stderr)
         return 3
+    except ValueError as e:
+        sys.exit(f"pignusd: {args.config}: {e}")
 
     if args.rescan_from is not None:
         if svc.watcher is None:

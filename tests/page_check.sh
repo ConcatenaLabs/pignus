@@ -142,8 +142,8 @@ fi
 # only an eye catches.
 if [ -n "${PIGNUS_SHOTS:-}" ]; then
     mkdir -p "$PIGNUS_SHOTS"
-    for size in 1280,2400 390,2600; do
-        for tab in borrow lend loans repo btc; do
+    for size in 1440,2400 390,2600; do
+        for tab in borrow lend loans more; do
             timeout 90 "$CHROME" --headless=new --no-sandbox --disable-gpu \
                 --no-first-run --disable-extensions --hide-scrollbars \
                 --virtual-time-budget=6000 --window-size="$size" \
@@ -178,7 +178,7 @@ errors = [l for l in console.splitlines()
           and not noise.search(l)]
 want("the page loads with no script errors", not errors, "; ".join(errors[:2]))
 
-want("it is the Pignus page", "Pignus" in dom and "lending" in dom)
+want("it is the Pignus page", "Pignus" in dom and "Borrow" in dom and "Lend" in dom)
 # The pin is the whole reason the browser may derive an address at all: it says
 # so on the page, and if the pinning failed the page refuses to work.
 m = re.search(r'id="pinned"[^>]*>([^<]*)<', dom)
@@ -187,14 +187,27 @@ want("the covenant pinning passed in the browser's own engine",
      "pinned" in pin and "cannot" not in pin.lower(), pin)
 want("the markets rendered from the oracle's signed prices",
      "GOLD / USDX" in dom or "GOLD/USDX" in dom)
-want("every tab's panel is present",
+want("every panel is present",
      all(f'data-panel="{t}"' in dom for t in
-         ("borrow", "lend", "loans", "repo", "btc")))
-want("the Bitcoin tab describes the tier it actually implements",
-     "Native Bitcoin collateral" in dom and "keyless" not in dom)
-want("the offers table rendered rather than staying on 'loading'",
-     "Open offers" in dom and dom.count("loading&hellip;") == 0)
-
+         ("borrow", "lend", "loans", "loan", "more", "repo", "btc")))
+want("the offers against bitcoin are on the borrow tab",
+     "Against bitcoin" in dom and "keyless" not in dom)
+want("the offers rendered rather than staying on 'Reading'",
+     "Against an asset" in dom and dom.count("Reading offers&hellip;") == 0)
+want("a visitor with no wallet is told how to connect one",
+     "To borrow or lend, connect a wallet." in dom)
+# Default mode's words: the machinery is named only behind a disclosure (the
+# details of an offer or a loan, More tools) or in the footer's checks.
+face = re.sub(r"<(details|style|script|noscript|textarea)[^>]*>.*?</\1>", "", dom, flags=re.S)
+face = re.sub(r'<section class="panel" data-panel="more".*?</section>', "", face, flags=re.S)
+face = re.sub(r"<[^>]+>", " ", face)
+jargon = sorted(set(re.findall(r"\b(covenant|tapscript|leaf|leaves|prog|LTV|oracle|strike|vault)\b", face, re.I)))
+want("the face carries none of the words kept for the details", not jargon, ", ".join(jargon))
+m = re.search(r'<details class="safe" id="design">(.*?)</details>', dom, re.S)
+want("the page's own checks (the covenant pin, the chain, the book) sit behind Design and security",
+     bool(m) and 'id="pinned"' in m.group(1) and 'id="chain"' in m.group(1)
+     and 'id="daemon"' in m.group(1) and "Design and security" in m.group(1)
+     and "covenant pinned" not in face, "")
 # A phone's viewport is about 360px and the content box inside a card is about
 # 296. An address or a 64-hex hash has no spaces in it, so without an explicit
 # break rule one of them widens EVERY row and the whole page gets a horizontal

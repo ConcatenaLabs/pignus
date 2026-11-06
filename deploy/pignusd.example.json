@@ -30,6 +30,8 @@
   "prune_after": 2592000,
   "_proxies_note": "Peers whose X-Forwarded-For this daemon believes, which is how the write rate limit is keyed per client behind Caddy. pignusd must not be reachable except through the proxy.",
   "trusted_proxies": ["127.0.0.1", "::1"],
+  "_wallet_connectors_note": "The wallets the page offers to connect, in the order it looks for one: extension (Ambra browser), local (Sequentia Core through sequentia-connect on the visitor's computer), webwallet (the Sequentia web wallet open in another tab of this site), phone (Ambra mobile, paired by a code). The page's content security policy opens the pairing relays and the loopback daemon only while phone and local are offered.",
+  "wallet_connectors": ["extension", "local", "webwallet", "phone"],
   "_rpc_note": "Optional. Without it the book still serves offers and whatever it last knew, and says so in /healthz rather than presenting stale states as fresh. Fill in ONE of cookie or user/password.",
   "rpc": {
     "url": "http://127.0.0.1:18200",

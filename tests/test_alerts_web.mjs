@@ -73,7 +73,7 @@ const live = (o = {}) => ({ state: "LIVE", loan_id: "L1", txid: "11".repeat(32),
 {
   const a = A.alertsFor(view({ offers: [{ offer_id: "O1", lender_prog: "1e".repeat(20), expired: true, lots_left: 2 }] }));
   ok("an expired offer with lots untaken tells the lender to withdraw, and that nothing returns on its own",
-     a.lender[0]?.action === "withdraw" && /2 lots/.test(a.lender[0].text) && /Nothing returns/.test(a.lender[0].text));
+     a.lender[0]?.action === "withdraw" && /2 loans/.test(a.lender[0].text) && /Nothing comes back/.test(a.lender[0].text));
   const b = A.alertsFor(view({ offers: [{ offer_id: "O1", lender_prog: "1e".repeat(20), expired: true, lots_left: 0 }] }));
   ok("...but not one that was fully taken", b.lender.length === 0);
   const c = A.alertsFor(view({ offers: [{ offer_id: "O1", lender_prog: "77".repeat(20), expired: true, lots_left: 1, manage_mine: true }] }));

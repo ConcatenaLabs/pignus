@@ -265,9 +265,9 @@ export function renderOffers(box, offers, ui, onBorrow, write, feerateSatVb) {
   const open = all.filter(o => o.loan && readable(o.loan));
   const dropped = all.length - open.length;
   if (!open.length) {
-    put('<div class="empty">No BTC-collateral offers are open. A lender ' +
-        'publishes one and keeps their side (pignus-cli btc-respond) online ' +
-        'while it rests.</div>');
+    put('<div class="empty">No offers against bitcoin are open right now. ' +
+        'A lender makes one from their own node, and keeps it online while ' +
+        'it is open.</div>');
     return;
   }
   const note = dropped
@@ -304,7 +304,7 @@ export function renderOffers(box, offers, ui, onBorrow, write, feerateSatVb) {
       const why = left === 0 ? 'every lot of this offer is taken'
         : !priced ? 'this offer cannot be funded at the current Bitcoin feerate'
         : underWater ? 'BTC is below this offer\'s seizure price right now'
-        : !canSign ? 'this wallet has no Bitcoin signing; update Ambra'
+        : !canSign ? 'this wallet does not sign the Bitcoin side of a loan: connect Ambra browser for these'
         : !heightKnown ? 'this book publishes no Bitcoin height' : '';
       return '<tr>' +
       '<td data-label="collateral">' + ui.atomsToBtc(l.btc_amount) + ' BTC</td>' +

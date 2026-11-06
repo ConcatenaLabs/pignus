@@ -76,9 +76,9 @@ bin/pignus-cli --version
 On the testnet:
 
 - the page is `https://sequentiatestnet.com/lending/`. It signs nothing
-  itself: the keys are in Ambra for Chromium
-  (`github.com/ConcatenaLabs/sequentia-extension`), the browser extension it
-  drives;
+  itself: the keys are in the wallet you connect there (the Sequentia web
+  wallet, Ambra browser, Ambra mobile, or Sequentia Core through
+  sequentia-connect; see *Using the page*);
 - testnet assets come from `https://sequentiatestnet.com/faucet`;
 - a source tarball of this repository is at
   `https://sequentiatestnet.com/download/`;
@@ -134,19 +134,37 @@ quietly reintroduced a trusted party.
 
 ## Using the page
 
-As a **lender**: connect the wallet, open *Lend*, pick a market, set the amount
-per loan, the number of loans, the interest, both loan-to-value figures and the
-term, and publish. Your principal goes into an offer covenant; borrowers take it
-while you are offline, and anything untaken comes back with *Withdraw* once the
-offer expires.
+**Connect a wallet** from the button at the top. The page offers the wallets
+`wallet_connectors` names in `pignusd`'s config (all four by default), through
+the same connector layer as SeqDEX (`web/shared/`, vendored from seqdex-web):
+the Sequentia web wallet open in another tab of the same site, Ambra browser,
+Ambra mobile paired by a code, and Sequentia Core on your own computer through
+sequentia-connect. The page builds every transaction itself and the wallet
+signs it through the provider protocol's `signPset`, after its own dialog shows
+what you pay, what you receive and the fee. A wallet that keeps its coins in
+its operator's tree (the web wallet in its default mode) is first asked to bring
+what a transaction needs onto the chain (`prepareCoins`). A wallet that cannot
+sign what the page builds is still shown connected, and every action says
+which wallet to use instead. Without a wallet, everything can be read and the
+page says how to connect one.
 
-As a **borrower**: open *Borrow*, pick an offer and press *Borrow*; the page
-shows the vault address and the exact terms before your wallet asks you to
-sign. Repay from *Loans* at any time until the vault is spent -- before maturity, or
-after it while nobody has called the loan -- and the collateral returns in the
-same transaction. For native Bitcoin, use *BTC collateral*: the collateral
-waits in a pre-vault only you can take back, from its abort height on, until
-you claim the principal.
+As a **lender**: open *Lend*, choose what to lend against what, set the amount
+per loan, how many loans, the interest, the loan size as a share of the
+collateral's value, the share at which a loan is liquidated, when loans are due
+and how long the offer stays open, and press *Lend*. The money goes into an
+offer covenant; borrowers take it while you are away, and what nobody borrowed
+comes back with *Take it back* once the offer closes.
+
+As a **borrower**: open *Borrow*, pick an offer and press *Borrow*. The page
+shows what you get, what you put up, what you repay and when, and the price at
+which the loan can be liquidated, before your wallet asks you to sign. *Loans*
+lists yours first; *Open the loan* shows a loan's own page, with what happens
+if it is not repaid or the price falls, how it ended once it has, and the terms
+as the chain reads them behind a disclosure. Repay at any time until the vault
+is spent -- before it is due, or after while nobody has called it in -- and the
+collateral returns in the same transaction. For native Bitcoin, use the offers
+*Against bitcoin*: the collateral waits in a pre-vault only you can take back,
+from its abort height on, until you claim the principal.
 
 A cross-chain loan is remembered in the browser and rebuilt from the book on
 any device with the same wallet, and what the chain says is read directly:
@@ -167,9 +185,12 @@ untaken, a matured loan to call, a loan under its strike that nobody has taken.
 Each carries the button, and says when the wallet could not pay for it. The
 count goes in the browser tab's title, the one surface a background tab still
 owns. Each tab has its own
-link -- `#borrow`, `#lend`, `#loans`, `#repo`, `#btc` after the page's address
--- so a runbook or a message can point at one, and a reload lands where you
-were.
+link -- `#borrow`, `#lend`, `#loans`, `#more` after the page's address, and
+`#loan/<loan id>` for a loan's page; `#repo` and `#v2` open *More*, and `#btc`
+the offers against bitcoin -- so a runbook or a message can point at one, and a
+reload lands where you were. *More* (shown when the wallet is in developer
+mode, and from *More tools* at the foot of the page) holds version 2 loans, the
+repurchase check and the check of a bitcoin loan ticket made by hand.
 
 ## Layout
 
@@ -559,7 +580,7 @@ out of the spend's own witness, because the three mean opposite things to a
 borrower and only one of them is good news.
 
 The page and the CLI are two routes, not one. A loan begun in the browser is
-finished in the browser, because its secret lives in the extension; a loan
+finished in the browser, because its secret lives in the wallet that began it; a loan
 begun with `btc-offer-take` is finished with the `btc-*` commands and the
 ticket file it wrote. Neither can pick up the other's loan.
 
@@ -1249,6 +1270,7 @@ tests/test_v2.py                   version 2: the vendored templates and their
                                    next state read off every kind of spend, a
                                    take's borrower, the five points
 tests/test_v2_web.mjs              web/v2.js against web/v2_vectors.json
+tests/test_vendor_web.mjs          web/shared/ against the seqdex-web commit it names
 tests/page_check.sh                the page, in a real browser; it skips
                                    itself where there is no headless Chromium.
                                    PIGNUS_SHOTS=<dir> keeps a desktop and a
