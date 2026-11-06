@@ -688,18 +688,26 @@ function rebuildMine() {
   state.mine = s;
 }
 
+// Kept per account address, and for this browser as a whole: a wallet whose
+// receive address moves on with every payment (the web wallet's does) is a new
+// account to the first list each time, and its loans would stop reading as
+// yours a session later. What this browser has borrowed, lent or been told is
+// its own stays so whatever address the wallet shows next.
+const MINE_BROWSER = "pignus.mine.browser";
 function mineKey() {
   return "pignus.mine." + String(state.account?.address || "").slice(-16);
 }
 function rememberedMine() {
-  try { return JSON.parse(localStorage.getItem(mineKey()) || "[]"); }
-  catch { return []; }
+  const read = (k) => { try { return JSON.parse(localStorage.getItem(k) || "[]"); } catch { return []; } };
+  return [...new Set([...read(mineKey()), ...read(MINE_BROWSER)])];
 }
 function rememberMine(...progs) {
   try {
-    const s = new Set(rememberedMine());
-    for (const p of progs) if (p) s.add(p);
-    localStorage.setItem(mineKey(), JSON.stringify([...s]));
+    for (const k of [mineKey(), MINE_BROWSER]) {
+      const s = new Set(JSON.parse(localStorage.getItem(k) || "[]"));
+      for (const p of progs) if (p) s.add(p);
+      localStorage.setItem(k, JSON.stringify([...s]));
+    }
   } catch { /* private mode: this session only */ }
 }
 
@@ -735,13 +743,19 @@ function renderWallet() {
       transaction before you approve it; this page never holds anything of yours.</div>`;
     return;
   }
-  const have = holdings();
+  // One figure per asset wherever the wallet holds it (getBalances' `total`),
+  // as the wallet itself shows; what is on the chain only, from a wallet that
+  // does not say.
+  const total = state.balances?.total;
+  const have = total && typeof total === "object"
+    ? Object.fromEntries(Object.entries(total).filter(([a]) => a !== "BTC").map(([a, v]) => [a, big(v)]))
+    : holdings();
   const rows = Object.entries(have)
     .filter(([, v]) => v > 0n)
     .sort((x, y) => meta(x[0]).ticker.localeCompare(meta(y[0]).ticker))
     .map(([a, v]) => `<span class="hold"><b>${units(v, a)}</b> ${esc(meta(a).ticker)}
       <span class="ref">${ref(v, a)}</span></span>`);
-  const bal = state.balances?.btc;
+  const bal = total && total.BTC != null ? total.BTC : state.balances?.btc;
   if (bal != null && big(bal) > 0n) {
     // Valued through a market whose DEBT side is the reference unit, and
     // labelled with the unit that market actually quotes in.
@@ -2325,7 +2339,9 @@ async function vaultArgs(l, t) {
   return { terms: t,
            vaultOutpoint: { txid: l.txid, vout: l.vout, scriptPubkey: out.scriptPubKey },
            collateralAmount: big(out.value), singleLeaf: !!l.single_leaf,
-           utxos: state.utxos, changeSpk: state.payout.spk };
+           // Read when the spend is composed, not now: a wallet asked to bring
+           // coins onto the chain first has new ones by then.
+           get utxos() { return state.utxos; }, changeSpk: state.payout.spk };
 }
 
 async function repay(l) {
