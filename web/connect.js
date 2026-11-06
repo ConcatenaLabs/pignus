@@ -138,5 +138,7 @@ export function mountConnect({ wallet, connected, gone, say }) {
   P.onAccountChange(() => { wallet.account = P.account(); draw(); });
   P.onPresence(draw);
   draw();
+  // The page ships the button disabled, so a press before the connectors have loaded is not lost.
+  btn.disabled = false;
   return { draw, open: () => btn.click() };
 }
