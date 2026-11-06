@@ -116,8 +116,16 @@ of the book is that it is current.
 **Body size.** A request body over 256 KiB is refused with 400.
 
 **The page's own files.** `GET /` serves `web/index.html`. A bare filename
-ending `.js`, `.json`, `.css` or `.svg` is served from `web/` if it exists
-there, and nothing else is: no directories, no traversal, no listing.
+ending `.js`, `.mjs`, `.json`, `.css` or `.svg` is served from `web/` if it
+exists there, and so is one under `shared/` or `shared/vendor/`, where the
+wallet connectors vendored from seqdex-web live as they are laid out there.
+Nothing else is: no other directories, no traversal, no listing.
+
+**Content security policy.** Every answer carries a policy that lets the page
+load only its own scripts and reach only this origin, plus what an offered
+wallet connector must reach: the pairing relays while `phone` is offered, and
+the sequentia-connect daemon on the visitor's loopback address while `local`
+is (`wallet_connectors` in the config).
 
 ---
 
@@ -553,6 +561,20 @@ in this process. Zero would mean the builder was never loaded; a non-zero count
 is an operator's proof that the check ran. `git_rev` and `version` say which
 checkout is answering, which is how a box that lags the repository is caught;
 `git_rev` is `null` when the daemon does not run from a git checkout.
+
+### `GET /v1/site`
+
+What the page needs before it loads its wallet connectors:
+
+```json
+{"wallet_connectors": ["extension", "local", "webwallet", "phone"]}
+```
+
+`wallet_connectors` is the config's setting, in the order the page looks for a
+wallet: `extension` (Ambra browser), `local` (Sequentia Core through
+sequentia-connect on the visitor's computer), `webwallet` (the Sequentia web
+wallet open in another tab of this origin) and `phone` (Ambra mobile, paired by
+a code). Without the setting, all four.
 
 ## Offers
 

@@ -4,15 +4,23 @@
 // The browser wallet, as Pignus uses it.
 //
 // The site holds no keys and never sees a mnemonic. Everything that needs a
-// signature goes out through `window.sequentia.signPset` and comes back signed
-// but not finalized; everything that needs a broadcast goes through the wallet
-// too. What the site contributes is the composition -- and the checking, which
-// is the part that matters: the wallet cannot know whether a vault address is
-// the one the borrower agreed to, so the site derives it locally and refuses to
-// ask for a signature when it does not match.
+// signature goes out through the wallet's `signPset` and comes back signed but
+// not finalized; everything that needs a broadcast goes through the wallet too.
+// What the site contributes is the composition -- and the checking, which is
+// the part that matters: the wallet cannot know whether a vault address is the
+// one the borrower agreed to, so the site derives it locally and refuses to ask
+// for a signature when it does not match.
 //
-// One wallet fact shapes the whole design: the extension is a `wpkhSlip77`
-// wallet, so every address it can receive at is SEGWIT V0. Loans originated
+// The wallet is whichever one the person connects, through SeqDEX's connector
+// layer (shared/connectors.js and shared/provider.js, vendored from seqdex-web
+// unchanged): Ambra browser, Sequentia Core through sequentia-connect, the
+// Sequentia web wallet open in another tab of this site, or Ambra mobile
+// paired by a code. Every one of them speaks the same provider protocol
+// (sequentia-extension doc/PROVIDER.md); which methods it serves is its
+// getCapabilities list, and a flow it cannot sign is refused in plain words.
+//
+// One wallet fact shapes the whole design: the wallets are `wpkhSlip77`
+// wallets, so every address they receive at is SEGWIT V0. Loans originated
 // here therefore pay v0 programs, which is why the covenant takes a payout
 // witness version at all.
 
@@ -20,39 +28,35 @@ const REQUIRED = ["getUtxos", "signPset", "broadcast"];
 
 export class WalletError extends Error {}
 
-export function provider() {
-  const p = globalThis.window?.sequentia;
-  if (!p?.isSequentia) return null;
-  return p;
-}
-
-/** Resolve once the extension has injected itself, or give up. */
-export function waitForProvider(timeoutMs = 3000) {
-  return new Promise((resolve) => {
-    if (provider()) return resolve(provider());
-    let done = false;
-    const finish = () => { if (!done) { done = true; resolve(provider()); } };
-    globalThis.addEventListener?.("sequentia#initialized", finish, { once: true });
-    setTimeout(finish, timeoutMs);
-  });
+// The connectors the book offers (`wallet_connectors` in pignusd's config, at
+// v1/site), set for provider.js before it loads, as it reads them only then.
+let _provider = null;
+export function loadProvider(offer) {
+  if (_provider) return _provider;
+  globalThis.SEQ_PROVIDER_SITE = { name: "Pignus", choiceKey: "pignus.connector",
+    offer: Array.isArray(offer) && offer.length ? offer : ["extension", "local", "webwallet", "phone"] };
+  _provider = import("./shared/provider.js");
+  return _provider;
 }
 
 export class Wallet {
-  constructor(p) {
-    this.p = p;
+  constructor(P) {
+    this.P = P;
     this.account = null;
   }
 
-  static async open() {
-    const p = await waitForProvider();
-    if (!p) throw new WalletError(
-      "no Sequentia wallet found. Pignus signs nothing itself: install Ambra " +
-      "for Chromium, the browser extension that holds your keys.");
-    return new Wallet(p);
+  /** The door to whichever wallet the person connects; never prompts. */
+  static async open(offer) {
+    return new Wallet(await loadProvider(offer));
   }
 
-  /** One request to the extension. `req` is the older name for the same thing. */
-  request(method, params) { return this.p.request({ method, params }); }
+  /** The connector in use (Ambra browser, the web wallet, ...). */
+  connector() { return this.P.activeConnector(); }
+  connectors() { return this.P.connectors(); }
+  present() { return this.P.hasWallet(); }
+
+  /** One request to the wallet. `req` is the older name for the same thing. */
+  request(method, params = {}) { return this.P.request(method, params); }
 
   req(method, params) { return this.request(method, params); }
 
@@ -61,24 +65,27 @@ export class Wallet {
     const missing = REQUIRED.filter(m => !(c.methods || []).includes(m));
     if (missing.length)
       throw new WalletError(
-        `this wallet is too old for Pignus: it has no ${missing.join(", ")}. ` +
-        "Update the extension.");
+        `${this.connector().label} cannot sign the transactions a loan needs ` +
+        "yet. Connect the Sequentia web wallet or Ambra browser instead, or " +
+        "use pignus-cli with your own node.");
     return c;
   }
 
-  /** Restore a session without prompting, if the origin is already connected. */
+  /** Does the wallet serve `method`? */
+  async supports(method) { return this.P.supports(method); }
+
+  /** Restore a session without prompting, if the site is already connected. */
   async resume() {
-    try {
-      const { accounts } = await this.req("getAccounts");
-      this.account = accounts?.[0] ?? null;
-    } catch { this.account = null; }
+    this.account = await this.P.restore();
     return this.account;
   }
 
   async connect() {
-    this.account = await this.req("connect");
+    this.account = await this.P.connect();
     return this.account;
   }
+
+  disconnect() { this.P.disconnect(); this.account = null; }
 
   async address() {
     const { address } = await this.req("getAddress", {});
@@ -103,7 +110,21 @@ export class Wallet {
     return txid;
   }
 
-  on(event, fn) { this.p.on?.(event, fn); }
+  /**
+   * Coins on the chain in the clear, which a transaction this page composes
+   * can spend. A wallet that holds part of them elsewhere (the web wallet
+   * keeps what it receives in its operator's tree) moves what is missing to
+   * its own address once its owner approves. -> whether anything moved.
+   */
+  async prepareCoins(coins) {
+    const r = await this.req("prepareCoins", {
+      coins: coins.map(c => ({ asset: c.asset, amount: String(c.amount) })) });
+    return (r?.moved || []).length > 0;
+  }
+
+  on(event, fn) {
+    this.P.onEvent(event, fn) || this.P.onProvider(() => this.P.onEvent(event, fn));
+  }
 }
 
 // ------------------------------------------------------------ coin selection

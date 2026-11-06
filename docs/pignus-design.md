@@ -1261,7 +1261,7 @@ browser is finished and signed by the wallet extension's contract engine
 What runs where:
 
 - **the browser**, at `/lending/` -- derives every address, composes every
-  Sequentia transaction, and asks the wallet extension only to sign and
+  Sequentia transaction, and asks the connected wallet only to sign and
   broadcast; the one transaction the wallet composes is the Bitcoin funding of
   a pre-vault, and the page finds the output paying the loan's own address the
   exact amount and refuses anything else. Every Bitcoin fact it shows comes
@@ -1279,8 +1279,13 @@ What runs where:
   principal, repaying and refunding on Sequentia need no signature at all, and
   reclaiming or aborting on Bitcoin needs only the wallet's ordinary taproot
   signature; the lender's side is the responder's.
-- **the wallet extension** -- holds every key. It signs its own Sequentia
-  inputs and, for a cross-chain loan, the Bitcoin funding and the reclaim. It
+- **the wallet** -- holds every key: whichever one the visitor connects through
+  the connector layer vendored from seqdex-web (`web/shared/`), the browser
+  extension, the web wallet in another tab of the same site, a wallet on a
+  phone, or Sequentia Core through sequentia-connect, each serving the provider
+  protocol's methods it can. It signs its own Sequentia inputs and, for a
+  cross-chain loan, the Bitcoin funding and the reclaim, where it serves the
+  Bitcoin methods. It
   cannot sign a covenant leaf and exposes no x-only key to bake into one, which
   is why every exit in section 2 and both legs in section 7 are signature-free.
 - **the CLI**, from `https://sequentiatestnet.com/download/` as a source

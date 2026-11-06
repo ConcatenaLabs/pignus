@@ -27,7 +27,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Ports below the kernel's ephemeral range, distinct (tests/ports.py says why).
-read -r OPORT DPORT BPORT HPORT HPORTD <<<"$(python3 "$HERE/ports.py" 5)"
+read -r OPORT DPORT BPORT HPORT HPORTD WPORT <<<"$(python3 "$HERE/ports.py" 6)"
 
 cat > "$WORK/oracle.json" <<EOF
 {
@@ -298,6 +298,50 @@ done
 grep -qi "^server: pignusd" "$WORK/hdr.txt" \
   || { echo "the Server header names the Python behind the daemon" >&2; exit 1; }
 echo "  refused, and the headers are on every answer"
+
+echo
+echo "== the wallet connectors: served from web/shared, and the policy opens only what is offered =="
+# The page offers the connectors pignusd's config names (all four by default)
+# and loads them from web/shared, vendored from seqdex-web as it is laid out
+# there. Those two folders are served by bare name like web/ itself; nothing
+# deeper and nothing beside them is.
+curl -sS "$D/v1/site" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d == {"wallet_connectors": ["extension", "local", "webwallet", "phone"]}, d
+'
+for p in shared/provider.js shared/connectors.js shared/vendor/nostr-tools.js shared/vendor/qrcode.mjs; do
+  ct=$(curl -s -o /dev/null -w '%{http_code} %{content_type}' "$D/$p")
+  case "$ct" in "200 application/javascript"*) ;; *) echo "/$p -> $ct" >&2; exit 1;; esac
+done
+for p in shared/../app.js shared/vendor/../../index.html shared/nosuch.js shared/vendor/x/y.js \
+         shared/.hidden.js tests/page_check.sh shared; do
+  code=$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$D/$p")
+  test "$code" = "404" || { echo "/$p -> $code, wanted 404" >&2; exit 1; }
+done
+curl -sD "$WORK/hdr.txt" -o /dev/null "$D/"
+grep -qi "^content-security-policy: .*connect-src 'self' wss://relay.primal.net wss://relay.damus.io http://127.0.0.1:7419 http://localhost:7419;" "$WORK/hdr.txt" \
+  || { echo "the default policy does not open the relays and the loopback daemon:" >&2; cat "$WORK/hdr.txt" >&2; exit 1; }
+# Offering the web wallet alone reaches nothing beyond this origin.
+sed -e "s/127.0.0.1:$DPORT/127.0.0.1:$WPORT/" -e "s#$WORK/book.json#$WORK/w-book.json#" \
+    -e 's/"poll": 5,/"poll": 5, "wallet_connectors": ["webwallet"],/' "$WORK/pignusd.json" > "$WORK/w.json"
+"$BIN/pignusd" --config "$WORK/w.json" >"$WORK/w.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 80); do curl -sf "http://127.0.0.1:$WPORT/healthz" >/dev/null && break; sleep 0.25; done
+curl -sS "http://127.0.0.1:$WPORT/v1/site" | grep -q '"webwallet"' \
+  && ! curl -sS "http://127.0.0.1:$WPORT/v1/site" | grep -q '"phone"' \
+  || { echo "a book offering the web wallet alone says otherwise" >&2; exit 1; }
+curl -sD "$WORK/hdr.txt" -o /dev/null "http://127.0.0.1:$WPORT/"
+grep -qi "^content-security-policy: .*connect-src 'self';" "$WORK/hdr.txt" \
+  || { echo "a book offering the web wallet alone opens more than its origin:" >&2; cat "$WORK/hdr.txt" >&2; exit 1; }
+# A connector nobody wrote is refused at start, by name.
+sed -e 's/"poll": 5,/"poll": 5, "wallet_connectors": ["pigeon"],/' "$WORK/pignusd.json" > "$WORK/bad.json"
+if "$BIN/pignusd" --config "$WORK/bad.json" >"$WORK/bad.log" 2>&1; then
+  echo "pignusd started with an unknown wallet connector" >&2; exit 1
+fi
+grep -q "'pigeon' is not one of extension, local, webwallet, phone" "$WORK/bad.log" \
+  || { echo "an unknown connector was refused without naming it:" >&2; cat "$WORK/bad.log" >&2; exit 1; }
+echo "  served by name from web/shared only; the policy follows the setting; an unknown one is refused"
 
 echo
 echo "== the oracle set is served with what each oracle declared =="

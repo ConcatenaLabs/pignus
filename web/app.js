@@ -24,6 +24,7 @@ import * as alerts from "./alerts.js";
 import * as v2 from "./v2.js";
 import { Wallet, payoutProgram, programFromScriptPubKey, programFromAddress,
          scriptPubKeyFor, WalletError } from "./wallet.js";
+import { mountConnect, short } from "./connect.js";
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
@@ -210,6 +211,11 @@ function whenBlock(h, chain = "") {
   const stale = state.bookDownSince ? ", stale" : "";
   return `${date}${time} <span class="small">(${dt < 0 ? rel + " ago" : "in " + rel}` +
          `${stale}, ${at})</span>`;
+}
+
+/** A due date in words for a summary line: the day and how far off. */
+function dueWords(h) {
+  return dueText(h).replace(/<[^>]*>/g, "");
 }
 
 /** The same, as plain text for a summary line. */
@@ -418,7 +424,7 @@ async function pinCovenant() {
     state.v2Pinned = v2.selfTest(await api("v2_vectors.json"));
   } catch (e) { state.v2Pinned = 0; state.v2Why = e.message; }
   $("#pinned").textContent =
-    `covenant pinned to ${state.pinned} golden vectors` +
+    `loan code checked here: covenant pinned to ${state.pinned} golden vectors` +
     (state.offerPinned ? `, offers to ${state.offerPinned}` : "") +
     (state.repoPinned ? `, repurchase to ${state.repoPinned}` : "") +
     (state.btcPinned ? `, BTC + adaptor pinned` : "") +
@@ -546,7 +552,8 @@ async function refresh() {
                             ["btcoffers", renderBtcOffers],
                             ["loans", renderLoans], ["alerts", renderAlerts],
                             ["lendform", renderLendForm],
-                            ["wallet", renderWallet]]) {
+                            ["wallet", renderWallet],
+                            ["loanpage", renderLoanPage]]) {
     try {
       fn();
       // It drew. Clear any error slot left from a previous failure, so a
@@ -557,6 +564,13 @@ async function refresh() {
     } catch (e) { panelFailed(name, e); }
   }
   renderBtcLoans().catch((e) => panelFailed("btcloans", e));
+  // The wallet's coins move too (a payment arrives, the wallet finishes
+  // syncing): read again, quietly, and redraw what depends on them.
+  if (state.account && state.wallet && !state.walletReading) {
+    state.walletReading = true;
+    loadWallet().then(() => { renderWallet(); renderOffers(); renderLoans(); renderAlerts(); renderLoanPage(); })
+      .catch(() => {}).finally(() => { state.walletReading = false; });
+  }
 }
 
 /**
@@ -585,21 +599,35 @@ function panelFailed(name, e) {
 
 // ------------------------------------------------------------------ wallet
 
+// The Connect wallet button opens the chooser (connect.js); a wallet that says
+// yes there lands here.
 async function connect() {
-  busy(true, "waiting for the wallet…");
+  if (state.connectUi) state.connectUi.open();
+}
+
+async function onConnected(account, quiet = false) {
+  state.account = account;
+  busy(true, "reading your wallet…");
   try {
-    state.wallet = state.wallet || await Wallet.open();
-    await state.wallet.capabilities();
-    state.account = await state.wallet.connect();
     await loadWallet();
-    note("Wallet connected. Pignus never sees your keys: it composes " +
-         "transactions and your wallet signs them.", "ok");
+    if (!quiet) note(state.canSign
+      ? "Wallet connected. Pignus never sees your keys: it builds each " +
+        "transaction and your wallet signs it."
+      : explain(state.canSignWhy), state.canSign ? "ok" : "warn");
   } catch (e) {
     note(explain(e), "bad");
   } finally {
     busy(false); renderWallet(); renderOffers(); renderLoans(); renderAlerts();
+    renderPreview(); renderLoanPage();
     renderBtcLoans().catch(() => {});
   }
+  state.wallet.P.walletMode().then(showMore).catch(() => {});
+}
+
+function walletGone() {
+  forgetWallet();
+  renderWallet(); renderOffers(); renderLoans(); renderAlerts(); renderLoanPage();
+  renderBtcLoans().catch(() => {});
 }
 
 /**
@@ -607,13 +635,21 @@ async function connect() {
  *
  * A wallet with nothing in it is a normal state, not a failure: the payout
  * address then comes from the account address instead, and if even that cannot
- * be read the page says so rather than half-connecting.
+ * be read the page says so rather than half-connecting. A wallet that cannot
+ * sign a transaction this page builds is still shown connected, with its
+ * balances, and every action says why it cannot go ahead.
  */
 async function loadWallet() {
-  state.utxos = await state.wallet.utxos();
-  state.balances = await state.wallet.balances();
+  const caps = await state.wallet.request("getCapabilities").catch(() => ({ methods: [] }));
+  try { await state.wallet.capabilities(); state.canSign = true; state.canSignWhy = null; }
+  catch (e) { state.canSign = false; state.canSignWhy = e; }
+  state.caps = caps;
+  state.utxos = state.canSign ? await state.wallet.utxos() : [];
+  state.balances = await state.wallet.balances().catch(() => ({}));
   try {
-    state.payout = await payoutProgram(state.wallet, state.utxos);
+    state.payout = state.canSign
+      ? await payoutProgram(state.wallet, state.utxos)
+      : programFromAddress(state.account?.address);
     state.payoutWhy = "";
   } catch (e) {
     state.payout = null;
@@ -681,57 +717,61 @@ function btcNetworkName() {
   return state.account?.btc_network || state.account?.network || "testnet4";
 }
 
+// What the connected wallet holds, under the header; and, for an old loan
+// that pays an address this page has not seen the wallet use, a way to say so.
 function renderWallet() {
   const el = $("#wallet");
+  if (state.connectUi) state.connectUi.draw();
   if (!state.account) {
-    el.innerHTML = `<div class="row"><button id="connect" class="primary">Connect wallet</button>
-      <span class="hint" style="margin:0">Ambra for Chromium, the Sequentia browser
-      extension. Pignus signs nothing itself.</span></div>`;
-    $("#connect").onclick = connect;
+    // How to connect, for a visitor without a wallet: everything here can be
+    // read without one, and the button lists every wallet this book offers.
+    const offered = state.wallet ? state.wallet.connectors().map(c => c.id) : [];
+    const names = { webwallet: '<a href="/wallet/" target="sequentia-web-wallet">the Sequentia web wallet</a>',
+      extension: "Ambra browser", phone: "Ambra mobile", local: "Sequentia Core on your computer" };
+    const list = offered.map(id => names[id]).filter(Boolean);
+    const words = list.length > 1 ? list.slice(0, -1).join(", ") + " or " + list[list.length - 1] : list[0] || "a Sequentia wallet";
+    el.innerHTML = `<div class="getwallet"><b>To borrow or lend, connect a wallet.</b>
+      Pignus works with ${words}. Your wallet holds your keys and shows you every
+      transaction before you approve it; this page never holds anything of yours.</div>`;
     return;
   }
   const have = holdings();
   const rows = Object.entries(have)
     .filter(([, v]) => v > 0n)
     .sort((x, y) => meta(x[0]).ticker.localeCompare(meta(y[0]).ticker))
-    .map(([a, v]) => `<span class="bal"><b>${units(v, a)}</b> ${esc(meta(a).ticker)}
+    .map(([a, v]) => `<span class="hold"><b>${units(v, a)}</b> ${esc(meta(a).ticker)}
       <span class="ref">${ref(v, a)}</span></span>`);
   const bal = state.balances?.btc;
   if (bal != null && big(bal) > 0n) {
     // Valued through a market whose DEBT side is the reference unit, and
-    // labelled with the unit that market actually quotes in. Any cross-chain
-    // market would do for the multiplication and would then be printed under
-    // the reference ticker whatever it was priced in -- a BTC/EURX quote read
-    // as dollars, with nothing on the page saying so.
+    // labelled with the unit that market actually quotes in.
     const m = (state.markets || []).find(
       x => x.cross_chain && x.unit_price != null && !x.stale &&
            x.debt_ticker === refUnit());
     const v = m
       ? `≈ ${money(Number(big(bal)) / 1e8 * Number(m.unit_price))} ${esc(m.debt_ticker)}`
       : "";
-    rows.unshift(`<span class="bal"><b>${pig.fixed(big(bal), 8, 8)}</b> ` +
-      `BTC <span class="ref">Bitcoin ${esc(btcNetworkName())} · ${v}</span></span>`);
+    rows.unshift(`<span class="hold"><b>${pig.fixed(big(bal), 8, 8)}</b> BTC ` +
+      `<span class="ref">${v}</span></span>`);
   }
-  const payout = state.payout
-    ? `<span class="small">pays out to v${state.payout.ver}
-        <span class="mono">${shortHex(state.payout.prog, 12)}</span></span>`
-    : `<span class="small" style="color:var(--warn)">no payout address yet:
-        ${esc(state.payoutWhy || "receive something first")}</span>`;
-  el.innerHTML = `<div class="row">
-      <span class="tag ok">connected</span>
-      <span class="mono">${esc(state.account.address)}</span>
-      ${payout}
-      <span class="spacer" style="flex:1"></span>
-      <button class="sm" id="reload">Reload balances</button>
-    </div><div class="bals">${rows.join("") || '<span class="hint">no balance yet: receive something first</span>'}</div>
-    <div class="row" style="margin-top:8px">
-      <input id="mineaddr" class="small" style="flex:1;min-width:16em" placeholder="an address of yours this page does not know, e.g. one an old offer or loan pays out to"
-             title="the page decides what is yours from the coins the wallet holds today and the addresses it has seen you use; paste one it has not, and its offers and loans become yours here">
-      <button class="sm" id="mineadd">This address is mine</button>
+  const empty = state.canSign
+    ? '<span class="small">Nothing to lend or put up yet: receive something in your wallet first.</span>'
+    : `<span class="small">${explain(state.canSignWhy)}</span>`;
+  el.innerHTML = `<div class="holdings" aria-label="What your wallet holds">
+      ${rows.join("") || empty}
+      <button class="btn sm" id="reload" type="button">Reload</button>
+      <details><summary>Not seeing an old loan or offer?</summary>
+        <div class="mineform">
+          <input id="mineaddr" placeholder="an address of yours it pays out to"
+                 title="this page counts as yours what the wallet holds today and the addresses it has seen you use; paste one it has not">
+          <button class="btn sm" id="mineadd" type="button">This address is mine</button>
+        </div>
+        ${state.payout ? "" : `<div class="small" style="margin-top:6px">No payout address yet: ${esc(state.payoutWhy || "receive something first")}</div>`}
+      </details>
     </div>`;
   $("#reload").onclick = async () => {
     try { await loadWallet(); } catch (e) { note(explain(e), "bad"); }
-    renderWallet(); renderOffers(); renderLoans(); renderAlerts();
+    renderWallet(); renderOffers(); renderLoans(); renderAlerts(); renderLoanPage();
   };
   $("#mineadd").onclick = () => {
     const raw = ($("#mineaddr").value || "").trim();
@@ -742,7 +782,7 @@ function renderWallet() {
       $("#mineaddr").value = "";
       note("Remembered. Anything paying out to that address now reads as yours " +
            "here; this browser keeps it, and nothing is sent anywhere.", "ok");
-      renderOffers(); renderLoans(); renderAlerts();
+      renderOffers(); renderLoans(); renderAlerts(); renderLoanPage();
     } catch (e) { note(explain(e), "bad"); }
   };
 }
@@ -759,11 +799,15 @@ function webUrl(u) {
 }
 
 function needWallet() {
-  if (!state.account) { note("Connect a wallet first.", "warn"); return true; }
+  if (!state.account) {
+    note("Connect a wallet first: choose one under Connect wallet, at the top.", "warn");
+    connect();
+    return true;
+  }
+  if (!state.canSign) { note(explain(state.canSignWhy), "warn"); return true; }
   if (!state.payout) {
-    note("This wallet has no output to take a payout address from yet, and its " +
-         "address could not be read: receive any asset first, then reload the " +
-         "balances.", "warn");
+    note("This wallet has no address to be paid at yet: receive any asset " +
+         "first, then press Reload.", "warn");
     return true;
   }
   return false;
@@ -774,17 +818,17 @@ function needWallet() {
 function renderIntro() {
   const el = $("#intro_markets");
   if (!el) return;
-  const lendable = state.markets.filter(m => m.lendable);
+  const lendable = state.markets.filter(m => m.lendable && !m.cross_chain);
   if (!lendable.length) return;
   const uniq = (xs) => [...new Set(xs.filter(Boolean))];
   const debts = uniq(lendable.map(m => m.debt_ticker));
   const cols = uniq(lendable.map(m => m.collateral_ticker));
   const list = (xs) => xs.length === 1 ? esc(xs[0])
     : esc(xs.slice(0, -1).join(", ")) + " or " + esc(xs[xs.length - 1]);
-  // Only the covenant tiers belong in this sentence: the one after it says
-  // what the network enforces, and that claim is false on the parent chain.
-  // Native Bitcoin has its own sentence, which stays put.
-  el.innerHTML = `Borrow ${list(debts)} against ${list(cols)}.`;
+  const btc = (state.btcOffers || []).length ? " or against bitcoin" : "";
+  el.innerHTML = `Borrow ${list(debts)} against ${list(cols)}${btc}, or lend and ` +
+    "earn interest. The network itself keeps each loan's terms: nobody holds " +
+    "your collateral, and you can repay whenever you like.";
 }
 
 /** How old a market's newest verified attestation is, in plain words. */
@@ -796,50 +840,24 @@ function priceAge(m) {
     : `${(s / 3600).toFixed(1)} hours old`;
 }
 
+// One tile per market: the price, who signed it and how long ago, and in
+// words why nothing can be lent against it when that is so.
 function renderMarkets() {
-  paint("#markets", state.markets.map(m => {
-    // The book decides what counts as fresh, from its own configured window;
-    // the age comparison here is only for a book that does not say.
+  paint("#markets", state.markets.filter(m => !m.cross_chain || m.unit_price != null).map(m => {
     const fresh = m.stale != null ? !m.stale
       : (m.age_seconds != null && m.age_seconds < 600);
-    const tags = [];
-    if (m.cross_chain) tags.push('<span class="tag dim">cross-chain</span>');
-    else if (m.lendable) tags.push('<span class="tag ok">lendable</span>');
-    else if (m.stale) tags.push('<span class="tag warn" title="the newest ' +
-      'attestation this book could verify for this market is ' + esc(priceAge(m)) +
-      ', which is past the age it will lend on. Nothing can be borrowed or ' +
-      'lent here until the oracle catches up.">stale price</span>');
-    else if (m.precision_mismatch)
-      tags.push('<span class="tag warn" title="the oracle quotes this market at ' +
-        'different asset precisions than the registry gives, so its price does ' +
-        'not mean what it appears to">not lendable</span>');
-    else if (!m.collateral_asset || !m.debt_asset)
-      tags.push('<span class="tag dim" title="one of this market\'s tickers has ' +
-        'no asset id in the registry or the node\'s labels, so nothing here can ' +
-        'name the asset a loan would be written in">not in the registry</span>');
-    else if (m.price == null)
-      tags.push('<span class="tag warn" title="this book holds no verified ' +
-        'attestation for this market at all, so there is no price to write a ' +
-        'loan against">no price yet</span>');
-    else
-      tags.push('<span class="tag dim" title="this book does not lend in ' +
-        'this market">not lendable</span>');
-    // The oracle quotes a price at assumed decimals. If they are not the
-    // registry's, the number is right and means something else.
-    if (m.precision_mismatch)
-      tags.push('<span class="tag bad" title="the oracle quotes this market at ' +
-        'different asset precisions than the registry gives, so its price does ' +
-        'not mean what it appears to; nothing is lent against it">precision mismatch</span>');
-    return `<div class="card m">
-      <div class="row" style="justify-content:space-between">
-        <span class="mk">${esc(m.collateral_ticker)} / ${esc(m.debt_ticker)}</span>
-        ${tags.join(" ")}
-      </div>
-      <div class="px">${m.unit_price == null ? "—" : money(m.unit_price, m.unit_price < 10 ? 4 : 2)}</div>
-      <div class="meta">${m.price == null ? "no attestation"
-        : `${esc(m.debt_ticker)} per ${esc(m.collateral_ticker)} · signed ${fresh ? `${m.age_seconds}s ago` : `<span style="color:var(--bad)">${Math.round(m.age_seconds / 60)} min ago</span>`}`}</div>
+    let why = "";
+    if (m.precision_mismatch) why = '<span class="tag bad" title="the price signer quotes this market at different decimals than the registry gives, so its price does not mean what it appears to">not usable now</span>';
+    else if (!m.collateral_asset || !m.debt_asset) why = '<span class="tag dim" title="an asset of this market is not in the registry">not listed</span>';
+    else if (m.price == null) why = '<span class="tag warn">no price yet</span>';
+    else if (!fresh) why = `<span class="tag warn" title="the newest price this book could check is ${esc(priceAge(m))}; nothing is lent on it until a new one is signed">price ${esc(priceAge(m))}</span>`;
+    const px = m.unit_price == null ? "—" : money(m.unit_price, m.unit_price < 10 ? 4 : 2);
+    return `<div class="price">
+      <div class="mk">1 ${esc(m.collateral_ticker)}</div>
+      <div class="px">${px}<small>${esc(m.debt_ticker)}</small></div>
+      <div class="meta">${m.price == null ? "no signed price" : fresh ? `signed ${esc(priceAge(m).replace(/ old$/, ""))} ago` : ""} ${why}</div>
     </div>`;
-  }).join("") || '<div class="empty">no markets</div>');
+  }).join("") || '<div class="empty">No prices yet.</div>');
 }
 
 function marketFor(terms) {
@@ -932,10 +950,12 @@ function fillDeferred(root) {
   });
 }
 
-function detailsRow(key, cols, body) {
+// The terms as the chain reads them, behind "Details". Opened state survives
+// the half-minute redraw, and the address inside is derived only once shown.
+function detailsBox(key, body, label = "Details") {
   const open = state.details.has(key);
-  return `<tr class="det"${open ? "" : " hidden"} data-det-row="${esc(key)}">
-    <td colspan="${cols}" data-label="details">${body}</td></tr>`;
+  return `<details class="more" data-det="${esc(key)}"${open ? " open" : ""}>
+    <summary data-focus="det:${esc(key)}">${esc(label)}</summary><div class="tech">${body}</div></details>`;
 }
 
 /** The whole of what a person is asked to trust, in one block they can copy. */
@@ -1017,20 +1037,13 @@ function wireCopy(box, textFor) {
 }
 
 function wireDetails(box) {
-  // A row that is ALREADY open across a redraw still needs its address.
-  box.querySelectorAll("[data-det-row]:not([hidden])").forEach(fillDeferred);
-  box.querySelectorAll("[data-det]").forEach(b => {
-    b.onclick = () => {
-      const key = b.dataset.det;
-      const row = box.querySelector(`[data-det-row="${CSS.escape(key)}"]`);
-      const open = state.details.has(key);
-      if (open) state.details.delete(key); else state.details.add(key);
-      if (row) {
-        row.hidden = open;
-        if (!open) fillDeferred(row);      // derive it the moment it is shown
-      }
-      b.setAttribute("aria-expanded", open ? "false" : "true");
-    };
+  box.querySelectorAll("details[data-det]").forEach(d => {
+    if (d.open) fillDeferred(d);
+    d.addEventListener("toggle", () => {
+      const key = d.dataset.det;
+      if (d.open) { state.details.add(key); fillDeferred(d); }
+      else state.details.delete(key);
+    });
   });
 }
 
@@ -1132,12 +1145,13 @@ function exitBlock(x, t) {
   if (x.price_used != null)
     rows.push(`<span class="k">Price it closed at</span><span>${px(x.price_used)}` +
       `<span class="small"> · the strike was ${px(x.strike)}</span></span>`);
-  if (x.seize_expected != null || x.seize_paid != null)
+  const repaid = /^REPAI/i.test(String(x.exit || ""));
+  if (!repaid && (x.seize_expected != null || x.seize_paid != null))
     rows.push(`<span class="k">Taken by the liquidator</span><span>${at(x.seize_paid, c)}` +
       `<span class="small"> · that price buys ${at(x.seize_expected, c)}</span></span>`);
   if (x.surplus_expected != null || x.surplus_paid != null)
     rows.push(`<span class="k">Back to the borrower</span><span>${at(x.surplus_paid, c)}` +
-      `<span class="small"> · that price leaves ${at(x.surplus_expected, c)}</span></span>`);
+      (repaid ? "" : `<span class="small"> · that price leaves ${at(x.surplus_expected, c)}</span>`) + `</span>`);
   if (x.lender_paid != null)
     rows.push(`<span class="k">Paid to the lender</span><span>${at(x.lender_paid, d)}` +
       `<span class="small"> · the debt was ${at(x.debt, d)}</span></span>`);
@@ -1185,17 +1199,15 @@ function wireExits(box, rows) {
         `exit yet: ${esc(e.message)}</span>`;
     }
   };
-  const fillOpen = () => targets.forEach(el => {
-    const row = el.closest("tr.det");
-    if (row && !row.hidden) fill(el);
+  // Shown at once where it is not inside a closed disclosure; otherwise when
+  // that is opened, and not before.
+  const fillShown = () => targets.forEach(el => {
+    const d = el.closest("details");
+    if (!d || d.open) fill(el);
   });
-  fillOpen();
-  // wireDetails has already put the toggle on these buttons; chain onto it so
-  // the fetch happens when a row is actually opened, and not before.
-  box.querySelectorAll("[data-det]").forEach(b => {
-    const toggle = b.onclick;
-    b.onclick = (ev) => { if (toggle) toggle(ev); fillOpen(); };
-  });
+  fillShown();
+  box.querySelectorAll("details[data-det]").forEach(d =>
+    d.addEventListener("toggle", fillShown));
 }
 
 // --------------------------------------------------------------- offers
@@ -1251,96 +1263,120 @@ function offersView() {
   return book.filter(o => (o.status || "open") === "open");
 }
 
+// A date a person can plan by: the day and time, and how far off it is. The
+// height it stands for is in the details.
+function dueText(h) {
+  const now = state.height;
+  const n = Number(h);
+  if (now == null) return `at block ${n.toLocaleString()}`;
+  const dt = (n - now) * blockSeconds() * 1000;
+  const d = new Date(Date.now() + dt);
+  const ms = Math.abs(dt);
+  const rel = ms < 3600e3 ? `${Math.max(1, Math.round(ms / 60e3))} minutes`
+    : ms < 86400e3 * 2 ? `${Math.round(ms / 3600e3)} hours`
+    : `${Math.round(ms / 86400e3)} days`;
+  const far = ms > 180 * 86400e3;
+  const date = d.toLocaleDateString(undefined, far
+    ? { year: "numeric", month: "short", day: "numeric" } : { month: "short", day: "numeric" });
+  return `${date} <span class="small">(${dt < 0 ? rel + " ago" : "in " + rel})</span>`;
+}
+
+// What an offer's state means, in words.
+const OFFER_WORD = { open: "Open", taken: "All taken", withdrawn: "Taken back by the lender",
+  gone: "Gone", ghost: "Undone by a Bitcoin reorg", expired: "Closed", unlisted: "Not listed yet" };
+
+function offerCard(o, i) {
+  const t = JSON.parse(o.terms);
+  const m = marketFor(t);
+  const { c, d } = { c: esc(meta(t.collateral_asset).ticker), d: esc(meta(t.debt_asset).ticker) };
+  const principal = o.principal ?? t.principal;
+  const collateral = o.collateral ?? t.collateral_amount;
+  const rate = (Number(big(t.debt)) / Number(big(principal)) - 1) * 100;
+  const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
+  const now = m?.unit_price != null ? Number(m.unit_price) : null;
+  const drop = now ? (1 - liq / now) * 100 : null;
+  const isMine = mine(o.lender_prog) || o.unlisted;
+  const canCancel = manageToken(o.offer_id);
+  const matured = state.height != null && Number(t.maturity) <= state.height;
+  const verOk = !state.payout || (t.borrower_ver ?? 1) === state.payout.ver;
+  const status = o.status || "open";
+  const key = detKey("offer", o.offer_id || o.outpoint || i);
+  const acts = [];
+  if (o.unlisted) {
+    acts.push(`<button data-list="${i}" data-focus="list:${esc(o.txid)}" class="btn primary">List the offer</button>`);
+    if (o.expired)
+      acts.push(`<button data-withdraw="${i}" data-focus="wd:${esc(o.outpoint)}" class="btn">Take it back</button>`);
+  } else if (o.expired) {
+    // The refund pays the lender's own address whoever builds it, so anyone
+    // may send an expired offer home.
+    acts.push(`<button data-withdraw="${i}" data-focus="wd:${esc(o.outpoint)}" class="btn${isMine ? " primary" : ""}"` +
+      (isMine ? "" : ' title="this pays the lender, at the address the offer names, whoever sends it"') +
+      `>${isMine ? "Take it back" : "Return it to the lender"}</button>`);
+  } else if (status !== "open") {
+    acts.push(`<button class="btn" disabled>Borrow</button>`);
+  } else if ((o.lots_left ?? 1) <= 0) {
+    acts.push('<button class="btn" disabled title="every loan of this offer has been taken">Borrow</button>');
+  } else if (matured) {
+    acts.push('<button class="btn" disabled title="these loans are already due: one taken now could be called in at once">Borrow</button>');
+  } else if (!verOk) {
+    acts.push(`<button class="btn" disabled title="this offer pays a kind of address your wallet does not use">Borrow</button>`);
+  } else if (!isMine) {
+    acts.push(`<button data-borrow="${i}" data-focus="bo:${esc(o.outpoint)}" class="btn primary">Borrow ${units(principal, t.debt_asset)} ${d}</button>`);
+  }
+  if (canCancel && status === "open" && !o.expired)
+    acts.push(`<button data-cancel="${i}" data-focus="ca:${esc(o.offer_id)}" class="btn sm">Take off the list</button>`);
+  const left = o.lots_left != null && status === "open" && !o.expired
+    ? `<div class="left">${o.lots_left} loan${o.lots_left === 1 ? "" : "s"} left</div>` : "";
+  const tags = [];
+  if (isMine && !o.unlisted) tags.push('<span class="tag gold">Your offer</span>');
+  if (status !== "open" || o.expired)
+    tags.push(`<span class="tag ${status === "ghost" ? "bad" : "dim"}" title="${esc(OFFER_STATUS_WHY[o.expired && status === "open" ? "expired" : status] || "")}">${esc(OFFER_WORD[o.expired && status === "open" ? "expired" : status] || status)}</span>`);
+  if ((o.warnings || []).length) tags.push(warnTag(o.warnings));
+  const odd = unknownOracles(t), bad = compromisedOracles(t);
+  if (bad.length) tags.push('<span class="tag bad" title="a price signer has said this key is compromised: whoever holds it can sign any price for these loans">price signer compromised</span>');
+  else if (odd.length) tags.push('<span class="tag bad" title="this offer\'s price signer is not one this book knows; whoever holds that key can sign any price">unknown price signer</span>');
+  offer.requirePinned();
+  // Registered, not computed: the address appears only once Details is open.
+  const spk = deferSpk(`offer:${o.outpoint}`, () => offer.offerTree({
+    terms: t, principal: big(o.principal || t.principal),
+    collateral: big(o.collateral || t.collateral_amount),
+    expiryLocktime: o.expiry_locktime }).scriptPubKey);
+  return `<article class="card${isMine ? " yours" : ""}">
+    <div class="deal">
+      <div class="term big"><div class="k">You get</div><div class="v">${units(principal, t.debt_asset)} ${d}</div></div>
+      <div class="term"><div class="k">You put up</div><div class="v">${units(collateral, t.collateral_asset)} ${c}</div><div class="s">${ref(collateral, t.collateral_asset)}</div></div>
+      <div class="term"><div class="k">You repay</div><div class="v">${units(t.debt, t.debt_asset)} ${d}</div><div class="s">${rate.toFixed(2).replace(/\.00$/, "")}% interest, due ${dueText(t.maturity)}</div></div>
+      <div class="term"><div class="k">Liquidated if</div><div class="v">${c} &lt; ${money(liq, liq < 10 ? 4 : 2)} ${d}</div><div class="s">${drop == null ? "" : drop < 0 ? "already below today's price: anyone could liquidate it at once" : `${drop.toFixed(0)}% below today's price`}</div></div>
+      <div class="act">${acts.join("")}${left}</div>
+    </div>
+    ${tags.length ? `<div class="verdict">${tags.join(" ")}${o.expiry_locktime && status === "open" && !o.expired ? `<span class="say">Offer closes ${dueText(o.expiry_locktime)}</span>` : ""}</div>` : ""}
+    ${detailsBox(key, detailsBlock({
+      idLabel: "Offer id", id: o.offer_id || "not listed in this book", copyId: key,
+      outpoint: o.outpoint, spk, terms: o.terms, t, warnings: o.warnings,
+      extra: `<span class="k">Offer closes</span><span>${o.expiry_locktime ? whenBlock(o.expiry_locktime) : "—"}</span>` +
+             `<span class="k">Taken so far</span><span>${o.taken ?? "—"}</span>` }))}
+  </article>`;
+}
+
 function renderOffers() {
   const view = offersView();
   if (!view.length) {
     paint("#offers", `<div class="empty">${state.offersFilter === "mine"
-      ? "No offers from this wallet." : state.offersFilter === "all"
-      ? "No offers yet." : "No open offers. Publish one from the Lend tab and a "
-      + "borrower can take it while you are offline."}</div>`);
+      ? (state.account ? "You have no offers. Make one under Lend." : "Connect a wallet to see your offers.")
+      : state.offersFilter === "all"
+      ? "No offers yet." : "No open offers right now. Make one under Lend: " +
+        "borrowers can take it while you are away."}</div>`);
     return;
   }
-  const html = `<table><thead><tr><th>market</th><th>borrow</th><th>repay</th>
-      <th>collateral to lock</th><th>liquidation price</th><th>matures</th>
-      <th>left</th><th>taken</th><th></th></tr></thead><tbody>` +
-    view.map((o, i) => { try {
-      const t = JSON.parse(o.terms);
-      const m = marketFor(t);
-      const rate = (Number(big(t.debt)) / Number(big(t.principal)) - 1) * 100;
-      const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
-      const now = m?.unit_price != null ? Number(m.unit_price) : null;
-      const drop = now ? (1 - liq / now) * 100 : null;
-      const isMine = mine(o.lender_prog) || o.unlisted;
-      const canCancel = manageToken(o.offer_id);
-      const matured = state.height != null && Number(t.maturity) <= state.height;
-      const verOk = !state.payout || (t.borrower_ver ?? 1) === state.payout.ver;
-      const status = o.status || "open";
-      const key = detKey("offer", o.offer_id || o.outpoint || i);
-      const acts = [];
-      if (o.unlisted) {
-        acts.push(`<button data-list="${i}" data-focus="list:${esc(o.txid)}" class="primary sm">Publish listing</button>`);
-        if (o.expired)
-          acts.push(`<button data-withdraw="${i}" data-focus="wd:${esc(o.outpoint)}" class="sm">Withdraw</button>`);
-      } else if (o.expired) {
-        // The refund leaf pays the lender's pinned program whoever signs, so
-        // anyone may send an expired offer home.
-        acts.push(`<button data-withdraw="${i}" data-focus="wd:${esc(o.outpoint)}" class="sm"` +
-          (isMine ? "" : ' title="the refund leaf pays the lender\'s pinned address, whoever builds it"') +
-          `>${isMine ? "Withdraw" : "Return to lender"}</button>`);
-      } else if (status !== "open") {
-        acts.push(`<button class="sm" disabled title="this offer is ${esc(status)}">Borrow</button>`);
-      } else if ((o.lots_left ?? 1) <= 0) {
-        acts.push('<button class="sm" disabled title="nothing left: every lot has been taken">Borrow</button>');
-      } else if (matured) {
-        acts.push('<span class="tag dim" title="these loans matured before the offer expired; a loan taken now could be called at once">matured</span>');
-      } else if (!verOk) {
-        acts.push(`<button class="sm" disabled title="this offer pays witness-v${t.borrower_ver} borrowers and your wallet pays out at v${state.payout.ver}">Borrow</button>`);
-      } else if (!isMine) {
-        acts.push(`<button data-borrow="${i}" data-focus="bo:${esc(o.outpoint)}" class="primary sm">Borrow</button>`);
-      }
-      if (isMine && !o.unlisted && !o.expired && status === "open")
-        acts.push('<span class="tag gold">your offer</span>');
-      if (canCancel && status === "open" && !o.expired)
-        acts.push(`<button data-cancel="${i}" data-focus="ca:${esc(o.offer_id)}" class="sm">Delist</button>`);
-      acts.push(`<button class="sm" data-det="${esc(key)}" data-focus="det:${esc(key)}" aria-expanded="${state.details.has(key)}">Details</button>`);
-      const st = status !== "open"
-        ? `<span class="tag ${status === "ghost" ? "bad" : "dim"}" title="${
-            esc(OFFER_STATUS_WHY[status] || "")}">${esc(status)}</span>` : "";
-      offer.requirePinned();
-      // Registered, not computed: the address only appears in the details row,
-      // which starts collapsed.
-      const spk = deferSpk(`offer:${o.outpoint}`, () => offer.offerTree({
-        terms: t, principal: big(o.principal || t.principal),
-        collateral: big(o.collateral || t.collateral_amount),
-        expiryLocktime: o.expiry_locktime }).scriptPubKey);
-      return `<tr>
-        <td data-label="market">${esc(o.collateral_ticker)} / ${esc(o.debt_ticker)}${oracleTags(t)}${warnTag(o.warnings)}${st}</td>
-        <td data-label="borrow"><b>${amount(o.principal ?? t.principal, t.debt_asset)}</b></td>
-        <td data-label="repay">${amount(t.debt, t.debt_asset)}<span class="sub2">+${rate.toFixed(2)}% to maturity</span></td>
-        <td data-label="collateral">${amount(o.collateral ?? t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(o.collateral ?? t.collateral_amount, t.collateral_asset)}${o.open_ltv != null ? ` · LTV ${(o.open_ltv * 100).toFixed(0)}%` : ""}</span></td>
-        <td data-label="liquidation">${money(liq, liq < 10 ? 4 : 2)} ${esc(o.debt_ticker)}<span class="sub2">${drop == null ? ""
-          : drop < 0 ? "above the price now — liquidatable immediately" : `${drop.toFixed(0)}% below now`}</span></td>
-        <td data-label="matures">${whenBlock(t.maturity)}<span class="sub2">offer expires ${o.expiry_locktime ? whenText(o.expiry_locktime) : "—"}</span></td>
-        <td data-label="left">${o.lots_left ?? "?"}</td>
-        <td data-label="taken">${o.taken ?? "—"}</td>
-        <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>` +
-      detailsRow(key, 9, detailsBlock({
-        idLabel: "offer id", id: o.offer_id || "not listed in this book",
-        // The DISPLAYED id is not an identity: two offers a book has refused
-        // to list both read "not listed in this book", and keying Copy terms
-        // off that hands the reader whichever of them the lookup finds first.
-        // `key` is this row's own, and is already unique.
-        copyId: key,
-        outpoint: o.outpoint, spk, terms: o.terms, t, warnings: o.warnings }));
-    } catch (e) {
-      // ONE row, not the panel: a record the page cannot draw threw out of
-      // the whole map, and every visitor lost the table over one stranger's
-      // listing.
-      return `<tr><td colspan="9" class="hint">an offer this page cannot draw (${esc(explainish(e))}); the book serves it at /v1/offer/${esc(o.offer_id || "")}</td></tr>`;
-    } }).join("") + "</tbody></table>";
+  const html = view.map((o, i) => { try { return offerCard(o, i); } catch (e) {
+      // ONE card, not the panel: a record the page cannot draw must not take
+      // every other offer down with it.
+      return `<div class="empty">An offer this page cannot draw (${esc(explainish(e))}); the book serves it at /v1/offer/${esc(o.offer_id || "")}</div>`;
+    } }).join("");
   paint("#offers", html, (b) => {
     wireMineProg(b);
     const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
+      if (btn.tagName === "DETAILS") return;
       btn.onclick = () => fn(view[Number(btn.dataset[attr])]);
     });
     hook("borrow", borrow);
@@ -1348,8 +1384,6 @@ function renderOffers() {
     hook("cancel", cancelListing);
     hook("list", listPending);
     wireDetails(b);
-    // Looked up by the ROW's own key, which is unique, rather than by the id
-    // displayed -- two unlisted offers display the same words.
     wireCopy(b, (key) => (view.find(
       (o, i) => detKey("offer", o.offer_id || o.outpoint || i) === key) || {}
     ).terms || "");
@@ -1388,120 +1422,189 @@ const STATE_WHY = {
   SPENT_UNKNOWN: "the vault was spent by a transaction this book cannot account for",
 };
 
+// A loan's state, in words.
+const STATE_WORD = { LIVE: "Open", UNCONFIRMED: "Opening", REPAID: "Repaid",
+  LIQUIDATED: "Liquidated", DEFAULTED: "Called in after it was due",
+  RECOVERED: "Taken by the lender after it was due", GHOST: "Undone by a Bitcoin reorg",
+  SPENT_UNKNOWN: "Closed" };
+
+// How a closed loan ended, in a sentence.
+const ENDED_WORDS = {
+  REPAID: "It was paid back, and the collateral went back to the borrower.",
+  LIQUIDATED: "It fell below its price and was liquidated: the lender was paid, and what was left of the collateral went back to the borrower.",
+  DEFAULTED: "It was not repaid in time and was called in: the lender was paid, and what was left of the collateral went back to the borrower.",
+  RECOVERED: "It was not repaid, and long after it was due the lender took the collateral.",
+  GHOST: "A Bitcoin reorg undid it: the collateral is back with the borrower, and the loan has to be taken again.",
+  SPENT_UNKNOWN: "It was closed by a transaction this book cannot account for.",
+};
+
+/** What one loan stands at, as a verdict in words with its colour. */
+function loanVerdict(l, t) {
+  const c = esc(meta(t.collateral_asset).ticker), d = esc(meta(t.debt_asset).ticker);
+  const depth = l.min_depth ?? state.minDepth;
+  if (l.state === "UNCONFIRMED")
+    return { cls: "warn", text: `It counts as open once ${depth} blocks are on top of it` +
+      (l.confirmations != null ? ` (${l.confirmations} so far).` : ".") };
+  if (l.state !== "LIVE") return { cls: l.state === "GHOST" ? "bad" : "dim", text: ENDED_WORDS[l.state] || STATE_WORD[l.state] || l.state };
+  const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
+  const m = marketFor(t);
+  const now = l.price != null
+    ? unitPrice(l.price, t.price_scale || 100000, t.collateral_asset, t.debt_asset)
+    : (m?.unit_price != null ? Number(m.unit_price) : null);
+  const h = l.health != null ? Number(l.health) : null;
+  const due = l.past_maturity ? " It is past due: anyone may call it in now." : "";
+  if (h == null || now == null)
+    return { cls: "dim", text: "No current price, so nobody can liquidate it until one is signed." + due };
+  const drop = (1 - liq / now) * 100;
+  if (h < 1) return { cls: "bad", text: `Can be liquidated now: ${c} is below ${money(liq, liq < 10 ? 4 : 2)} ${d}.` + due };
+  if (h < 1.15) return { cls: "warn", text: `At risk: ${c} can fall only ${drop.toFixed(0)}% before it can be liquidated.` + due };
+  return { cls: l.past_maturity ? "warn" : "ok", text: `Safe: ${c} can fall ${drop.toFixed(0)}% before it can be liquidated.` + due };
+}
+
+/** The buttons a loan offers, whoever is looking. */
+function loanActions(l, t, i, primaryFirst = true) {
+  const live = l.state === "LIVE";
+  const yours = mine(l.borrower_prog);
+  const acts = [];
+  // Repaying is permissionless and both payouts are fixed in the loan, so
+  // anyone may do it and it can only help the borrower.
+  if (live)
+    acts.push(`<button data-repay="${i}" data-focus="rp:${esc(l.txid)}" class="btn${yours ? " primary" : ""}"` +
+      (yours ? "" : ' title="this pays the lender and returns the collateral to the borrower, at the addresses the loan names"') +
+      `>${yours ? `Repay ${units(t.debt, t.debt_asset)} ${esc(meta(t.debt_asset).ticker)}` : "Repay for the borrower"}</button>`);
+  if (live && l.liquidatable)
+    acts.push(`<button data-liq="${i}" data-focus="lq:${esc(l.txid)}" class="btn warn">Liquidate</button>`);
+  if (live && l.past_maturity)
+    acts.push(`<button data-default="${i}" data-focus="df:${esc(l.txid)}" class="btn warn">Call it in</button>`);
+  if (live && l.recover_open)
+    acts.push(`<button data-recover="${i}" data-focus="rc:${esc(l.txid)}" class="btn">Take the collateral</button>`);
+  return acts;
+}
+
+function hookLoanActions(b, rows) {
+  const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
+    if (btn.tagName === "DETAILS") return;
+    btn.onclick = () => fn(rows[Number(btn.dataset[attr])]);
+  });
+  hook("repay", repay);
+  hook("liq", l => seize(l, false));
+  hook("default", l => seize(l, true));
+  hook("recover", recover);
+}
+
+const loanId = (l) => l.loan_id || l.txid;
+
+function loanCard(l, i) {
+  const t = JSON.parse(l.terms);
+  const c = esc(meta(t.collateral_asset).ticker), d = esc(meta(t.debt_asset).ticker);
+  const yours = mine(l.borrower_prog), lent = mine(l.lender_prog);
+  const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
+  const v = loanVerdict(l, t);
+  const role = yours ? '<span class="tag gold">You borrow</span>' : lent ? '<span class="tag gold">You lend</span>' : "";
+  const shortfall = l.state === "LIVE" && yours && state.utxos.length
+    ? (() => { const hv = holdings(true)[t.debt_asset] || 0n;
+               return hv >= big(t.debt) ? "" : `<div class="s" style="color:var(--warn)">Your wallet holds ${units(hv, t.debt_asset)} ${d} of the ${units(t.debt, t.debt_asset)} ${d} a repayment needs</div>`; })()
+    : "";
+  return `<article class="card${yours || lent ? " yours" : ""}">
+    <div class="deal">
+      <div class="term big"><div class="k">${yours ? "You borrowed" : lent ? "You lent" : "Borrowed"}</div><div class="v">${units(t.principal, t.debt_asset)} ${d}</div></div>
+      <div class="term"><div class="k">Collateral</div><div class="v">${units(t.collateral_amount, t.collateral_asset)} ${c}</div><div class="s">${ref(t.collateral_amount, t.collateral_asset)}</div></div>
+      <div class="term"><div class="k">To repay</div><div class="v">${units(t.debt, t.debt_asset)} ${d}</div><div class="s">due ${dueText(t.maturity)}</div>${shortfall}</div>
+      <div class="term"><div class="k">Liquidated if</div><div class="v">${c} &lt; ${money(liq, liq < 10 ? 4 : 2)} ${d}</div></div>
+      <div class="act">${loanActions(l, t, i).join("")}<a class="btn sm" href="#loan/${esc(loanId(l))}" data-focus="open:${esc(loanId(l))}">Open the loan</a></div>
+    </div>
+    <div class="verdict">${role}<span class="tag ${v.cls}">${esc(STATE_WORD[l.state] || l.state)}</span><span class="say">${v.text}</span></div>
+  </article>`;
+}
+
 function renderLoans() {
   let rows = state.loans;
   if (state.loansFilter === "live")
     rows = rows.filter(l => l.state === "LIVE" || l.state === "UNCONFIRMED");
   if (state.loansFilter === "mine")
     rows = rows.filter(l => mine(l.borrower_prog) || mine(l.lender_prog));
+  // Yours first, then everyone else's.
+  const own = (l) => (mine(l.borrower_prog) || mine(l.lender_prog)) ? 0 : 1;
+  rows = rows.slice().sort((x, y) => own(x) - own(y));
   if (!rows.length) {
     paint("#loans", `<div class="empty">${state.loansFilter === "mine"
-      ? (state.account ? "No loans involve this wallet." : "Connect a wallet to see your loans.")
-      : state.loansFilter === "live" ? "No live loans." : "No loans yet."}</div>`);
+      ? (state.account ? "You have no loans. Borrow from an offer, or make one under Lend." : "Connect a wallet to see your loans.")
+      : state.loansFilter === "live" ? "No open loans." : "No loans yet."}</div>`);
     return;
   }
-  const html = lenderSummary(rows) +
-    `<table><thead><tr><th>loan</th><th>market</th><th>owed</th><th>collateral</th>
-      <th>price / liquidation</th><th>health</th><th>matures</th><th>state</th><th></th></tr></thead><tbody>` +
-    rows.map((l, i) => { try {
-      const t = JSON.parse(l.terms);
-      const h = l.health != null ? Number(l.health) : null;
-      const cls = h == null ? "dim" : h < 1 ? "bad" : h < 1.15 ? "warn" : "ok";
-      const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
-      const m = marketFor(t);
-      // The price this loan's OWN health was computed from, which is not
-      // always the market's: a loan built on a rotated oracle, or on a
-      // threshold set, is judged by the keys its vault bakes in, and the book
-      // says so by serving `price` beside `health`. Printing the market's
-      // number next to that health puts two figures side by side that do not
-      // describe each other -- and the one a borrower would act on is the
-      // health.
-      const now = l.price != null
-        ? unitPrice(l.price, t.price_scale || 100000, t.collateral_asset,
-                    t.debt_asset)
-        : (m?.unit_price != null ? Number(m.unit_price) : null);
-      const ownPrice = l.price != null && m?.unit_price != null
-        && Math.abs(Number(unitPrice(l.price, t.price_scale || 100000,
-                                     t.collateral_asset, t.debt_asset))
-                    - Number(m.unit_price)) > 1e-9;
-      const live = l.state === "LIVE";
-      const yours = mine(l.borrower_prog);
-      const key = detKey("loan", l.loan_id || l.txid);
-      const role = yours ? '<span class="tag gold">you borrow</span>'
-        : mine(l.lender_prog) ? '<span class="tag gold">you lend</span>' : "";
-      const acts = [];
-      // Repaying is permissionless and both destinations are pinned in the
-      // vault address, so anyone may do it and it can only help the borrower.
-      if (live)
-        acts.push(`<button data-repay="${i}" data-focus="rp:${esc(l.txid)}" class="${yours ? "primary " : ""}sm"` +
-          (yours ? "" : ' title="permissionless: this pays the lender and the borrower at the addresses baked into the vault"') +
-          `>${yours ? "Repay" : "Repay for the borrower"}</button>`);
-      if (live && l.liquidatable)
-        acts.push(`<button data-liq="${i}" data-focus="lq:${esc(l.txid)}" class="warnbtn sm">Liquidate</button>`);
-      if (live && l.past_maturity)
-        acts.push(`<button data-default="${i}" data-focus="df:${esc(l.txid)}" class="warnbtn sm">Call default</button>`);
-      if (live && l.recover_open)
-        acts.push(`<button data-recover="${i}" data-focus="rc:${esc(l.txid)}" class="sm">Recover</button>`);
-      acts.push(`<button class="sm" data-det="${esc(key)}" data-focus="det:${esc(key)}" aria-expanded="${state.details.has(key)}">Details</button>`);
-      const closed = l.spent_by ? `<a class="small" href="${txLink(l.spent_by)}">closing tx</a>` : "";
-      const depth = l.min_depth ?? state.minDepth;
-      // A close is as provisional as a funding until it is buried: Sequentia
-      // follows Bitcoin, so a shallow closing transaction can still be undone
-      // and the loan come back. Show its depth rather than a settled tag.
-      const closedConf = l.closed_confirmations != null
-        ? Number(l.closed_confirmations)
-        : (state.height != null && l.spent_height
-            ? state.height - Number(l.spent_height) + 1 : 0);
-      const shallow = l.spent_by && closedConf < depth
-        ? ` <span class="small" title="the closing transaction is not buried yet; until it is, this loan can come back">${closedConf}/${depth}</span>`
-        : "";
-      const oracle = (t.oracles && t.oracles.length)
-        ? `<span class="sub2">${esc(l.oracle || "")} oracles</span>` : "";
-      const spk = deferSpk(`vault:${l.txid}:${l.vout}`, () => l.single_leaf
-        ? (offer.requirePinned(), offer.offerVaultScriptPubKey(t))
-        : pig.vaultScriptPubKey(t));
-      return `<tr>
-        <td data-label="loan" class="mono"><a href="${txLink(l.txid)}" style="color:inherit;text-decoration:none">${shortHex(l.txid, 10)}</a>${role ? "<br>" + role : ""}</td>
-        <td data-label="market">${esc(l.collateral_ticker)} / ${esc(l.debt_ticker)}${oracle}</td>
-        <td data-label="owed">${amount(t.debt, t.debt_asset)}<span class="sub2">borrowed ${units(t.principal, t.debt_asset)}</span>${
-          l.state === "LIVE" && l.seizure_if_liquidated != null
-            ? `<span class="sub2">if liquidated now: ${units(l.seizure_if_liquidated, t.collateral_asset)} ${esc(l.collateral_ticker)} taken, ${units(l.surplus_if_liquidated, t.collateral_asset)} back to the borrower</span>`
-            : ""}${
-          l.state === "LIVE" && mine(t.borrower_prog) && state.utxos.length
-            ? (() => { const hv = holdings(true)[t.debt_asset] || 0n;
-                       return hv >= big(t.debt) ? "" :
-                         `<span class="sub2" style="color:var(--warn)">this wallet holds ${units(hv, t.debt_asset)} of the ${units(t.debt, t.debt_asset)} a repayment needs, in unblinded (explicit) coins</span>`; })()
-            : ""}</td>
-        <td data-label="collateral">${amount(t.collateral_amount, t.collateral_asset)}<span class="sub2">${ref(t.collateral_amount, t.collateral_asset)}</span></td>
-        <td data-label="price / liq.">${now != null ? money(now, now < 10 ? 4 : 2) : "—"} / ${money(liq, liq < 10 ? 4 : 2)}<span class="sub2">${esc(l.debt_ticker)} per ${esc(l.collateral_ticker)}${l.ltv != null ? ` · LTV ${(l.ltv * 100).toFixed(0)}%` : ""}${ownPrice ? ` · <span title="this loan is judged by the oracle keys its own vault bakes in, which are not the ones this book quotes the market at">its own oracle</span>` : ""}</span></td>
-        <td data-label="health"><span class="tag health ${cls}">${h == null ? "no price" : h.toFixed(3)}</span>${
-          l.liquidatable && l.liquidatable_since
-            ? `<span class="sub2">under the strike for ${Math.max(1, Math.round((Date.now() / 1000 - Number(l.liquidatable_since)) / 60))} min and still open</span>`
-            : ""}</td>
-        <td data-label="matures">${whenBlock(t.maturity)}</td>
-        <td data-label="state"><span class="tag ${STATE_CLS[l.state] || "dim"}" title="${esc(STATE_WHY[l.state] || "")}">${esc(l.state)}</span>${l.state === "UNCONFIRMED" && l.confirmations != null ? ` <span class="small">${l.confirmations}/${depth}</span>` : ""}${shallow}${l.note ? `<span class="sub2">${esc(l.note)}</span>` : ""}<br>${closed}</td>
-        <td data-label="" class="row" style="gap:6px">${acts.join(" ")}</td></tr>` +
-      detailsRow(key, 9, detailsBlock({
-        idLabel: "loan id", id: l.loan_id || l.txid,
+  const html = lenderSummary(rows) + rows.map((l, i) => { try { return loanCard(l, i); } catch (e) {
+      return `<div class="empty">A loan this page cannot draw (${esc(explainish(e))}); the book serves it at /v1/loan/${esc(loanId(l) || "")}</div>`;
+    } }).join("");
+  paint("#loans", html, (b) => { hookLoanActions(b, rows); });
+}
+
+/**
+ * A loan's own page (#loan/<id>): what was put up, what was got, what it
+ * costs, when it is due, what happens if it is not repaid or the price falls,
+ * how it ended, and the terms as the chain reads them behind Details.
+ */
+function renderLoanPage() {
+  const box = $("#loanpage");
+  if (!box) return;
+  const m = /^#loan\/(.+)$/.exec(location.hash);
+  if (!m) return;
+  const id = decodeURIComponent(m[1]);
+  const l = state.loans.find(x => loanId(x) === id || x.txid === id);
+  if (!l) {
+    paint("#loanpage", `<div class="empty" style="margin-top:14px">${state.loans.length
+      ? "This book has no loan with that id." : "Reading the loan…"}</div>`);
+    return;
+  }
+  let html;
+  try {
+    const t = JSON.parse(l.terms);
+    const c = esc(meta(t.collateral_asset).ticker), d = esc(meta(t.debt_asset).ticker);
+    const yours = mine(l.borrower_prog), lent = mine(l.lender_prog);
+    const liq = unitPrice(t.strike, t.price_scale || 100000, t.collateral_asset, t.debt_asset);
+    const v = loanVerdict(l, t);
+    const cost = big(t.debt) - big(t.principal);
+    const rate = Number(cost) / Number(big(t.principal)) * 100;
+    const bonus = ((Number(t.bonus_num ?? 105) / Number(t.bonus_den ?? 100)) - 1) * 100;
+    const gapDays = ((Number(t.recover_after) - Number(t.maturity)) / blocksPerDay()).toFixed(0);
+    const you = yours ? "you" : "the borrower";
+    const live = l.state === "LIVE";
+    const ifNow = live && l.seizure_if_liquidated != null
+      ? ` Liquidated now, ${units(l.seizure_if_liquidated, t.collateral_asset)} ${c} would go to whoever does it and ${units(l.surplus_if_liquidated, t.collateral_asset)} ${c} back to ${you}.`
+      : "";
+    const spk = deferSpk(`vault:${l.txid}:${l.vout}`, () => l.single_leaf
+      ? (offer.requirePinned(), offer.offerVaultScriptPubKey(t))
+      : pig.vaultScriptPubKey(t));
+    const key = detKey("loan", loanId(l));
+    html = `<div class="loanhead">
+        <div><div class="small">${yours ? "Your loan" : lent ? "Your loan to a borrower" : "A loan"}</div>
+          <h2>${units(t.principal, t.debt_asset)} ${d} against ${units(t.collateral_amount, t.collateral_asset)} ${c}</h2></div>
+        <div class="acts">${loanActions(l, t, 0).join("")}</div>
+      </div>
+      <div class="note ${v.cls === "bad" ? "bad" : v.cls === "warn" ? "warn" : "ok"}" style="margin:0 0 14px"><b>${esc(STATE_WORD[l.state] || l.state)}.</b> ${v.text}</div>
+      <div class="facts">
+        <div class="fact"><div class="k">${yours ? "You put up" : "Collateral"}</div><div class="v">${units(t.collateral_amount, t.collateral_asset)} ${c}</div><div class="s">${ref(t.collateral_amount, t.collateral_asset)} at today's price.${live ? " Nobody holds it: it waits on the chain until the loan ends." : ""}</div></div>
+        <div class="fact"><div class="k">${yours ? "You got" : "Lent"}</div><div class="v">${units(t.principal, t.debt_asset)} ${d}</div></div>
+        <div class="fact"><div class="k">What it costs</div><div class="v">${units(cost, t.debt_asset)} ${d}</div><div class="s">${rate.toFixed(2).replace(/\.00$/, "")}% interest${live ? `: ${units(t.debt, t.debt_asset)} ${d} repays it, at any time before it is liquidated or called in` : ""}.</div></div>
+        ${live || l.state === "UNCONFIRMED" ? `<div class="fact"><div class="k">When it is due</div><div class="v">${dueText(t.maturity)}</div><div class="s">Repaying gives ${you === "you" ? "you" : "the borrower"} every ${c} back at once, and needs nobody's permission.</div></div>
+        <div class="fact"><div class="k">If ${c} falls below ${money(liq, liq < 10 ? 4 : 2)} ${d}</div><div class="s">Anyone may liquidate the loan: they repay the lender and take collateral worth what is owed, plus a ${bonus.toFixed(0)}% bonus. The rest comes back to ${you}.${ifNow}</div></div>
+        <div class="fact"><div class="k">If it is not repaid when due</div><div class="s">Anyone may call it in at the price of the day, on the same terms as a liquidation. ${gapDays} days after it is due, the lender may take all of the collateral without a price.</div></div>` : ""}
+        ${l.spent_by ? `<div class="fact wide"><div class="k">How it ended</div><div data-exit="${esc(loanId(l))}">…</div></div>` : ""}
+      </div>
+      ${detailsBox(key, detailsBlock({ idLabel: "Loan id", id: loanId(l),
         outpoint: `${l.txid}:${l.vout}`, spk, terms: l.terms, t,
-        extra: `<span class="k">Vault</span><span>${l.single_leaf
-          ? "single leaf (taken from a funded offer)" : "four leaves (originated directly)"}</span>`
-          + (l.spent_by ? `<span class="k">How it ended</span><span data-exit="${esc(l.loan_id || l.txid)}">…</span>` : "") }));
-    } catch (e) {
-      return `<tr><td colspan="9" class="hint">a loan this page cannot draw (${esc(explainish(e))}); the book serves it at /v1/loan/${esc(l.loan_id || l.txid || "")}</td></tr>`;
-    } }).join("") + "</tbody></table>";
-  paint("#loans", html, (b) => {
+        extra: `<span class="k">Price now</span><span>${l.price != null ? money(unitPrice(l.price, t.price_scale || 100000, t.collateral_asset, t.debt_asset), 4) + " " + d : "—"}${l.health != null ? ` (health ${Number(l.health).toFixed(3)})` : ""}</span>` +
+          `<span class="k">Vault</span><span>${l.single_leaf ? "single leaf (taken from a funded offer)" : "four leaves (originated directly)"}</span>` +
+          (l.spent_by ? `<span class="k">Closing transaction</span><span><a class="mono" href="${txLink(l.spent_by)}">${esc(l.spent_by)}</a></span>` : "") }), "The terms as the chain reads them")}
+      ${l.state === "LIVE" ? `<details class="more"><summary>Adding collateral</summary><div class="hint" style="margin-top:8px">To add collateral, repay and borrow again. The new loan accepts only prices signed after its offer was made.</div></details>` : ""}`;
+  } catch (e) {
+    html = `<div class="empty">This loan cannot be drawn (${esc(explainish(e))}); the book serves it at /v1/loan/${esc(id)}</div>`;
+  }
+  paint("#loanpage", html, (b) => {
+    hookLoanActions(b, [l]);
     wireMineProg(b);
-    const hook = (attr, fn) => b.querySelectorAll(`[data-${attr}]`).forEach(btn => {
-      btn.onclick = () => fn(rows[Number(btn.dataset[attr])]);
-    });
-    hook("repay", repay);
-    hook("liq", l => seize(l, false));
-    hook("default", l => seize(l, true));
-    hook("recover", recover);
     wireDetails(b);
-    wireExits(b, rows);
-    wireCopy(b, (id) => (rows.find(l => (l.loan_id || l.txid) === id) || {}).terms || "");
+    wireExits(b, [l]);
+    wireCopy(b, () => l.terms || "");
   });
 }
 
@@ -1548,14 +1651,14 @@ function renderAlerts() {
   const byLoan = new Map(state.loans.map(l => [l.loan_id || l.txid, l]));
   const byOffer = new Map(state.offers.map(o => [o.offer_id, o]));
   const byTake = new Map((state.btcLoans || []).map(r => [r.take_id, r]));
-  const LABEL = { repay: "Repay", withdraw: "Withdraw", default: "Call default",
-                  liquidate: "Liquidate", recover: "Recover", btcstep: "Repay", btcclaim: "Claim the principal" };
+  const LABEL = { repay: "Repay", withdraw: "Take it back", default: "Call it in",
+                  liquidate: "Liquidate", recover: "Take the collateral", btcstep: "Repay", btcclaim: "Claim the loan" };
   const all = [...a.borrower.map(x => ({ ...x, seat: "borrower" })),
                ...a.lender.map(x => ({ ...x, seat: "lender" })),
                ...a.btc.map(x => ({ ...x, seat: "btc" }))];
   const html = all.map((x, i) => `<div class="note ${x.level}">
-      ${x.seat === "lender" ? "<b>As lender:</b> " : ""}${esc(x.text)}
-      ${x.action ? `<button class="sm" data-alert="${i}" style="margin-left:8px">${LABEL[x.action]}</button>` : ""}
+      <span>${x.seat === "lender" ? "<b>As lender:</b> " : ""}${esc(x.text)}</span>
+      ${x.action ? `<button class="btn sm" data-alert="${i}">${LABEL[x.action]}</button>` : ""}
     </div>`).join("");
   paint("#alerts", html, (box) => {
     box.querySelectorAll("[data-alert]").forEach(b => {
@@ -1625,22 +1728,22 @@ function lendTerms() {
     // The strike and the collateral both come off the attested price, so an
     // offer built on a stale one is priced against a market that has moved.
     if (m.stale)
-      throw new Error(`${m.market} has no fresh price: the newest attestation ` +
-        `this book could verify is ${priceAge(m)}. An offer takes its ` +
-        `collateral and its strike from that number, so nothing can be built ` +
-        `on it until the oracle catches up.`);
+      throw new Error(`${m.market} has no current price: the newest one ` +
+        `this book could check is ${priceAge(m)}. An offer takes its ` +
+        `collateral and its liquidation price from that number, so nothing ` +
+        `can be lent here until a new price is signed.`);
     if (m.precision_mismatch)
-      throw new Error(`${m.market}'s oracle quotes it at different asset ` +
-        "precisions than the registry gives, so its price does not mean what " +
+      throw new Error(`${m.market}'s price signer quotes it at different ` +
+        "decimals than the registry gives, so its price does not mean what " +
         "it appears to; nothing can be lent against it until the two agree");
     if (m.price == null)
-      throw new Error(`${m.market} has no attestation at all yet, so there is ` +
-        "no price to set a strike against");
+      throw new Error(`${m.market} has no signed price yet, so there is ` +
+        "nothing to set a liquidation price from");
     throw new Error(`${m.market} cannot be lent against here`);
   }
   if (!(i.principal > 0)) throw new Error("enter an amount to lend");
   if (!(i.openLtv > 0 && i.openLtv < i.liqLtv && i.liqLtv <= 1))
-    throw new Error("the opening loan-to-value must be below the liquidation one, and both under 100%");
+    throw new Error("the loan size must be a smaller share of the collateral than the point it is liquidated at, and both under 100%");
   if (!(i.termDays > 0) || !(i.offerDays > 0)) throw new Error("term and offer days must be positive");
   if (i.offerDays > i.termDays)
     throw new Error("the offer would still be open after its loans mature; " +
@@ -1682,15 +1785,15 @@ function lendTerms() {
   if (oMode !== "single") {
     const n = Number(oMode);
     if (!(state.oracles.length >= n && n >= 2))
-      throw new Error("that oracle set is no longer available");
+      throw new Error("that set of price signers is no longer available");
     // A MAJORITY by default, never n-of-n: n-of-n makes every liquidation
     // depend on every oracle's uptime, and one frozen feed takes the
     // lender's only remedy away for as long as it lasts.
     oracle_x = ""; oracles = state.oracles.slice();
     oracle_threshold = Math.max(2, Math.ceil((n + 1) / 2));
   } else if (!state.oracleX) {
-    throw new Error("the book has no oracle key right now (its oracle is " +
-                    "unreachable); an offer cannot be built without one");
+    throw new Error("the book cannot reach its price signer right now, and " +
+                    "an offer cannot be made without one");
   }
   const terms = {
     collateral_asset: m.collateral_asset, debt_asset: m.debt_asset,
@@ -1715,8 +1818,8 @@ function renderLendForm() {
   const sel = $("#marketsel");
   const cur = sel.value;
   const opts = lendableMarkets().map(m =>
-    `<option value="${esc(m.market)}">${esc(m.collateral_ticker)} / ${esc(m.debt_ticker)}` +
-    `${m.lendable ? "" : " — no fresh price"}</option>`).join("");
+    `<option value="${esc(m.market)}">${esc(m.debt_ticker)} against ${esc(m.collateral_ticker)}` +
+    `${m.lendable ? "" : ": no current price"}</option>`).join("");
   if (sel.innerHTML !== opts) {          // leave an open dropdown alone
     sel.innerHTML = opts;
     if (cur) sel.value = cur;
@@ -1726,15 +1829,15 @@ function renderLendForm() {
   const osel = $("#oraclesel");
   const n = state.oracles.length;
   const ocur = osel.value;
-  const oopts = ['<option value="single">Single oracle (default)</option>'];
+  const oopts = ['<option value="single">One price signer (the default)</option>'];
   for (let m = 2; m <= n; m++)
     // n-of-n is named for what it is. The threshold is baked into the vault
     // and cannot be lowered afterwards, so requiring every oracle means one
     // outage stops liquidation entirely until maturity -- and this is the
     // moment the choice is made. `pignus-cli` warns about exactly this; the
     // page offered it without a word.
-    oopts.push(`<option value="${m}">Require ${m} of ${n} oracles` +
-               `${m === n ? " — every one, so any outage blocks liquidation"
+    oopts.push(`<option value="${m}">${m} of ${n} price signers` +
+               `${m === n ? ": every one, so any outage stops liquidation"
                           : ""}</option>`);
   const ohtml = oopts.join("");
   if (osel.innerHTML !== ohtml) {
@@ -1742,7 +1845,7 @@ function renderLendForm() {
     if (ocur) osel.value = ocur;
   }
   $("#oracle_count").textContent = n > 1
-    ? `${n} independent oracles available` : "";
+    ? `(${n} independent signers available)` : "";
   renderPreview();
 }
 
@@ -1752,23 +1855,26 @@ function renderPreview() {
   try { x = lendTerms(); } catch (e) { out.innerHTML = `<span class="k">${esc(e.message)}</span>`; return; }
   const { terms: t, m } = x;
   $("#lend_unit").textContent = `(${m.debt_ticker})`;
+  const c = esc(m.collateral_ticker), d = esc(m.debt_ticker);
   const liq = unitPrice(t.strike, t.price_scale, t.collateral_asset, t.debt_asset);
   const now = Number(m.unit_price);
   const drop = (1 - liq / now) * 100;
   const total = x.principal * BigInt(x.lots);
+  const earn = big(t.debt) - x.principal;
   out.innerHTML = `<div class="kv">
-    <span class="k">You lock</span><span><b>${amount(total, t.debt_asset)}</b> in an offer covenant${x.lots > 1 ? `, takeable ${x.lots} times` : ""}; whatever is untaken you withdraw yourself after ${whenBlock(x.expiry)}: a Withdraw button then appears under Borrow › Mine, and nothing returns on its own</span>
-    <span class="k">Each borrower locks</span><span><b>${amount(t.collateral_amount, t.collateral_asset)}</b> <span class="k">${ref(t.collateral_amount, t.collateral_asset)} at today's price, ${(x.i.openLtv * 100).toFixed(0)}% loan-to-value</span></span>
-    <span class="k">and repays</span><span><b>${amount(t.debt, t.debt_asset)}</b> <span class="k">by ${whenBlock(t.maturity)}</span></span>
-    <span class="k">Liquidation</span><span>if ${esc(m.collateral_ticker)} falls below <b>${money(liq, liq < 10 ? 4 : 2)} ${esc(m.debt_ticker)}</b> <span class="k">(${drop < 0 ? "above the price now — a loan would be liquidatable immediately"
-      : `${drop.toFixed(0)}% below now`}); whoever liquidates keeps a ${BONUS}% bonus and the rest of the collateral goes back to the borrower</span></span>
-    <span class="k">After maturity</span><span class="k">anyone may call the loan at any price; ${RECOVER_GAP_DAYS} days later you can sweep the vault without an oracle</span>
-    ${Number(t.oracle_threshold) > 0 ? `<span class="k">Oracles</span><span>${
-      Number(t.oracle_threshold)} of ${(t.oracles || []).length} must sign a liquidation${
+    <span class="k">You lend</span><span><b>${amount(x.principal, t.debt_asset)}</b>${x.lots > 1 ? ` per loan, up to ${x.lots} loans: <b>${amount(total, t.debt_asset)}</b> in all` : ""}. It waits in the offer until it is borrowed; what nobody borrows you take back after ${dueText(x.expiry)}, from Borrow, Yours. Nothing comes back by itself.</span>
+    <span class="k">Each borrower puts up</span><span><b>${amount(t.collateral_amount, t.collateral_asset)}</b> <span class="k">${ref(t.collateral_amount, t.collateral_asset)} today</span></span>
+    <span class="k">and repays</span><span><b>${amount(t.debt, t.debt_asset)}</b> by ${dueText(t.maturity)}: you earn ${amount(earn, t.debt_asset)} a loan</span>
+    <span class="k">Liquidated if</span><span>${c} falls below <b>${money(liq, liq < 10 ? 4 : 2)} ${d}</b> <span class="k">(${drop < 0 ? "above today's price: a loan would be liquidatable at once" : `${drop.toFixed(0)}% below today's price`}). Whoever liquidates pays you what is owed and keeps a ${BONUS}% bonus; the rest goes back to the borrower.</span></span>
+    <span class="k">After it is due</span><span class="k">anyone may call a loan in at the price of the day; ${RECOVER_GAP_DAYS} days later you may take its collateral without a price.</span>
+    ${Number(t.oracle_threshold) > 0 ? `<span class="k">Price signers</span><span>${
+      Number(t.oracle_threshold)} of ${(t.oracles || []).length} must sign a liquidation's price${
       Number(t.oracle_threshold) === (t.oracles || []).length
-        ? ` <span class="k">— every one of them, so while any single oracle is down this loan cannot be liquidated at all. The threshold is baked into the vault and cannot be lowered afterwards.</span>`
-        : ` <span class="k">— independent keys; a vault verifies against the ones baked into it</span>`}</span>` : ""}
+        ? ` <span class="k">: every one, so while any of them is down no loan can be liquidated at all. This cannot be changed later.</span>`
+        : ""}</span>` : ""}
   </div>`;
+  const go = $("#lendgo");
+  if (go) go.textContent = `Lend ${units(total, t.debt_asset)} ${m.debt_ticker}`;
 }
 
 // ------------------------------------------------------------------ actions
@@ -1785,41 +1891,40 @@ function renderPreview() {
 async function confirmAndSend(label, make, opts = {}) {
   const { flow, prefer = [], committed = {} } = opts;
   let fee = feeFor(flow, prefer, committed);
-  let built = make(fee);                       // a first failure is the caller's
+  let built = await composeWithCoins(() => make(fee));   // a failure is the caller's
   const choices = feeChoices(flow, committed);
 
   const draw = (problem) => {
     const lines = built
-      ? [...built.summary,
-         `Network fee: ${amount(built.fee ?? fee.atoms, fee.asset)} ${ref(built.fee ?? fee.atoms, fee.asset)}` +
-         (built.folded > 0n ? ` (includes ${units(built.folded, fee.asset)} of change too small to keep)` : ""),
-         ...(built.extra || [])].map(l => `<li>${esc(l)}</li>`).join("")
+      ? [...built.summary.map(l => [l, /^(LIQUIDATABLE|Warning)/.test(l)]),
+         [`Network fee: ${amount(built.fee ?? fee.atoms, fee.asset)} ${ref(built.fee ?? fee.atoms, fee.asset)}` +
+          (built.folded > 0n ? ` (with ${units(built.folded, fee.asset)} of change too small to keep)` : ""), false],
+         ...(built.extra || []).map(l => [l, false])]
+        .map(([l, w]) => `<li${w ? ' class="warnline"' : ""}>${esc(l)}</li>`).join("")
       : "";
     const options = choices.map(a =>
       `<option value="${esc(a)}"${a === fee.asset ? " selected" : ""}>${esc(meta(a).ticker)}</option>`).join("");
-    note(`<b>${esc(label)}</b><ul>${lines}</ul>
-      <div class="row" style="margin-top:10px">
-        <label for="feeasset" class="small">Pay the network fee in</label>
+    sheetOpen(`<h2 id="sheettitle">${esc(label)}</h2><ul>${lines}</ul>
+      <div class="fee">
+        <label for="feeasset">Pay the network fee in</label>
         <select id="feeasset"${choices.length > 1 ? "" : " disabled"}>${options}</select>
-        <span class="small">any asset the network prices; nothing here is privileged</span>
+        <span>any asset the network accepts</span>
       </div>
-      ${feeVsize(flow)?.estimated ? `<div class="hint" style="margin:8px 0 0">This
-      book publishes no size estimate for this kind of transaction, so the fee
-      above is priced at the largest size it does publish. It over-pays rather
-      than risking a transaction the network will not relay.</div>` : ""}
-      ${problem ? `<div class="hint" style="color:var(--bad);margin:8px 0 0">${problem}</div>` : ""}
-      <div class="hint" style="margin:8px 0 0">Your wallet will show its own view of this
-      before you approve it. If the two disagree, reject it.</div>
-      <div class="row" style="margin-top:10px">
-        <button class="primary" id="go"${built ? "" : " disabled"}>Continue to wallet</button>
-        <button id="nogo">Cancel</button>
-      </div>`, "info");
+      ${feeVsize(flow)?.estimated ? `<p class="hint">This book publishes no size for this kind
+      of transaction, so the fee is priced at the largest size it does publish: it pays a
+      little more rather than risk a transaction the network will not take.</p>` : ""}
+      ${problem ? `<p class="hint" style="color:var(--bad)">${problem}</p>` : ""}
+      <p class="hint">Your wallet shows its own reading of this before you approve it. If the two
+      disagree, reject it there.</p>
+      <div class="buttons">
+        <button class="btn primary" id="go"${built ? "" : " disabled"}>Continue in your wallet</button>
+        <button class="btn" id="nogo">Cancel</button>
+      </div>`);
   };
 
   const answer = await new Promise((settle) => {
-    // Every way out of this dialog goes through one place, so the document
-    // listener below is taken off however it ends -- Escape, a button, or a
-    // redraw. A listener left behind outlives the question it was asked for.
+    // Every way out of this sheet goes through one place, so the document
+    // listener below is taken off however it ends.
     let done = false;
     const resolve = (v) => {
       if (done) return;
@@ -1827,11 +1932,8 @@ async function confirmAndSend(label, make, opts = {}) {
       document.removeEventListener("keydown", esckey);
       settle(v);
     };
-    // `want` names the control the keyboard was on before a redraw. Changing
-    // the fee asset rebuilds this whole dialog, so without putting focus back
-    // the reader is dropped on <body> -- and note() scrolls, so they are also
-    // somewhere else on the page. They then cannot keep arrowing through the
-    // assets, and have to tab from the top of the document to try another.
+    // Changing the fee asset rebuilds the sheet, so focus goes back to the
+    // control that was being used.
     const wire = (want) => {
       const sel = $("#feeasset");
       if (sel) sel.onchange = () => {
@@ -1855,49 +1957,19 @@ async function confirmAndSend(label, make, opts = {}) {
         resolve(true);
       };
       $("#nogo").onclick = () => resolve(false);
-      // The redraw destroyed whatever had the keyboard; put it back on the
-      // control that was being used.
-      if (want) {
-        const back = $(want);
-        if (back) { try { back.focus(); } catch { /* not focusable */ } }
-      }
+      const back = $(want || "#go") || $("#nogo");
+      if (back) { try { back.focus(); } catch { /* not focusable */ } }
     };
-    // Escape cancels, as it does in every dialog anyone has used. Registered
-    // ONCE, for the life of this dialog: `wire()` runs again on every fee
-    // change, and a listener added there accumulates one per change and is
-    // never taken off the document.
     function esckey(ev) {
       if (ev.key === "Escape") resolve(false);
     }
     document.addEventListener("keydown", esckey);
     draw();
     wire();
-    // This asks a question and waits for an answer, so it is a DIALOG. It
-    // lived in a polite status region, which a screen reader announces
-    // whenever it feels like it and never moves focus to -- so somebody using
-    // one was left on whatever they had been doing while a decision about
-    // their money waited unread somewhere else on the page. Marking it and
-    // moving focus is the whole fix.
-    const box = $("#note");
-    if (box) {
-      box.setAttribute("role", "dialog");
-      box.setAttribute("aria-modal", "false");
-      box.setAttribute("aria-live", "assertive");
-      box.setAttribute("tabindex", "-1");
-      const first = $("#go") || $("#nogo") || box;
-      try { first.focus({ preventScroll: false }); } catch { box.focus(); }
-    }
   });
-  // Back to a status region once the question is answered, so ordinary
-  // progress messages are not announced as though they were a decision.
-  const box = $("#note");
-  if (box) {
-    box.setAttribute("role", "status");
-    box.setAttribute("aria-live", "polite");
-    box.removeAttribute("aria-modal");
-  }
+  sheetClose();
   if (!answer) {
-    note(`<b>${esc(label)} — cancelled.</b> Nothing was signed or sent.`, "info");
+    note(`<b>${esc(label)}: cancelled.</b> Nothing was signed or sent.`, "info");
     return null;
   }
   // `noSend` means the caller only wanted the ANSWER and the fee: a flow that
@@ -1909,24 +1981,77 @@ async function confirmAndSend(label, make, opts = {}) {
     `Network fee: ${amount(built.fee ?? fee.atoms, fee.asset)}`]
     .map(l => `<li>${esc(l)}</li>`).join("");
   let txid;
-  busy(true, "waiting for your approval in the wallet…");
+  busy(true, "Waiting for your approval in the wallet…");
   try {
     const signed = await state.wallet.signPset(built.pset);
-    busy(true, "broadcasting…");
+    busy(true, "Sending…");
     txid = await state.wallet.broadcast({ pset: signed });
+  } catch (e) {
+    if (/rejected/.test(e?.message || "")) {
+      note(`<b>${esc(label)}: you declined in the wallet.</b> Nothing was signed or sent.`, "info");
+      return null;
+    }
+    throw e;
   } finally { busy(false); }
   // Everything past the broadcast is bookkeeping. It must not be able to turn a
   // sent transaction into a reported failure.
-  note(`<b>${esc(label)} — sent.</b> <a href="${txLink(txid)}" class="mono">${esc(txid)}</a><ul>${lines}</ul>`, "ok");
+  note(`<b>${esc(label)}: sent.</b> <a href="${txLink(txid)}" class="mono">${esc(txid)}</a><ul>${lines}</ul>`, "ok");
   try {
     await loadWallet();
     renderWallet();
   } catch (e) {
-    note(`<b>${esc(label)} — sent.</b> <a href="${txLink(txid)}" class="mono">${esc(txid)}</a><ul>${lines}</ul>` +
+    note(`<b>${esc(label)}: sent.</b> <a href="${txLink(txid)}" class="mono">${esc(txid)}</a><ul>${lines}</ul>` +
          `<div class="hint">Balances could not be refreshed: ${explain(e)}</div>`, "ok");
   }
   setTimeout(() => refresh().catch(() => {}), 2500);
   return txid;
+}
+
+/**
+ * Compose, and when the wallet holds what a transaction needs somewhere this
+ * page cannot spend from (the web wallet keeps what it receives in its
+ * operator's tree), ask it to bring those coins onto the chain first, then
+ * compose again. Its own dialog asks its owner; a wallet that cannot do this
+ * leaves the shortfall to be said as it always was.
+ */
+async function composeWithCoins(make) {
+  for (let round = 0; ; round++) {
+    try { return make(); } catch (e) {
+      if (round >= 3 || !(e?.asset && e.need != null && e.short > 0n)) throw e;
+      if (!(await state.wallet.supports("prepareCoins"))) throw e;
+      busy(true, `Your wallet is getting ${units(e.short, e.asset)} ${meta(e.asset).ticker} ready: approve it there, then keep this page open.`);
+      try { await state.wallet.prepareCoins([{ asset: e.asset, amount: e.need }]); }
+      catch (x) {
+        if (/rejected/.test(x?.message || "")) throw new WalletError("You declined in the wallet. Nothing moved.");
+        throw x;
+      } finally { busy(false); }
+      await loadWallet();
+      renderWallet();
+    }
+  }
+}
+
+// The sheet a confirmation is asked in, over the page; focus goes into it and
+// comes back to where it was when it closes.
+let _sheetFrom = null;
+function sheetOpen(html) {
+  let box = $("#sheet");
+  if (!box) {
+    _sheetFrom = document.activeElement;
+    box = document.createElement("div");
+    box.className = "sheet"; box.id = "sheet";
+    box.setAttribute("role", "dialog"); box.setAttribute("aria-modal", "true");
+    box.setAttribute("aria-labelledby", "sheettitle");
+    box.innerHTML = '<div class="box"></div>';
+    document.body.appendChild(box);
+  }
+  box.firstElementChild.innerHTML = html;
+}
+function sheetClose() {
+  const box = $("#sheet");
+  if (box) box.remove();
+  try { if (_sheetFrom) _sheetFrom.focus(); } catch { /* gone */ }
+  _sheetFrom = null;
 }
 
 function tickers(t) {
@@ -1946,10 +2071,10 @@ function manageToken(offerId) {
 }
 async function cancelListing(o) {
   const token = manageToken(o.offer_id);
-  if (!token) { note("This browser did not publish that offer, so it has no " +
-    "token to cancel the listing. The coin is untouched either way: once the " +
-    "offer's expiry opens, Withdraw brings it back.", "warn"); return; }
-  busy(true, "cancelling the listing…");
+  if (!token) { note("This browser did not make that offer, so it cannot take " +
+    "it off the list. The money in it is untouched either way: once the offer " +
+    "closes, Take it back returns it.", "warn"); return; }
+  busy(true, "taking the offer off the list…");
   try {
     // The token goes in a header, never in the query string: the daemon logs
     // every request line, and a secret in a log is a secret given away.
@@ -1959,10 +2084,9 @@ async function cancelListing(o) {
     // The record is KEPT by the book and stays in this wallet's "mine" view:
     // it is the only copy of the terms that can build the refund, so the row
     // and its Withdraw button are what bring the principal back.
-    note("Delisted. Your principal is untouched in the " +
-         "offer covenant; the offer stays under \u201cmine\u201d, and once its " +
-         "expiry opens, Withdraw there brings it back. Nothing returns on its " +
-         "own.", "ok");
+    note("Taken off the list. Your money is untouched in the offer, which " +
+         "stays under Borrow, Yours; once it closes, Take it back there " +
+         "returns it. Nothing comes back by itself.", "ok");
     refresh().catch(() => {});
   } catch (e) { note(explain(e), "bad"); } finally { busy(false); }
 }
@@ -1977,12 +2101,11 @@ async function listPending(rec) {
       expiry_locktime: rec.expiry_locktime });
     if (r.manage_token && r.offer_id) rememberToken(r.offer_id, r.manage_token);
     forgetPending(rec.txid);
-    note("Offer listed. A borrower can take it now, with you offline.", "ok");
+    note("Offer listed. Borrowers can take it now, even while you are away.", "ok");
     refresh().catch(() => {});
   } catch (e) {
-    note(`The book still will not list it: ${explain(e)} Your principal is safe ` +
-         "in the offer covenant either way; once the expiry opens, Withdraw " +
-         "brings it back.", "bad");
+    note(`The book still will not list it: ${explain(e)} Your money is safe ` +
+         "in the offer either way; once it closes, Take it back returns it.", "bad");
   } finally { busy(false); renderOffers(); }
 }
 
@@ -2004,11 +2127,11 @@ async function borrow(o) {
       throw new Error(`this offer is ${o.status}; it cannot be taken`);
     if (o.expired || (state.height != null && o.expiry_locktime != null
                       && Number(o.expiry_locktime) <= state.height))
-      throw new Error("this offer has expired: the lender can take the coin " +
-                      "back at any moment, and a take racing that loses its fee");
+      throw new Error("this offer has closed: the lender can take the money " +
+                      "back at any moment, and a borrow racing that loses its fee");
     if (state.height != null && Number(t.recover_after) <= state.height)
-      throw new Error("this offer's loans let the lender sweep the collateral " +
-                      "without an oracle already");
+      throw new Error("this offer's loans already let the lender take the " +
+                      "collateral without a price");
     const [txid, vout] = String(o.outpoint).split(":");
     const out = await api(`v1/outpoint/${txid}/${vout}`).catch(() => null);
     if (!out) throw new Error(
@@ -2066,34 +2189,34 @@ async function borrow(o) {
       vaultTerms = built.terms;
       built.summary = [
         ...(soon ? ["This loan matures in under a day"] : []),
-        `Borrow ${units(drawn, t.debt_asset)} ${d}`,
-        `Lock ${units(collateral, t.collateral_asset)} ${c} as collateral ${ref(collateral, t.collateral_asset)}`,
-        `Repay ${units(t.debt, t.debt_asset)} ${d} by ${whenText(t.maturity)} to get it back`,
+        `You get ${units(drawn, t.debt_asset)} ${d}`,
+        `You put up ${units(collateral, t.collateral_asset)} ${c} ${ref(collateral, t.collateral_asset)}`,
+        `You repay ${units(t.debt, t.debt_asset)} ${d} by ${dueWords(t.maturity)} to get it back`,
         // ...or ALREADY. An offer whose strike sits above the current price
         // makes a loan anyone may liquidate the moment it exists, and telling
         // a borrower it becomes liquidatable "if" the price falls describes
         // a future that has already happened.
         (price != null && price < liq
-          ? `LIQUIDATABLE IMMEDIATELY: ${c} is ${money(price, 4)} ${d} and this ` +
+          ? `LIQUIDATABLE AT ONCE: ${c} is ${money(price, 4)} ${d} and this ` +
             `loan may be liquidated below ${money(liq, 4)} ${d}. Anyone can ` +
             "close it the moment you open it."
-          : `Liquidatable if ${c} falls below ${money(liq, 4)} ${d}`),
+          : `If ${c} falls below ${money(liq, 4)} ${d}, anyone may liquidate the loan`),
         // What a liquidator KEEPS, out of the collateral, on top of the debt
         // they repay. It is in the terms and in no address, so a borrower has
         // no way to see it except by being told -- and at the strike, which is
         // the first price a seizure is possible at, the figure is exact.
-        `A liquidator keeps ${(((Number(t.bonus_num ?? 105) /
-           Number(t.bonus_den ?? 100)) - 1) * 100).toFixed(1)}% of the debt ` +
-          `out of your collateral as their bonus`,
-        "After maturity anyone may call the loan at any price",
-        `The lender may sweep the vault without an oracle after ${whenText(t.recover_after)}, ${gapDays} days past maturity`,
+        `Whoever liquidates keeps ${(((Number(t.bonus_num ?? 105) /
+           Number(t.bonus_den ?? 100)) - 1) * 100).toFixed(1)}% of what is owed ` +
+          `out of your collateral as a bonus; the rest comes back to you`,
+        "Once it is due, anyone may call it in at the price of the day",
+        `${gapDays} days after it is due, the lender may take all of the collateral without a price`,
         ...(o.warnings || []).map(w => `Warning: ${w}`),
-        ...(odd.length ? [`Warning: this offer's liquidation oracle ${odd[0].slice(0, 12)}… ` +
-          "is not one this book quotes; whoever holds that key can attest any " +
-          "price and liquidate you at the strike"] : []),
+        ...(odd.length ? [`Warning: this offer's price signer ${odd[0].slice(0, 12)}… ` +
+          "is not one this book knows; whoever holds that key can sign any " +
+          "price and liquidate you"] : []),
       ];
       built.extra = [
-        `The vault this creates: ${built.vaultScriptPubKey.slice(0, 24)}… — derived here, from these terms; the offer's own script refuses anything else.`,
+        `Your collateral goes to an address this page rebuilt from these terms (${built.vaultScriptPubKey.slice(0, 24)}…); the offer itself refuses any other.`,
       ];
       return built;
     }, { flow: "take", prefer: [t.collateral_asset, t.debt_asset],
@@ -2109,6 +2232,7 @@ async function borrow(o) {
         x.classList.toggle("on", on);
         x.setAttribute("aria-pressed", on ? "true" : "false");
       });
+      location.hash = "#loans";
       refresh().catch(() => {});
     }
   } catch (e) { note(explain(e), "bad"); }
@@ -2124,13 +2248,13 @@ async function withdraw(o) {
       "was taken or withdrawn. Press Refresh; the row will say which.");
     if (state.height != null && o.expiry_locktime != null
         && state.height < Number(o.expiry_locktime))
-      throw new Error("the offer's expiry has not opened yet: the refund is " +
-                      `locked until block ${Number(o.expiry_locktime).toLocaleString()}` +
-                      ", and a node would refuse the transaction as non-final");
+      throw new Error("the offer has not closed yet: its money can be taken back " +
+                      `from block ${Number(o.expiry_locktime).toLocaleString()}` +
+                      ", and the network refuses it before then");
     if (out.asset !== t.debt_asset)
-      throw new Error("that offer's coin does not hold the debt asset the " +
-                      "refund leaf pays out, so there is nothing to return");
-    const sent = await confirmAndSend("Withdraw offer", (fee) => {
+      throw new Error("that offer's coin does not hold the asset it lends, " +
+                      "so there is nothing to return");
+    const sent = await confirmAndSend("Take back the offer", (fee) => {
       const built = flows.buildWithdrawOffer({
         terms: t, offerOutpoint: { txid, vout: Number(vout), scriptPubkey: out.scriptPubKey },
         offerValue: out.value, principal: big(o.principal || t.principal),
@@ -2140,8 +2264,8 @@ async function withdraw(o) {
         dustAtoms: dustFor(fee.asset),
       });
       built.summary = [
-        `Return ${amount(out.value, t.debt_asset)} to the lender's address baked into the vault`,
-        "The offer expired; this is its only remaining exit"];
+        `${amount(out.value, t.debt_asset)} goes back to the lender, at the address the offer names`,
+        "The offer has closed: this is the only way the money leaves it"];
       return built;
     }, { flow: "withdraw", prefer: [t.debt_asset] });
     if (sent) { forgetPending(txid); renderOffers(); }
@@ -2159,8 +2283,8 @@ async function withdraw(o) {
 async function vaultArgs(l, t) {
   const out = await api(`v1/outpoint/${l.txid}/${l.vout}`).catch(() => null);
   if (!out) throw new Error(
-    "that vault is already spent, or the book's node cannot see it; refresh " +
-    "the list");
+    "that loan is already closed, or the book's node cannot see it; press " +
+    "Refresh");
   // Both halves matter. An asset the book cannot see is a blinded one, and
   // every leaf here compares assets, so a spend composed against a coin whose
   // asset nobody can read is a spend nobody can settle.
@@ -2194,15 +2318,14 @@ async function repay(l) {
       // else's loan off.
       const yours = mine(t.borrower_prog || t.borrower_x);
       built.summary = [
-        `Pay ${units(t.debt, t.debt_asset)} ${d} to the lender`,
+        `You pay the lender ${units(t.debt, t.debt_asset)} ${d}`,
         yours
-          ? `Take back all ${units(args.collateralAmount, t.collateral_asset)} ${c}`
-          : `Send all ${units(args.collateralAmount, t.collateral_asset)} ${c} ` +
-            "to the borrower, not to you: the vault pays the address baked into the vault " +
-            "whoever broadcasts this",
+          ? `You get back all ${units(args.collateralAmount, t.collateral_asset)} ${c}`
+          : `All ${units(args.collateralAmount, t.collateral_asset)} ${c} goes back ` +
+            "to the borrower, not to you: the loan pays its borrower whoever repays it",
         ...(yours ? [] : ["You are paying somebody else's loan off. Nothing " +
                           "comes back to you."]),
-        "No oracle and no signature: this exit is always open"];
+        "Repaying needs no price and nobody's permission"];
       return built;
     }, { flow: l.single_leaf ? "repay" : "repay4", prefer: [t.debt_asset],
          committed: { [t.debt_asset]: big(t.debt) } });
@@ -2238,16 +2361,16 @@ async function seize(l, atMaturity) {
       // took whatever verified.
       set = named.filter(a => !a.stale);
       if (!named.length)
-        throw new Error("none of this loan's oracles have a verifiable " +
-                        "attestation right now; the covenant would refuse it.");
+        throw new Error("none of this loan's price signers has a price this " +
+                        "page can check right now, so the loan would refuse it.");
       if (set.length < Number(t.oracle_threshold || 1)) {
         const ages = named.map(a => `${shortHex(a.oracle_x, 8)} ` +
           (a.age != null ? `${Number(a.age)}s old` : "age unknown"))
           .join(", ");
-        throw new Error(`this loan needs ${t.oracle_threshold} of its oracles ` +
-          `and only ${set.length} have a current price (${ages}). Closing at a ` +
-          "stale price is closing at a price the market has left behind; wait " +
-          "for the oracles to catch up, or use pignus-cli with --allow-stale.");
+        throw new Error(`this loan needs ${t.oracle_threshold} of its price signers ` +
+          `and only ${set.length} have a current price (${ages}). Closing at an ` +
+          "old price is closing at a price the market has left behind; wait " +
+          "for new prices, or use pignus-cli with --allow-stale.");
       }
     } else {
       // Ask for THIS LOAN'S oracle by name. Unqualified, the book serves
@@ -2262,9 +2385,9 @@ async function seize(l, atMaturity) {
       // accepts the oracle it named, and a number quoted at another scale is
       // one the covenant would read as a different price entirely.
       if (!pig.verifyAttestation(t, single))
-        throw new Error("that attestation does not verify against the oracle this " +
-                        "loan names, or is quoted at another price scale, so the " +
-                        "covenant would misread it. Refusing to build it.");
+        throw new Error("that price is not signed by the signer this loan names, " +
+                        "or is quoted at another scale, so the loan would misread " +
+                        "it. Nothing was built.");
     }
     // A seizure takes somebody's collateral, and the covenant will accept any
     // attestation its own key signed however old it is. So a stale price is
@@ -2274,24 +2397,24 @@ async function seize(l, atMaturity) {
       : mk ? priceAge(mk) : "of an unknown age";
     if (single?.stale ?? mk?.stale)
       throw new Error(
-        `the newest attestation this book can verify for ${t.market} is ` +
-        `${staleAge}, past the age it treats as current. Closing a position ` +
+        `the newest price this book can check for ${t.market} is ` +
+        `${staleAge}, older than it treats as current. Closing a loan ` +
         "on a price the market has moved away from splits the collateral at " +
-        "the wrong number, so this page refuses it until the oracle catches " +
-        "up. pignus-cli will build it against a stale price with --allow-stale.");
+        "the wrong number, so this page waits for a new one. pignus-cli " +
+        "builds it on an old price with --allow-stale.");
     const args = await vaultArgs(l, t);
     const flow = (atMaturity ? "default" : "liquidate") + (l.single_leaf ? "" : "4");
     const { c, d } = tickers(t);
-    await confirmAndSend(atMaturity ? "Call default" : "Liquidate", (fee) => {
+    await confirmAndSend(atMaturity ? "Call it in" : "Liquidate", (fee) => {
       const built = flows.buildLiquidate({ ...args,
         attestation: single, attestations: set, atMaturity,
         takerSpk: state.payout.spk, feeAsset: fee.asset, feeAmount: fee.atoms,
         dustAtoms: dustFor(fee.asset) });
-      built.summary = [`Pay ${units(t.debt, t.debt_asset)} ${d} to the lender`,
-        `Keep ${units(args.collateralAmount - built.surplus, t.collateral_asset)} ${c} ${ref(args.collateralAmount - built.surplus, t.collateral_asset)}`,
+      built.summary = [`You pay the lender ${units(t.debt, t.debt_asset)} ${d}`,
+        `You get ${units(args.collateralAmount - built.surplus, t.collateral_asset)} ${c} ${ref(args.collateralAmount - built.surplus, t.collateral_asset)}`,
         built.surplus > 0n
-          ? `Return ${units(built.surplus, t.collateral_asset)} ${c} to the borrower — the covenant enforces this`
-          : "This position is under water: there is no surplus to return"];
+          ? `${units(built.surplus, t.collateral_asset)} ${c} goes back to the borrower: the loan itself makes sure of it`
+          : "The collateral is worth less than what is owed: nothing goes back to the borrower"];
       return built;
     }, { flow, prefer: [t.debt_asset], committed: { [t.debt_asset]: big(t.debt) } });
   } catch (e) { note(explain(e), "bad"); }
@@ -2303,12 +2426,12 @@ async function recover(l) {
     const t = JSON.parse(l.terms);
     const args = await vaultArgs(l, t);
     const { c } = tickers(t);
-    await confirmAndSend("Recover", (fee) => {
+    await confirmAndSend("Take the collateral", (fee) => {
       const built = flows.buildRecover({ ...args, feeAsset: fee.asset,
         feeAmount: fee.atoms, dustAtoms: dustFor(fee.asset) });
       built.summary = [
-        `Sweep all ${units(args.collateralAmount, t.collateral_asset)} ${c} to the lender's address baked into the vault`,
-        `Open since ${whenText(t.recover_after)}: the lender's sweep that needs no oracle`];
+        `All ${units(args.collateralAmount, t.collateral_asset)} ${c} goes to the lender, at the address the loan names`,
+        `Allowed since ${dueWords(t.recover_after)}: long enough after the due date that the lender may take it without a price`];
       return built;
     }, { flow: l.single_leaf ? "recover" : "recover4", prefer: [t.debt_asset] });
   } catch (e) { note(explain(e), "bad"); }
@@ -2321,7 +2444,7 @@ async function lend(ev) {
     const x = lendTerms();
     const total = x.principal * BigInt(x.lots);
     const { c, d } = tickers(x.terms);
-    const txid = await confirmAndSend("Publish a funded offer", (fee) => {
+    const txid = await confirmAndSend("Make an offer", (fee) => {
       const built = flows.buildFundOffer({
         terms: x.terms, principal: x.principal, collateral: x.collateral,
         expiryLocktime: x.expiry, lots: x.lots, utxos: state.utxos,
@@ -2329,11 +2452,11 @@ async function lend(ev) {
         dustAtoms: dustFor(fee.asset),
       });
       built.summary = [
-        `Lock ${units(total, x.terms.debt_asset)} ${d} in an offer covenant, takeable ${x.lots} time(s) at ${units(x.principal, x.terms.debt_asset)} each`,
-        `Each borrower locks ${units(x.collateral, x.terms.collateral_asset)} ${c} and repays ${units(x.debt, x.terms.debt_asset)} ${d}`,
-        `Anything untaken you withdraw yourself after ${whenText(x.expiry)}; nothing returns on its own`,
+        `${units(total, x.terms.debt_asset)} ${d} goes into your offer: ${x.lots === 1 ? "one loan" : `up to ${x.lots} loans of ${units(x.principal, x.terms.debt_asset)} ${d} each`}`,
+        `Each borrower puts up ${units(x.collateral, x.terms.collateral_asset)} ${c} and repays ${units(x.debt, x.terms.debt_asset)} ${d}`,
+        `What nobody borrows you take back after ${dueWords(x.expiry)}; nothing comes back by itself`,
       ];
-      built.extra = [`Offer address: ${built.offerScriptPubKey.slice(0, 24)}…`];
+      built.extra = [`Your offer's address, rebuilt here from these terms: ${built.offerScriptPubKey.slice(0, 24)}…`];
       return built;
     }, { flow: "fund", prefer: [x.terms.debt_asset],
          committed: { [x.terms.debt_asset]: total } });
@@ -2359,11 +2482,11 @@ async function lend(ev) {
       $$("[data-tab]")[0].click();
       refresh().catch(() => {});
     } catch (e) {
-      note(`<b>Offer funded, but not listed.</b> Your principal is locked in the ` +
-        `offer covenant at <span class="mono">${esc(rec.outpoint)}</span>. The book ` +
+      note(`<b>Your offer is made, but not listed.</b> Your money is in the ` +
+        `offer at <span class="mono">${esc(rec.outpoint)}</span>. The book ` +
         `did not accept the listing (${esc(e.message)}), so no borrower can see it ` +
-        `yet. It is in your offers under "Mine", where you can list it again or, ` +
-        `after the expiry, withdraw it. <button class="sm" id="retrylist">Publish listing</button>`,
+        `yet. It is under Borrow, Yours, where you can list it again or, ` +
+        `once it closes, take it back. <button class="btn sm" id="retrylist">List the offer</button>`,
         "warn");
       const b = $("#retrylist");
       if (b) b.onclick = () => listPending(rec);
@@ -2434,14 +2557,14 @@ async function confirmBtcSpend(label, lines, { flow, prefer = [],
  * fixed. The page said "shown to you before you sign"; here it is.
  */
 async function confirmLines(label, lines) {
-  note(`<b>${esc(label)}</b><ul>${lines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
-    <div class="hint" style="margin:8px 0 0">Your wallet will show its own view of this
-    before you approve it. If the two disagree, reject it.</div>
-    <div class="row" style="margin-top:10px">
-      <button class="primary" id="go">Continue to wallet</button>
-      <button id="nogo">Cancel</button>
-    </div>`, "info");
-  return new Promise((settle) => {
+  sheetOpen(`<h2 id="sheettitle">${esc(label)}</h2><ul>${lines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
+    <p class="hint">Your wallet shows its own reading of this before you approve it. If the two
+    disagree, reject it there.</p>
+    <div class="buttons">
+      <button class="btn primary" id="go">Continue in your wallet</button>
+      <button class="btn" id="nogo">Cancel</button>
+    </div>`);
+  const ok = await new Promise((settle) => {
     let done = false;
     const resolve = (v) => { if (done) return; done = true;
                              document.removeEventListener("keydown", esckey); settle(v); };
@@ -2449,7 +2572,10 @@ async function confirmLines(label, lines) {
     document.addEventListener("keydown", esckey);
     $("#go").onclick = () => resolve(true);
     $("#nogo").onclick = () => resolve(false);
+    $("#go").focus();
   });
+  sheetClose();
+  return ok;
 }
 
 function btcUi({ flow = "btcrepay", prefer = [], committed = {},
@@ -2630,7 +2756,7 @@ async function renderBtcLoans() {
     ? `<div class="hint">${unreadable} of your loan records ${unreadable === 1 ? "is" : "are"} not shown: ` +
       `their terms carry a value that is not a number, so nothing here can ` +
       `read them. That is the book serving a malformed record, not a loan ` +
-      `you have lost -- the covenant behind it is on chain either way. Ask ` +
+      `you have lost: the loan itself is on chain either way. Ask ` +
       `this book's operator to correct the record.</div>`
     : "";
   if (!rows.length) {
@@ -2694,7 +2820,7 @@ async function renderBtcLoans() {
       if (rec.repay_txid && !rec.secret_t && !rec.lender_claim_txid
           && !rec.terminal && state.height != null
           && state.height >= Number(l.repay_deadline))
-        acts.push(`<button data-btcunpay="${i}" data-focus="bu:${esc(rec.take_id || i)}" class="sm" title="the lender never claimed it, so the repayment's refund leaf is open">Take the repayment back</button>`);
+        acts.push(`<button data-btcunpay="${i}" data-focus="bu:${esc(rec.take_id || i)}" class="sm" title="the lender never claimed it, so your repayment can come back to you">Take the repayment back</button>`);
       const funded = rec.prevault_txid || rec.funding_txid;
       return `<tr>
         <td data-label="collateral">${pig.fixed(BigInt(l.btc_amount), 8, 8)} BTC
@@ -2878,7 +3004,7 @@ async function btcRefundRepayment(rec) {
         locktime: Number(l.repay_deadline),
         summary: [
           `Take back ${units(out.value, l.debt_asset)} ${d} the lender never claimed`,
-          "The refund leaf pays your own address baked into the output and nobody else's",
+          "It can pay only your own address, the one the repayment names",
           "Your Bitcoin collateral stays where it is: the lender can still sweep it after their own deadline",
         ] }),
       { flow: "btcclaim", prefer: [l.debt_asset] });
@@ -3230,46 +3356,62 @@ async function v2Sign(kind, pick, medianTime) {
 
 // ------------------------------------------------------------------ boot
 
+// The tabs, and the page each address shows: #borrow, #lend, #loans, #more,
+// and a loan's own page at #loan/<id>. Older links keep working: #repo and
+// #v2 open More, #btc the bitcoin offers under Borrow.
+const ALIAS = { repo: "more", v2: "more", btc: "borrow" };
+
+function showMore(mode) {
+  const t = $("#tab-more");
+  if (t) t.hidden = !(mode === "developer" || location.hash === "#more" || state.moreShown);
+}
+
 function wireTabs() {
   const tabs = $$("[data-tab]");
-  const show = (b) => {
+  const panels = $$("section[data-panel]");
+  const show = (name, keepHash) => {
     tabs.forEach(x => {
-      const on = x === b;
+      const on = x.dataset.tab === name;
       x.classList.toggle("on", on);
       x.setAttribute("aria-selected", on ? "true" : "false");
       x.tabIndex = on ? 0 : -1;
     });
-    $$("[data-panel]").forEach(p => { p.hidden = p.dataset.panel !== b.dataset.tab; });
-    // The tab is the URL's fragment, so a tab can be linked to -- from a
-    // runbook, a chat, a bug report -- and the back button and a reload
-    // land where the reader was. Replaced, not pushed: five tabs are not
-    // five pages of history.
-    if (location.hash !== "#" + b.dataset.tab)
-      history.replaceState(null, "", "#" + b.dataset.tab);
+    panels.forEach(p => { p.hidden = p.dataset.panel !== name; });
+    if (name === "more") { state.moreShown = true; showMore(null); }
+    if (name === "loan") renderLoanPage();
+    // The tab is the address's fragment, so a tab can be linked to and a reload
+    // lands where the reader was. Replaced, not pushed, except for a loan's page.
+    if (!keepHash && location.hash !== "#" + name)
+      history.replaceState(null, "", "#" + name);
   };
   const byHash = () => {
-    const want = location.hash.slice(1);
-    const t = tabs.find(x => x.dataset.tab === want);
-    if (t && !t.classList.contains("on")) show(t);
+    const h = location.hash.slice(1);
+    if (/^loan\//.test(h)) { show("loan", true); const el = $("#panel-loan"); if (el) el.scrollIntoView(); return; }
+    const want = ALIAS[h] || h;
+    if (tabs.some(x => x.dataset.tab === want)) {
+      show(want, want !== h);
+      if (h === "btc") { const el = $("#btc"); if (el) el.scrollIntoView(); }
+    } else if (!h) show("borrow", true);
   };
   window.addEventListener("hashchange", byHash);
   byHash();
   tabs.forEach((b, i) => {
     b.setAttribute("role", "tab");
-    b.setAttribute("aria-selected", b.classList.contains("on") ? "true" : "false");
-    b.tabIndex = b.classList.contains("on") ? 0 : -1;
-    b.onclick = () => show(b);
+    b.onclick = () => show(b.dataset.tab);
     b.onkeydown = (e) => {
-      const to = e.key === "ArrowRight" ? (i + 1) % tabs.length
-        : e.key === "ArrowLeft" ? (i - 1 + tabs.length) % tabs.length
+      const vis = tabs.filter(x => !x.hidden);
+      const j = vis.indexOf(b);
+      const to = e.key === "ArrowRight" ? (j + 1) % vis.length
+        : e.key === "ArrowLeft" ? (j - 1 + vis.length) % vis.length
         : e.key === "Home" ? 0
-        : e.key === "End" ? tabs.length - 1 : null;
+        : e.key === "End" ? vis.length - 1 : null;
       if (to === null) return;
       e.preventDefault();
-      show(tabs[to]);
-      tabs[to].focus();
+      show(vis[to].dataset.tab);
+      vis[to].focus();
     };
   });
+  $("#moretools").onclick = (e) => { e.preventDefault(); state.moreShown = true; showMore(null); show("more"); window.scrollTo(0, $("nav.tabs").offsetTop - 10); };
 }
 
 function wireFilters(attr, set) {
@@ -3290,57 +3432,54 @@ async function boot() {
   try {
     await pinCovenant();
   } catch (e) {
-    $("#pinned").textContent = "covenant NOT pinned";
+    $("#pinned").textContent = "this page's loan code did NOT check out";
     $("#pinned").className = "tag bad";
-    note("Refusing to run: this page could not pin its covenant implementation " +
+    note("Refusing to run: this page could not check its own loan code " +
          "against the golden vectors, so any address it derived could be wrong. " +
          esc(e.message), "bad");
-    // ...and make the dead chrome LOOK dead. Returning here wires nothing, so
-    // the tabs and the Refresh button stay on screen and do nothing when
-    // clicked -- which reads as a broken page rather than as a page that has
-    // deliberately stopped, and invites a reader to keep trying.
+    // ...and make the dead chrome LOOK dead.
     document.querySelectorAll("button, select, input, textarea")
       .forEach((el) => { try { el.disabled = true; } catch { /* not a control */ } });
-    document.querySelectorAll("[data-panel]").forEach((el) => {
+    document.querySelectorAll("section[data-panel]").forEach((el) => {
       el.innerHTML = '<div class="note bad">This page has stopped: it could ' +
-        'not check its own covenant code against the golden vectors, and it ' +
+        'not check its own loan code against the golden vectors, and it ' +
         'will not derive an address it cannot prove. Nothing here is safe to ' +
-        'act on until that is fixed — use <code>pignus-cli</code>, which pins ' +
+        'act on until that is fixed: use <code>pignus-cli</code>, which checks ' +
         'the same vectors against the proven builder, or reload once the site ' +
         'is updated.</div>';
     });
     return;
   }
+  wireTabs();
   try { await refresh(); } catch (e) { note("The book is not answering: " + esc(e.message), "bad"); }
-  renderWallet();
   $("#lendform").onsubmit = lend;
   $("#lendform").oninput = renderPreview;
   $("#repoform").onsubmit = checkRepurchase;
   $("#btcform").onsubmit = checkBtc;
   $("#refresh").onclick = () => refresh().catch(e => note(explain(e), "bad"));
-  wireTabs();
   wireFilters("lf", (v) => { state.loansFilter = v; renderLoans(); });
   wireFilters("of", (v) => { state.offersFilter = v; renderOffers(); });
-  // resume a prior connection without prompting
+  // The wallets this book offers, then the one chosen before, without prompting.
   try {
-    state.wallet = await Wallet.open();
+    const site = await api("v1/site").catch(() => null);
+    state.wallet = await Wallet.open(site?.wallet_connectors);
+    state.connectUi = mountConnect({
+      wallet: state.wallet,
+      connected: (account) => onConnected(account),
+      gone: walletGone,
+      say: (text, kind) => note(esc(text), kind),
+    });
+    await Promise.all([state.wallet.P.localReady, state.wallet.P.webWalletReady]).catch(() => {});
     const account = await state.wallet.resume();
-    if (account) {
-      state.account = account;
-      await loadWallet();
-      renderWallet(); renderOffers(); renderLoans(); renderAlerts(); renderPreview();
-      renderBtcLoans().catch(() => {});
-    }
-    const gone = () => {
-      forgetWallet();
-      renderWallet(); renderOffers(); renderLoans(); renderAlerts();
-      renderBtcLoans().catch(() => {});
-    };
-    state.wallet.on("accountsChanged", gone);
-    state.wallet.on("disconnect", gone);
-  } catch { /* no wallet installed; the page still reads */ }
+    if (account) await onConnected(account, true);
+    state.wallet.P.walletMode().then(showMore).catch(() => {});
+    state.wallet.P.onAccountChange((acc) => {
+      if (!acc && state.account) walletGone();
+    });
+  } catch (e) { console.warn("pignus: wallet connectors", e); }
+  renderWallet();
   // An offer funded in an earlier session whose listing never landed: try once,
-  // quietly. It shows up under "Mine" with a List button either way.
+  // quietly. It shows up under Yours with a button either way.
   for (const rec of pendingOffers()) {
     post("v1/offers", { terms: rec.terms, kind: "funded", outpoint: rec.outpoint,
       principal: rec.principal, collateral: rec.collateral,

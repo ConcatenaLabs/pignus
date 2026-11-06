@@ -77,6 +77,7 @@ run "browser: what a take puts at index 1" node tests/test_takeoffer_web.mjs
 run "browser: amounts the page shows exactly" node tests/test_format_web.mjs
 run "alerts: what needs a person, per seat" node tests/test_alerts_web.mjs
 run "browser: version 2 vs vectors"   node tests/test_v2_web.mjs
+run "browser: the wallet connectors as vendored" node tests/test_vendor_web.mjs
 run "a cached spend's depth, and a reorg under it" python3 tests/test_spend_depth.py
 run "a cross-chain offer's own end"   python3 tests/test_offer_expiry.py
 run "BTC relay: what it may be believed about" python3 tests/test_btc_relay_auth.py

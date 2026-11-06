@@ -69,54 +69,54 @@ export function alertsFor(view) {
     if (l.oracle_compromised && (mine(t.borrower_prog) || mine(t.lender_prog))) {
       (mine(t.borrower_prog) ? borrower : lender).push({
         level: "bad", key, action: mine(t.borrower_prog) ? "repay" : null,
-        text: "An oracle has declared the key this loan bakes compromised: whoever holds it can sign any price. " +
-              (mine(t.borrower_prog) ? "Repay now; nothing else protects the collateral."
-                                     : "Expect nothing honest from that oracle; the borrower has been told to repay.") });
+        text: "A price signer has said the key this loan uses is compromised: whoever holds it can sign any price. " +
+              (mine(t.borrower_prog) ? "Repay now; nothing else protects your collateral."
+                                     : "Expect nothing honest from that price signer; the borrower has been told to repay.") });
     }
     if (mine(t.borrower_prog)) {
       if (l.recover_open) {
         borrower.push({ level: "bad", key, action: "repay",
-          text: "The lender may now sweep the whole collateral, with no oracle " +
-                "and at no price. Repay this moment or it is gone." });
+          text: "The lender may now take the whole collateral, without a price. " +
+                "Repay this moment or it is gone." });
       } else if (l.past_maturity) {
         borrower.push({ level: "bad", key, action: "repay",
-          text: "This loan has matured: anyone may call it at any price and " +
-                "keep the bonus out of your collateral. Repay it now." +
-                (toRecover != null ? ` The lender's oracle-free sweep opens ${inWords(toRecover)}.` : "") });
+          text: "This loan is past due: anyone may call it in at any price and " +
+                "keep a bonus out of your collateral. Repay it now." +
+                (toRecover != null ? ` The lender may take all of it without a price ${inWords(toRecover)}.` : "") });
       } else if (h != null && h < 1) {
         borrower.push({ level: "bad", key, action: "repay",
           text: "Liquidatable now" +
                 (liqFor != null ? ` (and for ${liqFor < 1 ? "under an hour" : Math.round(liqFor) + " hours"})` : "") +
-                ": anyone may take the bonus out of your collateral. Repay it to close it." });
+                ": anyone may take a bonus out of your collateral. Repay it to close it." });
       } else if (h != null && h < 1.15) {
         borrower.push({ level: "warn", key, action: "repay",
-          text: `Health ${h.toFixed(3)}: close to the strike. Repay it, or watch it.` });
+          text: "At risk: the price is close to where this loan can be liquidated. Repay it, or watch it." });
       }
       if (!l.past_maturity && toMaturity != null && toMaturity < soon) {
         borrower.push({ level: "warn", key, action: "repay",
-          text: `Matures ${inWords(toMaturity)}. After that anyone may call it at any price; repay before.` });
+          text: `Due ${inWords(toMaturity)}. After that anyone may call it in at any price; repay before.` });
       }
       if (!canPay && (l.past_maturity || (h != null && h < 1.15))) {
         borrower.push({ level: "warn", key, action: null,
-          text: "This wallet does not hold the debt in unblinded (explicit) coins, so " +
-                "Repay would fail. Get the debt asset, or send what you already hold to your own unblinded address first." });
+          text: "This wallet does not hold the debt in coins it can repay from, so " +
+                "Repay would fail. Get the debt asset, or send what you hold to your own address in the clear first." });
       }
     }
 
     if (mine(t.lender_prog)) {
-      const needs = canPay ? "" : " Calling it pays the debt from your wallet first, " +
-        "and this wallet does not hold it in unblinded (explicit) coins.";
+      const needs = canPay ? "" : " Calling it in pays what is owed from your wallet first, " +
+        "and this wallet does not hold it in coins it can spend here.";
       if (l.recover_open) {
         lender.push({ level: "warn", key, action: "recover",
-          text: "Matured, unrepaid, and the oracle-free sweep is open: Recover " +
-                "takes the whole collateral and needs nothing from anyone." });
+          text: "Past due, unrepaid, and you may now take the whole collateral " +
+                "without a price: Take the collateral needs nothing from anyone." });
       } else if (l.past_maturity) {
         lender.push({ level: "warn", key, action: canPay ? "default" : null,
-          text: "Matured and unrepaid: Call default at any price." + needs +
-                (toRecover != null ? ` Recover, which needs nothing, opens ${inWords(toRecover)}.` : "") });
+          text: "Past due and unrepaid: you may call it in at any price." + needs +
+                (toRecover != null ? ` You may take the collateral without a price ${inWords(toRecover)}.` : "") });
       } else if (l.liquidatable) {
         lender.push({ level: "warn", key, action: canPay ? "liquidate" : null,
-          text: "Under the strike" +
+          text: "Below its liquidation price" +
                 (liqFor != null ? ` for ${liqFor < 1 ? "under an hour" : Math.round(liqFor) + " hours"}` : "") +
                 " and nobody has liquidated it. Liquidate, or wait for someone who will." + needs });
       }
@@ -128,8 +128,8 @@ export function alertsFor(view) {
     const left = o.lots_left != null ? Number(o.lots_left) : 1;
     if (o.expired && left > 0 && (o.status || "open") !== "withdrawn") {
       lender.push({ level: "warn", key: o.offer_id, action: "withdraw",
-        text: `An offer of yours has expired with ${left} lot${left > 1 ? "s" : ""} untaken. ` +
-              "Nothing returns on its own: Withdraw brings the principal back." });
+        text: `An offer of yours has closed with ${left} loan${left > 1 ? "s" : ""} nobody borrowed. ` +
+              "Nothing comes back by itself: Take it back returns your money." });
     }
   }
 
@@ -158,7 +158,7 @@ export function alertsFor(view) {
                                     view.debtPrecision ? view.debtPrecision(l.debt_asset) : 8);
       if (health != null && health < 1) {
         btc.push({ level: "bad", key, action: stage === "live" ? "btcstep" : null,
-          text: `BTC is below this loan's seizure price (health ${health.toFixed(2)}): the lender and the oracle can co-sign a seizure now.` +
+          text: "BTC is below this loan's seizure price: the lender and the price signer can take the collateral now." +
                 (stage === "live" ? " Repay." : "") });
       }
     }
