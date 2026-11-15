@@ -320,7 +320,7 @@ def main():
             # bot cannot restate a fee paid in another asset into the units
             # its profit is measured in and refuses to decide -- correctly,
             # and a dry run that "ran clean" on that refusal proved nothing.
-            n.setfeeexchangerates({d: 100_000_000}, False)
+            n.setfeeexchangerates({d: 100_000_000})
             bot = subprocess.run(
                 [sys.executable, os.path.join(BIN, "pignus-liquidator"),
                  "--once", "--dry-run", "--book", book,

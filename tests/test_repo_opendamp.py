@@ -90,7 +90,7 @@ def main():
         # the old one and bitcoin still pays for everything else here.
         rates = n.getfeeexchangerates()
         rates[money] = COIN
-        n.setfeeexchangerates(rates, False)
+        n.setfeeexchangerates(rates)
 
         node_args = ["--rpc", f"http://127.0.0.1:{rig.seq_rpcport}",
                      "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS,
